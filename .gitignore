@@ -1,6 +1,6 @@
-# Binarios compilados
-agent
-wapp-edge-agent
+# Binarios compilados (anclados a la raíz para no ignorar cmd/agent/)
+/agent
+/wapp-edge-agent
 *.exe
 *.exe~
 *.test
