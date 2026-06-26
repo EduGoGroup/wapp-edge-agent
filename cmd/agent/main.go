@@ -35,6 +35,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/enroll"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/logger"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 	"google.golang.org/grpc"
@@ -76,6 +77,16 @@ func main() {
 		}
 		if err := runSend(context.Background(), cfg, log, os.Args[2], os.Args[3]); err != nil {
 			log.Error("envio fallido", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// `enroll` ejecuta el enrolamiento real contra el Gateway: genera el par mTLS del Edge a partir de
+	// un código de activación y persiste cert+clave en TLSCert/TLSKey para que `listen` use mTLS.
+	if len(os.Args) > 1 && os.Args[1] == "enroll" {
+		if err := runEnroll(context.Background(), cfg, log); err != nil {
+			log.Error("enrolamiento fallido", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -208,6 +219,32 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 
 	log.Info("restauracion/escucha finalizada: socket cerrado limpiamente")
 	return nil
+}
+
+// runEnroll cablea el subcomando `enroll`: lee el código de activación de cfg o de os.Args
+// (`agent enroll <codigo>`), valida precondiciones (endpoint de enrolamiento, TLSCA pre-provista y
+// código presentes) y delega al paquete enroll, que genera el par mTLS y lo persiste en TLSCert/TLSKey.
+// No toca pair/send/listen. La TLSCA DEBE estar pre-provista antes de enrolar (valida al Gateway).
+func runEnroll(ctx context.Context, cfg config.Config, log sharedlogger.Logger) error {
+	// Override opcional del código por argumento posicional: `agent enroll <codigo>`.
+	if len(os.Args) > 2 && os.Args[2] != "" {
+		cfg.CloudLink.ActivationCode = os.Args[2]
+	}
+
+	if cfg.CloudLink.EnrollmentEndpoint == "" {
+		return fmt.Errorf("falta enrollment_endpoint (configura cloudlink.enrollment_endpoint o WAPP_AGENT_CLOUDLINK_ENROLLMENT_ENDPOINT)")
+	}
+	if cfg.CloudLink.TLSCA == "" {
+		return fmt.Errorf("falta tls_ca: la CA que valida al Gateway debe estar pre-provista antes de enrolar")
+	}
+	if cfg.CloudLink.ActivationCode == "" {
+		return fmt.Errorf("falta el código de activación (usa `agent enroll <codigo>` o WAPP_AGENT_CLOUDLINK_ACTIVATION_CODE)")
+	}
+
+	log.Info("enrolando el Edge contra el Gateway",
+		"endpoint", cfg.CloudLink.EnrollmentEndpoint, "tls_cert", cfg.CloudLink.TLSCert, "tls_key", cfg.CloudLink.TLSKey)
+
+	return enroll.Run(ctx, cfg, log)
 }
 
 // buildSink construye el InboundSink de la escucha 24/7.

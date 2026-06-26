@@ -46,6 +46,16 @@ type CloudLinkConfig struct {
 	// LeasePubKeyPath es la ruta a la clave pública Ed25519 del emisor de leases (servidor). Si está
 	// presente, se activa el gate de lease (kill-switch); si no, no se gatea (dev).
 	LeasePubKeyPath string `yaml:"lease_pubkey_path"`
+	// EnrollmentEndpoint es la dirección gRPC del servidor de enrolamiento del Gateway (subcomando
+	// `enroll`). En dev suele ser un puerto distinto al de Connect (p.ej. "localhost:8444"). El dial de
+	// enrolamiento usa TLS-de-servidor (NO mTLS): valida al Gateway con TLSCA. Vacío desactiva `enroll`.
+	EnrollmentEndpoint string `yaml:"enrollment_endpoint"`
+	// ActivationCode es el código de activación emitido por el Gateway para autorizar el enrolamiento.
+	// De un solo uso. Se puede pasar también como argumento: `agent enroll <codigo>`.
+	ActivationCode string `yaml:"activation_code"`
+	// EdgeID es la identidad del Edge que va al CommonName del CSR durante el enrolamiento. Si está
+	// vacío se resuelve en tiempo de ejecución: SessionID si existe, si no el hostname del equipo.
+	EdgeID string `yaml:"edge_id"`
 }
 
 // defaults devuelve la configuracion con valores por defecto sensatos.
@@ -83,6 +93,14 @@ func Load(path string) (Config, error) {
 	cfg.DEKPath = loader.GetString("DEK_PATH", cfg.DEKPath)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
+	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)
+	cfg.CloudLink.TLSKey = loader.GetString("CLOUDLINK_TLS_KEY", cfg.CloudLink.TLSKey)
+	cfg.CloudLink.TLSCA = loader.GetString("CLOUDLINK_TLS_CA", cfg.CloudLink.TLSCA)
+	cfg.CloudLink.ServerName = loader.GetString("CLOUDLINK_SERVER_NAME", cfg.CloudLink.ServerName)
+	cfg.CloudLink.LeasePubKeyPath = loader.GetString("CLOUDLINK_LEASE_PUBKEY_PATH", cfg.CloudLink.LeasePubKeyPath)
+	cfg.CloudLink.EnrollmentEndpoint = loader.GetString("CLOUDLINK_ENROLLMENT_ENDPOINT", cfg.CloudLink.EnrollmentEndpoint)
+	cfg.CloudLink.ActivationCode = loader.GetString("CLOUDLINK_ACTIVATION_CODE", cfg.CloudLink.ActivationCode)
+	cfg.CloudLink.EdgeID = loader.GetString("CLOUDLINK_EDGE_ID", cfg.CloudLink.EdgeID)
 
 	return cfg, nil
 }
