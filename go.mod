@@ -3,10 +3,11 @@ module github.com/EduGoGroup/wapp-edge-agent
 go 1.26.0
 
 require (
-	github.com/EduGoGroup/wapp-cloudlink v0.0.0-00010101000000-000000000000
-	github.com/EduGoGroup/wapp-shared/config v0.0.0-00010101000000-000000000000
-	github.com/EduGoGroup/wapp-shared/envelope v0.0.0-00010101000000-000000000000
-	github.com/EduGoGroup/wapp-shared/logger v0.0.0-00010101000000-000000000000
+	github.com/EduGoGroup/wapp-cloudlink v0.1.0
+	github.com/EduGoGroup/wapp-shared/config v0.1.0
+	github.com/EduGoGroup/wapp-shared/envelope v0.1.0
+	github.com/EduGoGroup/wapp-shared/logger v0.1.0
+	github.com/google/uuid v1.6.0
 	github.com/mdp/qrterminal/v3 v3.2.1
 	go.mau.fi/whatsmeow v0.0.0-20260616120636-eaa388b4e537
 	google.golang.org/grpc v1.81.1
@@ -18,10 +19,8 @@ require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/beeper/argo-go v1.1.2 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
@@ -38,6 +37,7 @@ require (
 	golang.org/x/sys v0.46.0 // indirect
 	golang.org/x/term v0.44.0 // indirect
 	golang.org/x/text v0.38.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

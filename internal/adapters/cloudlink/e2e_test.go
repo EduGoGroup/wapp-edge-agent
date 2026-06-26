@@ -46,7 +46,7 @@ import (
 // recibe del Edge y permite al test EMPUJAR comandos cloud->edge por el mismo stream.
 type serverDouble struct {
 	cloudlinkv1.UnimplementedCloudLinkServer
-	received chan *cloudlinkv1.EdgeToCloud         // edge -> cloud (lo que emite el Adapter)
+	received chan *cloudlinkv1.EdgeToCloud            // edge -> cloud (lo que emite el Adapter)
 	streamCh chan cloudlinkv1.CloudLink_ConnectServer // se entrega al test cuando el Adapter conecta
 }
 

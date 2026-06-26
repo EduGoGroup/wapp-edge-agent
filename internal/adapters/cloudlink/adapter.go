@@ -33,8 +33,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	cloudlinkv1 "github.com/EduGoGroup/wapp-cloudlink/gen/wapp/cloudlink/v1"
 	"github.com/EduGoGroup/wapp-cloudlink/client"
+	cloudlinkv1 "github.com/EduGoGroup/wapp-cloudlink/gen/wapp/cloudlink/v1"
 	"github.com/EduGoGroup/wapp-cloudlink/lease"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
@@ -53,7 +53,7 @@ type Adapter struct {
 	sessionID string
 	sendFunc  SendFunc
 	validator *lease.Validator // opcional (nil => sin gate de lease, p.ej. dev sin clave pública)
-	hasDEK    func() bool       // proveedor del booleano del gate 2-de-2 (p.ej. custody.Exists)
+	hasDEK    func() bool      // proveedor del booleano del gate 2-de-2 (p.ej. custody.Exists)
 	log       logger.Logger
 
 	hbInterval time.Duration
