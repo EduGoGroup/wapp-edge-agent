@@ -14,8 +14,15 @@ dist/
 .env
 .env.*
 
+# Material criptográfico — JAMÁS al repo (zero-knowledge, ADR-0007). La DEK del
+# spike vive en dek.key (custodia provisional; en v1 va al keystore del SO).
+dek.key
+*.key
+
 # Bases de datos locales (solo en desarrollo; el .db real tiene datos sensibles)
 *.db
+*.db-shm
+*.db-wal
 
 # Vendor (descomentar si se usa go mod vendor)
 # vendor/
