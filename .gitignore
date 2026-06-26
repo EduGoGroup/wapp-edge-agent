@@ -20,6 +20,10 @@ dist/
 # Vendor (descomentar si se usa go mod vendor)
 # vendor/
 
+# go workspace — SOLO desarrollo local (overlay de wapp-shared sin publicar)
+go.work
+go.work.sum
+
 # macOS
 .DS_Store
 
