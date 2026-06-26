@@ -3,7 +3,8 @@
 // Bootstrap minimo (T0, Plan 002): carga configuracion, construye el logger y
 // registra el arranque. El subcomando `pair` (T3.4) ejecuta el emparejamiento por
 // QR local con los adaptadores REALES (store SQLite cifrado + whatsmeow + control
-// en terminal + custodia de la DEK en archivo). La logica restante (CloudLink,
+// en terminal + custodia de la DEK en archivo). El subcomando `send` (T4.3) despacha
+// un texto a un destino usando la sesion ya pareada. La logica restante (CloudLink,
 // listener 24/7, systray) se incorpora en chunks posteriores.
 package main
 
@@ -48,6 +49,18 @@ func main() {
 		return
 	}
 
+	if len(os.Args) > 1 && os.Args[1] == "send" {
+		if len(os.Args) < 4 {
+			log.Error("uso: agent send <destino> <texto>")
+			os.Exit(1)
+		}
+		if err := runSend(context.Background(), cfg, log, os.Args[2], os.Args[3]); err != nil {
+			log.Error("envio fallido", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	log.Info("wapp-edge-agent arrancando",
 		"version", Version,
 		"log_level", cfg.LogLevel,
@@ -82,5 +95,30 @@ func runPair(ctx context.Context, cfg config.Config, log sharedlogger.Logger) er
 
 	log.Info("emparejamiento completado (PairSuccess): DEK sellada y store cifrado creado",
 		"wa_jid", res.WaJID, "db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
+	return nil
+}
+
+// runSend ejecuta el caso de uso app.Send con los adaptadores REALES: abre/migra el store SQLite
+// cifrado, carga la DEK custodiada en archivo, construye el sender whatsmeow real (que resuelve la
+// sesion pareada, conecta un cliente efimero y despacha el texto) y envia. Requiere una sesion ya
+// emparejada (subcomando `pair`); envia por red de verdad (es el hito interactivo T4.3).
+func runSend(ctx context.Context, cfg config.Config, log sharedlogger.Logger, to, text string) error {
+	database, err := db.OpenAndMigrate(ctx, cfg.DBPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = database.Close() }()
+
+	custody := keycustody.NewFileCustody(cfg.DEKPath)
+	sender := waconn.NewSender(database)
+
+	log.Info("envio: despachando texto a WhatsApp",
+		"to", to, "db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
+
+	if err := app.NewSend(custody, sender).Run(ctx, to, text); err != nil {
+		return err
+	}
+
+	log.Info("envio completado: texto despachado a WhatsApp", "to", to)
 	return nil
 }

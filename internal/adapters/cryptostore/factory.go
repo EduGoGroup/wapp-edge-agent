@@ -15,6 +15,7 @@ package cryptostore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 
 	"github.com/EduGoGroup/wapp-shared/envelope"
@@ -77,4 +78,28 @@ func LoadDevice(ctx context.Context, container store.DeviceContainer, jid types.
 		panic("cryptostore: LoadDevice requiere un container creado por NewEncryptedContainer")
 	}
 	return c.GetDevice(ctx, jid)
+}
+
+// FirstDeviceJID devuelve el JID del único device pareado en el store cifrado (tabla
+// msg_enc_device). El Edge del spike custodia UNA sola sesión; este helper la resuelve sin que el
+// llamante (el sender) tenga que conocer el JID de antemano, que tampoco se persiste fuera del
+// store. Es la contraparte de LoadDevice para el caso de envío: primero resolver el JID, luego
+// cargar el device.
+//
+// Consulta solo la columna `jid` (NO material sensible: no descifra nada). Devuelve error si no hay
+// ninguna sesión pareada (envío imposible) o si el JID persistido no parsea.
+func FirstDeviceJID(ctx context.Context, db *sql.DB) (types.JID, error) {
+	var raw string
+	err := db.QueryRowContext(ctx, `SELECT jid FROM msg_enc_device LIMIT 1`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return types.JID{}, fmt.Errorf("cryptostore: no hay device pareado en el store")
+	}
+	if err != nil {
+		return types.JID{}, fmt.Errorf("cryptostore: leer device pareado: %w", err)
+	}
+	jid, err := types.ParseJID(raw)
+	if err != nil {
+		return types.JID{}, fmt.Errorf("cryptostore: JID pareado inválido: %w", err)
+	}
+	return jid, nil
 }
