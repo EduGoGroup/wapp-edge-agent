@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,14 +74,14 @@ func (f *fakeLocator) PairedJID(_ context.Context) (string, bool, error) {
 
 // fakeRunner simula app.Listen: registra si se invocó y respeta la cancelación del ctx.
 type fakeRunner struct {
-	called          bool
+	called          atomic.Bool
 	runErr          error
 	blockTillCancel bool
 	gotCancel       error
 }
 
 func (f *fakeRunner) Run(ctx context.Context) error {
-	f.called = true
+	f.called.Store(true)
 	if f.runErr != nil {
 		return f.runErr
 	}
@@ -114,7 +115,7 @@ func TestRestore_FromRegistry_DelegatesAndMarksActive(t *testing.T) {
 	}()
 
 	// Espera a que el runner haya sido invocado, luego cancela.
-	waitFor(t, func() bool { return run.called })
+	waitFor(t, func() bool { return run.called.Load() })
 	cancel()
 
 	select {
@@ -156,7 +157,7 @@ func TestRestore_BackfillsFromLocator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !run.called {
+	if !run.called.Load() {
 		t.Fatal("el runner debía invocarse tras el backfill")
 	}
 	up, ok := store.lastUpsert()
@@ -177,7 +178,7 @@ func TestRestore_NoSessions(t *testing.T) {
 	if !errors.Is(err, ErrNoSessions) {
 		t.Fatalf("error = %v, esperaba ErrNoSessions", err)
 	}
-	if run.called {
+	if run.called.Load() {
 		t.Fatal("el runner NO debía invocarse sin sesión")
 	}
 }
@@ -192,7 +193,7 @@ func TestRestore_LoggedOut(t *testing.T) {
 	if !errors.Is(err, ErrSessionLoggedOut) {
 		t.Fatalf("error = %v, esperaba ErrSessionLoggedOut", err)
 	}
-	if run.called {
+	if run.called.Load() {
 		t.Fatal("el runner NO debía invocarse con la sesión cerrada")
 	}
 }
@@ -206,7 +207,7 @@ func TestRestore_ListError(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v, esperaba envolver %v", err, sentinel)
 	}
-	if run.called {
+	if run.called.Load() {
 		t.Fatal("el runner NO debía invocarse si falla List")
 	}
 }
@@ -221,7 +222,7 @@ func TestRestore_LocatorError(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v, esperaba envolver %v", err, sentinel)
 	}
-	if run.called {
+	if run.called.Load() {
 		t.Fatal("el runner NO debía invocarse si falla el locator")
 	}
 }
@@ -238,7 +239,7 @@ func TestRestore_UpsertError(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v, esperaba envolver %v", err, sentinel)
 	}
-	if run.called {
+	if run.called.Load() {
 		t.Fatal("el runner NO debía invocarse si falla el Upsert")
 	}
 }
@@ -255,7 +256,7 @@ func TestRestore_RunnerError(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v, esperaba envolver %v", err, sentinel)
 	}
-	if !run.called {
+	if !run.called.Load() {
 		t.Fatal("el runner debía haberse invocado")
 	}
 }
