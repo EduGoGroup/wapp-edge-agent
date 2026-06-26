@@ -11,15 +11,27 @@ package db
 import (
 	"context"
 	"database/sql"
-	_ "embed"
+	"embed"
 	"fmt"
+	"io/fs"
 	"os"
+	"sort"
+	"strings"
 
 	_ "modernc.org/sqlite" // driver "sqlite" (CGO-free)
 )
 
-//go:embed migrations/0001_init.sql
-var migration0001 string
+// embeddedMigrations embebe TODO el directorio de migraciones (0001_init.sql, 0002_sessions.sql, …).
+// Migrate las aplica en orden lexicográfico del nombre (el prefijo NNNN_ garantiza el orden).
+//
+//go:embed migrations/*.sql
+var embeddedMigrations embed.FS
+
+// migrationsFS es la fuente de las migraciones. Es una var (no la embed.FS directa) para que los
+// tests puedan inyectar un FS que fuerce los errores de lectura, normalmente inalcanzables con embed.
+var migrationsFS fs.FS = embeddedMigrations
+
+const migrationsDir = "migrations"
 
 // Open abre (creando si hace falta) el store SQLite en path con permisos 0600 y deja la
 // conexión lista: journal_mode=WAL, foreign_keys=ON, busy_timeout=5s.
@@ -58,13 +70,45 @@ func Open(path string) (*sql.DB, error) {
 	return database, nil
 }
 
-// Migrate aplica la migración embebida 0001 (tablas msg_enc_*). Es idempotente
-// (CREATE TABLE IF NOT EXISTS), así que reaplicarla sobre un store ya migrado es no-op.
+// Migrate aplica TODAS las migraciones embebidas (migrations/*.sql) en orden lexicográfico de su
+// nombre. Cada migración es idempotente (CREATE TABLE IF NOT EXISTS), así que:
+//   - sobre un store nuevo crea todo el esquema (0001 msg_enc_* + 0002 sessions);
+//   - sobre un store que ya tiene la 0001 (p.ej. la sesión real del spike), la 0001 es no-op y solo
+//     se añade la 0002 (tabla sessions), sin tocar los datos existentes;
+//   - reaplicarla entera sobre un store ya migrado es no-op.
+//
+// El orden importa (FKs/dependencias futuras): el prefijo NNNN_ del nombre fija la secuencia.
 func Migrate(ctx context.Context, database *sql.DB) error {
-	if _, err := database.ExecContext(ctx, migration0001); err != nil {
-		return fmt.Errorf("db: aplicar migración 0001: %w", err)
+	names, err := migrationNames()
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		sqlText, err := fs.ReadFile(migrationsFS, migrationsDir+"/"+name)
+		if err != nil {
+			return fmt.Errorf("db: leer migración %q: %w", name, err)
+		}
+		if _, err := database.ExecContext(ctx, string(sqlText)); err != nil {
+			return fmt.Errorf("db: aplicar migración %q: %w", name, err)
+		}
 	}
 	return nil
+}
+
+// migrationNames lista los ficheros .sql embebidos en orden lexicográfico (orden de aplicación).
+func migrationNames() ([]string, error) {
+	entries, err := fs.ReadDir(migrationsFS, migrationsDir)
+	if err != nil {
+		return nil, fmt.Errorf("db: listar migraciones: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 // OpenAndMigrate combina Open + Migrate: deja un *sql.DB con permisos 0600, pragmas fijados

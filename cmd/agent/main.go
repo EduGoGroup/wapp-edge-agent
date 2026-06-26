@@ -16,11 +16,15 @@ import (
 	"os/signal"
 	"syscall"
 
+	"time"
+
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cloudlink"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/logger"
@@ -66,9 +70,11 @@ func main() {
 		return
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "listen" {
-		if err := runListen(cfg, log); err != nil {
-			log.Error("escucha fallida", "error", err)
+	// `listen` y `restore` comparten flujo: restaurar la sesión persistida (T6.2) y mantener el
+	// socket vivo 24/7. Se mantienen ambos nombres por claridad del hito T6.3.
+	if len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "restore") {
+		if err := runRestore(cfg, log); err != nil {
+			log.Error("restauración/escucha fallida", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -106,7 +112,20 @@ func runPair(ctx context.Context, cfg config.Config, log sharedlogger.Logger) er
 		return err
 	}
 
-	log.Info("emparejamiento completado (PairSuccess): DEK sellada y store cifrado creado",
+	// Registra los METADATOS DE NEGOCIO de la sesión recién pareada (T6.1) para que RestoreSessions
+	// la reanude al reiniciar (RF-7). En claro: jid + estado + timestamps (sin material cripto).
+	now := time.Now()
+	sess := domain.Session{
+		JID:       res.WaJID,
+		State:     domain.SessionStateActive,
+		PairedAt:  now,
+		UpdatedAt: now,
+	}
+	if err := sessionstore.New(database).Upsert(ctx, sess); err != nil {
+		return err
+	}
+
+	log.Info("emparejamiento completado (PairSuccess): DEK sellada, store cifrado creado y sesión registrada",
 		"wa_jid", res.WaJID, "db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
 	return nil
 }
@@ -136,13 +155,14 @@ func runSend(ctx context.Context, cfg config.Config, log sharedlogger.Logger, to
 	return nil
 }
 
-// runListen ejecuta el caso de uso app.Listen con los adaptadores REALES: abre/migra el store SQLite
-// cifrado, carga la DEK custodiada en archivo, construye el ListenGateway whatsmeow real (always-on:
-// resuelve la sesion pareada, conecta el cliente, registra el Listener) y reenvia cada mensaje
-// entrante al LogSink (stub CloudLink del spike). Mantiene el socket VIVO hasta Ctrl-C / SIGINT,
-// momento en que cancela el ctx para un cierre limpio. Requiere una sesion ya emparejada (subcomando
-// `pair`); recibe por red de verdad (es el hito interactivo T5.5).
-func runListen(cfg config.Config, log sharedlogger.Logger) error {
+// runRestore ejecuta el caso de uso app.RestoreSessions con los adaptadores REALES (T6.2/T6.3): abre/
+// migra el store SQLite cifrado (aplica 0001 + 0002), resuelve la sesion a restaurar desde la tabla
+// `sessions` (o la backfillea desde el store cifrado si la BD se pareo antes de existir esa tabla),
+// marca la sesion activa y DELEGA la escucha always-on a app.Listen (que carga la DEK custodiada,
+// reconstruye el device pareado, conecta el cliente y registra el Listener). Reenvia cada mensaje
+// entrante al LogSink (stub CloudLink del spike) y mantiene el socket VIVO hasta Ctrl-C / SIGINT.
+// Requiere una sesion ya emparejada (subcomando `pair`); reanuda SIN re-emparejar (es el hito T6.3).
+func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 	// ctx cancelado por SIGINT (Ctrl-C) o SIGTERM: dispara el cierre limpio del socket always-on.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -156,14 +176,21 @@ func runListen(cfg config.Config, log sharedlogger.Logger) error {
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
 	gateway := waconn.NewListenGateway(database, log)
 	sink := cloudlink.NewLogSink(log)
+	sessions := sessionstore.New(database)
+	locator := sessionstore.NewLocator(database)
 
-	log.Info("escucha 24/7: manteniendo el socket vivo (envia un WhatsApp al numero para ver el InboundEvent; Ctrl-C para detener)",
+	// app.Listen hace el restore CRIPTOGRAFICO + socket always-on; RestoreSessions le antepone el
+	// registro de negocio (resolver/backfillear/marcar activa la sesion). Sin duplicar la conexion.
+	listener := app.NewListen(custody, gateway, sink)
+	restore := app.NewRestoreSessions(sessions, locator, listener)
+
+	log.Info("restaurando sesion persistida y manteniendo el socket vivo (envia un WhatsApp al numero para ver el InboundEvent; Ctrl-C para detener)",
 		"db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
 
-	if err := app.NewListen(custody, gateway, sink).Run(ctx); err != nil {
+	if err := restore.Run(ctx); err != nil {
 		return err
 	}
 
-	log.Info("escucha 24/7 finalizada: socket cerrado limpiamente")
+	log.Info("restauracion/escucha finalizada: socket cerrado limpiamente")
 	return nil
 }
