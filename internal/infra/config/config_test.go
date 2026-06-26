@@ -111,3 +111,63 @@ func TestLoad_BadYAML(t *testing.T) {
 		t.Fatal("Load deberia fallar con YAML invalido, pero devolvio nil")
 	}
 }
+
+func TestLoad_CloudLinkEnrollFromYAML(t *testing.T) {
+	// Los campos de enrolamiento (T6) se leen del YAML bajo cloudlink.
+	path := writeTempYAML(t, `
+cloudlink:
+  enrollment_endpoint: localhost:8444
+  activation_code: code-yaml
+  edge_id: edge-yaml
+  tls_ca: /etc/wapp/ca.pem
+  tls_cert: /etc/wapp/edge.crt
+  tls_key: /etc/wapp/edge.key
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+
+	if cfg.CloudLink.EnrollmentEndpoint != "localhost:8444" {
+		t.Errorf("EnrollmentEndpoint: got %q", cfg.CloudLink.EnrollmentEndpoint)
+	}
+	if cfg.CloudLink.ActivationCode != "code-yaml" {
+		t.Errorf("ActivationCode: got %q", cfg.CloudLink.ActivationCode)
+	}
+	if cfg.CloudLink.EdgeID != "edge-yaml" {
+		t.Errorf("EdgeID: got %q", cfg.CloudLink.EdgeID)
+	}
+	if cfg.CloudLink.TLSCA != "/etc/wapp/ca.pem" {
+		t.Errorf("TLSCA: got %q", cfg.CloudLink.TLSCA)
+	}
+}
+
+func TestLoad_CloudLinkEnrollEnvOverridesYAML(t *testing.T) {
+	// El entorno con prefijo WAPP_AGENT_CLOUDLINK_* sobreescribe los campos de enrolamiento.
+	path := writeTempYAML(t, `
+cloudlink:
+  enrollment_endpoint: localhost:8444
+  activation_code: code-yaml
+  edge_id: edge-yaml
+`)
+
+	t.Setenv(EnvPrefix+"CLOUDLINK_ENROLLMENT_ENDPOINT", "gw.dev:9444")
+	t.Setenv(EnvPrefix+"CLOUDLINK_ACTIVATION_CODE", "code-env")
+	t.Setenv(EnvPrefix+"CLOUDLINK_EDGE_ID", "edge-env")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+
+	if cfg.CloudLink.EnrollmentEndpoint != "gw.dev:9444" {
+		t.Errorf("env override EnrollmentEndpoint: got %q", cfg.CloudLink.EnrollmentEndpoint)
+	}
+	if cfg.CloudLink.ActivationCode != "code-env" {
+		t.Errorf("env override ActivationCode: got %q", cfg.CloudLink.ActivationCode)
+	}
+	if cfg.CloudLink.EdgeID != "edge-env" {
+		t.Errorf("env override EdgeID: got %q", cfg.CloudLink.EdgeID)
+	}
+}
