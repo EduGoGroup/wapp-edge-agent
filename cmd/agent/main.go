@@ -12,12 +12,20 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"database/sql"
+	"encoding/hex"
+	"fmt"
+	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"time"
 
+	"github.com/EduGoGroup/wapp-cloudlink/lease"
+	"github.com/EduGoGroup/wapp-cloudlink/mtls"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cloudlink"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
@@ -29,6 +37,9 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/logger"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Version identifica la build del Edge Agent.
@@ -175,9 +186,13 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
 	gateway := waconn.NewListenGateway(database, log)
-	sink := cloudlink.NewLogSink(log)
 	sessions := sessionstore.New(database)
 	locator := sessionstore.NewLocator(database)
+
+	// Sink: conducto CloudLink REAL si hay endpoint configurado (con LogSink en tee para diagnóstico);
+	// si no, LogSink puro (no rompe el flujo del spike). El adaptador corre su loop de conexión en
+	// segundo plano, ligado al mismo ctx (se cierra con SIGINT junto al socket).
+	sink := buildSink(ctx, cfg, log, custody, database)
 
 	// app.Listen hace el restore CRIPTOGRAFICO + socket always-on; RestoreSessions le antepone el
 	// registro de negocio (resolver/backfillear/marcar activa la sesion). Sin duplicar la conexion.
@@ -193,4 +208,94 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 
 	log.Info("restauracion/escucha finalizada: socket cerrado limpiamente")
 	return nil
+}
+
+// buildSink construye el InboundSink de la escucha 24/7.
+//
+//   - Sin cfg.CloudLink.Endpoint: LogSink PURO (diagnóstico, sin red). Mantiene el comportamiento del
+//     spike intacto (pair/send/listen siguen funcionando sin nube).
+//   - Con endpoint: dial gRPC (mTLS si hay cert/clave/CA; insecure en dev con advertencia), se
+//     construye el Adapter CloudLink real conectándolo a app.Send vía SendFunc, y se devuelve un TEE
+//     (Adapter primario + LogSink de diagnóstico). El loop de conexión del Adapter corre en goroutine
+//     ligada a ctx. ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK.
+func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, custody app.KeyCustody, database *sql.DB) app.InboundSink {
+	logSink := cloudlink.NewLogSink(log)
+	if cfg.CloudLink.Endpoint == "" {
+		log.Info("CloudLink deshabilitado (sin endpoint): usando LogSink puro para diagnóstico")
+		return logSink
+	}
+
+	creds, err := clientCreds(cfg.CloudLink, log)
+	if err != nil {
+		log.Error("CloudLink: credenciales mTLS inválidas, cayendo a LogSink puro", "error", err)
+		return logSink
+	}
+
+	cc, err := grpc.NewClient(cfg.CloudLink.Endpoint, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		log.Error("CloudLink: no se pudo crear el cliente gRPC, cayendo a LogSink puro", "error", err)
+		return logSink
+	}
+
+	validator, err := loadValidator(cfg.CloudLink, log)
+	if err != nil {
+		log.Error("CloudLink: clave pública de lease inválida, cayendo a LogSink puro", "error", err)
+		_ = cc.Close()
+		return logSink
+	}
+
+	// SendFunc: conecta los comandos SendText de la nube al caso de uso app.Send (despachador real).
+	sendUC := app.NewSend(custody, waconn.NewSender(database))
+	sendFunc := func(ctx context.Context, to, text string) error { return sendUC.Run(ctx, to, text) }
+
+	adapter := cloudlink.NewAdapter(cc, cfg.CloudLink.SessionID, sendFunc, validator, custody.Exists, log)
+	go func() {
+		_ = adapter.Run(ctx)
+		_ = cc.Close()
+	}()
+
+	log.Info("CloudLink habilitado: reenviando entrantes y atendiendo comandos cloud->edge",
+		"endpoint", cfg.CloudLink.Endpoint, "session_id", cfg.CloudLink.SessionID,
+		"lease_gate", validator != nil)
+	return cloudlink.NewTeeSink(adapter, logSink)
+}
+
+// clientCreds construye las transport-credentials del dial CloudLink: mTLS si están las tres rutas
+// (cert/clave/CA); insecure en dev (con advertencia) si faltan.
+func clientCreds(cl config.CloudLinkConfig, log sharedlogger.Logger) (credentials.TransportCredentials, error) {
+	if cl.TLSCert != "" && cl.TLSKey != "" && cl.TLSCA != "" {
+		serverName := cl.ServerName
+		if serverName == "" {
+			host, _, splitErr := net.SplitHostPort(cl.Endpoint)
+			if splitErr == nil {
+				serverName = host
+			} else {
+				serverName = cl.Endpoint
+			}
+		}
+		return mtls.LoadClientCredsFromFiles(cl.TLSCert, cl.TLSKey, cl.TLSCA, serverName)
+	}
+	log.Warn("CloudLink: sin material mTLS (cert/clave/CA); dial INSECURE — solo desarrollo")
+	return insecure.NewCredentials(), nil
+}
+
+// loadValidator construye el Validator del gate de lease si hay clave pública configurada. Acepta la
+// clave en hex o como 32 bytes crudos. Devuelve nil (sin gate) si no hay ruta configurada.
+func loadValidator(cl config.CloudLinkConfig, log sharedlogger.Logger) (*lease.Validator, error) {
+	if cl.LeasePubKeyPath == "" {
+		log.Warn("CloudLink: sin clave pública de lease; gate de kill-switch DESACTIVADO (solo desarrollo)")
+		return nil, nil
+	}
+	raw, err := os.ReadFile(cl.LeasePubKeyPath)
+	if err != nil {
+		return nil, err
+	}
+	pub := raw
+	if decoded, decErr := hex.DecodeString(strings.TrimSpace(string(raw))); decErr == nil && len(decoded) == ed25519.PublicKeySize {
+		pub = decoded
+	}
+	if len(pub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("clave pública de lease con tamaño inválido: %d (esperado %d)", len(pub), ed25519.PublicKeySize)
+	}
+	return lease.NewValidator(ed25519.PublicKey(pub)), nil
 }

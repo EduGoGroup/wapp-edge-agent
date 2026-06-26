@@ -23,6 +23,29 @@ type Config struct {
 	DBPath string `yaml:"db_path"`
 	// DEKPath es la ruta del material relacionado con la DEK custodiada localmente.
 	DEKPath string `yaml:"dek_path"`
+	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
+	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
+	CloudLink CloudLinkConfig `yaml:"cloudlink"`
+}
+
+// CloudLinkConfig agrupa los parámetros del conducto CloudLink. Todos OPCIONALES: con Endpoint vacío
+// no se conecta a la nube (LogSink puro). El material cripto (cert/clave) vive fuera de git (.gitignore).
+type CloudLinkConfig struct {
+	// Endpoint es la dirección gRPC de la plataforma cloud (p.ej. "cloud.wapp.example:8443"). Vacío
+	// desactiva el conducto real.
+	Endpoint string `yaml:"endpoint"`
+	// SessionID identifica la sesión/teléfono dentro del Edge (multiplexado, ADR-0008).
+	SessionID string `yaml:"session_id"`
+	// TLSCert/TLSKey/TLSCA son las rutas del cert de cliente del Edge y la CA (mTLS, ADR-0006). Si las
+	// tres están presentes se usa mTLS; si no, el dial va insecure (solo dev; se loguea advertencia).
+	TLSCert string `yaml:"tls_cert"`
+	TLSKey  string `yaml:"tls_key"`
+	TLSCA   string `yaml:"tls_ca"`
+	// ServerName es el SAN esperado en el cert del servidor (mTLS). Por defecto se deriva del Endpoint.
+	ServerName string `yaml:"server_name"`
+	// LeasePubKeyPath es la ruta a la clave pública Ed25519 del emisor de leases (servidor). Si está
+	// presente, se activa el gate de lease (kill-switch); si no, no se gatea (dev).
+	LeasePubKeyPath string `yaml:"lease_pubkey_path"`
 }
 
 // defaults devuelve la configuracion con valores por defecto sensatos.
@@ -58,6 +81,8 @@ func Load(path string) (Config, error) {
 	cfg.LogJSON = loader.GetBool("LOG_JSON", cfg.LogJSON)
 	cfg.DBPath = loader.GetString("DB_PATH", cfg.DBPath)
 	cfg.DEKPath = loader.GetString("DEK_PATH", cfg.DEKPath)
+	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
+	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 
 	return cfg, nil
 }
