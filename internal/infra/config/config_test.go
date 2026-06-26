@@ -171,3 +171,93 @@ cloudlink:
 		t.Errorf("env override EdgeID: got %q", cfg.CloudLink.EdgeID)
 	}
 }
+
+func TestLoad_CloudLinkTLSFromYAML(t *testing.T) {
+	// Los campos TLS/lease se leen del YAML bajo cloudlink.
+	path := writeTempYAML(t, `
+cloudlink:
+  tls_cert: /etc/wapp/edge.crt
+  tls_key: /etc/wapp/edge.key
+  tls_ca: /etc/wapp/ca.pem
+  server_name: cloud.wapp.example
+  lease_pubkey_path: /etc/wapp/lease.pub
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+
+	if cfg.CloudLink.TLSCert != "/etc/wapp/edge.crt" {
+		t.Errorf("TLSCert: got %q", cfg.CloudLink.TLSCert)
+	}
+	if cfg.CloudLink.TLSKey != "/etc/wapp/edge.key" {
+		t.Errorf("TLSKey: got %q", cfg.CloudLink.TLSKey)
+	}
+	if cfg.CloudLink.TLSCA != "/etc/wapp/ca.pem" {
+		t.Errorf("TLSCA: got %q", cfg.CloudLink.TLSCA)
+	}
+	if cfg.CloudLink.ServerName != "cloud.wapp.example" {
+		t.Errorf("ServerName: got %q", cfg.CloudLink.ServerName)
+	}
+	if cfg.CloudLink.LeasePubKeyPath != "/etc/wapp/lease.pub" {
+		t.Errorf("LeasePubKeyPath: got %q", cfg.CloudLink.LeasePubKeyPath)
+	}
+}
+
+func TestLoad_CloudLinkTLSEnvOverridesYAML(t *testing.T) {
+	// El entorno con prefijo WAPP_AGENT_CLOUDLINK_* sobreescribe los campos TLS/lease.
+	path := writeTempYAML(t, `
+cloudlink:
+  tls_cert: /from/yaml/edge.crt
+  tls_key: /from/yaml/edge.key
+  tls_ca: /from/yaml/ca.pem
+  server_name: yaml.wapp.example
+  lease_pubkey_path: /from/yaml/lease.pub
+`)
+
+	t.Setenv(EnvPrefix+"CLOUDLINK_TLS_CERT", "/from/env/edge.crt")
+	t.Setenv(EnvPrefix+"CLOUDLINK_TLS_KEY", "/from/env/edge.key")
+	t.Setenv(EnvPrefix+"CLOUDLINK_TLS_CA", "/from/env/ca.pem")
+	t.Setenv(EnvPrefix+"CLOUDLINK_SERVER_NAME", "env.wapp.example")
+	t.Setenv(EnvPrefix+"CLOUDLINK_LEASE_PUBKEY_PATH", "/from/env/lease.pub")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+
+	if cfg.CloudLink.TLSCert != "/from/env/edge.crt" {
+		t.Errorf("env override TLSCert: got %q", cfg.CloudLink.TLSCert)
+	}
+	if cfg.CloudLink.TLSKey != "/from/env/edge.key" {
+		t.Errorf("env override TLSKey: got %q", cfg.CloudLink.TLSKey)
+	}
+	if cfg.CloudLink.TLSCA != "/from/env/ca.pem" {
+		t.Errorf("env override TLSCA: got %q", cfg.CloudLink.TLSCA)
+	}
+	if cfg.CloudLink.ServerName != "env.wapp.example" {
+		t.Errorf("env override ServerName: got %q", cfg.CloudLink.ServerName)
+	}
+	if cfg.CloudLink.LeasePubKeyPath != "/from/env/lease.pub" {
+		t.Errorf("env override LeasePubKeyPath: got %q", cfg.CloudLink.LeasePubKeyPath)
+	}
+}
+
+func TestLoad_CloudLinkTLSEnvOnlyOverDefaults(t *testing.T) {
+	// Sin estos campos en YAML ni env: deben quedar vacíos (sin default).
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+
+	if cfg.CloudLink.TLSCert != "" {
+		t.Errorf("TLSCert default vacío: got %q", cfg.CloudLink.TLSCert)
+	}
+	if cfg.CloudLink.ServerName != "" {
+		t.Errorf("ServerName default vacío: got %q", cfg.CloudLink.ServerName)
+	}
+	if cfg.CloudLink.LeasePubKeyPath != "" {
+		t.Errorf("LeasePubKeyPath default vacío: got %q", cfg.CloudLink.LeasePubKeyPath)
+	}
+}
