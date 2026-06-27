@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
+	"github.com/google/uuid"
 )
 
 // SessionStore es el puerto de PERSISTENCIA de los metadatos de negocio de las sesiones (tabla
@@ -155,9 +156,15 @@ func (r *RestoreSessions) resolve(ctx context.Context) (domain.Session, error) {
 		return domain.Session{}, ErrNoSessions
 	}
 	now := r.now()
+	// PUENTE T0 (Plan 008): el modelo multi-sesión llava por session_id (ADR-0016 §3); el device legacy
+	// pareado pre-registro se da de alta bajo un UUID nuevo y su store_dir relativo. En T4 este backfill
+	// DESAPARECE: restore itera las sesiones activas ya registradas por el Manager (design §6).
+	sessionID := uuid.NewString()
 	return domain.Session{
+		SessionID: sessionID,
 		JID:       jid,
 		State:     domain.SessionStateActive,
+		StoreDir:  "sessions/" + sessionID,
 		PairedAt:  now, // desconocido (pareado antes del registro): se ancla al backfill.
 		UpdatedAt: now,
 	}, nil

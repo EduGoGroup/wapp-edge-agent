@@ -38,6 +38,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/enroll"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/logger"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
+	"github.com/google/uuid"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
@@ -134,12 +135,21 @@ func runPair(ctx context.Context, cfg config.Config, log sharedlogger.Logger) er
 		return err
 	}
 
-	// Registra los METADATOS DE NEGOCIO de la sesión recién pareada (T6.1) para que RestoreSessions
-	// la reanude al reiniciar (RF-7). En claro: jid + estado + timestamps (sin material cripto).
+	// Registra los METADATOS DE NEGOCIO de la sesión recién pareada (RF-7) para que RestoreSessions
+	// la reanude al reiniciar. En claro: session_id + jid + estado + store_dir + timestamps (sin
+	// material cripto).
+	//
+	// PUENTE T0 (Plan 008): el modelo multi-sesión llava por session_id (ADR-0016 §3), así que aquí se
+	// genera el UUID de la sesión y su store_dir relativo. La GENERALIZACIÓN real (el Manager genera el
+	// session_id ANTES del pairing, mkdir del dir por sesión, Upsert(pairing)->Upsert(active)) llega en
+	// T3; este `agent pair` single-sesión es legacy y se reescribe entonces.
 	now := time.Now()
+	sessionID := uuid.NewString()
 	sess := domain.Session{
+		SessionID: sessionID,
 		JID:       res.WaJID,
 		State:     domain.SessionStateActive,
+		StoreDir:  "sessions/" + sessionID,
 		PairedAt:  now,
 		UpdatedAt: now,
 	}
