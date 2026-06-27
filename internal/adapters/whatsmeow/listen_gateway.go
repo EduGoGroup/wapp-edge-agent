@@ -39,6 +39,7 @@ type ListenGateway struct {
 }
 
 var _ app.ListenGateway = (*ListenGateway)(nil)
+var _ app.LiveLogout = (*ListenGateway)(nil)
 
 // NewListenGateway construye el gateway real sobre la BD propia del Edge. La BD debe estar YA migrada
 // y con una sesión pareada (T3).
@@ -93,6 +94,32 @@ func (g *ListenGateway) setLiveClient(client *wm.Client) {
 	g.mu.Lock()
 	g.client = client
 	g.mu.Unlock()
+}
+
+// LogoutLiveClient implementa app.LiveLogout: hace un LOGOUT REMOTO best-effort sobre el cliente VIVO de
+// la escucha (que WhatsApp suelte el dispositivo vinculado), reutilizando la conexión ya autenticada (no
+// requiere la DEK). Es el paso opcional de la desvinculación (app.UnlinkSession): si tiene éxito, el
+// teléfono ve el dispositivo desvinculado; si no, la limpieza LOCAL continúa igual.
+//
+// Devuelve app.ErrNoLiveClient (no fatal) si no hay escucha activa (cliente nil / sin device cargado) o
+// si el cliente vivo es de OTRA sesión (su JID no coincide): en single-sesión coincide, pero se comprueba
+// para ser forward-compatible (MP-01). client.Logout envía remove-companion-device, desconecta y borra su
+// device del store; el borrado del resto del material local lo completa cryptostore.DeleteDevice
+// (idempotente con lo que Logout ya haya borrado).
+func (g *ListenGateway) LogoutLiveClient(ctx context.Context, jid string) error {
+	g.mu.RLock()
+	client := g.client
+	g.mu.RUnlock()
+	if client == nil || client.Store == nil || client.Store.ID == nil {
+		return app.ErrNoLiveClient
+	}
+	if client.Store.ID.String() != jid {
+		return app.ErrNoLiveClient
+	}
+	if err := client.Logout(ctx); err != nil {
+		return fmt.Errorf("whatsapp: logout remoto del cliente vivo: %w", err)
+	}
+	return nil
 }
 
 // SendViaLiveClient envía un texto REUTILIZANDO el cliente whatsmeow VIVO de la escucha (RF-4 sobre la

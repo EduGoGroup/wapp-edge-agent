@@ -9,10 +9,13 @@
 //   POST /v1/daemon/start  -> mismo cuerpo daemonStatusResponse
 //   POST /v1/daemon/stop   -> mismo cuerpo daemonStatusResponse
 //   GET  /v1/health        -> 200 {status:"ok",version} | 503 {"error":{"code":"daemon_down",...}}
-//   GET  /v1/sessions      -> {sessions:[{jid,state,paired_at?,updated_at?}]}             (server/handlers.go)
-//   POST /v1/sessions/pair -> {id,status,qr}  (qr = data-URL PNG o "")                    (server/pair.go)
-//   GET  /v1/sessions/{id}/pair -> {status:"pending"|"success"|"error", qr, error?}       (server/pair.go)
-//   GET  /v1/logs          -> SSE; cada evento `data: <línea de log>`                      (logsink/handler.go)
+//   GET    /v1/sessions      -> {sessions:[{jid,state,paired_at?,updated_at?}]}           (server/handlers.go)
+//   POST   /v1/sessions/pair -> {id,status,qr}  (qr = data-URL PNG o "")                  (server/pair.go)
+//   GET    /v1/sessions/{id}/pair -> {status:"pending"|"success"|"error", qr, error?}     (server/pair.go)
+//   DELETE /v1/sessions/{id} -> 200 {jid,unlinked,previous_state?,remote_logout} | 404    (server/unlink.go)
+//   GET    /v1/logs          -> SSE; cada evento `data: <línea de log>`                    (logsink/handler.go)
+//
+// NOTA (honestidad): /v1/logs es el log GLOBAL del daemon, no filtrado por sesión (ver index.html).
 
 "use strict";
 
@@ -25,7 +28,9 @@ const el = {
   btnStart: $("btn-start"),
   btnStop: $("btn-stop"),
   sessionsBody: $("sessions-body"),
+  sessionsNotice: $("sessions-notice"),
   btnRefreshSessions: $("btn-refresh-sessions"),
+  logsScope: $("logs-scope"),
   btnPair: $("btn-pair"),
   pairStatus: $("pair-status"),
   pairQrWrap: $("pair-qr-wrap"),
@@ -117,7 +122,7 @@ function setDaemonControls(canStart, canStop) {
 
 // degradeCoreSections deja sesiones/logs/pair en estado seguro cuando el núcleo cae (no rompe la UI).
 function degradeCoreSections() {
-  el.sessionsBody.innerHTML = '<tr><td colspan="4" class="muted">Daemon detenido.</td></tr>';
+  el.sessionsBody.innerHTML = '<tr><td colspan="5" class="muted">Daemon detenido.</td></tr>';
   setBadge(el.logsState, "down", "Desconectado");
   disconnectLogs();
   stopPairPolling();
@@ -179,14 +184,14 @@ function scheduleStartupRepolls() {
 
 async function refreshSessions() {
   if (!ui.daemonRunning) {
-    el.sessionsBody.innerHTML = '<tr><td colspan="4" class="muted">Daemon detenido.</td></tr>';
+    el.sessionsBody.innerHTML = '<tr><td colspan="5" class="muted">Daemon detenido.</td></tr>';
     return;
   }
   try {
     const res = await fetch("/v1/sessions", { cache: "no-store" });
     if (res.status === 503) {
       // El proxy traduce núcleo-caído a 503 daemon_down: degradamos sin romper.
-      el.sessionsBody.innerHTML = '<tr><td colspan="4" class="muted">Daemon no disponible.</td></tr>';
+      el.sessionsBody.innerHTML = '<tr><td colspan="5" class="muted">Daemon no disponible.</td></tr>';
       return;
     }
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -194,29 +199,121 @@ async function refreshSessions() {
     renderSessions(data.sessions || []);
   } catch (err) {
     el.sessionsBody.innerHTML =
-      '<tr><td colspan="4" class="muted">Error al listar: ' + escapeHtml(err.message) + "</td></tr>";
+      '<tr><td colspan="5" class="muted">Error al listar: ' + escapeHtml(err.message) + "</td></tr>";
   }
 }
 
 function renderSessions(sessions) {
+  updateLogsScope(sessions);
   if (sessions.length === 0) {
-    el.sessionsBody.innerHTML = '<tr><td colspan="4" class="muted">Sin sesiones.</td></tr>';
+    el.sessionsBody.innerHTML = '<tr><td colspan="5" class="muted">Sin sesiones.</td></tr>';
     return;
   }
+  // El botón lleva data-jid/data-action; el click se atiende por delegación (onSessionsClick), así
+  // los listeners sobreviven a los re-render por innerHTML.
   el.sessionsBody.innerHTML = sessions
-    .map(
-      (s) =>
+    .map((s) => {
+      const jid = s.jid || "";
+      const jidAttr = escapeHtml(jid).replace(/'/g, "&#39;");
+      return (
         "<tr><td>" +
-        escapeHtml(s.jid || "—") +
+        escapeHtml(jid || "—") +
         "</td><td>" +
         escapeHtml(s.state || "—") +
         "</td><td>" +
         escapeHtml(s.paired_at || "—") +
         "</td><td>" +
         escapeHtml(s.updated_at || "—") +
+        '</td><td class="session-actions">' +
+        (jid
+          ? '<button type="button" class="secondary small danger" data-action="unlink" data-jid="' +
+            jidAttr +
+            '">Eliminar y limpiar</button>'
+          : "—") +
         "</td></tr>"
-    )
+      );
+    })
     .join("");
+}
+
+// updateLogsScope refleja en la etiqueta del visor de logs el JID de la sesión "activa" (la primera
+// activa, o la primera a secas). HONESTIDAD: los logs siguen siendo el log GLOBAL del daemon; esto solo
+// vincula visualmente el visor a la sesión vigente (no es un filtrado real; ver index.html / MP-01).
+function updateLogsScope(sessions) {
+  if (!el.logsScope) return;
+  const active = sessions.find((s) => s.state === "active") || sessions[0];
+  el.logsScope.textContent = active && active.jid ? active.jid : "—";
+}
+
+// onSessionsClick atiende por DELEGACIÓN los botones de la tabla de sesiones (sobreviven a los
+// re-render). "unlink" abre una confirmación in-page (NO window.confirm: no bloquea la UI).
+function onSessionsClick(ev) {
+  const btn = ev.target.closest("button[data-action]");
+  if (!btn) return;
+  const jid = btn.getAttribute("data-jid") || "";
+  const action = btn.getAttribute("data-action");
+  if (action === "unlink") {
+    showUnlinkConfirm(btn, jid);
+  } else if (action === "confirm-unlink") {
+    deleteSession(jid);
+  } else if (action === "cancel-unlink") {
+    refreshSessions();
+  }
+}
+
+// showUnlinkConfirm sustituye la celda de acciones de la fila por una confirmación inline (Confirmar /
+// Cancelar), evitando un diálogo bloqueante. Confirmar dispara deleteSession; Cancelar re-renderiza.
+function showUnlinkConfirm(btn, jid) {
+  const cell = btn.closest("td");
+  if (!cell) return;
+  const jidAttr = escapeHtml(jid).replace(/'/g, "&#39;");
+  cell.innerHTML =
+    '<span class="confirm-text">¿Desvincular y borrar estado local?</span> ' +
+    '<button type="button" class="small danger" data-action="confirm-unlink" data-jid="' +
+    jidAttr +
+    '">Confirmar</button> ' +
+    '<button type="button" class="small secondary" data-action="cancel-unlink" data-jid="' +
+    jidAttr +
+    '">Cancelar</button>';
+}
+
+// deleteSession ejecuta DELETE /v1/sessions/{jid}: desvincula (logout remoto best-effort) y limpia el
+// estado local (device + registro + DEK). Refresca la lista y el estado del daemon al terminar.
+async function deleteSession(jid) {
+  showSessionsNotice("Desvinculando " + jid + "…", false);
+  try {
+    const res = await fetch("/v1/sessions/" + encodeURIComponent(jid), { method: "DELETE" });
+    if (res.status === 404) {
+      showSessionsNotice("La sesión ya no existe (nada que limpiar).", false);
+      refreshSessions();
+      return;
+    }
+    if (res.status === 503) {
+      showSessionsNotice("Daemon no disponible. Arráncalo e inténtalo de nuevo.", true);
+      return;
+    }
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json(); // {jid, unlinked, previous_state?, remote_logout}
+    const logout =
+      data.remote_logout === "ok"
+        ? " Logout remoto OK (WhatsApp soltó el dispositivo)."
+        : data.remote_logout === "failed"
+        ? " El logout remoto falló, pero el estado local quedó limpio."
+        : " Sin cliente vivo: solo se limpió el estado local.";
+    showSessionsNotice("✅ Sesión desvinculada y estado local limpiado." + logout, false);
+    refreshSessions();
+    fetchStatus();
+  } catch (err) {
+    showSessionsNotice("⚠️ No se pudo desvincular: " + err.message, true);
+  }
+}
+
+// showSessionsNotice muestra un aviso bajo la tabla de sesiones (isError pinta en tono de error).
+function showSessionsNotice(msg, isError) {
+  if (!el.sessionsNotice) return;
+  el.sessionsNotice.textContent = msg;
+  el.sessionsNotice.className = "detail" + (isError ? " notice-error" : " muted");
+  el.sessionsNotice.classList.remove("hidden");
 }
 
 // ----------------------------- Emparejar (QR + poll) -----------------------------
@@ -375,6 +472,7 @@ el.btnStart.addEventListener("click", startDaemon);
 el.btnStop.addEventListener("click", stopDaemon);
 el.btnPair.addEventListener("click", startPairing);
 el.btnRefreshSessions.addEventListener("click", refreshSessions);
+el.sessionsBody.addEventListener("click", onSessionsClick);
 
 // Primer sondeo inmediato + bucle de estado cada 3s (el supervisor siempre responde aunque el núcleo
 // esté caído, así que este loop nunca deja la UI en blanco).

@@ -97,6 +97,21 @@ func (c *FileCustody) Load() ([]byte, error) {
 	return dek, nil
 }
 
+// Clear elimina la DEK custodiada (borra el archivo dek.key). Es la limpieza de custodia de una
+// desvinculación (app.UnlinkSession): tras borrar el device del store y el registro de negocio, la DEK
+// que lo descifraba ya no tiene uso y debe desaparecer para que un re-emparejamiento quede limpio.
+//
+// Idempotente: si no hay DEK custodiada (archivo ausente) NO es error. Limitación honesta de la custodia
+// PROVISIONAL de archivo (ver el doc del paquete): os.Remove desliga el inodo pero NO garantiza un
+// borrado seguro del contenido en disco (eso lo da el keystore del SO de v1; ADR-0007/0013). No se
+// zeroiza memoria aquí porque la DEK en claro nunca se carga en este método (solo se borra el archivo).
+func (c *FileCustody) Clear() error {
+	if err := os.Remove(c.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("no se pudo eliminar la DEK custodiada: %w", err)
+	}
+	return nil
+}
+
 // Exists indica si hay una DEK custodiada (el archivo existe y es regular).
 // Cualquier error de acceso distinto a "no existe" se trata como ausencia: el
 // consumidor confirma con Load, que sí devuelve el error detallado.

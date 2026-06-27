@@ -83,6 +83,21 @@ button.secondary {
 }
 button.small { padding: 5px 10px; font-size: 0.85rem; }
 
+/* Acción destructiva (desvincular/limpiar): borde/acento rojo, sobrio. */
+button.danger {
+  border-color: var(--err);
+  color: var(--err);
+  background: transparent;
+}
+button.danger:hover:not(:disabled) { background: #fee2e2; opacity: 1; }
+
+/* Confirmación inline (sin diálogo bloqueante) en la celda de acciones. */
+.session-actions { white-space: nowrap; }
+.confirm-text { font-size: 0.85rem; color: var(--warn); margin-right: 4px; }
+
+/* Aviso de resultado bajo la tabla de sesiones. */
+.notice-error { color: var(--err); }
+
 /* ---------- Badges de estado ---------- */
 .badge {
   font-size: 0.8rem;

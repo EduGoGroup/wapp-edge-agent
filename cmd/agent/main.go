@@ -215,7 +215,8 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 	defer func() { _ = database.Close() }()
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
-	restore := newEscucha(ctx, cfg, log, database, custody)
+	gateway := waconn.NewListenGateway(database, log)
+	restore := newEscucha(ctx, cfg, log, database, custody, gateway)
 
 	log.Info("restaurando sesion persistida y manteniendo el socket vivo (envia un WhatsApp al numero para ver el InboundEvent; Ctrl-C para detener)",
 		"db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
@@ -236,8 +237,7 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 // Cliente vivo (lección Plan 006): el envío reutiliza el cliente VIVO de la escucha (buildSink detecta
 // app.LiveSender en el gateway y enruta SendViaLiveClient), no un cliente efímero que dejaría sorda la
 // escucha. El pairing es aparte (subcomando serve): usa un cliente efímero de identidad NUEVA, ver runServe.
-func newEscucha(ctx context.Context, cfg config.Config, log sharedlogger.Logger, database *sql.DB, custody app.KeyCustody) *app.RestoreSessions {
-	gateway := waconn.NewListenGateway(database, log)
+func newEscucha(ctx context.Context, cfg config.Config, log sharedlogger.Logger, database *sql.DB, custody app.KeyCustody, gateway *waconn.ListenGateway) *app.RestoreSessions {
 	sessions := sessionstore.New(database)
 	locator := sessionstore.NewLocator(database)
 
@@ -280,15 +280,26 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	defer func() { _ = database.Close() }()
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
+	sessions := sessionstore.New(database)
+
+	// Gateway de escucha COMPARTIDO entre la escucha 24/7 y el logout remoto best-effort del DELETE: el
+	// Unlinker necesita el MISMO gateway (su cliente vivo) para soltar el dispositivo en WhatsApp. Se
+	// construye aquí una sola vez y se inyecta a ambos (sin duplicar el cliente vivo, lección Plan 006).
+	gateway := waconn.NewListenGateway(database, log)
 
 	// Servidor /v1 sobre el Unix socket co-ubicado, alimentado por la BD viva (sessions reales). Se
-	// cuelgan los endpoints de T1 (logs SSE) y T2 (pairing) sobre el mismo servidor antes de Serve.
+	// cuelgan los endpoints de T1 (logs SSE), T2 (pairing) y T8 (DELETE desvincular) antes de Serve.
 	srv := server.New(
 		server.Config{SocketPath: cfg.ControlSocketPath, Version: Version},
-		log, sessionstore.New(database),
+		log, sessions,
 	)
 	srv.Handle(http.MethodGet, "/v1/logs", logsink.Handler(sink))
 	srv.RegisterPairing(server.NewLivePairer(waconn.NewConnector(database), custody))
+	// Desvincular + limpiar (DELETE /v1/sessions/{id}, ADR-0015): registry + eraser + custody reales, y el
+	// gateway compartido como logout remoto best-effort. Sin duplicar construcción (misma BD/custodia).
+	srv.RegisterUnlink(app.NewUnlinkSession(
+		sessions, sessionstore.NewLocator(database), sessionstore.NewDeviceEraser(database), custody, gateway,
+	))
 
 	ln, err := srv.Listen()
 	if err != nil {
@@ -298,9 +309,9 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
-	// Escucha 24/7 sobre la MISMA BD/custodia, ligada al mismo ctx. Sus errores NO tumban el /v1.
+	// Escucha 24/7 sobre la MISMA BD/custodia/gateway, ligada al mismo ctx. Sus errores NO tumban el /v1.
 	go func() {
-		switch err := newEscucha(ctx, cfg, log, database, custody).Run(ctx); {
+		switch err := newEscucha(ctx, cfg, log, database, custody, gateway).Run(ctx); {
 		case err == nil, errors.Is(err, context.Canceled):
 			// Cierre limpio (ctx cancelado) o fin normal de la escucha.
 		case errors.Is(err, app.ErrNoSessions):

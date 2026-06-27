@@ -39,12 +39,13 @@
         </div>
         <table id="sessions-table">
           <thead>
-            <tr><th>JID</th><th>Estado</th><th>Emparejada</th><th>Actualizada</th></tr>
+            <tr><th>JID</th><th>Estado</th><th>Emparejada</th><th>Actualizada</th><th>Acciones</th></tr>
           </thead>
           <tbody id="sessions-body">
-            <tr><td colspan="4" class="muted">—</td></tr>
+            <tr><td colspan="5" class="muted">—</td></tr>
           </tbody>
         </table>
+        <p id="sessions-notice" class="detail muted hidden"></p>
       </section>
 
       <!-- ===================== Emparejar ===================== -->
@@ -67,6 +68,16 @@
           <h2>Logs en vivo</h2>
           <span id="logs-state" class="badge badge-unknown">Desconectado</span>
         </div>
+        <!--
+          HONESTIDAD (verdad de campo, dossier MP-01): /v1/logs es el log GLOBAL del daemon (un único
+          sink de proceso), NO un log filtrado por sesión — el logging por-sesión es parte de MP-01.
+          Como hoy el Edge es single-sesión, el visor se asocia a "la sesión activa", pero lo que se ve
+          es el log del daemon completo. La etiqueta de abajo lo deja claro y muestra el JID activo.
+        -->
+        <p class="detail muted">
+          Logs del <strong>daemon</strong> (sesión activa: <span id="logs-scope">—</span>).
+          Es el log global del proceso; el filtrado por sesión llegará con el multi-sesión.
+        </p>
         <pre id="logs" class="logs" aria-live="polite"></pre>
       </section>
     </main>

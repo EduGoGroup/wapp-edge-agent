@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"time"
 
+	"go.mau.fi/whatsmeow/types"
+
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
@@ -86,6 +88,16 @@ func (s *Store) Get(ctx context.Context, jid string) (domain.Session, error) {
 	return sess, nil
 }
 
+// Delete elimina la fila de negocio de la sesión con ese JID. Idempotente: borrar un JID ausente NO es
+// error (DELETE ... WHERE no afecta filas). Es la parte de metadatos de la desvinculación (el material
+// cripto lo borra cryptostore.DeleteDevice y la DEK la limpia la custodia; ver app.UnlinkSession).
+func (s *Store) Delete(ctx context.Context, jid string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM sessions WHERE jid = ?`, jid); err != nil {
+		return fmt.Errorf("sessionstore: borrar sesión: %w", err)
+	}
+	return nil
+}
+
 // scanner abstrae *sql.Row y *sql.Rows (ambos exponen Scan) para compartir el mapeo fila->Session.
 type scanner interface {
 	Scan(dest ...any) error
@@ -148,4 +160,28 @@ func (l *Locator) PairedJID(ctx context.Context) (string, bool, error) {
 		return "", false, nil
 	}
 	return jid.String(), true, nil
+}
+
+// DeviceEraser implementa app.DeviceEraser: borra el material cripto local de la sesión `jid` del store
+// cifrado, envolviendo cryptostore.DeleteDevice. SIN la DEK (solo borra filas/ciphertext, no descifra),
+// igual que el Locator resuelve el JID sin descifrar. Lo usa app.UnlinkSession (DELETE /v1/sessions/{id}).
+type DeviceEraser struct {
+	db *sql.DB
+}
+
+var _ app.DeviceEraser = (*DeviceEraser)(nil)
+
+// NewDeviceEraser construye el eraser sobre la BD propia del Edge.
+func NewDeviceEraser(db *sql.DB) *DeviceEraser {
+	return &DeviceEraser{db: db}
+}
+
+// DeleteDevice parsea el JID y delega en cryptostore.DeleteDevice (idempotente). Un JID inválido es un
+// error de entrada (no del store): se reporta sin tocar la BD.
+func (e *DeviceEraser) DeleteDevice(ctx context.Context, jid string) error {
+	j, err := types.ParseJID(jid)
+	if err != nil {
+		return fmt.Errorf("sessionstore: JID inválido para borrado de device: %w", err)
+	}
+	return cryptostore.DeleteDevice(ctx, e.db, j)
 }
