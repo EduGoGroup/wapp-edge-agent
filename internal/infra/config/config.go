@@ -23,6 +23,10 @@ type Config struct {
 	DBPath string `yaml:"db_path"`
 	// DEKPath es la ruta del material relacionado con la DEK custodiada localmente.
 	DEKPath string `yaml:"dek_path"`
+	// ControlSocketPath es la ruta del Unix domain socket donde el núcleo expone el contrato /v1 del
+	// plano de control (ADR-0015): co-ubicado, SIN puerto de red. Default relativo al cwd, junto al
+	// db_path (ver defaults). Override por WAPP_AGENT_CONTROL_SOCKET_PATH (mismo overlay que el resto).
+	ControlSocketPath string `yaml:"control_socket_path"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -61,10 +65,11 @@ type CloudLinkConfig struct {
 // defaults devuelve la configuracion con valores por defecto sensatos.
 func defaults() Config {
 	return Config{
-		LogLevel: "info",
-		LogJSON:  false,
-		DBPath:   "wapp-edge.db",
-		DEKPath:  "dek.key",
+		LogLevel:          "info",
+		LogJSON:           false,
+		DBPath:            "wapp-edge.db",
+		DEKPath:           "dek.key",
+		ControlSocketPath: "wapp-edge.sock",
 	}
 }
 
@@ -91,6 +96,7 @@ func Load(path string) (Config, error) {
 	cfg.LogJSON = loader.GetBool("LOG_JSON", cfg.LogJSON)
 	cfg.DBPath = loader.GetString("DB_PATH", cfg.DBPath)
 	cfg.DEKPath = loader.GetString("DEK_PATH", cfg.DEKPath)
+	cfg.ControlSocketPath = loader.GetString("CONTROL_SOCKET_PATH", cfg.ControlSocketPath)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)
