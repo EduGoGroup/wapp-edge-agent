@@ -34,6 +34,7 @@ const (
 	codeNotFound         = "not_found"
 	codeMethodNotAllowed = "method_not_allowed"
 	codeInternal         = "internal"
+	codeConflict         = "conflict"
 )
 
 // writeError responde con el envelope de error y el status HTTP indicado. Reusable por todos los

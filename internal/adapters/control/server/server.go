@@ -89,8 +89,12 @@ func (s *Server) Handle(method, pattern string, h http.HandlerFunc) {
 // envelope de error: 405 si algún plantilla casa la ruta con otro método (añade Allow), 404 si
 // ninguna casa.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if h, pattern := s.mux.Handler(r); pattern != "" {
-		h.ServeHTTP(w, r)
+	// mux.Handler solo DECIDE si hay match (y nos da la plantilla para el 404/405); el despacho real va
+	// por mux.ServeHTTP para que pueble r.PathValue de los comodines {param} (mux.Handler NO los
+	// pobla). Sin esto, un handler con {id} recibiría r.PathValue("id") vacío. El envelope custom de
+	// 404/405 solo corre cuando NO hay match (pattern == ""), así que mux.ServeHTTP nunca toca ese caso.
+	if _, pattern := s.mux.Handler(r); pattern != "" {
+		s.mux.ServeHTTP(w, r)
 		return
 	}
 
