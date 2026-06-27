@@ -15,8 +15,10 @@ import (
 	"crypto/ed25519"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -28,6 +30,8 @@ import (
 	"github.com/EduGoGroup/wapp-cloudlink/mtls"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cloudlink"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/logsink"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/server"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
@@ -97,6 +101,21 @@ func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "restore") {
 		if err := runRestore(cfg, log); err != nil {
 			log.Error("restauración/escucha fallida", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// `serve` arranca, en UN SOLO proceso, el plano de control /v1 (Unix socket: health/sessions/logs/
+	// pairing) + la escucha 24/7, con shutdown unificado (decisión §10.E del Plan 007). El logger se
+	// construye con tee al ring-buffer (logsink) para alimentar GET /v1/logs sin perder stdout.
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		sink := logsink.New(0)
+		serveLog := logger.NewWithSink(cfg, sink)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := runServe(ctx, cfg, serveLog, sink); err != nil {
+			serveLog.Error("serve fallido", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -196,6 +215,28 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 	defer func() { _ = database.Close() }()
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
+	restore := newEscucha(ctx, cfg, log, database, custody)
+
+	log.Info("restaurando sesion persistida y manteniendo el socket vivo (envia un WhatsApp al numero para ver el InboundEvent; Ctrl-C para detener)",
+		"db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
+
+	if err := restore.Run(ctx); err != nil {
+		return err
+	}
+
+	log.Info("restauracion/escucha finalizada: socket cerrado limpiamente")
+	return nil
+}
+
+// newEscucha cablea la escucha always-on (RestoreSessions -> app.Listen) sobre la BD viva y el sink de
+// reenvío (CloudLink real con tee a LogSink si hay endpoint; LogSink puro si no). Comparte el cableado
+// del núcleo entre `runRestore` (subcomando listen/restore) y `runServe` (subcomando serve) para no
+// DUPLICAR la construcción: misma BD, misma custodia, mismo gateway de escucha y mismo sink.
+//
+// Cliente vivo (lección Plan 006): el envío reutiliza el cliente VIVO de la escucha (buildSink detecta
+// app.LiveSender en el gateway y enruta SendViaLiveClient), no un cliente efímero que dejaría sorda la
+// escucha. El pairing es aparte (subcomando serve): usa un cliente efímero de identidad NUEVA, ver runServe.
+func newEscucha(ctx context.Context, cfg config.Config, log sharedlogger.Logger, database *sql.DB, custody app.KeyCustody) *app.RestoreSessions {
 	gateway := waconn.NewListenGateway(database, log)
 	sessions := sessionstore.New(database)
 	locator := sessionstore.NewLocator(database)
@@ -208,16 +249,91 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 	// app.Listen hace el restore CRIPTOGRAFICO + socket always-on; RestoreSessions le antepone el
 	// registro de negocio (resolver/backfillear/marcar activa la sesion). Sin duplicar la conexion.
 	listener := app.NewListen(custody, gateway, sink)
-	restore := app.NewRestoreSessions(sessions, locator, listener)
+	return app.NewRestoreSessions(sessions, locator, listener)
+}
 
-	log.Info("restaurando sesion persistida y manteniendo el socket vivo (envia un WhatsApp al numero para ver el InboundEvent; Ctrl-C para detener)",
-		"db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
+// runServe cablea el subcomando `agent serve` (decisión §10.E del Plan 007): arranca en UN SOLO proceso
+// el servidor /v1 del plano de control (Unix socket co-ubicado: health, sessions, logs SSE y pairing) Y
+// la escucha 24/7, con shutdown unificado bajo el mismo ctx (SIGINT/SIGTERM, o cancelación del caller en
+// los tests).
+//
+// CLIENTE VIVO (lección Plan 006): la escucha opera su propio cliente whatsmeow VIVO (ListenGateway) y
+// el ENVÍO lo reutiliza (SendViaLiveClient, vía buildSink). El PAIRING, en cambio, necesita por fuerza
+// un cliente EFÍMERO de identidad NUEVA (un device sin parear que pinta un QR nuevo); no puede reusar el
+// cliente ya pareado de la escucha. En el MVP de sesión única esto NO rompe el socket porque ambos no
+// coexisten sobre la misma identidad: el primer emparejamiento ocurre cuando aún NO hay escucha
+// (RestoreSessions -> ErrNoSessions, sin conexión whatsmeow), y la escucha de la sesión recién pareada
+// arranca en el siguiente ciclo del daemon (stop/restart del supervisor, T4; el rearranque del e2e T6).
+//
+// La escucha NO es fatal para el plano de control: si no hay sesión que restaurar (primer arranque antes
+// de emparejar) el servidor /v1 SIGUE arriba para poder emparejar por POST /v1/sessions/pair.
+func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, sink *logsink.Sink) error {
+	// Contexto hijo: garantiza apagar la escucha al salir de runServe por CUALQUIER vía (señal o caída
+	// del servidor /v1), sin depender de que el caller cancele.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
-	if err := restore.Run(ctx); err != nil {
+	database, err := db.OpenAndMigrate(ctx, cfg.DBPath)
+	if err != nil {
 		return err
 	}
+	defer func() { _ = database.Close() }()
 
-	log.Info("restauracion/escucha finalizada: socket cerrado limpiamente")
+	custody := keycustody.NewFileCustody(cfg.DEKPath)
+
+	// Servidor /v1 sobre el Unix socket co-ubicado, alimentado por la BD viva (sessions reales). Se
+	// cuelgan los endpoints de T1 (logs SSE) y T2 (pairing) sobre el mismo servidor antes de Serve.
+	srv := server.New(
+		server.Config{SocketPath: cfg.ControlSocketPath, Version: Version},
+		log, sessionstore.New(database),
+	)
+	srv.Handle(http.MethodGet, "/v1/logs", logsink.Handler(sink))
+	srv.RegisterPairing(server.NewLivePairer(waconn.NewConnector(database), custody))
+
+	ln, err := srv.Listen()
+	if err != nil {
+		return fmt.Errorf("serve: abrir socket /v1: %w", err)
+	}
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	// Escucha 24/7 sobre la MISMA BD/custodia, ligada al mismo ctx. Sus errores NO tumban el /v1.
+	go func() {
+		switch err := newEscucha(ctx, cfg, log, database, custody).Run(ctx); {
+		case err == nil, errors.Is(err, context.Canceled):
+			// Cierre limpio (ctx cancelado) o fin normal de la escucha.
+		case errors.Is(err, app.ErrNoSessions):
+			log.Info("escucha 24/7: sin sesión emparejada todavía; el plano /v1 sigue arriba para emparejar (POST /v1/sessions/pair)")
+		case errors.Is(err, app.ErrSessionLoggedOut):
+			log.Warn("escucha 24/7: la sesión está cerrada (loggedout); re-empareja por /v1", "error", err)
+		default:
+			log.Error("escucha 24/7 finalizó con error; el plano /v1 sigue arriba", "error", err)
+		}
+	}()
+
+	log.Info("agent serve: plano de control /v1 + escucha 24/7 en un solo proceso",
+		"socket", cfg.ControlSocketPath, "version", Version, "db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
+
+	// Cierre unificado: señal/cancelación (ctx) o caída del servidor /v1.
+	select {
+	case <-ctx.Done():
+		log.Info("agent serve: señal de cierre recibida, apagando")
+	case err := <-serveErr:
+		if err != nil {
+			log.Error("agent serve: el servidor /v1 falló, apagando", "error", err)
+		}
+	}
+
+	// Apaga el servidor /v1 (drena conexiones en curso y elimina el socket file: sin socket huérfano).
+	// La escucha se detiene al cancelarse el ctx (defer cancel()); su goroutine retorna al desbloquear.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("agent serve: cierre del servidor /v1 con error", "error", err)
+	}
+
+	log.Info("agent serve: detenido limpiamente (socket /v1 cerrado, escucha apagada)")
 	return nil
 }
 
