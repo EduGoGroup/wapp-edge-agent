@@ -107,3 +107,14 @@ func (c *FileCustody) Exists() bool {
 	}
 	return info.Mode().IsRegular()
 }
+
+// Clear elimina la DEK custodiada (borrado quirúrgico por sesión, ADR-0016 §3 / Plan 008 R5). Es
+// IDEMPOTENTE: si el archivo ya no existe, no es un error. Opera solo sobre c.path (la entrada de ESTA
+// sesión): no toca el store ni la custodia de ninguna otra. La usa el Manager al desvincular una
+// sesión, vía el puerto de limpieza por sesión (sin afectar a las demás entradas, design §3).
+func (c *FileCustody) Clear() error {
+	if err := os.Remove(c.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("no se pudo borrar la DEK custodiada: %w", err)
+	}
+	return nil
+}

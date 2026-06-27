@@ -35,6 +35,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/edgemigrate"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/enroll"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/logger"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
@@ -61,6 +62,15 @@ func main() {
 	}
 
 	log := logger.New(cfg)
+
+	// Migración de ARRANQUE clean-slate al layout multi-sesión (ADR-0016 / Plan 008 §10.C): archiva el
+	// store/DEK PLANOS heredados (DBPath/DEKPath) bajo <data_dir>/_archived-pre-008/ y crea el layout
+	// <data_dir>/sessions/ vacío que el Manager poblará. Es IDEMPOTENTE (no-op si ya migró) y NO fatal:
+	// un fallo de E/S aquí no debe impedir arrancar el daemon (se loguea y se continúa).
+	if err := edgemigrate.ArchiveLegacySingleSession(cfg.DataDir, cfg.DBPath, cfg.DEKPath, log); err != nil {
+		log.Error("migración clean-slate de arranque falló (continuo de todas formas)",
+			"error", err, "data_dir", cfg.DataDir)
+	}
 
 	// Despacho de subcomandos. Sin argumento: bootstrap (arranque informativo).
 	if len(os.Args) > 1 && os.Args[1] == "pair" {

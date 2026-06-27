@@ -20,9 +20,25 @@ type Config struct {
 	// LogJSON selecciona el formato JSON del logger cuando es true.
 	LogJSON bool `yaml:"log_json"`
 	// DBPath es la ruta del store SQLite cifrado del cryptostore.
+	//
+	// LEGACY (Plan 008): es la ruta PLANA single-sesión heredada. El modelo multi-sesión deriva el
+	// store por sesión de DataDir (sessions/<id>/store.db, ADR-0016 §4); DBPath se conserva solo como
+	// referencia del estado viejo para la migración clean-slate de arranque (edgemigrate).
 	DBPath string `yaml:"db_path"`
 	// DEKPath es la ruta del material relacionado con la DEK custodiada localmente.
+	//
+	// LEGACY (Plan 008): ruta PLANA single-sesión heredada. El modelo multi-sesión deriva la DEK por
+	// sesión de DataDir (sessions/<id>/dek.key); se conserva solo para la migración clean-slate.
 	DEKPath string `yaml:"dek_path"`
+	// DataDir es el directorio base del Edge (ADR-0016 §4): aloja el layout multi-sesión
+	// (<data_dir>/sessions/<session_id>/{store.db,dek.key}), la BD de metadatos y el socket de control.
+	// El Layout (internal/app/sessionmgr) deriva de aquí todas las rutas por sesión; nadie las arma a
+	// mano. Default "." (directorio actual), coherente con las rutas relativas heredadas del spike.
+	DataDir string `yaml:"data_dir"`
+	// MaxSessions es el límite SUAVE de sesiones simultáneas (guardarraíl de RAM/sockets, design §10.G).
+	// NO es un invariante de seguridad: un POST /pair por encima del límite responde error claro, no
+	// crash. Se lee de WAPP_AGENT_MAX_SESSIONS (default 5).
+	MaxSessions int `yaml:"max_sessions"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -61,10 +77,12 @@ type CloudLinkConfig struct {
 // defaults devuelve la configuracion con valores por defecto sensatos.
 func defaults() Config {
 	return Config{
-		LogLevel: "info",
-		LogJSON:  false,
-		DBPath:   "wapp-edge.db",
-		DEKPath:  "dek.key",
+		LogLevel:    "info",
+		LogJSON:     false,
+		DBPath:      "wapp-edge.db",
+		DEKPath:     "dek.key",
+		DataDir:     ".",
+		MaxSessions: 5,
 	}
 }
 
@@ -91,6 +109,8 @@ func Load(path string) (Config, error) {
 	cfg.LogJSON = loader.GetBool("LOG_JSON", cfg.LogJSON)
 	cfg.DBPath = loader.GetString("DB_PATH", cfg.DBPath)
 	cfg.DEKPath = loader.GetString("DEK_PATH", cfg.DEKPath)
+	cfg.DataDir = loader.GetString("DATA_DIR", cfg.DataDir)
+	cfg.MaxSessions = loader.GetInt("MAX_SESSIONS", cfg.MaxSessions)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)
