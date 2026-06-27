@@ -25,6 +25,10 @@ dek.key
 *.db-shm
 *.db-wal
 
+# Runtime del plano de control (Unix socket + PID file del supervisor)
+*.sock
+*.pid
+
 # Vendor (descomentar si se usa go mod vendor)
 # vendor/
 
