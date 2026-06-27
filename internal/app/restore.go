@@ -40,6 +40,10 @@ type SessionStore interface {
 	Upsert(ctx context.Context, s domain.Session) error
 	// List devuelve todas las sesiones persistidas (vacío si no hay ninguna).
 	List(ctx context.Context) ([]domain.Session, error)
+	// ListActive devuelve SOLO las sesiones en estado 'active': las que el arranque debe restaurar
+	// (design §6). El Session Manager (sessionmgr.Manager.Restore, T4) itera ESTA lista para arrancar
+	// un listener por sesión; las 'pairing'/'loggedout' se omiten por construcción.
+	ListActive(ctx context.Context) ([]domain.Session, error)
 	// Get devuelve la sesión con ese session_id, o ErrSessionNotFound si no existe.
 	Get(ctx context.Context, sessionID string) (domain.Session, error)
 	// Delete elimina la fila de la sesión con ese session_id (idempotente: borrar una ausente no es
@@ -79,7 +83,14 @@ var (
 	ErrSessionNotFound = errors.New("sessionstore: sesión no encontrada")
 )
 
-// RestoreSessions es el caso de uso. Sus dependencias son puertos (interfaces) para inyectar fakes.
+// RestoreSessions es el caso de uso SINGLE-SESIÓN heredado (resuelve UNA sesión y delega a un runner).
+//
+// SUPERSEDIDO POR sessionmgr.Manager.Restore (Plan 008 T4): la restauración MULTI-SESIÓN real —iterar
+// todas las activas (SessionStore.ListActive) y arrancar UN listener por sesión, cada uno en su
+// goroutine con aislamiento de fallos y apagado ordenado (design §6/§10.H/§10.I)— vive en el Session
+// Manager, que es quien posee el ciclo de vida de N sesiones. Este tipo se conserva mientras el
+// daemon legacy (cmd/agent runRestore) no se recablee al Manager (cierre en T6, junto al plano de
+// control). El `agent serve` ya usa el Manager. Sus dependencias son puertos para inyectar fakes.
 type RestoreSessions struct {
 	sessions SessionStore
 	locator  PairedDeviceLocator

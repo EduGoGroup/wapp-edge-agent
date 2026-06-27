@@ -149,20 +149,10 @@ func (m *Manager) Pair(ctx context.Context) (app.PairResult, error) {
 	m.mu.Lock()
 	m.live[id] = s
 	m.mu.Unlock()
-	m.startListener(s)
+	m.startListener(s) // arranca la escucha always-on de la sesión (real en T4; ver listen.go).
 
 	// Invariante: solo el JID sale del núcleo; la DEK queda sellada en la custodia de la sesión.
 	return app.PairResult{WaJID: res.WaJID}, nil
-}
-
-// startListener arranca la escucha always-on de una sesión recién registrada (design §6/§10.I).
-//
-// PLACEHOLDER T3: aquí NO se arranca escucha real (un listener a medio construir sería peor que
-// ninguno). Solo se deja la traza de que la sesión quedó lista para escuchar; T4 lo reemplaza por la
-// goroutine listener real (con su context+cancel y el WaitGroup del apagado ordenado) y lo cableará
-// también en Restore. Mantener el método ya invocado desde Pair evita reescribir el flujo en T4.
-func (m *Manager) startListener(s *liveSession) {
-	s.log.Info("sesión emparejada y registrada; listener pendiente (T4)")
 }
 
 // cleanupPairing revierte TODO lo provisionado por un pairing que no llegó a 'active' (design §5): la

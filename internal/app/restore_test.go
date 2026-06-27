@@ -41,6 +41,21 @@ func (f *fakeSessionStore) List(_ context.Context) ([]domain.Session, error) {
 	return f.list, nil
 }
 
+func (f *fakeSessionStore) ListActive(_ context.Context) ([]domain.Session, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var active []domain.Session
+	for _, s := range f.list {
+		if s.State == domain.SessionStateActive {
+			active = append(active, s)
+		}
+	}
+	return active, nil
+}
+
 func (f *fakeSessionStore) Get(_ context.Context, jid string) (domain.Session, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

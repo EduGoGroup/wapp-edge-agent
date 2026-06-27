@@ -19,6 +19,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
@@ -108,6 +110,18 @@ func main() {
 	if len(os.Args) > 1 && (os.Args[1] == "listen" || os.Args[1] == "restore") {
 		if err := runRestore(cfg, log); err != nil {
 			log.Error("restauración/escucha fallida", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// `serve` es el daemon MULTI-SESIÓN (Plan 008): restaura TODAS las sesiones activas del registro y
+	// mantiene un listener por sesión 24/7 vía el Session Manager (concurrencia Go, ADR-0003). Apagado
+	// ordenado con SIGINT/SIGTERM (§10.I). CloudLink real por-sesión (session_id + lease) llega en T7;
+	// aquí el sink de diagnóstico es el LogSink.
+	if len(os.Args) > 1 && os.Args[1] == "serve" {
+		if err := runServe(cfg, log); err != nil {
+			log.Error("daemon multi-sesión fallido", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -238,6 +252,48 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 	}
 
 	log.Info("restauracion/escucha finalizada: socket cerrado limpiamente")
+	return nil
+}
+
+// runServe es el daemon MULTI-SESIÓN (Plan 008 T4): abre la BD CENTRAL de metadatos (<data_dir>/
+// sessions.db), construye el Session Manager con la escucha real (WithWhatsmeowListen) y RESTAURA todas
+// las sesiones activas, arrancando un listener por sesión (cada una en su goroutine, ADR-0003). Bloquea
+// hasta SIGINT/SIGTERM y entonces realiza el apagado ORDENADO (Manager.Stop: cancela los listeners,
+// espera el WaitGroup y cierra cada store.db).
+//
+// Alcance T4: el sink es el LogSink de diagnóstico. El CloudLink real POR SESIÓN (session_id por
+// mensaje + lease por sesión sobre el único stream del Edge, ADR-0008) se cablea en T7; mientras tanto
+// el plano de control (T6) será el que arranque/pare sesiones en caliente sobre este mismo Manager.
+func runServe(cfg config.Config, log sharedlogger.Logger) error {
+	// ctx cancelado por SIGINT (Ctrl-C) o SIGTERM: dispara el apagado ordenado del Manager.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	metaPath := filepath.Join(cfg.DataDir, "sessions.db")
+	metaDB, err := db.OpenAndMigrateMeta(ctx, metaPath)
+	if err != nil {
+		return fmt.Errorf("abrir/migrar la BD de metadatos %q: %w", metaPath, err)
+	}
+	defer func() { _ = metaDB.Close() }()
+
+	sessions := sessionstore.New(metaDB)
+	layout := sessionmgr.NewLayout(cfg.DataDir)
+	sink := cloudlink.NewLogSink(log) // T7: CloudLink real por-sesión.
+
+	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
+		sessionmgr.WithWhatsmeowListen(sink))
+
+	log.Info("daemon multi-sesión: restaurando sesiones activas y manteniendo los sockets vivos (Ctrl-C para detener)",
+		"data_dir", cfg.DataDir, "max_sesiones", cfg.MaxSessions)
+
+	if err := mgr.Restore(ctx); err != nil {
+		return err
+	}
+
+	<-ctx.Done()
+	log.Info("daemon multi-sesión: señal de apagado recibida, deteniendo listeners (apagado ordenado)")
+	mgr.Stop()
+	log.Info("daemon multi-sesión: detenido limpiamente")
 	return nil
 }
 

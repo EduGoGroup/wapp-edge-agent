@@ -3,6 +3,7 @@ package sessionmgr
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
@@ -38,6 +39,18 @@ type Manager struct {
 	// (design §5). Se inyecta por opción (WithWhatsmeowPairing en producción; un fake en los tests)
 	// para que Manager.Pair sea testeable sin WhatsApp. nil hasta que se configure: Pair lo exige.
 	newPairer pairFactory
+
+	// newListener construye, para UNA sesión, el runner de escucha always-on sobre su custodia y su
+	// store (design §6). Se inyecta por opción (WithWhatsmeowListen en producción; un fake en los
+	// tests) para que Restore/runListener sean testeables sin WhatsApp. nil hasta que se configure:
+	// Restore lo exige y startListener registra la sesión SIN escucha (warn) si falta.
+	newListener listenFactory
+
+	// backoffBase/backoffMax acotan la política de reintento de un listener caído (aislamiento §10.H):
+	// retroceso exponencial Base·2^n saturado en Max. Defaults 1s/60s; los tests inyectan valores
+	// minúsculos (WithListenerBackoff) para no depender de esperas reales.
+	backoffBase time.Duration
+	backoffMax  time.Duration
 }
 
 // Option configura un Manager en su construcción (inyección de dependencias opcionales como el
@@ -50,16 +63,32 @@ type Option func(*Manager)
 // WithWhatsmeowPairing para habilitar Manager.Pair).
 func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlogger.Logger, opts ...Option) *Manager {
 	m := &Manager{
-		live:     make(map[string]*liveSession),
-		layout:   layout,
-		sessions: sessions,
-		max:      max,
-		log:      log,
+		live:        make(map[string]*liveSession),
+		layout:      layout,
+		sessions:    sessions,
+		max:         max,
+		log:         log,
+		backoffBase: 1 * time.Second,
+		backoffMax:  60 * time.Second,
 	}
 	for _, o := range opts {
 		o(m)
 	}
 	return m
+}
+
+// WithListenerBackoff ajusta la política de reintento de los listeners caídos (aislamiento §10.H). En
+// producción se usan los defaults (1s/60s); los tests inyectan valores minúsculos para ejercitar el
+// reintento de forma determinista y rápida (sin esperas reales). base y max deben ser > 0.
+func WithListenerBackoff(base, max time.Duration) Option {
+	return func(m *Manager) {
+		if base > 0 {
+			m.backoffBase = base
+		}
+		if max > 0 {
+			m.backoffMax = max
+		}
+	}
 }
 
 // custodyFor resuelve la custodia DEK de UNA sesión: NewFileCustody apuntando a Layout.DEKPath(id)
@@ -96,20 +125,37 @@ func (m *Manager) Persisted(ctx context.Context) ([]domain.Session, error) {
 // usa para reportar/gatear POST /pair por encima del límite (T3/T6).
 func (m *Manager) Capacity() int { return m.max }
 
-// Stop realiza el apagado ORDENADO (design §10.I): cancela el listener de cada sesión viva y espera a
-// que todas las goroutines terminen (WaitGroup). En el esqueleto T1 no hay listeners arrancados, así
-// que es un no-op seguro; la estructura queda lista para cuando T4 arranque goroutines por sesión.
+// Health devuelve la salud de runtime del listener de una sesión viva (design §10.H): listening si
+// escucha, degraded si cayó y reintenta, stopped tras el apagado. ok=false si el session_id no está
+// vivo. El plano de control (T6) lo usa para reportar el estado real por sesión.
+func (m *Manager) Health(id string) (SessionHealth, bool) {
+	m.mu.Lock()
+	s, ok := m.live[id]
+	m.mu.Unlock()
+	if !ok {
+		return HealthStopped, false
+	}
+	h, _ := s.snapshot()
+	return h, true
+}
+
+// Stop realiza el apagado ORDENADO (design §10.I): cancela el context de cada listener vivo y espera a
+// que TODAS las goroutines terminen (WaitGroup), momento en que cada una ya cerró su *sql.DB vía defer.
+// Snapshotea las sesiones bajo el lock y cancela FUERA de él para no sostener m.mu mientras corren los
+// cancels (y para que cancel se lea bajo el lock de la propia liveSession, sin carrera con startListener).
+// Sin listeners arrancados es un no-op seguro (WaitGroup vacío).
 func (m *Manager) Stop() {
 	m.mu.Lock()
 	m.log.Info("deteniendo session manager", "sesiones_vivas", len(m.live))
+	sessions := make([]*liveSession, 0, len(m.live))
 	for _, s := range m.live {
-		if s.log != nil {
-			s.log.Info("deteniendo listener de sesión")
-		}
-		if s.cancel != nil {
-			s.cancel()
-		}
+		sessions = append(sessions, s)
 	}
 	m.mu.Unlock()
+
+	for _, s := range sessions {
+		s.log.Info("deteniendo listener de sesión")
+		s.stop()
+	}
 	m.wg.Wait()
 }
