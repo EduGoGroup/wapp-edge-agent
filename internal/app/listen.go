@@ -47,6 +47,16 @@ type ListenGateway interface {
 	Listen(ctx context.Context, dek []byte, sink InboundSink) error
 }
 
+// LiveSender es el puerto de ENVÍO sobre el cliente VIVO de la escucha always-on: reutiliza la MISMA
+// conexión que recibe (una sola conexión por sesión) en lugar de abrir un socket efímero que, con la
+// misma identidad multi-dispositivo, reemplazaría la conexión y dejaría la escucha sorda. El cliente
+// vivo ya está autenticado: NO requiere la DEK. Lo satisface *whatsmeow.ListenGateway (el adaptador).
+type LiveSender interface {
+	// SendViaLiveClient despacha un texto a `to` (número crudo o JID) por el cliente vivo. Devuelve
+	// error si no hay sesión de escucha activa (sin cliente vivo) o si el envío falla.
+	SendViaLiveClient(ctx context.Context, to, text string) error
+}
+
 // Listen es el caso de uso. Sus dependencias son puertos (interfaces) para inyectar fakes en tests.
 type Listen struct {
 	custody KeyCustody
