@@ -89,6 +89,10 @@ var (
 type PairResult struct {
 	// WaJID es el JID de la sesión emparejada.
 	WaJID string
+	// SessionID es la identidad canónica de la sesión (ADR-0016 §3). app.Pair lo deja vacío (no conoce
+	// el session_id); lo rellena sessionmgr.Manager.Pair, que lo genera y posee. El plano de control lo
+	// reporta en la respuesta del pairing para que la UI lo correlacione con GET /v1/sessions.
+	SessionID string
 }
 
 // Pair es el caso de uso. Sus dependencias son puertos (interfaces) para inyectar fakes en tests.

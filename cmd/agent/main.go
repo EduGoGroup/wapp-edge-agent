@@ -17,6 +17,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -29,6 +30,8 @@ import (
 	"github.com/EduGoGroup/wapp-cloudlink/mtls"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cloudlink"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/logsink"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/server"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
@@ -115,13 +118,19 @@ func main() {
 		return
 	}
 
-	// `serve` es el daemon MULTI-SESIÓN (Plan 008): restaura TODAS las sesiones activas del registro y
-	// mantiene un listener por sesión 24/7 vía el Session Manager (concurrencia Go, ADR-0003). Apagado
-	// ordenado con SIGINT/SIGTERM (§10.I). CloudLink real por-sesión (session_id + lease) llega en T7;
-	// aquí el sink de diagnóstico es el LogSink.
+	// `serve` es el daemon MULTI-SESIÓN unificado (Plan 008 + plano de control Plan 007): en UN SOLO
+	// proceso restaura TODAS las sesiones activas del registro y mantiene un listener por sesión 24/7 vía
+	// el Session Manager (concurrencia Go, ADR-0003) Y levanta el contrato /v1 sobre el Unix socket
+	// co-ubicado (health/sessions/logs/pairing/unlink), con apagado ordenado bajo el mismo ctx
+	// (SIGINT/SIGTERM, §10.I). El logger se construye con tee al ring-buffer (logsink) para alimentar
+	// GET /v1/logs sin perder stdout. CloudLink real por-sesión (session_id + lease) llega en T7.
 	if len(os.Args) > 1 && os.Args[1] == "serve" {
-		if err := runServe(cfg, log); err != nil {
-			log.Error("daemon multi-sesión fallido", "error", err)
+		sink := logsink.New(0)
+		serveLog := logger.NewWithSink(cfg, sink)
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := runServe(ctx, cfg, serveLog, sink); err != nil {
+			serveLog.Error("daemon multi-sesión fallido", "error", err)
 			os.Exit(1)
 		}
 		return
@@ -231,18 +240,7 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
 	gateway := waconn.NewListenGateway(database, log)
-	sessions := sessionstore.New(database)
-	locator := sessionstore.NewLocator(database)
-
-	// Sink: conducto CloudLink REAL si hay endpoint configurado (con LogSink en tee para diagnóstico);
-	// si no, LogSink puro (no rompe el flujo del spike). El adaptador corre su loop de conexión en
-	// segundo plano, ligado al mismo ctx (se cierra con SIGINT junto al socket).
-	sink := buildSink(ctx, cfg, log, custody, database, gateway)
-
-	// app.Listen hace el restore CRIPTOGRAFICO + socket always-on; RestoreSessions le antepone el
-	// registro de negocio (resolver/backfillear/marcar activa la sesion). Sin duplicar la conexion.
-	listener := app.NewListen(custody, gateway, sink)
-	restore := app.NewRestoreSessions(sessions, locator, listener)
+	restore := newEscucha(ctx, cfg, log, database, custody, gateway)
 
 	log.Info("restaurando sesion persistida y manteniendo el socket vivo (envia un WhatsApp al numero para ver el InboundEvent; Ctrl-C para detener)",
 		"db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
@@ -255,46 +253,130 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 	return nil
 }
 
-// runServe es el daemon MULTI-SESIÓN (Plan 008 T4): abre la BD CENTRAL de metadatos (<data_dir>/
-// sessions.db), construye el Session Manager con la escucha real (WithWhatsmeowListen) y RESTAURA todas
-// las sesiones activas, arrancando un listener por sesión (cada una en su goroutine, ADR-0003). Bloquea
-// hasta SIGINT/SIGTERM y entonces realiza el apagado ORDENADO (Manager.Stop: cancela los listeners,
-// espera el WaitGroup y cierra cada store.db).
+// newEscucha cablea la escucha always-on (RestoreSessions -> app.Listen) sobre la BD viva y el sink de
+// reenvío (CloudLink real con tee a LogSink si hay endpoint; LogSink puro si no). Comparte el cableado
+// del núcleo entre `runRestore` (subcomando listen/restore) y `runServe` (subcomando serve) para no
+// DUPLICAR la construcción: misma BD, misma custodia, mismo gateway de escucha y mismo sink.
 //
-// Alcance T4: el sink es el LogSink de diagnóstico. El CloudLink real POR SESIÓN (session_id por
-// mensaje + lease por sesión sobre el único stream del Edge, ADR-0008) se cablea en T7; mientras tanto
-// el plano de control (T6) será el que arranque/pare sesiones en caliente sobre este mismo Manager.
-func runServe(cfg config.Config, log sharedlogger.Logger) error {
-	// ctx cancelado por SIGINT (Ctrl-C) o SIGTERM: dispara el apagado ordenado del Manager.
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+// Cliente vivo (lección Plan 006): el envío reutiliza el cliente VIVO de la escucha (buildSink detecta
+// app.LiveSender en el gateway y enruta SendViaLiveClient), no un cliente efímero que dejaría sorda la
+// escucha. El pairing es aparte (subcomando serve): usa un cliente efímero de identidad NUEVA, ver runServe.
+func newEscucha(ctx context.Context, cfg config.Config, log sharedlogger.Logger, database *sql.DB, custody app.KeyCustody, gateway *waconn.ListenGateway) *app.RestoreSessions {
+	sessions := sessionstore.New(database)
+	locator := sessionstore.NewLocator(database)
 
+	// Sink: conducto CloudLink REAL si hay endpoint configurado (con LogSink en tee para diagnóstico);
+	// si no, LogSink puro (no rompe el flujo del spike). El adaptador corre su loop de conexión en
+	// segundo plano, ligado al mismo ctx (se cierra con SIGINT junto al socket).
+	sink := buildSink(ctx, cfg, log, custody, database, gateway)
+
+	// app.Listen hace el restore CRIPTOGRAFICO + socket always-on; RestoreSessions le antepone el
+	// registro de negocio (resolver/backfillear/marcar activa la sesion). Sin duplicar la conexion.
+	listener := app.NewListen(custody, gateway, sink)
+	return app.NewRestoreSessions(sessions, locator, listener)
+}
+
+// runServe es el daemon MULTI-SESIÓN UNIFICADO (integración Plan 008 + plano de control Plan 007): en UN
+// SOLO proceso (decisión §10.E Plan 007 + ADR-0014/0015) levanta el Session Manager —restaura TODAS las
+// sesiones activas y mantiene un listener por sesión 24/7 (concurrencia Go sin broker, ADR-0003)— Y el
+// servidor /v1 del plano de control sobre el Unix socket co-ubicado (health, sessions, logs SSE, pairing
+// async y unlink quirúrgico), con shutdown unificado bajo el mismo ctx (SIGINT/SIGTERM o cancelación del
+// caller en los tests).
+//
+// RE-LLAVEADO A session_id (integración 008): el contrato /v1 ya NO llavea por JID. El Manager es la
+// fuente única: GET /v1/sessions lista N por session_id+estado+salud; POST /v1/sessions/pair dispara
+// Manager.Pair (genera su propio session_id/dir/DEK, async, devuelve SOLO QR/estado — la DEK nunca cruza,
+// ADR-0007/0015); DELETE /v1/sessions/{id} hace Manager.Unlink(session_id) (borrado quirúrgico, §7).
+//
+// El servidor /v1 SIGUE arriba aunque no haya sesiones que restaurar (primer arranque antes de emparejar):
+// así se puede emparejar el primer teléfono por POST /v1/sessions/pair sin reiniciar el daemon.
+func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, sink *logsink.Sink) error {
+	// Contexto hijo: apaga el Manager y la escucha al salir por CUALQUIER vía (señal o caída del /v1).
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// BD CENTRAL de metadatos multi-sesión (<data_dir>/sessions.db, tabla sessions_v2). El store cifrado
+	// y la DEK viven POR SESIÓN bajo <data_dir>/sessions/<id>/ (ADR-0016); el Manager los resuelve.
 	metaPath := filepath.Join(cfg.DataDir, "sessions.db")
 	metaDB, err := db.OpenAndMigrateMeta(ctx, metaPath)
 	if err != nil {
-		return fmt.Errorf("abrir/migrar la BD de metadatos %q: %w", metaPath, err)
+		return fmt.Errorf("serve: abrir/migrar la BD de metadatos %q: %w", metaPath, err)
 	}
 	defer func() { _ = metaDB.Close() }()
 
 	sessions := sessionstore.New(metaDB)
 	layout := sessionmgr.NewLayout(cfg.DataDir)
-	sink := cloudlink.NewLogSink(log) // T7: CloudLink real por-sesión.
+	listenSink := cloudlink.NewLogSink(log) // T7: CloudLink real por-sesión (session_id + lease).
 
+	// Manager con escucha real (un listener por sesión) y pairing real (un Connector por sesión sobre SU
+	// store; el QRSink lo inyecta el plano de control POR emparejamiento para el polling async del QR).
 	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
-		sessionmgr.WithWhatsmeowListen(sink))
-
-	log.Info("daemon multi-sesión: restaurando sesiones activas y manteniendo los sockets vivos (Ctrl-C para detener)",
-		"data_dir", cfg.DataDir, "max_sesiones", cfg.MaxSessions)
+		sessionmgr.WithWhatsmeowListen(listenSink),
+		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
+	)
 
 	if err := mgr.Restore(ctx); err != nil {
-		return err
+		return fmt.Errorf("serve: restaurar sesiones activas: %w", err)
 	}
 
-	<-ctx.Done()
-	log.Info("daemon multi-sesión: señal de apagado recibida, deteniendo listeners (apagado ordenado)")
+	// Servidor /v1 sobre el Unix socket co-ubicado, LLAVEADO POR session_id contra el Manager (inventario
+	// + salud por sesión). Endpoints colgados antes de Serve: logs SSE (Plan 007), pairing async y unlink.
+	srv := server.New(
+		server.Config{SocketPath: cfg.ControlSocketPath, Version: Version},
+		log, managerInventory{mgr},
+	)
+	srv.Handle(http.MethodGet, "/v1/logs", logsink.Handler(sink))
+	srv.RegisterPairing(mgr) // POST /v1/sessions/pair → Manager.Pair (async; QR por polling)
+	srv.RegisterUnlink(mgr)  // DELETE /v1/sessions/{id} → Manager.Unlink(session_id)
+
+	ln, err := srv.Listen()
+	if err != nil {
+		return fmt.Errorf("serve: abrir socket /v1: %w", err)
+	}
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(ln) }()
+
+	log.Info("agent serve: daemon multi-sesión + plano de control /v1 en un solo proceso",
+		"socket", cfg.ControlSocketPath, "version", Version, "data_dir", cfg.DataDir, "max_sesiones", cfg.MaxSessions)
+
+	// Cierre unificado: señal/cancelación (ctx) o caída del servidor /v1.
+	select {
+	case <-ctx.Done():
+		log.Info("agent serve: señal de cierre recibida, apagando")
+	case err := <-serveErr:
+		if err != nil {
+			log.Error("agent serve: el servidor /v1 falló, apagando", "error", err)
+		}
+	}
+
+	// Apaga el servidor /v1 (drena conexiones y elimina el socket file: sin socket huérfano) y detiene el
+	// Manager (cancela cada listener, espera el WaitGroup y cierra cada store.db — apagado ordenado §10.I).
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("agent serve: cierre del servidor /v1 con error", "error", err)
+	}
 	mgr.Stop()
-	log.Info("daemon multi-sesión: detenido limpiamente")
+
+	log.Info("agent serve: detenido limpiamente (socket /v1 cerrado, listeners apagados)")
 	return nil
+}
+
+// managerInventory adapta *sessionmgr.Manager al puerto de LECTURA del plano de control (server.
+// SessionLister): GET /v1/sessions combina el inventario persistido (Persisted) con la salud de runtime
+// por sesión (Health → etiqueta). Mantiene el paquete server desacoplado del tipo SessionHealth.
+type managerInventory struct{ mgr *sessionmgr.Manager }
+
+// Persisted devuelve TODAS las sesiones registradas (incluye 'pairing' aún no viva).
+func (m managerInventory) Persisted(ctx context.Context) ([]domain.Session, error) {
+	return m.mgr.Persisted(ctx)
+}
+
+// Health devuelve la etiqueta de salud de runtime de una sesión viva (ok=false si no está viva).
+func (m managerInventory) Health(id string) (string, bool) {
+	h, ok := m.mgr.Health(id)
+	return h.String(), ok
 }
 
 // runEnroll cablea el subcomando `enroll`: lee el código de activación de cfg o de os.Args

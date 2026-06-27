@@ -38,16 +38,20 @@ type pairRunner interface {
 	Run(ctx context.Context) (app.PairResult, error)
 }
 
-// pairFactory construye el pairRunner para una sesión concreta: recibe SU custodia DEK y la *sql.DB de
-// SU store ya abierto/migrado. El factory decide qué connector (real o fake) cablear.
-type pairFactory func(custody app.KeyCustody, storeDB *sql.DB) pairRunner
+// pairFactory construye el pairRunner para una sesión concreta: recibe SU custodia DEK, la *sql.DB de SU
+// store ya abierto/migrado y el QRSink de ESTE emparejamiento (inyectado POR llamada para que el plano
+// de control haga polling async del QR sin compartir un sink global). El factory decide qué connector
+// (real o fake) cablear.
+type pairFactory func(custody app.KeyCustody, storeDB *sql.DB, qr app.QRSink) pairRunner
 
 // WithWhatsmeowPairing habilita Manager.Pair con el pairing REAL sobre whatsmeow: por cada sesión
 // construye un Connector sobre su store (whatsmeow.NewConnector) y un app.Pair que pinta el QR en el
-// qr dado y acota el flujo con timeout. La DEK la genera/sella app.Pair en la dek.key de la sesión.
-func WithWhatsmeowPairing(qr app.QRSink, timeout time.Duration) Option {
+// QRSink que Manager.Pair recibe POR llamada y acota el flujo con timeout. La DEK la genera/sella
+// app.Pair en la dek.key de la sesión. El QRSink ya NO es global: lo provee cada POST /v1/sessions/pair
+// (un MemoryQRSink propio) para que el polling del QR sea por-emparejamiento.
+func WithWhatsmeowPairing(timeout time.Duration) Option {
 	return func(m *Manager) {
-		m.newPairer = func(custody app.KeyCustody, storeDB *sql.DB) pairRunner {
+		m.newPairer = func(custody app.KeyCustody, storeDB *sql.DB, qr app.QRSink) pairRunner {
 			connector := whatsmeow.NewConnector(storeDB)
 			return app.NewPair(connector, qr, custody, app.WithTimeout(timeout))
 		}
@@ -61,7 +65,11 @@ func WithWhatsmeowPairing(qr app.QRSink, timeout time.Duration) Option {
 //
 // Anti-pisado (objetivo del plan): el session_id es un UUIDv4 nuevo en cada llamada, así que el dir,
 // la DEK y la fila son propios; un segundo Pair no puede sobrescribir al primero (MP-01 por construcción).
-func (m *Manager) Pair(ctx context.Context) (app.PairResult, error) {
+//
+// El QRSink lo provee el llamante (el plano de control inyecta un MemoryQRSink propio del emparejamiento
+// para hacer polling async del QR; ver control/server/pair.go). app.Pair publica cada QR rotado ahí; la
+// DEK NUNCA cruza por ese puerto (invariante zero-knowledge, ADR-0007/0015).
+func (m *Manager) Pair(ctx context.Context, qr app.QRSink) (app.PairResult, error) {
 	if m.newPairer == nil {
 		return app.PairResult{}, ErrPairingNotConfigured
 	}
@@ -118,7 +126,7 @@ func (m *Manager) Pair(ctx context.Context) (app.PairResult, error) {
 
 	// 5. Correr el pairing (QR → escaneo → Connected) sobre el store/custodia de la sesión. app.Pair
 	//    genera y sella la DEK; al volver sin error, el JID ya es conocido.
-	res, err := m.newPairer(custody, storeDB).Run(ctx)
+	res, err := m.newPairer(custody, storeDB, qr).Run(ctx)
 	if err != nil {
 		// Fallo/cancelación/timeout: sin restos (DEK + dir + fila).
 		m.cleanupPairing(ctx, id, sessionDir, custody)
@@ -151,8 +159,9 @@ func (m *Manager) Pair(ctx context.Context) (app.PairResult, error) {
 	m.mu.Unlock()
 	m.startListener(s) // arranca la escucha always-on de la sesión (real en T4; ver listen.go).
 
-	// Invariante: solo el JID sale del núcleo; la DEK queda sellada en la custodia de la sesión.
-	return app.PairResult{WaJID: res.WaJID}, nil
+	// Invariante: solo el JID + el session_id salen del núcleo; la DEK queda sellada en la custodia de la
+	// sesión y NUNCA cruza (ADR-0007). El session_id permite al plano de control correlacionar el pairing.
+	return app.PairResult{WaJID: res.WaJID, SessionID: id}, nil
 }
 
 // cleanupPairing revierte TODO lo provisionado por un pairing que no llegó a 'active' (design §5): la

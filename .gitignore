@@ -1,7 +1,7 @@
 # Binarios compilados (anclados a la raíz para no ignorar cmd/agent/)
 /agent
-/wapp-edge-agent
 /wapp-ctl
+/wapp-edge-agent
 *.exe
 *.exe~
 *.test
@@ -24,6 +24,10 @@ dek.key
 *.db
 *.db-shm
 *.db-wal
+
+# Runtime del plano de control (Unix socket + PID file del supervisor)
+*.sock
+*.pid
 
 # Vendor (descomentar si se usa go mod vendor)
 # vendor/

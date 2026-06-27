@@ -20,6 +20,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-shared/envelope"
 	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 )
 
@@ -78,6 +79,49 @@ func LoadDevice(ctx context.Context, container store.DeviceContainer, jid types.
 		panic("cryptostore: LoadDevice requiere un container creado por NewEncryptedContainer")
 	}
 	return c.GetDevice(ctx, jid)
+}
+
+// DeleteDevice borra TODO el material local de la sesión `jid` del store: la fila del device cifrado
+// (msg_enc_device) y el material de sesión por JID (identities/sessions/prekeys/sender_keys), MÁS las
+// filas whatsmeow_* NO sensibles vía el Container nativo (que conoce el esquema y sus cascadas). Es la
+// limpieza local de una desvinculación (DELETE /v1/sessions/{id}, ADR-0015).
+//
+// NO requiere la DEK: solo borra filas/ciphertext, no DESCIFRA nada. Por eso no toca la custodia ni
+// viola zero-knowledge (la DEK la limpia aparte el caso de uso). Idempotente: borrar una sesión ausente
+// no es error (los DELETE ... WHERE no afectan filas y no fallan).
+//
+// SINGLE-SESIÓN (verdad de campo 2026-06-27): hoy el Edge custodia una sola sesión; este borrado por
+// JID es correcto y forward-compatible para el multi-sesión per-JID que resolverá MP-01 (no asume que
+// haya una sola, borra exactamente la del JID dado).
+func DeleteDevice(ctx context.Context, db *sql.DB, jid types.JID) error {
+	// 1. whatsmeow_* (no sensible): delega al Container nativo. Upgrade es idempotente (crea las tablas
+	//    whatsmeow_* si la BD nunca pareó); DeleteDevice solo necesita el JID (DELETE ... WHERE jid=?).
+	inner := sqlstore.NewWithDB(db, "sqlite", nil)
+	if err := inner.Upgrade(ctx); err != nil {
+		return fmt.Errorf("cryptostore: upgrade esquema whatsmeow para borrado: %w", err)
+	}
+	jidCopy := jid
+	if err := inner.DeleteDevice(ctx, &store.Device{ID: &jidCopy}); err != nil {
+		return fmt.Errorf("cryptostore: borrar device whatsmeow: %w", err)
+	}
+
+	// 2. msg_enc_* (cifrado, esquema propio): el decorator no expone un borrado por JID, así que se
+	//    eliminan las filas a mano. Sentencias explícitas (no query dinámica) por claridad y para no
+	//    construir SQL por concatenación.
+	stmts := []string{
+		`DELETE FROM msg_enc_device      WHERE jid=?`,
+		`DELETE FROM msg_enc_identities  WHERE our_jid=?`,
+		`DELETE FROM msg_enc_sessions    WHERE our_jid=?`,
+		`DELETE FROM msg_enc_prekeys     WHERE jid=?`,
+		`DELETE FROM msg_enc_sender_keys WHERE our_jid=?`,
+	}
+	j := jid.String()
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(ctx, stmt, j); err != nil {
+			return fmt.Errorf("cryptostore: borrar material cifrado de la sesión: %w", err)
+		}
+	}
+	return nil
 }
 
 // FirstDeviceJID devuelve el JID del único device pareado en el store cifrado (tabla

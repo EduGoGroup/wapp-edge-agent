@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<!--
+  Web UI del plano de control del Edge (Plan 007, T5). HTML/CSS/JS vanilla, SIN build step:
+  se embebe con //go:embed (ver webui.go) y se sirve en el MISMO origen loopback (127.0.0.1:8765)
+  que el proxy /v1/* del supervisor → sin CORS. La lógica vive en app.js; el estilo en styles.css.
+-->
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wApp Edge · plano de control</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>wApp Edge</h1>
+      <p class="subtitle">Plano de control local</p>
+    </header>
+
+    <main>
+      <!-- ===================== Estado del daemon ===================== -->
+      <section id="section-daemon" class="card">
+        <div class="card-head">
+          <h2>Daemon (núcleo)</h2>
+          <span id="daemon-badge" class="badge badge-unknown">Comprobando…</span>
+        </div>
+        <p id="daemon-detail" class="detail">Consultando estado…</p>
+        <div class="actions">
+          <button id="btn-start" type="button" disabled>Arrancar</button>
+          <button id="btn-stop" type="button" class="secondary" disabled>Detener</button>
+        </div>
+      </section>
+
+      <!-- ===================== Sesiones ===================== -->
+      <section id="section-sessions" class="card">
+        <div class="card-head">
+          <h2>Sesiones</h2>
+          <button id="btn-refresh-sessions" type="button" class="secondary small">Refrescar</button>
+        </div>
+        <table id="sessions-table">
+          <thead>
+            <tr><th>JID</th><th>Estado</th><th>Emparejada</th><th>Actualizada</th><th>Acciones</th></tr>
+          </thead>
+          <tbody id="sessions-body">
+            <tr><td colspan="5" class="muted">—</td></tr>
+          </tbody>
+        </table>
+        <p id="sessions-notice" class="detail muted hidden"></p>
+      </section>
+
+      <!-- ===================== Emparejar ===================== -->
+      <section id="section-pair" class="card">
+        <div class="card-head">
+          <h2>Emparejar teléfono</h2>
+          <button id="btn-pair" type="button">Emparejar</button>
+        </div>
+        <p id="pair-status" class="detail muted">
+          Pulsa «Emparejar» para generar un código QR y escanéalo con WhatsApp.
+        </p>
+        <div id="pair-qr-wrap" class="qr-wrap hidden">
+          <img id="pair-qr" alt="Código QR de emparejamiento" />
+        </div>
+      </section>
+
+      <!-- ===================== Logs en vivo ===================== -->
+      <section id="section-logs" class="card">
+        <div class="card-head">
+          <h2>Logs en vivo</h2>
+          <span id="logs-state" class="badge badge-unknown">Desconectado</span>
+        </div>
+        <!--
+          HONESTIDAD (verdad de campo, dossier MP-01): /v1/logs es el log GLOBAL del daemon (un único
+          sink de proceso), NO un log filtrado por sesión — el logging por-sesión es parte de MP-01.
+          Como hoy el Edge es single-sesión, el visor se asocia a "la sesión activa", pero lo que se ve
+          es el log del daemon completo. La etiqueta de abajo lo deja claro y muestra el JID activo.
+        -->
+        <p class="detail muted">
+          Logs del <strong>daemon</strong> (sesión activa: <span id="logs-scope">—</span>).
+          Es el log global del proceso; el filtrado por sesión llegará con el multi-sesión.
+        </p>
+        <pre id="logs" class="logs" aria-live="polite"></pre>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

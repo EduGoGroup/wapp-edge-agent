@@ -3,7 +3,9 @@
 package logger
 
 import (
+	"io"
 	"log/slog"
+	"os"
 	"strings"
 
 	edgeconfig "github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
@@ -13,9 +15,32 @@ import (
 // New construye el Logger del Edge Agent a partir de la configuracion dada,
 // aplicando nivel y formato (texto/JSON) segun cfg.
 func New(cfg edgeconfig.Config) sharedlogger.Logger {
+	return newWithWriters(cfg, os.Stdout, nil)
+}
+
+// NewWithSink construye el Logger del Edge "teeando" su salida a stdout Y al sink dado (el
+// ring-buffer de internal/adapters/control/logsink, que alimenta GET /v1/logs). El comportamiento
+// en stdout es IDENTICO al de New: mismo nivel, mismo formato; el sink recibe exactamente las
+// mismas lineas ya formateadas, porque ambos destinos comparten el mismo slog.Handler vía
+// io.MultiWriter (wapp-shared/logger no expone su Handler, pero si acepta el io.Writer destino).
+// Si sink es nil, equivale a New. Este es el PUNTO DE ENGANCHE para T3 (agent serve): construir el
+// sink y pasar logger.NewWithSink(cfg, sink) en lugar de logger.New(cfg).
+func NewWithSink(cfg edgeconfig.Config, sink io.Writer) sharedlogger.Logger {
+	return newWithWriters(cfg, os.Stdout, sink)
+}
+
+// newWithWriters centraliza la construccion del Logger sobre wapp-shared, dirigiendo la salida a
+// base (stdout en produccion) y, si sink != nil, tambien a sink mediante io.MultiWriter. Es
+// unexportada y parametriza base para poder testear el tee sin tocar el stdout real del proceso.
+func newWithWriters(cfg edgeconfig.Config, base, sink io.Writer) sharedlogger.Logger {
+	w := base
+	if sink != nil {
+		w = io.MultiWriter(base, sink)
+	}
 	return sharedlogger.New(
 		sharedlogger.WithLevel(ParseLevel(cfg.LogLevel)),
 		sharedlogger.WithJSON(cfg.LogJSON),
+		sharedlogger.WithWriter(w),
 	)
 }
 

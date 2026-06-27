@@ -39,6 +39,12 @@ func (f *fakePairer) Run(_ context.Context) (app.PairResult, error) {
 	return app.PairResult{WaJID: f.jid}, nil
 }
 
+// discardQR es un app.QRSink que descarta el QR: el fakePairer no lo usa (no hay WhatsApp), pero
+// Manager.Pair exige un sink por llamada (el plano de control inyecta un MemoryQRSink real en producción).
+type discardQR struct{}
+
+func (discardQR) ShowQR(string) error { return nil }
+
 // newPairTestManager arma un Manager con un sessionstore REAL (sessions.db en un tempdir) y el factory
 // de pairing dado (un fake). Devuelve también el store y el Layout para inspeccionar el resultado.
 func newPairTestManager(t *testing.T, factory pairFactory) (*Manager, *sessionstore.Store, Layout) {
@@ -63,7 +69,7 @@ func newPairTestManager(t *testing.T, factory pairFactory) (*Manager, *sessionst
 // (jid-1, jid-2, …) — emula app.Pair feliz y permite demostrar el anti-pisado entre sesiones.
 func sealingFactory() pairFactory {
 	calls := 0
-	return func(custody app.KeyCustody, _ *sql.DB) pairRunner {
+	return func(custody app.KeyCustody, _ *sql.DB, _ app.QRSink) pairRunner {
 		calls++
 		return &fakePairer{
 			custody: custody,
@@ -94,7 +100,7 @@ func TestManager_Pair_Happy(t *testing.T) {
 	ctx := context.Background()
 	m, sessions, layout := newPairTestManager(t, sealingFactory())
 
-	res, err := m.Pair(ctx)
+	res, err := m.Pair(ctx, discardQR{})
 	if err != nil {
 		t.Fatalf("Pair() error: %v", err)
 	}
@@ -142,7 +148,7 @@ func TestManager_Pair_AntiClobber(t *testing.T) {
 	ctx := context.Background()
 	m, sessions, layout := newPairTestManager(t, sealingFactory())
 
-	res1, err := m.Pair(ctx)
+	res1, err := m.Pair(ctx, discardQR{})
 	if err != nil {
 		t.Fatalf("Pair() #1 error: %v", err)
 	}
@@ -158,7 +164,7 @@ func TestManager_Pair_AntiClobber(t *testing.T) {
 		t.Fatalf("Load(DEK #1): %v", err)
 	}
 
-	res2, err := m.Pair(ctx)
+	res2, err := m.Pair(ctx, discardQR{})
 	if err != nil {
 		t.Fatalf("Pair() #2 error: %v", err)
 	}
@@ -209,11 +215,11 @@ func TestManager_Pair_AntiClobber(t *testing.T) {
 func TestManager_Pair_FailureCleansUp(t *testing.T) {
 	ctx := context.Background()
 	sentinel := errors.New("escaneo cancelado por el usuario")
-	m, sessions, layout := newPairTestManager(t, func(custody app.KeyCustody, _ *sql.DB) pairRunner {
+	m, sessions, layout := newPairTestManager(t, func(custody app.KeyCustody, _ *sql.DB, _ app.QRSink) pairRunner {
 		return &fakePairer{custody: custody, err: sentinel}
 	})
 
-	_, err := m.Pair(ctx)
+	_, err := m.Pair(ctx, discardQR{})
 	if err == nil {
 		t.Fatalf("Pair() debería fallar cuando el pairing falla")
 	}
@@ -246,7 +252,7 @@ func TestManager_Pair_DEKInvariant(t *testing.T) {
 	ctx := context.Background()
 	m, sessions, _ := newPairTestManager(t, sealingFactory())
 
-	res, err := m.Pair(ctx)
+	res, err := m.Pair(ctx, discardQR{})
 	if err != nil {
 		t.Fatalf("Pair() error: %v", err)
 	}
