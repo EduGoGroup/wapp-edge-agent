@@ -203,7 +203,7 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 	// Sink: conducto CloudLink REAL si hay endpoint configurado (con LogSink en tee para diagnóstico);
 	// si no, LogSink puro (no rompe el flujo del spike). El adaptador corre su loop de conexión en
 	// segundo plano, ligado al mismo ctx (se cierra con SIGINT junto al socket).
-	sink := buildSink(ctx, cfg, log, custody, database)
+	sink := buildSink(ctx, cfg, log, custody, database, gateway)
 
 	// app.Listen hace el restore CRIPTOGRAFICO + socket always-on; RestoreSessions le antepone el
 	// registro de negocio (resolver/backfillear/marcar activa la sesion). Sin duplicar la conexion.
@@ -255,7 +255,7 @@ func runEnroll(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 //     construye el Adapter CloudLink real conectándolo a app.Send vía SendFunc, y se devuelve un TEE
 //     (Adapter primario + LogSink de diagnóstico). El loop de conexión del Adapter corre en goroutine
 //     ligada a ctx. ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK.
-func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, custody app.KeyCustody, database *sql.DB) app.InboundSink {
+func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, custody app.KeyCustody, database *sql.DB, gateway *waconn.ListenGateway) app.InboundSink {
 	logSink := cloudlink.NewLogSink(log)
 	if cfg.CloudLink.Endpoint == "" {
 		log.Info("CloudLink deshabilitado (sin endpoint): usando LogSink puro para diagnóstico")
@@ -281,9 +281,18 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 		return logSink
 	}
 
-	// SendFunc: conecta los comandos SendText de la nube al caso de uso app.Send (despachador real).
-	sendUC := app.NewSend(custody, waconn.NewSender(database))
-	sendFunc := func(ctx context.Context, to, text string) error { return sendUC.Run(ctx, to, text) }
+	// SendFunc: conecta los comandos SendText de la nube al despachador del Edge. Prioriza el CLIENTE
+	// VIVO de la escucha (una sola conexión por sesión): con la misma identidad multi-dispositivo, un
+	// cliente efímero aparte reemplazaría la conexión y dejaría la escucha sorda. Si el gateway no
+	// expone un emisor vivo (defensivo), cae al sender efímero (NewClient+Connect+Disconnect por envío).
+	var sendFunc func(ctx context.Context, to, text string) error
+	if liveSender, ok := any(gateway).(app.LiveSender); ok && gateway != nil {
+		sendFunc = func(ctx context.Context, to, text string) error { return liveSender.SendViaLiveClient(ctx, to, text) }
+		log.Info("CloudLink: el envío reutilizará el CLIENTE VIVO de la escucha (conexión única por sesión)")
+	} else {
+		sendUC := app.NewSend(custody, waconn.NewSender(database))
+		sendFunc = func(ctx context.Context, to, text string) error { return sendUC.Run(ctx, to, text) }
+	}
 
 	adapter := cloudlink.NewAdapter(cc, cfg.CloudLink.SessionID, sendFunc, validator, custody.Exists, log)
 	go func() {

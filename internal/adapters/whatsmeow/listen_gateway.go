@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
@@ -27,6 +28,14 @@ import (
 type ListenGateway struct {
 	loadDevice loadDeviceFunc
 	log        logger.Logger
+
+	// mu protege SOLO el puntero `client` (no las llamadas a whatsmeow, que son seguras concurrentes).
+	mu sync.RWMutex
+	// client es el cliente VIVO de la escucha mientras serve() bloquea; nil fuera de una sesión Listen.
+	// Permite que el envío reutilice la MISMA conexión que recibe (una sola conexión por sesión): con
+	// la misma identidad multi-dispositivo, un cliente efímero aparte REEMPLAZARÍA esta conexión y
+	// dejaría el socket de escucha sordo. El device ya está autenticado: enviar NO requiere la DEK.
+	client *wm.Client
 }
 
 var _ app.ListenGateway = (*ListenGateway)(nil)
@@ -58,6 +67,10 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	client := wm.NewClient(device, waLog.Noop)
 	client.EnableAutoReconnect = true // whatsmeow reintenta el socket; el Listener traza el backoff.
 
+	// Publica el cliente VIVO para que el envío reutilice esta misma conexión, y lo limpia al salir.
+	g.setLiveClient(client)
+	defer g.setLiveClient(nil)
+
 	listener := NewListener(sink, g.log)
 	listener.Register(ctx, client)
 
@@ -72,5 +85,35 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	// vive en RAM durante toda esta espera (ADR-0007).
 	<-ctx.Done()
 	g.log.Info("escucha 24/7 detenida: cancelación recibida, cerrando socket")
+	return nil
+}
+
+// setLiveClient publica (o limpia con nil) el cliente VIVO de la escucha bajo lock de escritura.
+func (g *ListenGateway) setLiveClient(client *wm.Client) {
+	g.mu.Lock()
+	g.client = client
+	g.mu.Unlock()
+}
+
+// SendViaLiveClient envía un texto REUTILIZANDO el cliente whatsmeow VIVO de la escucha (RF-4 sobre la
+// conexión always-on): una sola conexión por sesión, sin abrir un socket efímero que dejaría sorda la
+// escucha. Falla con error claro si no hay sesión de escucha activa (cliente nil). El cliente vivo ya
+// está autenticado (device cargado al arrancar): NO necesita la DEK. client.SendMessage es seguro para
+// uso concurrente; el RWMutex solo protege la lectura del puntero.
+func (g *ListenGateway) SendViaLiveClient(ctx context.Context, to, text string) error {
+	g.mu.RLock()
+	client := g.client
+	g.mu.RUnlock()
+	if client == nil {
+		return fmt.Errorf("whatsapp: sin cliente vivo de escucha para enviar (¿está corriendo `restore`/`listen`?)")
+	}
+
+	toJID, err := parseRecipient(to)
+	if err != nil {
+		return err
+	}
+	if _, err := client.SendMessage(ctx, toJID, buildMessage(outgoing{to: toJID, text: text})); err != nil {
+		return fmt.Errorf("whatsapp: enviar por cliente vivo: %w", err)
+	}
 	return nil
 }
