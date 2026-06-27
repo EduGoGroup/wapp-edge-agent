@@ -1,0 +1,142 @@
+/*
+  Estilo sobrio del plano de control (Plan 007, T5). Sin frameworks ni CDN: CSS plano embebido.
+  Prioriza legibilidad y función sobre estética. Paleta neutra con un acento sobrio.
+*/
+
+:root {
+  --bg: #f4f5f7;
+  --card: #ffffff;
+  --ink: #1c2128;
+  --muted: #6b7280;
+  --border: #e2e5ea;
+  --accent: #2563eb;
+  --accent-ink: #ffffff;
+  --ok: #16a34a;
+  --warn: #d97706;
+  --err: #dc2626;
+  --logs-bg: #0d1117;
+  --logs-ink: #d1d5db;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  line-height: 1.45;
+}
+
+header {
+  padding: 20px 24px 8px;
+}
+header h1 { margin: 0; font-size: 1.4rem; }
+header .subtitle { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; }
+
+main {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 12px 24px 48px;
+  display: grid;
+  gap: 16px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.card-head h2 { margin: 0; font-size: 1.05rem; }
+
+.detail { margin: 4px 0 12px; font-size: 0.92rem; }
+.muted { color: var(--muted); }
+.hidden { display: none !important; }
+
+/* ---------- Botones ---------- */
+.actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+  padding: 8px 16px;
+  border-radius: 7px;
+  transition: opacity 0.15s ease;
+}
+button:hover:not(:disabled) { opacity: 0.88; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.secondary {
+  background: transparent;
+  color: var(--accent);
+}
+button.small { padding: 5px 10px; font-size: 0.85rem; }
+
+/* ---------- Badges de estado ---------- */
+.badge {
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+.badge-unknown { background: #e5e7eb; color: var(--muted); }
+.badge-ok      { background: #dcfce7; color: var(--ok); }
+.badge-down    { background: #fee2e2; color: var(--err); }
+.badge-warn    { background: #fef3c7; color: var(--warn); }
+
+/* ---------- Tabla de sesiones ---------- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+th, td {
+  text-align: left;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+}
+th { color: var(--muted); font-weight: 600; }
+td { word-break: break-all; }
+
+/* ---------- QR ---------- */
+.qr-wrap {
+  margin-top: 8px;
+  display: flex;
+  justify-content: center;
+}
+.qr-wrap img {
+  width: 256px;
+  height: 256px;
+  image-rendering: pixelated;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fff;
+  padding: 8px;
+}
+
+/* ---------- Logs ---------- */
+.logs {
+  margin: 0;
+  background: var(--logs-bg);
+  color: var(--logs-ink);
+  padding: 12px;
+  border-radius: 8px;
+  height: 280px;
+  overflow-y: auto;
+  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

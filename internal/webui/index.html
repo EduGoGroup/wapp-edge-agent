@@ -1,26 +1,76 @@
 <!DOCTYPE html>
 <!--
-  PLACEHOLDER de T4 (Plan 007). La web UI REAL (estado del daemon, emparejar con QR,
-  logs en vivo por SSE, botones arrancar/detener) la implementa T5, que reemplaza
-  este archivo. En T4 solo existe para que internal/webui (embed.FS) compile y se
-  pueda probar el reverse-proxy /v1/* y el control de proceso /v1/daemon/*.
+  Web UI del plano de control del Edge (Plan 007, T5). HTML/CSS/JS vanilla, SIN build step:
+  se embebe con //go:embed (ver webui.go) y se sirve en el MISMO origen loopback (127.0.0.1:8765)
+  que el proxy /v1/* del supervisor → sin CORS. La lógica vive en app.js; el estilo en styles.css.
 -->
 <html lang="es">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>wApp Edge — plano de control</title>
+    <title>wApp Edge · plano de control</title>
+    <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
+    <header>
+      <h1>wApp Edge</h1>
+      <p class="subtitle">Plano de control local</p>
+    </header>
+
     <main>
-      <h1>wApp Edge · plano de control</h1>
-      <p>Placeholder de T4. La interfaz real llega en <strong>T5</strong>.</p>
-      <p>
-        El supervisor ya expone:
-        <code>POST /v1/daemon/start</code>, <code>POST /v1/daemon/stop</code>,
-        <code>GET /v1/daemon/status</code> y el reverse-proxy de <code>/v1/*</code>
-        hacia el núcleo (Unix socket).
-      </p>
+      <!-- ===================== Estado del daemon ===================== -->
+      <section id="section-daemon" class="card">
+        <div class="card-head">
+          <h2>Daemon (núcleo)</h2>
+          <span id="daemon-badge" class="badge badge-unknown">Comprobando…</span>
+        </div>
+        <p id="daemon-detail" class="detail">Consultando estado…</p>
+        <div class="actions">
+          <button id="btn-start" type="button" disabled>Arrancar</button>
+          <button id="btn-stop" type="button" class="secondary" disabled>Detener</button>
+        </div>
+      </section>
+
+      <!-- ===================== Sesiones ===================== -->
+      <section id="section-sessions" class="card">
+        <div class="card-head">
+          <h2>Sesiones</h2>
+          <button id="btn-refresh-sessions" type="button" class="secondary small">Refrescar</button>
+        </div>
+        <table id="sessions-table">
+          <thead>
+            <tr><th>JID</th><th>Estado</th><th>Emparejada</th><th>Actualizada</th></tr>
+          </thead>
+          <tbody id="sessions-body">
+            <tr><td colspan="4" class="muted">—</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ===================== Emparejar ===================== -->
+      <section id="section-pair" class="card">
+        <div class="card-head">
+          <h2>Emparejar teléfono</h2>
+          <button id="btn-pair" type="button">Emparejar</button>
+        </div>
+        <p id="pair-status" class="detail muted">
+          Pulsa «Emparejar» para generar un código QR y escanéalo con WhatsApp.
+        </p>
+        <div id="pair-qr-wrap" class="qr-wrap hidden">
+          <img id="pair-qr" alt="Código QR de emparejamiento" />
+        </div>
+      </section>
+
+      <!-- ===================== Logs en vivo ===================== -->
+      <section id="section-logs" class="card">
+        <div class="card-head">
+          <h2>Logs en vivo</h2>
+          <span id="logs-state" class="badge badge-unknown">Desconectado</span>
+        </div>
+        <pre id="logs" class="logs" aria-live="polite"></pre>
+      </section>
     </main>
+
+    <script src="app.js"></script>
   </body>
 </html>
