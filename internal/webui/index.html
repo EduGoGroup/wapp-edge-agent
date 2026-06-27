@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+  PLACEHOLDER de T4 (Plan 007). La web UI REAL (estado del daemon, emparejar con QR,
+  logs en vivo por SSE, botones arrancar/detener) la implementa T5, que reemplaza
+  este archivo. En T4 solo existe para que internal/webui (embed.FS) compile y se
+  pueda probar el reverse-proxy /v1/* y el control de proceso /v1/daemon/*.
+-->
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wApp Edge — plano de control</title>
+  </head>
+  <body>
+    <main>
+      <h1>wApp Edge · plano de control</h1>
+      <p>Placeholder de T4. La interfaz real llega en <strong>T5</strong>.</p>
+      <p>
+        El supervisor ya expone:
+        <code>POST /v1/daemon/start</code>, <code>POST /v1/daemon/stop</code>,
+        <code>GET /v1/daemon/status</code> y el reverse-proxy de <code>/v1/*</code>
+        hacia el núcleo (Unix socket).
+      </p>
+    </main>
+  </body>
+</html>
