@@ -57,6 +57,17 @@ func (l Layout) SessionDir(id string) (string, error) {
 	return filepath.Join(l.dataDir, sessionsDirName, id), nil
 }
 
+// RelSessionDir devuelve sessions/<id>: la ruta RELATIVA a data_dir del directorio de la sesión, tal
+// como se persiste en el metadato domain.Session.StoreDir (ADR-0016 §4). No mezcla data_dir para que
+// el registro sea portable si el daemon se mueve de directorio base. Misma validación de UUID que
+// SessionDir (impide rutas que se escapen).
+func (l Layout) RelSessionDir(id string) (string, error) {
+	if !validSessionID(id) {
+		return "", fmt.Errorf("layout: session_id inválido (se esperaba UUID): %q", id)
+	}
+	return filepath.Join(sessionsDirName, id), nil
+}
+
 // StoreDB devuelve <data_dir>/sessions/<id>/store.db (Container whatsmeow cifrado de la sesión).
 func (l Layout) StoreDB(id string) (string, error) {
 	dir, err := l.SessionDir(id)

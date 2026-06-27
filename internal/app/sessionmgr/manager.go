@@ -33,19 +33,33 @@ type Manager struct {
 	max int
 	// log es el logger raíz; cada liveSession derivará un hijo con session_id/jid (design §10.J).
 	log sharedlogger.Logger
+
+	// newPairer construye, para UNA sesión, el caso de uso de pairing sobre su custodia y su store
+	// (design §5). Se inyecta por opción (WithWhatsmeowPairing en producción; un fake en los tests)
+	// para que Manager.Pair sea testeable sin WhatsApp. nil hasta que se configure: Pair lo exige.
+	newPairer pairFactory
 }
+
+// Option configura un Manager en su construcción (inyección de dependencias opcionales como el
+// factory de pairing). Mantiene NewManager retrocompatible: sin opciones, el esqueleto T1 intacto.
+type Option func(*Manager)
 
 // NewManager construye el Manager con el Layout, el puerto de persistencia de metadatos, el límite
 // suave de sesiones (max) y el logger. No abre sockets ni restaura sesiones: eso lo hacen
-// Pair/Restore en tramos posteriores.
-func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlogger.Logger) *Manager {
-	return &Manager{
+// Pair/Restore en tramos posteriores. Las opciones inyectan dependencias del ciclo de vida (p.ej.
+// WithWhatsmeowPairing para habilitar Manager.Pair).
+func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlogger.Logger, opts ...Option) *Manager {
+	m := &Manager{
 		live:     make(map[string]*liveSession),
 		layout:   layout,
 		sessions: sessions,
 		max:      max,
 		log:      log,
 	}
+	for _, o := range opts {
+		o(m)
+	}
+	return m
 }
 
 // custodyFor resuelve la custodia DEK de UNA sesión: NewFileCustody apuntando a Layout.DEKPath(id)

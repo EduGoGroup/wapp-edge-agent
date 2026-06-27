@@ -36,12 +36,16 @@ import (
 // `sessions`). La implementación real (internal/adapters/sessionstore) lee/escribe SQLite EN CLARO;
 // un fake en los tests lo simula en memoria. No custodia material cripto (eso es cryptostore/DEK).
 type SessionStore interface {
-	// Upsert inserta o actualiza la sesión por su JID (clave primaria).
+	// Upsert inserta o actualiza la sesión por su session_id (clave primaria, ADR-0016 §3).
 	Upsert(ctx context.Context, s domain.Session) error
 	// List devuelve todas las sesiones persistidas (vacío si no hay ninguna).
 	List(ctx context.Context) ([]domain.Session, error)
-	// Get devuelve la sesión con ese JID, o ErrSessionNotFound si no existe.
-	Get(ctx context.Context, jid string) (domain.Session, error)
+	// Get devuelve la sesión con ese session_id, o ErrSessionNotFound si no existe.
+	Get(ctx context.Context, sessionID string) (domain.Session, error)
+	// Delete elimina la fila de la sesión con ese session_id (idempotente: borrar una ausente no es
+	// error). Es la parte de metadatos del borrado quirúrgico (design §7) y de la limpieza del
+	// pairing fallido (design §5): el Manager la usa para no dejar restos.
+	Delete(ctx context.Context, sessionID string) error
 }
 
 // PairedDeviceLocator resuelve el JID del device pareado que vive en el store CIFRADO

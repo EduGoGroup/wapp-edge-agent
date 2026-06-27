@@ -52,6 +52,19 @@ func (f *fakeSessionStore) Get(_ context.Context, jid string) (domain.Session, e
 	return domain.Session{}, ErrSessionNotFound
 }
 
+func (f *fakeSessionStore) Delete(_ context.Context, sessionID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := f.list[:0]
+	for _, s := range f.list {
+		if s.SessionID != sessionID {
+			out = append(out, s)
+		}
+	}
+	f.list = out
+	return nil
+}
+
 func (f *fakeSessionStore) lastUpsert() (domain.Session, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
