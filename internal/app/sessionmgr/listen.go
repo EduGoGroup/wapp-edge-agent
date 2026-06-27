@@ -132,7 +132,7 @@ func (m *Manager) startListener(s *liveSession) {
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s.setCancel(cancel)
+	s.arm(cancel)
 	s.mark(HealthStarting, nil)
 	m.wg.Add(1)
 	go m.runListener(ctx, s)
@@ -144,6 +144,9 @@ func (m *Manager) startListener(s *liveSession) {
 // demás (cada una vive en su goroutine con su context).
 func (m *Manager) runListener(ctx context.Context, s *liveSession) {
 	defer m.wg.Done()
+	// Señala el fin de ESTA goroutine para que Unlink pueda unirla aislada (sin esperar al WaitGroup
+	// global). Corre antes que wg.Done por orden LIFO de defers; ambos órdenes serían correctos.
+	defer s.signalDone()
 
 	backoff := &whatsmeow.Backoff{Base: m.backoffBase, Max: m.backoffMax}
 	for {

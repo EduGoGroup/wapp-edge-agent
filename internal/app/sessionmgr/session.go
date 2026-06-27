@@ -61,22 +61,51 @@ type liveSession struct {
 	// log arrastra session_id/jid en cada línea (design §10.J); hijo del logger del Manager.
 	log sharedlogger.Logger
 
-	// mu protege cancel/health/lastErr: los escribe la goroutine listener y los leen Stop()/Health().
+	// mu protege cancel/done/health/lastErr: los escribe la goroutine listener y los leen Stop()/Health().
 	mu sync.Mutex
 	// cancel detiene la goroutine listener de la sesión (apagado ordenado, design §10.I). nil hasta que
 	// startListener arranca un listener real.
 	cancel context.CancelFunc
+	// done se CIERRA cuando la goroutine listener de la sesión retorna (tras cancel, ya cerró su *sql.DB
+	// vía defer). Permite a Unlink esperar SOLO a ESTA goroutine —el borrado quirúrgico de una sesión
+	// sin tocar a las demás (design §7)— sin usar el WaitGroup GLOBAL del Manager (que une a todas). nil
+	// si no se arrancó listener (sesión registrada sin escucha): waitDone es entonces un no-op.
+	done chan struct{}
 	// health es la salud de runtime observada por la goroutine listener (starting→listening→degraded→stopped).
 	health SessionHealth
 	// lastErr es la última causa de caída del listener (para diagnóstico/plano de control); nil si sano.
 	lastErr error
 }
 
-// setCancel guarda el cancel del listener bajo lock (lo arranca startListener; lo invoca Stop).
-func (s *liveSession) setCancel(cancel context.CancelFunc) {
+// arm prepara la sesión para su goroutine listener bajo lock: guarda su cancel (apagado ordenado /
+// borrado quirúrgico) y abre el canal done que esa goroutine cerrará al retornar. Lo invoca
+// startListener justo antes de lanzar la goroutine; Stop usa cancel y Unlink espera done.
+func (s *liveSession) arm(cancel context.CancelFunc) {
 	s.mu.Lock()
 	s.cancel = cancel
+	s.done = make(chan struct{})
 	s.mu.Unlock()
+}
+
+// signalDone cierra el canal done (la goroutine listener ya retornó). Idempotente solo dentro de una
+// goroutine (cada listener lo cierra una vez al salir, vía defer). Seguro sin lock: la referencia a
+// done quedó publicada por arm antes del `go` (happens-before), y el cierre no compite con escrituras.
+func (s *liveSession) signalDone() {
+	if s.done != nil {
+		close(s.done)
+	}
+}
+
+// waitDone bloquea hasta que la goroutine listener de ESTA sesión haya retornado (done cerrado). Si la
+// sesión se registró SIN escucha (done nil), retorna de inmediato. Lee la referencia bajo lock para no
+// competir con arm. Es la pieza que permite a Unlink unir SOLO esta goroutine, no el WaitGroup global.
+func (s *liveSession) waitDone() {
+	s.mu.Lock()
+	done := s.done
+	s.mu.Unlock()
+	if done != nil {
+		<-done
+	}
 }
 
 // stop cancela la goroutine listener si está arrancada (idempotente). No espera: el WaitGroup del
