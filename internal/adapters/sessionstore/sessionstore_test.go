@@ -330,3 +330,37 @@ func TestLocatorWithDevice(t *testing.T) {
 		t.Fatalf("jid = %q", jid)
 	}
 }
+
+// TestSessionStoreOnCentralMetaDB: el sessionstore opera sobre la db CENTRAL de metadatos abierta con
+// el set "meta" SOLO (db.OpenAndMigrateMeta), sin el esquema del store cifrado. Es la garantía T2(d):
+// separar las migraciones (store por sesión vs metadatos central) deja el sessionstore verde sobre la
+// db central que usará el Manager en T3/T4.
+func TestSessionStoreOnCentralMetaDB(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sessions.db")
+	database, err := db.OpenAndMigrateMeta(ctx, path)
+	if err != nil {
+		t.Fatalf("OpenAndMigrateMeta: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+
+	store := New(database)
+	in := domain.Session{
+		SessionID: "22222222-2222-4222-8222-222222222222",
+		JID:       "56984467443:47@s.whatsapp.net",
+		State:     domain.SessionStateActive,
+		StoreDir:  "sessions/22222222-2222-4222-8222-222222222222",
+		PairedAt:  time.Unix(1_700_000_000, 0).UTC(),
+		UpdatedAt: time.Unix(1_700_000_500, 0).UTC(),
+	}
+	if err := store.Upsert(ctx, in); err != nil {
+		t.Fatalf("Upsert sobre la db central: %v", err)
+	}
+	got, err := store.Get(ctx, in.SessionID)
+	if err != nil {
+		t.Fatalf("Get sobre la db central: %v", err)
+	}
+	if got.SessionID != in.SessionID || got.JID != in.JID || got.State != in.State {
+		t.Fatalf("Get = %+v, esperaba %+v", got, in)
+	}
+}

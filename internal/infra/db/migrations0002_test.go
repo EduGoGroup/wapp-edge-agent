@@ -95,7 +95,7 @@ func TestMigrate0002OnDBWithOnly0001(t *testing.T) {
 	defer func() { _ = database.Close() }()
 
 	// Aplica SOLO la 0001 (leída del fichero en disco) para emular el estado "pre-0002".
-	sql0001, err := os.ReadFile(filepath.Join("migrations", "0001_init.sql"))
+	sql0001, err := os.ReadFile(filepath.Join("migrations", "store", "0001_init.sql"))
 	if err != nil {
 		t.Fatalf("leer 0001: %v", err)
 	}
@@ -198,7 +198,7 @@ func TestMigrateFailsWhenDirMissing(t *testing.T) {
 // TestMigrateFailsWhenReadFileErrors: el directorio lista un .sql pero leerlo falla; Migrate propaga.
 func TestMigrateFailsWhenReadFileErrors(t *testing.T) {
 	mapFS := fstest.MapFS{
-		"migrations/0001_x.sql": {Data: []byte("CREATE TABLE t (x);")},
+		"migrations/store/0001_x.sql": {Data: []byte("CREATE TABLE t (x);")},
 	}
 	withMigrationsFS(t, readFileErrFS{mapFS})
 	path := filepath.Join(t.TempDir(), "store.db")
