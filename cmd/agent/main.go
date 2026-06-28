@@ -306,12 +306,17 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 
 	sessions := sessionstore.New(metaDB)
 	layout := sessionmgr.NewLayout(cfg.DataDir)
-	listenSink := cloudlink.NewLogSink(log) // T7: CloudLink real por-sesión (session_id + lease).
+
+	// Multiplexor CloudLink REAL (T7): UN solo stream Connect por Edge que multiplexa N sesiones por
+	// session_id (ADR-0008) con lease POR sesión (ADR-0016 §5). Su loop de stream corre en goroutine
+	// ligada a ctx. Sin endpoint configurado cae a LogMux (diagnóstico por sesión, sin red). El Manager
+	// registra cada sesión (live-sender + presencia de DEK) al arrancar su listener y la quita en Unlink.
+	mux := buildMux(ctx, cfg, log)
 
 	// Manager con escucha real (un listener por sesión) y pairing real (un Connector por sesión sobre SU
 	// store; el QRSink lo inyecta el plano de control POR emparejamiento para el polling async del QR).
 	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
-		sessionmgr.WithWhatsmeowListen(listenSink),
+		sessionmgr.WithWhatsmeowListen(mux),
 		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
 	)
 
@@ -432,7 +437,7 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 		return logSink
 	}
 
-	validator, err := loadValidator(cfg.CloudLink, log)
+	newValidator, err := loadValidatorFactory(cfg.CloudLink, log)
 	if err != nil {
 		log.Error("CloudLink: clave pública de lease inválida, cayendo a LogSink puro", "error", err)
 		_ = cc.Close()
@@ -452,7 +457,11 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 		sendFunc = func(ctx context.Context, to, text string) error { return sendUC.Run(ctx, to, text) }
 	}
 
-	adapter := cloudlink.NewAdapter(cc, cfg.CloudLink.SessionID, sendFunc, validator, custody.Exists, log)
+	// El Adapter es un multiplexor (un stream por Edge). El camino legacy single-sesión registra LA
+	// única sesión (cfg.CloudLink.SessionID) y usa SU sink etiquetado; la mecánica de mux es idéntica a
+	// la del daemon multi-sesión (runServe), solo que aquí hay una sola sesión.
+	adapter := cloudlink.NewAdapter(cc, log, newValidator)
+	adapter.Register(cfg.CloudLink.SessionID, sendFunc, custody.Exists)
 	go func() {
 		_ = adapter.Run(ctx)
 		_ = cc.Close()
@@ -460,8 +469,53 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 
 	log.Info("CloudLink habilitado: reenviando entrantes y atendiendo comandos cloud->edge",
 		"endpoint", cfg.CloudLink.Endpoint, "session_id", cfg.CloudLink.SessionID,
-		"lease_gate", validator != nil)
-	return cloudlink.NewTeeSink(adapter, logSink)
+		"lease_gate", newValidator != nil)
+	return cloudlink.NewTeeSink(adapter.SinkFor(cfg.CloudLink.SessionID), logSink)
+}
+
+// buildMux construye el multiplexor CloudLink del daemon MULTI-SESIÓN (un solo stream, N sesiones por
+// session_id, ADR-0008). Reusa el mismo dial mTLS y la misma factory de Validator que el camino legacy:
+//
+//   - Sin cfg.CloudLink.Endpoint: LogMux (diagnóstico por sesión, sin red). El daemon sigue arriba con
+//     los listeners y los entrantes a log, igual que el LogSink puro hacía en el single-sesión.
+//   - Con endpoint: dial gRPC (mTLS si hay cert/clave/CA; insecure en dev con advertencia) y Adapter
+//     real cuyo loop de stream corre en goroutine ligada a ctx. El Manager registra cada sesión.
+//
+// ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK (ADR-0007).
+func buildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger) sessionmgr.CloudLinkMux {
+	if cfg.CloudLink.Endpoint == "" {
+		log.Info("CloudLink deshabilitado (sin endpoint): usando LogMux por sesión para diagnóstico")
+		return cloudlink.NewLogMux(log)
+	}
+
+	creds, err := clientCreds(cfg.CloudLink, log)
+	if err != nil {
+		log.Error("CloudLink: credenciales mTLS inválidas, cayendo a LogMux", "error", err)
+		return cloudlink.NewLogMux(log)
+	}
+
+	cc, err := grpc.NewClient(cfg.CloudLink.Endpoint, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		log.Error("CloudLink: no se pudo crear el cliente gRPC, cayendo a LogMux", "error", err)
+		return cloudlink.NewLogMux(log)
+	}
+
+	newValidator, err := loadValidatorFactory(cfg.CloudLink, log)
+	if err != nil {
+		log.Error("CloudLink: clave pública de lease inválida, cayendo a LogMux", "error", err)
+		_ = cc.Close()
+		return cloudlink.NewLogMux(log)
+	}
+
+	adapter := cloudlink.NewAdapter(cc, log, newValidator)
+	go func() {
+		_ = adapter.Run(ctx)
+		_ = cc.Close()
+	}()
+
+	log.Info("CloudLink habilitado (multi-sesión): un stream multiplexado por session_id",
+		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil)
+	return adapter
 }
 
 // clientCreds construye las transport-credentials del dial CloudLink: mTLS si están las tres rutas
@@ -483,9 +537,11 @@ func clientCreds(cl config.CloudLinkConfig, log sharedlogger.Logger) (credential
 	return insecure.NewCredentials(), nil
 }
 
-// loadValidator construye el Validator del gate de lease si hay clave pública configurada. Acepta la
-// clave en hex o como 32 bytes crudos. Devuelve nil (sin gate) si no hay ruta configurada.
-func loadValidator(cl config.CloudLinkConfig, log sharedlogger.Logger) (*lease.Validator, error) {
+// loadValidatorFactory construye la FACTORY del Validator del gate de lease si hay clave pública
+// configurada. Acepta la clave en hex o como 32 bytes crudos y la parsea UNA vez; la factory devuelve un
+// Validator FRESCO (estado de lease propio) por sesión (lease por sesión, ADR-0016 §5) sobre esa misma
+// clave del Edge. Devuelve nil (sin gate) si no hay ruta configurada.
+func loadValidatorFactory(cl config.CloudLinkConfig, log sharedlogger.Logger) (cloudlink.ValidatorFactory, error) {
 	if cl.LeasePubKeyPath == "" {
 		log.Warn("CloudLink: sin clave pública de lease; gate de kill-switch DESACTIVADO (solo desarrollo)")
 		return nil, nil
@@ -501,5 +557,5 @@ func loadValidator(cl config.CloudLinkConfig, log sharedlogger.Logger) (*lease.V
 	if len(pub) != ed25519.PublicKeySize {
 		return nil, fmt.Errorf("clave pública de lease con tamaño inválido: %d (esperado %d)", len(pub), ed25519.PublicKeySize)
 	}
-	return lease.NewValidator(ed25519.PublicKey(pub)), nil
+	return func() *lease.Validator { return lease.NewValidator(ed25519.PublicKey(pub)) }, nil
 }

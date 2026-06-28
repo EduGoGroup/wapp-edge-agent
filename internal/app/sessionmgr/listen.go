@@ -46,15 +46,36 @@ type listenRunner interface {
 // Devuelve error si no pudo provisionar el store/gateway: runListener lo trata como una caída (reintento).
 type listenFactory func(ctx context.Context, s *liveSession) (listenRunner, io.Closer, error)
 
-// WithWhatsmeowListen habilita Restore/startListener con la escucha REAL sobre whatsmeow: por cada
-// sesión abre SU store.db (Layout.StoreDB(id)), construye un ListenGateway sobre esa *sql.DB y un
-// app.Listen que carga la DEK de la sesión (custodia inyectada) y mantiene el socket vivo, reenviando
-// los entrantes al sink dado. El *sql.DB se devuelve como io.Closer para el apagado ordenado.
+// CloudLinkMux es el multiplexor CloudLink del Edge (UN stream Connect, N sesiones por session_id,
+// ADR-0008). El Manager lo usa para (a) registrar cada sesión al arrancar su listener —pasando su
+// emisor por cliente vivo (sendVia) y la presencia de su DEK (hasDEK)— y quitarla al desvincularla; y
+// (b) obtener el sink de SALIDA etiquetado por session_id de esa sesión. El estado de lease POR SESIÓN
+// (ADR-0016 §5) lo mantiene el propio mux: el Manager no conoce lease ni proto (lo satisface el Adapter
+// real de cloudlink, o el LogMux de diagnóstico). Interfaz estructural: sessionmgr no importa cloudlink.
+type CloudLinkMux interface {
+	// Register da de alta una sesión en el multiplex (register-on-start): send es su emisor por cliente
+	// vivo, hasDEK la presencia de la DEK (gate 2-de-2). El mux construye el estado de lease de la sesión.
+	Register(sessionID string, send func(ctx context.Context, to, text string) error, hasDEK func() bool)
+	// Unregister da de baja la sesión (unregister-on-unlink): sus comandos posteriores se ignoran.
+	Unregister(sessionID string)
+	// SinkFor devuelve el sink de SALIDA (entrantes->cloud) etiquetado con session_id.
+	SinkFor(sessionID string) app.InboundSink
+}
+
+// WithWhatsmeowListen habilita Restore/startListener con la escucha REAL sobre whatsmeow Y la cablea al
+// multiplexor CloudLink (T7): por cada sesión abre SU store.db (Layout.StoreDB(id)), construye un
+// ListenGateway sobre esa *sql.DB y un app.Listen que carga la DEK de la sesión (custodia inyectada) y
+// mantiene el socket vivo, reenviando los entrantes al sink ETIQUETADO de esa sesión (mux.SinkFor(id)).
+// El *sql.DB se devuelve como io.Closer para el apagado ordenado.
 //
-// El sink es COMPARTIDO en este corte (un LogSink/CloudLink por Edge, ADR-0008: un stream por Edge). El
-// etiquetado por session_id del multiplex CloudLink (sinkFor(s)) y el lease por sesión son T7.
-func WithWhatsmeowListen(sink app.InboundSink) Option {
+// MULTIPLEX (ADR-0008: un stream por Edge): el mux es ÚNICO; SinkFor(id) etiqueta la salida con el
+// session_id y el lease es por sesión (lo mantiene el mux). El live-sender se EXPONE así: cada ciclo de
+// escucha rota s.setLiveSender(gateway.SendViaLiveClient) y el mux tiene registrado s.sendVia
+// (indirección estable, ver startListener), de modo que un SendText para la sesión X llega al cliente
+// VIVO de X (no a uno efímero, lección Plan 006). El register/unregister vive en startListener/Unlink.
+func WithWhatsmeowListen(mux CloudLinkMux) Option {
 	return func(m *Manager) {
+		m.cloudMux = mux
 		m.newListener = func(ctx context.Context, s *liveSession) (listenRunner, io.Closer, error) {
 			storePath, err := m.layout.StoreDB(s.meta.SessionID)
 			if err != nil {
@@ -65,7 +86,10 @@ func WithWhatsmeowListen(sink app.InboundSink) Option {
 				return nil, nil, fmt.Errorf("abrir store de sesión: %w", err)
 			}
 			gateway := whatsmeow.NewListenGateway(sdb, s.log)
-			runner := app.NewListen(s.custody, gateway, sink)
+			// Rota el live-sender de ESTE ciclo: el mux ya tiene registrado s.sendVia; aquí solo apunta la
+			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo).
+			s.setLiveSender(gateway.SendViaLiveClient)
+			runner := app.NewListen(s.custody, gateway, mux.SinkFor(s.meta.SessionID))
 			return runner, sdb, nil
 		}
 	}
@@ -130,6 +154,12 @@ func (m *Manager) startListener(s *liveSession) {
 	if m.newListener == nil {
 		s.log.Warn("sesión registrada pero SIN escucha: falta WithWhatsmeowListen (listener no arrancado)")
 		return
+	}
+	// Register-on-start (Restore y Pair): multiplexa esta sesión en el único stream del Edge (ADR-0008).
+	// sendVia es la indirección estable al cliente vivo (lo rota el factory en cada ciclo); custody.Exists
+	// alimenta el gate 2-de-2 por sesión. nil en tests que cablean newListener sin mux.
+	if m.cloudMux != nil {
+		m.cloudMux.Register(s.meta.SessionID, s.sendVia, s.custody.Exists)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.arm(cancel)

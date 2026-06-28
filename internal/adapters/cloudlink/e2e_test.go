@@ -26,6 +26,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -92,16 +93,22 @@ const e2eSessionID = "sess-t6"
 
 type sendCall struct{ to, text string }
 
-// e2eHarness cablea el Adapter real (cliente) contra el server-double (bufconn + insecure), igual
-// patrón que los tests de transporte de cloudlink.
+// e2eHarness cablea el Adapter MULTIPLEXOR real (cliente) contra el server-double (bufconn + insecure),
+// igual patrón que los tests de transporte de cloudlink. Registra una o varias sesiones y captura por
+// session_id lo que cada sendFunc fake despacha, para verificar el demux de entrada por sesión.
 type e2eHarness struct {
 	srv     *serverDouble
 	stream  cloudlinkv1.CloudLink_ConnectServer
-	sent    chan sendCall // capturas del Sender fake (to,text) de cada SendText despachado
 	adapter *Adapter
+
+	mu   sync.Mutex
+	sent map[string]chan sendCall // session_id -> capturas (to,text) del sendFunc fake de esa sesión
 }
 
-func newE2EHarness(t *testing.T, ctx context.Context, validator *lease.Validator) *e2eHarness {
+// newE2EHarness arma el multiplexor con el factory de Validator dado (nil => sin gate de lease) y
+// registra las sesiones indicadas (cada una con su captura de envíos y hasDEK=true). Heartbeat largo:
+// solo nos interesa el latido inicial por sesión (ancla de conexión), sin ruido periódico.
+func newE2EHarness(t *testing.T, ctx context.Context, newValidator ValidatorFactory, sessionIDs ...string) *e2eHarness {
 	t.Helper()
 
 	// 1) server-double sobre bufconn (in-memory, sin red ni TLS).
@@ -123,36 +130,48 @@ func newE2EHarness(t *testing.T, ctx context.Context, validator *lease.Validator
 	}
 	t.Cleanup(func() { _ = cc.Close() })
 
-	// 2) Sender fake: captura (to,text). hasDEK=true (gate 2-de-2: la parte DEK presente).
-	sent := make(chan sendCall, 8)
-	sendFunc := func(_ context.Context, to, text string) error {
-		sent <- sendCall{to: to, text: text}
-		return nil
-	}
-	hasDEK := func() bool { return true }
-
 	// Logger a buffer descartable: el sub-test ZK inspecciona que NO se logueen secretos.
 	log := sharedlogger.New(sharedlogger.WithWriter(&bytes.Buffer{}), sharedlogger.WithJSON(true))
 
-	// 3) Adapter REAL. Heartbeat largo: solo nos interesa el latido inicial (ancla de conexión); no
-	// queremos ruido periódico en el canal del server-double durante el test.
-	adapter := NewAdapter(cc, e2eSessionID, sendFunc, validator, hasDEK, log, WithHeartbeatInterval(time.Hour))
+	// 2) Adapter MULTIPLEXOR real (un stream, N sesiones). Las sesiones se registran ANTES de Run: al
+	// conectar, el adapter emite el heartbeat inicial de cada una.
+	adapter := NewAdapter(cc, log, newValidator, WithHeartbeatInterval(time.Hour))
+
+	h := &e2eHarness{srv: srv, adapter: adapter, sent: make(map[string]chan sendCall)}
+	for _, id := range sessionIDs {
+		h.register(id)
+	}
 
 	go func() { _ = adapter.Run(ctx) }()
 
-	// Handshake: esperamos el stream (el Adapter conectó) y drenamos el heartbeat inicial. Tras él,
-	// currentClient() del Adapter es no-nil, así que Deliver ya tiene stream vivo.
-	var stream cloudlinkv1.CloudLink_ConnectServer
+	// Handshake: esperamos el stream (el Adapter conectó). Los heartbeats iniciales por sesión los filtra
+	// recvKind (busca por tipo), así que no hace falta drenarlos explícitamente.
 	select {
-	case stream = <-srv.streamCh:
+	case h.stream = <-srv.streamCh:
 	case <-ctx.Done():
 		t.Fatalf("timeout esperando que el Adapter abra el stream: %v", ctx.Err())
 	}
-	recvKind(t, ctx, srv, "heartbeat inicial", func(m *cloudlinkv1.EdgeToCloud) bool {
-		return m.GetHeartbeat() != nil
-	})
+	return h
+}
 
-	return &e2eHarness{srv: srv, stream: stream, sent: sent, adapter: adapter}
+// register da de alta una sesión en el multiplex con un sendFunc fake que captura (to,text) en su propio
+// canal y hasDEK=true (gate 2-de-2: la parte DEK presente).
+func (h *e2eHarness) register(sessionID string) {
+	ch := make(chan sendCall, 8)
+	h.mu.Lock()
+	h.sent[sessionID] = ch
+	h.mu.Unlock()
+	h.adapter.Register(sessionID, func(_ context.Context, to, text string) error {
+		ch <- sendCall{to: to, text: text}
+		return nil
+	}, func() bool { return true })
+}
+
+// sentCh devuelve el canal de capturas de envío de la sesión.
+func (h *e2eHarness) sentCh(sessionID string) chan sendCall {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sent[sessionID]
 }
 
 // --- test e2e -----------------------------------------------------------------------------------
@@ -170,11 +189,11 @@ func TestE2E_CloudLinkAdapter_Flow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewIssuer: %v", err)
 	}
-	validator := lease.NewValidator(pub)
+	newValidator := func() *lease.Validator { return lease.NewValidator(pub) }
 
-	h := newE2EHarness(t, ctx, validator)
+	h := newE2EHarness(t, ctx, newValidator, e2eSessionID)
 
-	// (a) SALIDA: Deliver(InboundEvent) -> IncomingMessage con campos de negocio mapeados.
+	// (a) SALIDA: SinkFor(session).Deliver(InboundEvent) -> IncomingMessage con campos de negocio mapeados.
 	t.Run("incoming", func(t *testing.T) {
 		ts := time.Date(2026, 6, 26, 10, 30, 0, 0, time.UTC)
 		evt := domain.InboundEvent{
@@ -185,7 +204,7 @@ func TestE2E_CloudLinkAdapter_Flow(t *testing.T) {
 			Text:      "hola desde el cliente",
 			IsGroup:   false,
 		}
-		if err := h.adapter.Deliver(ctx, evt); err != nil {
+		if err := h.adapter.SinkFor(e2eSessionID).Deliver(ctx, evt); err != nil {
 			t.Fatalf("Deliver: %v", err)
 		}
 		msg := recvKind(t, ctx, h.srv, "IncomingMessage", func(m *cloudlinkv1.EdgeToCloud) bool {
@@ -237,7 +256,7 @@ func TestE2E_CloudLinkAdapter_Flow(t *testing.T) {
 		})
 
 		select {
-		case sc := <-h.sent:
+		case sc := <-h.sentCh(e2eSessionID):
 			if sc.to != "5491100000000" || sc.text != "respuesta de la nube" {
 				t.Errorf("Sender invocado con (%q,%q), inesperado", sc.to, sc.text)
 			}
@@ -279,8 +298,185 @@ func TestE2E_CloudLinkAdapter_Flow(t *testing.T) {
 			t.Errorf("Ack.ok: got true want false (el lease revocado debe bloquear el envío)")
 		}
 		select {
-		case sc := <-h.sent:
+		case sc := <-h.sentCh(e2eSessionID):
 			t.Fatalf("el Sender fue invocado pese al lease revocado: (%q,%q)", sc.to, sc.text)
+		default:
+		}
+	})
+}
+
+// TestE2E_CloudLinkMux_TwoSessions ancla el MULTIPLEX de T7 (ADR-0008 §"un stream", ADR-0016 §5 "lease
+// por sesión"): DOS sesiones (A y B) sobre UN ÚNICO stream Connect. Verifica:
+//
+//	(1) SALIDA etiquetada: un evento por SinkFor(A) sale con session_id=A y uno por SinkFor(B) con B,
+//	    POR EL MISMO stream.
+//	(2) DEMUX de entrada: un CloudToEdge{session_id=B, SendText} se enruta al sender de B, no al de A.
+//	(3) LEASE POR SESIÓN: revocar el lease de A bloquea los envíos de A pero NO los de B.
+//	(4) LIFECYCLE: Unregister(A) y, tras él, los comandos para A se ignoran limpio (sin Ack ni envío),
+//	    mientras B sigue respondiendo por el mismo stream.
+func TestE2E_CloudLinkMux_TwoSessions(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	issuer, err := lease.NewIssuer(priv)
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	// Factory: cada sesión obtiene un Validator FRESCO (estado de lease independiente) sobre la misma
+	// clave del Edge — justo lo que prueba el "lease por sesión".
+	newValidator := func() *lease.Validator { return lease.NewValidator(pub) }
+
+	const sessA, sessB = "sess-A", "sess-B"
+	h := newE2EHarness(t, ctx, newValidator, sessA, sessB)
+
+	// (1) SALIDA etiquetada por sesión, mismo stream.
+	t.Run("salida_etiquetada_por_sesion", func(t *testing.T) {
+		evtA := domain.InboundEvent{MessageID: "A1", Sender: "111@s.whatsapp.net", Text: "hola A", Timestamp: time.Unix(1_700_000_000, 0)}
+		evtB := domain.InboundEvent{MessageID: "B1", Sender: "222@s.whatsapp.net", Text: "hola B", Timestamp: time.Unix(1_700_000_001, 0)}
+		if err := h.adapter.SinkFor(sessA).Deliver(ctx, evtA); err != nil {
+			t.Fatalf("Deliver A: %v", err)
+		}
+		if err := h.adapter.SinkFor(sessB).Deliver(ctx, evtB); err != nil {
+			t.Fatalf("Deliver B: %v", err)
+		}
+		mA := recvKind(t, ctx, h.srv, "Incoming de A", func(m *cloudlinkv1.EdgeToCloud) bool {
+			return m.GetIncoming() != nil && m.GetSessionId() == sessA
+		})
+		if mA.GetIncoming().GetWaMessageId() != "A1" {
+			t.Errorf("Incoming de A: wa_message_id=%q want A1", mA.GetIncoming().GetWaMessageId())
+		}
+		mB := recvKind(t, ctx, h.srv, "Incoming de B", func(m *cloudlinkv1.EdgeToCloud) bool {
+			return m.GetIncoming() != nil && m.GetSessionId() == sessB
+		})
+		if mB.GetIncoming().GetWaMessageId() != "B1" {
+			t.Errorf("Incoming de B: wa_message_id=%q want B1", mB.GetIncoming().GetWaMessageId())
+		}
+	})
+
+	// Aplica un lease VIGENTE a A y a B (counter=1 cada uno: estado independiente) para habilitar envíos.
+	for _, id := range []string{sessA, sessB} {
+		lu, err := issuer.Issue("edge-1", "tenant-1", time.Hour, 1)
+		if err != nil {
+			t.Fatalf("Issue(%s): %v", id, err)
+		}
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: "lease-" + id,
+			SessionId: id,
+			Payload:   &cloudlinkv1.CloudToEdge_LeaseUpdate{LeaseUpdate: lu},
+		})
+	}
+
+	// (2) DEMUX de entrada: SendText a B se enruta a B, no a A.
+	t.Run("demux_entrada_a_B", func(t *testing.T) {
+		const cmdID = "send-B"
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: cmdID,
+			SessionId: sessB,
+			Payload:   &cloudlinkv1.CloudToEdge_SendText{SendText: &cloudlinkv1.SendText{To: "222", Text: "para B"}},
+		})
+		select {
+		case sc := <-h.sentCh(sessB):
+			if sc.to != "222" || sc.text != "para B" {
+				t.Errorf("B recibió (%q,%q), inesperado", sc.to, sc.text)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timeout: B no recibió el SendText: %v", ctx.Err())
+		}
+		ack := recvAck(t, ctx, h.srv, cmdID)
+		if !ack.GetOk() {
+			t.Errorf("Ack de B: ok=false (err=%q) want true", ack.GetError())
+		}
+		// A no debe haber recibido nada (el Ack de B sirve de barrera: el comando ya se procesó).
+		select {
+		case sc := <-h.sentCh(sessA):
+			t.Fatalf("A recibió un envío que era para B: (%q,%q)", sc.to, sc.text)
+		default:
+		}
+	})
+
+	// (3) LEASE POR SESIÓN: revocar A bloquea A, B sigue operando.
+	t.Run("lease_por_sesion", func(t *testing.T) {
+		luRev, err := issuer.Revoke("edge-1", "tenant-1")
+		if err != nil {
+			t.Fatalf("Revoke: %v", err)
+		}
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: "lease-revoke-A",
+			SessionId: sessA,
+			Payload:   &cloudlinkv1.CloudToEdge_LeaseUpdate{LeaseUpdate: luRev},
+		})
+
+		// SendText a A -> bloqueado (Ack ok=false, sender mudo).
+		const cmdBlocked = "send-A-blocked"
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: cmdBlocked,
+			SessionId: sessA,
+			Payload:   &cloudlinkv1.CloudToEdge_SendText{SendText: &cloudlinkv1.SendText{To: "111", Text: "no debe salir"}},
+		})
+		ackA := recvAck(t, ctx, h.srv, cmdBlocked)
+		if ackA.GetOk() {
+			t.Errorf("Ack de A: ok=true want false (lease de A revocado debe bloquear)")
+		}
+		select {
+		case sc := <-h.sentCh(sessA):
+			t.Fatalf("A envió pese al lease revocado: (%q,%q)", sc.to, sc.text)
+		default:
+		}
+
+		// SendText a B -> sigue funcionando (su lease no fue tocado).
+		const cmdBOK = "send-B-ok"
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: cmdBOK,
+			SessionId: sessB,
+			Payload:   &cloudlinkv1.CloudToEdge_SendText{SendText: &cloudlinkv1.SendText{To: "222", Text: "B sigue viva"}},
+		})
+		select {
+		case sc := <-h.sentCh(sessB):
+			if sc.text != "B sigue viva" {
+				t.Errorf("B recibió texto inesperado: %q", sc.text)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timeout: B bloqueada indebidamente tras revocar A: %v", ctx.Err())
+		}
+		ackB := recvAck(t, ctx, h.srv, cmdBOK)
+		if !ackB.GetOk() {
+			t.Errorf("Ack de B: ok=false (err=%q) want true (revocar A no debe afectar a B)", ackB.GetError())
+		}
+	})
+
+	// (4) LIFECYCLE: Unregister(A); comandos para A se ignoran limpio; B sigue respondiendo.
+	t.Run("unregister_A_ignora_comandos", func(t *testing.T) {
+		h.adapter.Unregister(sessA)
+
+		// Comando para A tras el unregister: debe ignorarse (sin Ack ni envío, sin panic).
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: "send-A-post",
+			SessionId: sessA,
+			Payload:   &cloudlinkv1.CloudToEdge_SendText{SendText: &cloudlinkv1.SendText{To: "111", Text: "post unlink"}},
+		})
+
+		// Barrera determinista: un Ping a B debe responder Pong. El loop de recepción procesa en orden
+		// sobre una sola goroutine, así que al llegar el Pong el comando para A ya fue procesado (ignorado).
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: "ping-B",
+			SessionId: sessB,
+			Payload:   &cloudlinkv1.CloudToEdge_Ping{Ping: &cloudlinkv1.Ping{Nonce: 7}},
+		})
+		pong := recvKind(t, ctx, h.srv, "Pong de B", func(m *cloudlinkv1.EdgeToCloud) bool {
+			return m.GetPong() != nil && m.GetSessionId() == sessB
+		})
+		if pong.GetPong().GetNonce() != 7 {
+			t.Errorf("Pong de B: nonce=%d want 7", pong.GetPong().GetNonce())
+		}
+
+		// A no envió nada y no hay Ack para "send-A-post" (el comando se ignoró por sesión desconocida).
+		select {
+		case sc := <-h.sentCh(sessA):
+			t.Fatalf("A envió tras Unregister: (%q,%q)", sc.to, sc.text)
 		default:
 		}
 	})
@@ -314,8 +510,8 @@ func TestE2E_ZeroKnowledge_NoSecretsOnWire(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	// Sin Validator (nil) para aislar el camino de SALIDA puro.
-	h := newE2EHarness(t, ctx, nil)
+	// Sin factory de Validator (nil) para aislar el camino de SALIDA puro.
+	h := newE2EHarness(t, ctx, nil, e2eSessionID)
 
 	evt := domain.InboundEvent{
 		MessageID: "WAMID-ZK",
@@ -324,7 +520,7 @@ func TestE2E_ZeroKnowledge_NoSecretsOnWire(t *testing.T) {
 		Timestamp: time.Unix(1_700_000_000, 0),
 		Text:      "mensaje de negocio",
 	}
-	if err := h.adapter.Deliver(ctx, evt); err != nil {
+	if err := h.adapter.SinkFor(e2eSessionID).Deliver(ctx, evt); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
 	msg := recvKind(t, ctx, h.srv, "IncomingMessage", func(m *cloudlinkv1.EdgeToCloud) bool {

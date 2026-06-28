@@ -53,6 +53,12 @@ func (m *Manager) Unlink(ctx context.Context, id string) error {
 		s.log.Info("sesión desvinculada: listener detenido, procediendo al borrado quirúrgico")
 	}
 
+	// Unregister-on-unlink: saca la sesión del multiplex CloudLink para que sus comandos posteriores se
+	// ignoren limpio (sin afectar a las demás del único stream). Idempotente: no-op si nunca se registró.
+	if m.cloudMux != nil {
+		m.cloudMux.Unregister(id)
+	}
+
 	// 2. Existencia: si no estaba viva, confirmar que existe en metadatos antes de borrar nada. Así un
 	//    id inexistente devuelve ErrSessionNotFound (→ 404) sin efectos colaterales. Una sesión viva ya
 	//    existía por definición: se procede directo a la limpieza.

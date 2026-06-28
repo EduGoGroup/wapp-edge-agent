@@ -46,6 +46,12 @@ type Manager struct {
 	// Restore lo exige y startListener registra la sesión SIN escucha (warn) si falta.
 	newListener listenFactory
 
+	// cloudMux es el multiplexor CloudLink del Edge (UN stream, N sesiones, ADR-0008): el Manager
+	// registra cada sesión al arrancar su listener (Restore/Pair) y la quita al desvincularla (Unlink).
+	// Lo inyecta WithWhatsmeowListen junto al factory de escucha. nil en los tests que cablean newListener
+	// directamente (sin mux): startListener/Unlink omiten el registro de forma segura.
+	cloudMux CloudLinkMux
+
 	// backoffBase/backoffMax acotan la política de reintento de un listener caído (aislamiento §10.H):
 	// retroceso exponencial Base·2^n saturado en Max. Defaults 1s/60s; los tests inyectan valores
 	// minúsculos (WithListenerBackoff) para no depender de esperas reales.

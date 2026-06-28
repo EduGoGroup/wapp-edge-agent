@@ -42,3 +42,33 @@ func (s *LogSink) Deliver(_ context.Context, evt domain.InboundEvent) error {
 	)
 	return nil
 }
+
+// LogMux es el multiplexor CloudLink de DIAGNÓSTICO: la variante sin red del Adapter para cuando no hay
+// endpoint configurado (dev / primer arranque). Satisface el mismo contrato que el Adapter real frente
+// al Session Manager (Register/Unregister/SinkFor) pero NO envía a ninguna nube: cada sesión obtiene un
+// LogSink etiquetado con su session_id y Register/Unregister son no-ops. Mantiene el daemon multi-sesión
+// funcionando (listeners arriba, entrantes a log) sin CloudLink, igual que el LogSink puro hacía en el
+// camino single-sesión del spike.
+type LogMux struct {
+	log logger.Logger
+}
+
+// NewLogMux construye el multiplexor de diagnóstico sobre el logger dado.
+func NewLogMux(log logger.Logger) *LogMux {
+	return &LogMux{log: log}
+}
+
+// Register es un no-op: el LogMux no gatea lease ni mantiene estado por sesión (solo loguea).
+func (m *LogMux) Register(sessionID string, _ func(ctx context.Context, to, text string) error, _ func() bool) {
+	m.log.Info("CloudLink (LogMux): sesión registrada para diagnóstico (sin reenvío a la nube)", "session_id", sessionID)
+}
+
+// Unregister es un no-op simétrico a Register.
+func (m *LogMux) Unregister(sessionID string) {
+	m.log.Info("CloudLink (LogMux): sesión removida del diagnóstico", "session_id", sessionID)
+}
+
+// SinkFor devuelve un LogSink que arrastra el session_id en cada línea (diagnóstico por sesión).
+func (m *LogMux) SinkFor(sessionID string) app.InboundSink {
+	return NewLogSink(m.log.With("session_id", sessionID))
+}

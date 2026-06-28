@@ -2,12 +2,18 @@ package sessionmgr
 
 import (
 	"context"
+	"errors"
 	"sync"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
+
+// ErrNoLiveSender: el multiplex CloudLink intentó enviar por el cliente vivo de la sesión pero no hay
+// ciclo de escucha activo (entre reconexiones o antes del primer Connect del listener). El Adapter lo
+// traduce a Ack{ok=false} y NO tumba nada: es un envío que llegó con la sesión sin cliente vivo.
+var ErrNoLiveSender = errors.New("sessionmgr: sin cliente vivo para enviar en esta sesión")
 
 // SessionHealth es la salud de RUNTIME del listener de una sesión (design §10.H): un estado vivo,
 // distinto del estado de NEGOCIO persistido (domain.SessionState: pairing/active/loggedout). El
@@ -75,6 +81,32 @@ type liveSession struct {
 	health SessionHealth
 	// lastErr es la última causa de caída del listener (para diagnóstico/plano de control); nil si sano.
 	lastErr error
+	// liveSend es el emisor por CLIENTE VIVO de esta sesión, ROTADO por el factory del listener en cada
+	// ciclo de (re)conexión (el gateway whatsmeow se recrea por ciclo, lección Plan 006: nada efímero).
+	// El multiplex CloudLink registra sendVia (indirección ESTABLE) UNA sola vez al arrancar; así un
+	// comando SendText siempre llega al cliente vivo ACTUAL de la sesión, no a uno muerto de un ciclo
+	// previo. nil entre ciclos / antes del primer Connect: sendVia devuelve ErrNoLiveSender.
+	liveSend func(ctx context.Context, to, text string) error
+}
+
+// setLiveSender publica (o limpia con nil) el emisor por cliente vivo de ESTE ciclo de escucha. Lo
+// invoca el factory del listener en cada (re)conexión, apuntando al gateway recién creado.
+func (s *liveSession) setLiveSender(fn func(ctx context.Context, to, text string) error) {
+	s.mu.Lock()
+	s.liveSend = fn
+	s.mu.Unlock()
+}
+
+// sendVia despacha por el cliente vivo ACTUAL de la sesión (indirección estable que el multiplex
+// registra una vez). Si no hay ciclo de escucha activo (liveSend nil), devuelve ErrNoLiveSender.
+func (s *liveSession) sendVia(ctx context.Context, to, text string) error {
+	s.mu.Lock()
+	fn := s.liveSend
+	s.mu.Unlock()
+	if fn == nil {
+		return ErrNoLiveSender
+	}
+	return fn(ctx, to, text)
 }
 
 // arm prepara la sesión para su goroutine listener bajo lock: guarda su cancel (apagado ordenado /
