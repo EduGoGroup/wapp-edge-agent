@@ -223,3 +223,98 @@ func TestHandleEvent_Unknown(t *testing.T) {
 		t.Fatalf("estado inicial debía mantenerse en StateDisconnected, fue %v", l.State())
 	}
 }
+
+// TestHandleEvent_Connected_DisparaPresenciaUnaVez: tras Connected se dispara el hook onConnect (anuncio
+// de presencia, §10.D) UNA vez; otros eventos (Message) NO lo disparan.
+func TestHandleEvent_Connected_DisparaPresenciaUnaVez(t *testing.T) {
+	l := NewListener(&spySink{}, quietLogger())
+	calls := 0
+	l.onConnect = func() { calls++ }
+
+	l.handleEvent(context.Background(), &events.Connected{})
+	if calls != 1 {
+		t.Fatalf("onConnect debía dispararse 1 vez tras Connected, fueron %d", calls)
+	}
+
+	l.handleEvent(context.Background(), &events.Message{
+		Info:    types.MessageInfo{ID: "M"},
+		Message: &waE2E.Message{Conversation: proto.String("hola")},
+	})
+	if calls != 1 {
+		t.Fatalf("un Message NO debía disparar onConnect; total=%d", calls)
+	}
+}
+
+// TestHandleEvent_Receipt_Delivered: un events.Receipt de entrega se mapea a domain.ReceiptEvent con
+// estado delivered, sus MessageIDs y timestamp, y se despacha por el hook.
+func TestHandleEvent_Receipt_Delivered(t *testing.T) {
+	l := NewListener(&spySink{}, quietLogger())
+	var got []domain.ReceiptEvent
+	l.onReceipt = func(e domain.ReceiptEvent) { got = append(got, e) }
+
+	ts := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+	l.handleEvent(context.Background(), &events.Receipt{
+		MessageIDs: []types.MessageID{"S1", "S2"},
+		Timestamp:  ts,
+		Type:       types.ReceiptTypeDelivered,
+	})
+
+	if len(got) != 1 {
+		t.Fatalf("se esperaba 1 acuse, hubo %d", len(got))
+	}
+	ack := got[0]
+	if ack.Status != domain.ReceiptDelivered {
+		t.Fatalf("status = %q, quería delivered", ack.Status)
+	}
+	if len(ack.MessageIDs) != 2 || ack.MessageIDs[0] != "S1" || ack.MessageIDs[1] != "S2" {
+		t.Fatalf("MessageIDs mal mapeados: %+v", ack.MessageIDs)
+	}
+	if !ack.Timestamp.Equal(ts) {
+		t.Fatalf("timestamp = %v, quería %v", ack.Timestamp, ts)
+	}
+}
+
+// TestHandleEvent_Receipt_ReadVariants: Read, ReadSelf y Played mapean todos a estado read (§10.A).
+func TestHandleEvent_Receipt_ReadVariants(t *testing.T) {
+	for _, rt := range []types.ReceiptType{
+		types.ReceiptTypeRead, types.ReceiptTypeReadSelf, types.ReceiptTypePlayed,
+	} {
+		l := NewListener(&spySink{}, quietLogger())
+		var got []domain.ReceiptEvent
+		l.onReceipt = func(e domain.ReceiptEvent) { got = append(got, e) }
+
+		l.handleEvent(context.Background(), &events.Receipt{
+			MessageIDs: []types.MessageID{"S"},
+			Type:       rt,
+		})
+		if len(got) != 1 || got[0].Status != domain.ReceiptRead {
+			t.Fatalf("tipo %q debía mapear a read, dio %+v", rt, got)
+		}
+	}
+}
+
+// TestHandleEvent_Receipt_TipoIgnorado: un tipo de acuse fuera del ciclo saliente (p.ej. Sender) se
+// IGNORA sin despachar nada ni romper (§10.A).
+func TestHandleEvent_Receipt_TipoIgnorado(t *testing.T) {
+	l := NewListener(&spySink{}, quietLogger())
+	called := false
+	l.onReceipt = func(domain.ReceiptEvent) { called = true }
+
+	l.handleEvent(context.Background(), &events.Receipt{
+		MessageIDs: []types.MessageID{"S"},
+		Type:       types.ReceiptTypeSender,
+	})
+	if called {
+		t.Fatal("un tipo de acuse ignorado no debía despachar ReceiptEvent")
+	}
+}
+
+// TestHandleEvent_Receipt_HookNil: sin hook cableado (T0), un acuse no entra en pánico (se descarta).
+func TestHandleEvent_Receipt_HookNil(t *testing.T) {
+	l := NewListener(&spySink{}, quietLogger())
+	l.handleEvent(context.Background(), &events.Receipt{
+		MessageIDs: []types.MessageID{"S"},
+		Type:       types.ReceiptTypeDelivered,
+	})
+	// No debe hacer panic; nada que aseverar más allá de sobrevivir.
+}

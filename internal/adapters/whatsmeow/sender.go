@@ -171,6 +171,12 @@ func buildMessage(msg outgoing) *waE2E.Message {
 
 // realDispatch es el ciclo efímero PRODUCTIVO sobre whatsmeow. No se ejercita en los tests de este
 // repo (necesita un teléfono pareado): calca el ciclo de EduGo con WaitForConnection determinista.
+//
+// LEGADO / DEPRECADO para envío real (Plan 013 §10.C): el envío que espera ACUSES (delivered/read) debe
+// ir por el CLIENTE VIVO de la escucha (ListenGateway.SendViaLiveClient/SendViaLiveClientTracked), NO
+// por este cliente efímero. El Disconnect inmediato pierde los events.Receipt asíncronos (que llegan
+// DESPUÉS) y este ciclo además descarta el SendResponse, con lo que se pierde el MessageID necesario
+// para la correlación (§10.E). Se conserva como costura de tests/legacy; no se borra en este plan.
 func realDispatch(ctx context.Context, device *store.Device, msg outgoing, connectTimeout, flushDelay time.Duration) error {
 	// Logger silencioso: whatsmeow NO debe volcar material sensible (claves/store) a los logs.
 	client := wm.NewClient(device, waLog.Noop)

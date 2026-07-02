@@ -18,6 +18,7 @@ import (
 	"time"
 
 	wm "go.mau.fi/whatsmeow"
+	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
@@ -53,6 +54,17 @@ type Listener struct {
 	// verificar el disparo de la política de reconexión, y queda como costura para una reconexión
 	// manual en Fase 1.
 	onDisconnect func(attempt int, delay time.Duration)
+
+	// onConnect, si está definido, se invoca tras marcar el estado conectado en cada *events.Connected.
+	// La escucha lo usa para anunciar presencia (SendPresence available, §10.D) sobre el cliente vivo,
+	// de modo que WhatsApp propague los acuses de entrega/lectura. nil = no hace nada (tests que no lo
+	// ejercitan). Se re-dispara en cada reconexión (re-anunciar presencia es lo correcto).
+	onConnect func()
+
+	// onReceipt, si está definido, recibe cada ACUSE (delivered/read) ya mapeado a domain.ReceiptEvent.
+	// Es la costura de SALIDA del acuse (el análogo del InboundSink de los entrantes): el CloudLink la
+	// cablea en T2 para subir el estado a la nube. nil = se ignora sin romper la escucha. No lleva PII.
+	onReceipt func(domain.ReceiptEvent)
 }
 
 // NewListener construye el listener con el sink y el logger dados y el backoff por defecto del spike.
@@ -92,8 +104,10 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 		l.onDisconnected()
 	case *events.LoggedOut:
 		l.onLoggedOut(e)
+	case *events.Receipt:
+		l.onReceiptEvent(e)
 	default:
-		// Otros eventos (receipts, presencia, history sync, …) no son del alcance del spike.
+		// Otros eventos (presencia, history sync, …) no son del alcance actual.
 	}
 }
 
@@ -107,13 +121,54 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 	}
 }
 
-// onConnected marca el estado conectado y resetea el backoff (reconexión exitosa).
+// onConnected marca el estado conectado, resetea el backoff (reconexión exitosa) y dispara el hook
+// onConnect si está cableado (anuncio de presencia, §10.D). El hook corre FUERA del lock.
 func (l *Listener) onConnected() {
 	l.mu.Lock()
 	l.state = StateConnected
 	l.backoff.Reset()
+	hook := l.onConnect
 	l.mu.Unlock()
 	l.log.Info("listener: socket conectado (escucha 24/7 activa)")
+	if hook != nil {
+		hook()
+	}
+}
+
+// onReceiptEvent mapea un *events.Receipt a domain.ReceiptEvent (acuse de entrega/lectura de un
+// SALIENTE) y lo despacha por el hook onReceipt si está cableado. Los tipos de acuse fuera del ciclo
+// {delivered, read} se IGNORAN sin romper (§10.A). El SessionID lo etiqueta el sink por-sesión aguas
+// abajo (T2), como el InboundSink de entrantes (mux.SinkFor); aquí va vacío. No emite PII a los logs.
+func (l *Listener) onReceiptEvent(e *events.Receipt) {
+	status, ok := mapReceiptStatus(e.Type)
+	if !ok {
+		return // sender/retry/inactive/hist_sync/… no son del ciclo de vida de un saliente.
+	}
+	if l.onReceipt == nil {
+		return
+	}
+	l.onReceipt(domain.ReceiptEvent{
+		// Copia defensiva del slice de whatsmeow (types.MessageID es alias de string).
+		MessageIDs: append([]string(nil), e.MessageIDs...),
+		Status:     status,
+		Timestamp:  e.Timestamp,
+		// SessionID: lo rellena el sink por-sesión en T2 (patrón mux.SinkFor de los entrantes).
+	})
+}
+
+// mapReceiptStatus traduce el types.ReceiptType de whatsmeow al estado de dominio (Plan 013 §10.A):
+// Delivered→delivered (✓✓); Read/ReadSelf/Played→read (✓✓ azul); cualquier otro tipo se ignora
+// (ok=false). NOTA DE CAMPO: las constantes reales llevan el infijo "Type"
+// (types.ReceiptTypeDelivered/Read/ReadSelf/Played); el diseño §10.A las citaba sin él.
+func mapReceiptStatus(t types.ReceiptType) (domain.ReceiptStatus, bool) {
+	switch t {
+	case types.ReceiptTypeDelivered:
+		return domain.ReceiptDelivered, true
+	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf, types.ReceiptTypePlayed:
+		return domain.ReceiptRead, true
+	default:
+		return "", false
+	}
 }
 
 // onDisconnected marca el estado desconectado y AVANZA el backoff. whatsmeow auto-reconecta; aquí
