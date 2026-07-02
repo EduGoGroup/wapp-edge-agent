@@ -35,6 +35,7 @@ import (
 	"context"
 	"errors"
 	"math/rand"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -191,15 +192,20 @@ func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error 
 			"wa_message_id", evt.MessageID, "session_id", s.sessionID)
 		return nil
 	}
+	fromPN, fromLID := deriveContactRefs(evt.Sender, evt.SenderAlt)
 	msg := &cloudlinkv1.EdgeToCloud{
 		CommandId: uuid.NewString(),
 		SessionId: s.sessionID,
 		Payload: &cloudlinkv1.EdgeToCloud_Incoming{Incoming: &cloudlinkv1.IncomingMessage{
-			From:        evt.Sender,
-			Text:        evt.Text,
-			TsUnix:      evt.Timestamp.Unix(),
-			WaMessageId: evt.MessageID,
-			IsGroup:     evt.IsGroup,
+			From:           evt.Sender, // se mantiene (compat, ADR-0005)
+			Text:           evt.Text,
+			TsUnix:         evt.Timestamp.Unix(),
+			WaMessageId:    evt.MessageID,
+			IsGroup:        evt.IsGroup,
+			PushName:       evt.PushName,
+			FromPn:         fromPN,
+			FromLid:        fromLID,
+			AddressingMode: evt.AddressingMode,
 		}},
 	}
 	if err := cl.Send(msg); err != nil {
@@ -208,6 +214,59 @@ func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error 
 		return nil
 	}
 	return nil
+}
+
+// Servidores JID de WhatsApp usados para clasificar un remitente como número o LID (Plan 010 §9).
+// Se replican como constantes locales (no se importa go.mau.fi/whatsmeow en este adaptador de
+// transporte) — los valores son los mismos que types.DefaultUserServer y types.HiddenUserServer.
+const (
+	serverPN  = "s.whatsapp.net" // número real → kind phone_e164
+	serverLID = "lid"            // LID oculto  → kind wa_lid
+)
+
+// deriveContactRefs deriva el número (from_pn, E.164 sin '+') y el LID (from_lid) del remitente a
+// partir de su JID principal (sender) y su alterno (senderAlt) — ambos en formato ".String()"
+// (`user[.agent][:device]@server`). La clasificación número-vs-LID es por SERVER del JID
+// (DefaultUserServer vs HiddenUserServer, Plan 010 §9), no por el orden: da igual cuál sea el
+// principal. La normalización se hace tomando la user-part (se descarta server y device/agent).
+//
+// Tolerancia (Plan 010 §10.H): si senderAlt viene vacío (whatsmeow aún no aprendió el mapeo), solo
+// se puebla el lado conocido; el otro queda "" y NO se falla. Un JID de server desconocido (grupo,
+// broadcast, …) simplemente no puebla ninguno de los dos campos de identidad.
+func deriveContactRefs(sender, senderAlt string) (fromPN, fromLID string) {
+	for _, jid := range [2]string{sender, senderAlt} {
+		if jid == "" {
+			continue
+		}
+		user := jidUser(jid)
+		switch jidServer(jid) {
+		case serverPN:
+			fromPN = user
+		case serverLID:
+			fromLID = user
+		}
+	}
+	return fromPN, fromLID
+}
+
+// jidUser devuelve la user-part normalizada de un JID `user[.agent][:device]@server`: sin el server
+// y sin el sufijo de dispositivo/agente. Para un número queda el E.164 sin '+'; para un LID, su id.
+func jidUser(jid string) string {
+	if i := strings.IndexByte(jid, '@'); i >= 0 {
+		jid = jid[:i]
+	}
+	if i := strings.IndexAny(jid, ".:"); i >= 0 {
+		jid = jid[:i]
+	}
+	return jid
+}
+
+// jidServer devuelve el server de un JID (lo que sigue al último '@'), o "" si no lo trae.
+func jidServer(jid string) string {
+	if i := strings.LastIndexByte(jid, '@'); i >= 0 {
+		return jid[i+1:]
+	}
+	return ""
 }
 
 // Run mantiene el único stream Connect vivo: conecta, recibe comandos (demux por session_id), late, y

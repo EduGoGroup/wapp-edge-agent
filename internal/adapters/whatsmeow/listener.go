@@ -150,12 +150,17 @@ func toInboundEvent(e *events.Message) domain.InboundEvent {
 		MessageID: e.Info.ID,
 		Chat:      e.Info.Chat.String(),
 		Sender:    e.Info.Sender.String(),
-		PushName:  e.Info.PushName,
-		Timestamp: e.Info.Timestamp,
-		Type:      e.Info.Type,
-		Text:      messageText(e),
-		IsFromMe:  e.Info.IsFromMe,
-		IsGroup:   e.Info.IsGroup,
+		// SenderAlt: la dirección alterna (número<->LID) que resuelve whatsmeow. Si el mapeo aún no se
+		// conoce (JID vacío, "No LID found" en el primer contacto), .String() devuelve "" y aguas
+		// abajo se sube solo lo conocido (tolerancia Plan 010 §10.H, sin llamar a GetPNForLID).
+		SenderAlt:      e.Info.SenderAlt.String(),
+		AddressingMode: string(e.Info.AddressingMode),
+		PushName:       e.Info.PushName,
+		Timestamp:      e.Info.Timestamp,
+		Type:           e.Info.Type,
+		Text:           messageText(e),
+		IsFromMe:       e.Info.IsFromMe,
+		IsGroup:        e.Info.IsGroup,
 	}
 }
 

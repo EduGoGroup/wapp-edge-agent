@@ -535,11 +535,15 @@ func TestE2E_ZeroKnowledge_NoSecretsOnWire(t *testing.T) {
 	// El IncomingMessage solo tiene campos de negocio (no hay campo de DEK/store en el contrato). Lo
 	// verificamos serializando a wire y comprobando que solo contiene lo de negocio reconstruible: el
 	// re-marshal de un IncomingMessage con EXACTAMENTE esos campos es byte-idéntico al recibido.
+	// Nota (Plan 010): from_pn es CONTENIDO DE NEGOCIO derivado del Sender (número E.164 sin '+'),
+	// no material secreto; entra en el conjunto esperado. Con SenderAlt/PushName/AddressingMode
+	// vacíos en este evento, esos campos no se pueblan.
 	want := &cloudlinkv1.IncomingMessage{
 		From:        evt.Sender,
 		Text:        evt.Text,
 		TsUnix:      evt.Timestamp.Unix(),
 		WaMessageId: evt.MessageID,
+		FromPn:      "5491100000000",
 	}
 	gotBytes, err := proto.Marshal(msg.GetIncoming())
 	if err != nil {

@@ -16,8 +16,17 @@ type InboundEvent struct {
 	MessageID string
 	// Chat es el JID del chat donde se recibió (DM o grupo).
 	Chat string
-	// Sender es el JID del usuario que envió el mensaje.
+	// Sender es el JID del usuario que envió el mensaje, en el formato PRINCIPAL que reporta
+	// whatsmeow (número `…@s.whatsapp.net` o LID `…@lid`, según AddressingMode).
 	Sender string
+	// SenderAlt es la dirección ALTERNATIVA del mismo remitente que resuelve whatsmeow: si Sender es
+	// el número, SenderAlt trae el LID, y viceversa (Plan 010 §5, identidad de contacto). Viene VACÍO
+	// cuando whatsmeow aún no aprendió el mapeo (primer contacto: "No LID found"); en ese caso solo se
+	// conoce Sender y NO se falla (tolerancia §10.H). Formato JID (`…@s.whatsapp.net` o `…@lid`).
+	SenderAlt string
+	// AddressingMode es el modo de direccionamiento del mensaje según whatsmeow: "pn" (Sender es el
+	// número) o "lid" (Sender es el LID). Diagnóstico/derivación; puede venir vacío.
+	AddressingMode string
 	// PushName es el nombre visible que el remitente publica en WhatsApp (puede venir vacío).
 	PushName string
 	// Timestamp es el instante en que WhatsApp fechó el mensaje.

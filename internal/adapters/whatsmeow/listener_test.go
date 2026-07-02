@@ -77,6 +77,54 @@ func TestHandleEvent_Message_Conversation(t *testing.T) {
 	}
 }
 
+// TestToInboundEvent_Identity: toInboundEvent copia la identidad alterna (SenderAlt) y el
+// AddressingMode al InboundEvent — Sender número + SenderAlt LID (Plan 010 §9).
+func TestToInboundEvent_Identity(t *testing.T) {
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Sender:         newJID("593999", types.DefaultUserServer),
+				SenderAlt:      newJID("10001", types.HiddenUserServer),
+				AddressingMode: types.AddressingModePN,
+			},
+			ID: "ID-PN",
+		},
+		Message: &waE2E.Message{Conversation: proto.String("x")},
+	}
+	in := toInboundEvent(evt)
+	if in.Sender != "593999@s.whatsapp.net" {
+		t.Fatalf("Sender = %q", in.Sender)
+	}
+	if in.SenderAlt != "10001@lid" {
+		t.Fatalf("SenderAlt = %q, quería 10001@lid", in.SenderAlt)
+	}
+	if in.AddressingMode != "pn" {
+		t.Fatalf("AddressingMode = %q, quería pn", in.AddressingMode)
+	}
+}
+
+// TestToInboundEvent_Identity_NoAlt: si whatsmeow aún no conoce el alterno (SenderAlt vacío,
+// "No LID found" del primer contacto), SenderAlt queda "" y NO se falla (tolerancia §10.H).
+func TestToInboundEvent_Identity_NoAlt(t *testing.T) {
+	evt := &events.Message{
+		Info: types.MessageInfo{
+			MessageSource: types.MessageSource{
+				Sender:         newJID("593999", types.DefaultUserServer),
+				AddressingMode: types.AddressingModePN,
+			},
+			ID: "ID-NOALT",
+		},
+		Message: &waE2E.Message{Conversation: proto.String("x")},
+	}
+	in := toInboundEvent(evt)
+	if in.SenderAlt != "" {
+		t.Fatalf("SenderAlt debía venir vacío (mapeo no aprendido), fue %q", in.SenderAlt)
+	}
+	if in.Sender != "593999@s.whatsapp.net" || in.AddressingMode != "pn" {
+		t.Fatalf("lo conocido debía subir igual: %+v", in)
+	}
+}
+
 // TestHandleEvent_Message_ExtendedText: el texto se extrae del ExtendedTextMessage cuando no hay
 // Conversation.
 func TestHandleEvent_Message_ExtendedText(t *testing.T) {
