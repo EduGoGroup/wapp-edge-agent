@@ -88,6 +88,14 @@ internal/
 | Cola durable | `outbox` | Órdenes de envío pendientes (sin Redis) |
 | Sesiones | tabla de metadatos | Una fila por número/sesión; multi-teléfono |
 
+> **Ruta sagrada del store (`data_dir`, MP-02).** El `data_dir` (raíz del layout multi-sesión de
+> ADR-0016 §4) tiene **default absoluto en el HOME del usuario** por SO (macOS
+> `~/Library/Application Support/wApp/edge`; Linux `~/.config/wApp/edge`; Windows `%AppData%\wApp\edge`;
+> ver `internal/infra/config/config.go:defaultDataDir`), **nunca** rutas de sistema con root. `config.Load`
+> lo **absolutiza** (`filepath.Abs`) y el arranque hace `MkdirAll 0700`; se loguea la ruta efectiva en
+> `serve`/`pair`. **No** vuelvas al default `"."` (CWD): reintroduce el re-emparejamiento. Override:
+> `WAPP_AGENT_DATA_DIR`. El metadato `store_dir` sigue siendo **relativo/portable**.
+
 ---
 
 ## Modelo de doble llave (zero-knowledge)

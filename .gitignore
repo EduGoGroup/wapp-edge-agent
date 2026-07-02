@@ -2,6 +2,7 @@
 /agent
 /wapp-ctl
 /wapp-edge-agent
+/wapp-agent
 *.exe
 *.exe~
 *.test
@@ -28,6 +29,12 @@ dek.key
 # Runtime del plano de control (Unix socket + PID file del supervisor)
 *.sock
 *.pid
+
+# Data dirs y configs de prueba locales (MP-02 D5): árboles de store/DEK/sessions y YAMLs de
+# ambiente sueltos que NO deben commitearse. Contienen sesiones reales del usuario — no borrar a
+# mano; solo mantenerlos fuera de git. La ruta sagrada real vive en el home del usuario, no aquí.
+edgedata-*/
+edge-*.yaml
 
 # Vendor (descomentar si se usa go mod vendor)
 # vendor/

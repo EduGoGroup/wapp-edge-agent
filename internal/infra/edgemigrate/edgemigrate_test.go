@@ -130,6 +130,56 @@ func TestFreshInstallJustCreatesSessions(t *testing.T) {
 	}
 }
 
+// TestMoveFile_SameDirUsesRename: en el mismo volumen moveFile mueve el fichero (Rename) preservando
+// bytes; el origen desaparece.
+func TestMoveFile_SameDirUsesRename(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.bin")
+	dst := filepath.Join(dir, "dst.bin")
+	writeFile(t, src, "PAYLOAD")
+
+	if err := moveFile(src, dst); err != nil {
+		t.Fatalf("moveFile: %v", err)
+	}
+	if fileExists(src) {
+		t.Fatal("el origen debía desaparecer tras moveFile")
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || string(got) != "PAYLOAD" {
+		t.Fatalf("destino: got=%q err=%v", got, err)
+	}
+}
+
+// TestCopyFile_BytesAndPerms: copyFile (el camino de fallback EXDEV) preserva los bytes y crea el
+// destino con permisos restrictivos 0600 (material sensible del store/DEK). No se puede forzar EXDEV
+// de forma portable en test, así que se ejercita el helper directamente entre dos dirs temporales.
+func TestCopyFile_BytesAndPerms(t *testing.T) {
+	srcDir := t.TempDir()
+	dstDir := t.TempDir()
+	src := filepath.Join(srcDir, "dek.key")
+	dst := filepath.Join(dstDir, "dek.key")
+	writeFile(t, src, "SECRET-DEK-BYTES")
+
+	if err := copyFile(src, dst); err != nil {
+		t.Fatalf("copyFile: %v", err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || string(got) != "SECRET-DEK-BYTES" {
+		t.Fatalf("bytes copiados: got=%q err=%v", got, err)
+	}
+	info, err := os.Stat(dst)
+	if err != nil {
+		t.Fatalf("stat destino: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("permisos del destino: got %o, want 0600", perm)
+	}
+	// copyFile NO borra el origen (eso lo hace moveFile tras copiar): sigue presente.
+	if !fileExists(src) {
+		t.Fatal("copyFile no debe borrar el origen")
+	}
+}
+
 // TestDoesNotTouchOtherFiles: un fichero ajeno (p.ej. de la nube) en data_dir queda intacto.
 func TestDoesNotTouchOtherFiles(t *testing.T) {
 	dataDir := t.TempDir()

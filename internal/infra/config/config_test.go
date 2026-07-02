@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -17,7 +18,9 @@ func writeTempYAML(t *testing.T, content string) string {
 }
 
 func TestLoad_Defaults(t *testing.T) {
-	// Sin archivo y sin entorno: deben quedar los valores por defecto.
+	// Sin archivo y sin entorno: deben quedar los valores por defecto. El data_dir sale del default
+	// sagrado (defaultDataDir) y Load lo absolutiza; como defaultDataDir ya es absoluto y filepath.Abs
+	// es idempotente, la estructura cargada coincide con defaults().
 	cfg, err := Load(filepath.Join(t.TempDir(), "no-existe.yaml"))
 	if err != nil {
 		t.Fatalf("Load devolvio error inesperado: %v", err)
@@ -26,6 +29,75 @@ func TestLoad_Defaults(t *testing.T) {
 	want := defaults()
 	if cfg != want {
 		t.Fatalf("defaults: got %+v, want %+v", cfg, want)
+	}
+	// El default de data_dir NO es "." y ES una ruta absoluta (MP-02, D1/D2): el store no depende del CWD.
+	if cfg.DataDir == "." {
+		t.Fatalf("data_dir por defecto no debe ser \".\" (ruta sagrada MP-02): got %q", cfg.DataDir)
+	}
+	if !filepath.IsAbs(cfg.DataDir) {
+		t.Fatalf("data_dir por defecto debe ser absoluto: got %q", cfg.DataDir)
+	}
+}
+
+// TestDefaultDataDir_AbsoluteInHome: la ruta sagrada por defecto es absoluta, vive en el home del
+// usuario (no en rutas de sistema como /var/lib que exigirían root) y no es "." (MP-02, D1).
+func TestDefaultDataDir_AbsoluteInHome(t *testing.T) {
+	got := defaultDataDir()
+	if got == "." {
+		t.Fatalf("defaultDataDir no debe ser \".\": got %q", got)
+	}
+	if !filepath.IsAbs(got) {
+		t.Fatalf("defaultDataDir debe ser absoluto: got %q", got)
+	}
+	if strings.HasPrefix(got, "/var/lib") || strings.HasPrefix(got, "/etc") {
+		t.Fatalf("defaultDataDir no debe caer en rutas de sistema con permisos root: got %q", got)
+	}
+	// Debe colgar del home / carpeta de config del usuario.
+	home, herr := os.UserHomeDir()
+	cfgBase, cerr := os.UserConfigDir()
+	inHome := (herr == nil && strings.HasPrefix(got, home)) || (cerr == nil && strings.HasPrefix(got, cfgBase))
+	if !inHome {
+		t.Fatalf("defaultDataDir debe vivir en el home del usuario: got %q (home=%q cfg=%q)", got, home, cfgBase)
+	}
+}
+
+// TestLoad_DataDirRelativeIsAbsolutized: un data_dir RELATIVO (por env) se normaliza a absoluto
+// respecto al CWD tras Load, y la operación es idempotente (MP-02, D2).
+func TestLoad_DataDirRelativeIsAbsolutized(t *testing.T) {
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	t.Setenv(EnvPrefix+"DATA_DIR", "rel/store")
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+
+	if !filepath.IsAbs(cfg.DataDir) {
+		t.Fatalf("data_dir relativo debe absolutizarse: got %q", cfg.DataDir)
+	}
+	want := filepath.Join(tmp, "rel", "store")
+	if cfg.DataDir != want {
+		t.Fatalf("data_dir absolutizado: got %q, want %q", cfg.DataDir, want)
+	}
+	// Idempotencia: Abs de una ruta ya absoluta no la cambia.
+	if again, _ := filepath.Abs(cfg.DataDir); again != cfg.DataDir {
+		t.Fatalf("filepath.Abs no es idempotente sobre %q: got %q", cfg.DataDir, again)
+	}
+}
+
+// TestLoad_DataDirEnvOverrideAbsoluteRespected: un override absoluto por WAPP_AGENT_DATA_DIR se
+// respeta tal cual (MP-02, D1/D2).
+func TestLoad_DataDirEnvOverrideAbsoluteRespected(t *testing.T) {
+	abs := filepath.Join(t.TempDir(), "sagrado")
+	t.Setenv(EnvPrefix+"DATA_DIR", abs)
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+	if cfg.DataDir != abs {
+		t.Fatalf("override absoluto de data_dir: got %q, want %q", cfg.DataDir, abs)
 	}
 }
 

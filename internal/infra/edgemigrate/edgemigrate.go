@@ -15,9 +15,11 @@ package edgemigrate
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -97,10 +99,53 @@ func archiveFile(src, archiveDir string) (bool, error) {
 		return false, fmt.Errorf("edgemigrate: crear %s: %w", archiveDir, err)
 	}
 	dst := filepath.Join(archiveDir, filepath.Base(src))
-	if err := os.Rename(src, dst); err != nil {
+	if err := moveFile(src, dst); err != nil {
 		return false, fmt.Errorf("edgemigrate: archivar %s -> %s: %w", src, dst, err)
 	}
 	return true, nil
+}
+
+// moveFile mueve src a dst. Intenta os.Rename (atómico, barato) y SOLO si el destino está en otro
+// volumen —error EXDEV "cross-device link", p.ej. data_dir y CWD en discos distintos (D3, MP-02)—
+// cae a copy+remove. Cualquier otro error se propaga tal cual. Preserva permisos restrictivos (0600)
+// del store/DEK, coherente con la sensibilidad del material (ADR-0007).
+func moveFile(src, dst string) error {
+	err := os.Rename(src, dst)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+	// Cross-device: no se puede renombrar entre volúmenes; copiamos los bytes y borramos el origen.
+	if err := copyFile(src, dst); err != nil {
+		return err
+	}
+	return os.Remove(src)
+}
+
+// copyFile copia src a dst creando dst con permisos 0600 (material sensible; el dir ya es 0700) y
+// sincronizando a disco antes de cerrar, para que el remove posterior de moveFile no pierda datos.
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = in.Close() }()
+
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // dirExists indica si path existe y es un directorio.

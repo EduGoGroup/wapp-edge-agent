@@ -69,6 +69,16 @@ func main() {
 
 	log := logger.New(cfg)
 
+	// RUTA SAGRADA (MP-02, D2): cfg.DataDir ya viene ABSOLUTO desde config.Load (independiente del CWD).
+	// Aseguramos la raíz del store con permisos restrictivos (0700) UNA sola vez aquí, antes de cualquier
+	// subcomando: es el directorio base del layout multi-sesión (ADR-0016 §4) y todo cuelga de él. Si no
+	// se puede crear, nada del daemon funcionaría, así que es fatal. NO se loguea ningún secreto: solo la
+	// ruta del directorio (nunca la DEK).
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		log.Error("no se pudo asegurar el directorio de datos (data_dir)", "error", err, "data_dir", cfg.DataDir)
+		os.Exit(1)
+	}
+
 	// Migración de ARRANQUE clean-slate al layout multi-sesión (ADR-0016 / Plan 008 §10.C): archiva el
 	// store/DEK PLANOS heredados (DBPath/DEKPath) bajo <data_dir>/_archived-pre-008/ y crea el layout
 	// <data_dir>/sessions/ vacío que el Manager poblará. Es IDEMPOTENTE (no-op si ya migró) y NO fatal:
@@ -141,6 +151,7 @@ func main() {
 		"version", Version,
 		"log_level", cfg.LogLevel,
 		"log_json", cfg.LogJSON,
+		"data_dir", cfg.DataDir,
 		"db_path", cfg.DBPath,
 		"config_path", path,
 	)
@@ -160,8 +171,10 @@ func runPair(ctx context.Context, cfg config.Config, log sharedlogger.Logger) er
 	qrSink := control.NewTerminalQRSink(os.Stdout)
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
 
+	// Loguea la RUTA ABSOLUTA del store (MP-02, D2): el operador siempre debe ver dónde vive el store,
+	// nunca depender del CWD ni de dónde se lanzó el comando. Sin secretos (jamás la DEK).
 	log.Info("emparejamiento: escanea el QR con WhatsApp (Dispositivos vinculados)",
-		"db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
+		"data_dir", cfg.DataDir, "db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
 
 	pairer := app.NewPair(connector, qrSink, custody)
 	res, err := pairer.Run(ctx)

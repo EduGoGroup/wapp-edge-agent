@@ -6,6 +6,10 @@
 package config
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
+
 	sharedconfig "github.com/EduGoGroup/wapp-shared/config"
 )
 
@@ -33,7 +37,13 @@ type Config struct {
 	// DataDir es el directorio base del Edge (ADR-0016 §4): aloja el layout multi-sesión
 	// (<data_dir>/sessions/<session_id>/{store.db,dek.key}), la BD de metadatos y el socket de control.
 	// El Layout (internal/app/sessionmgr) deriva de aquí todas las rutas por sesión; nadie las arma a
-	// mano. Default "." (directorio actual), coherente con las rutas relativas heredadas del spike.
+	// mano.
+	//
+	// RUTA SAGRADA (MP-02, D1/D2): el default deja de ser "." (CWD) — que sembraba árboles sessions/
+	// distintos según desde dónde se arrancara y forzaba re-emparejar. Ahora el default es una carpeta
+	// de datos del usuario POR SO, SIEMPRE en el home y sin permisos de sistema (ver defaultDataDir), y
+	// tras Load se ANCLA a ruta absoluta (filepath.Abs) una sola vez, venga del default, del YAML o del
+	// override WAPP_AGENT_DATA_DIR. Así el store vive siempre en el mismo sitio, independiente del CWD.
 	DataDir string `yaml:"data_dir"`
 	// MaxSessions es el límite SUAVE de sesiones simultáneas (guardarraíl de RAM/sockets, design §10.G).
 	// NO es un invariante de seguridad: un POST /pair por encima del límite responde error claro, no
@@ -83,6 +93,24 @@ type CloudLinkConfig struct {
 	EdgeID string `yaml:"edge_id"`
 }
 
+// defaultDataDir calcula la RUTA SAGRADA por defecto del store del Edge (MP-02, D1): SIEMPRE en el
+// home del usuario y sin permisos de sistema (funciona para un usuario normal sin sudo). Nunca /var/lib
+// ni rutas de sistema que exijan root.
+//
+// Base por SO vía os.UserConfigDir (macOS → ~/Library/Application Support; Linux → $XDG_CONFIG_HOME o
+// ~/.config; Windows → %AppData%), a la que se añade wApp/edge. Si UserConfigDir falla, cae a
+// ~/.wapp-edge (os.UserHomeDir). Último recurso: "." (nunca peor que el comportamiento previo). El valor
+// devuelto es absoluto salvo en ese último fallback, que Load absolutiza igualmente.
+func defaultDataDir() string {
+	if base, err := os.UserConfigDir(); err == nil && base != "" {
+		return filepath.Join(base, "wApp", "edge")
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".wapp-edge")
+	}
+	return "."
+}
+
 // defaults devuelve la configuracion con valores por defecto sensatos.
 func defaults() Config {
 	return Config{
@@ -90,7 +118,7 @@ func defaults() Config {
 		LogJSON:           false,
 		DBPath:            "wapp-edge.db",
 		DEKPath:           "dek.key",
-		DataDir:           ".",
+		DataDir:           defaultDataDir(),
 		MaxSessions:       5,
 		ControlSocketPath: "wapp-edge.sock",
 	}
@@ -133,6 +161,16 @@ func Load(path string) (Config, error) {
 	cfg.CloudLink.EnrollmentEndpoint = loader.GetString("CLOUDLINK_ENROLLMENT_ENDPOINT", cfg.CloudLink.EnrollmentEndpoint)
 	cfg.CloudLink.ActivationCode = loader.GetString("CLOUDLINK_ACTIVATION_CODE", cfg.CloudLink.ActivationCode)
 	cfg.CloudLink.EdgeID = loader.GetString("CLOUDLINK_EDGE_ID", cfg.CloudLink.EdgeID)
+
+	// D2 (MP-02): ancla data_dir a ruta ABSOLUTA una sola vez, venga del default sagrado, del YAML o del
+	// override WAPP_AGENT_DATA_DIR. filepath.Abs es idempotente (una ruta ya absoluta se devuelve limpia)
+	// y no toca el disco; el MkdirAll de la raíz lo hace el arranque (cmd/agent). Así el store nunca
+	// depende del CWD desde el que se lance el daemon.
+	absDataDir, err := filepath.Abs(cfg.DataDir)
+	if err != nil {
+		return Config{}, fmt.Errorf("config: no se pudo resolver data_dir %q a ruta absoluta: %w", cfg.DataDir, err)
+	}
+	cfg.DataDir = absDataDir
 
 	return cfg, nil
 }
