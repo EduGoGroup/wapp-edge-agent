@@ -89,8 +89,74 @@ func Open(path string) (*sql.DB, error) {
 // MigrateStore aplica el set "store" (migrations/store/*.sql → tablas msg_enc_*) sobre database. Es
 // la migración de un store.db POR SESIÓN (ADR-0016 §4): crea SOLO el esquema del cryptostore, sin las
 // tablas de metadatos de negocio. Idempotente (CREATE TABLE IF NOT EXISTS).
+//
+// Tras los .sql, aplica las migraciones GUARDADAS de columnas nuevas que un ALTER pelado no puede
+// hacer idempotentes (el runner re-ejecuta todo en cada arranque y modernc SQLite no soporta ADD
+// COLUMN IF NOT EXISTS): ver ensureDeviceMetadataColumns.
 func MigrateStore(ctx context.Context, database *sql.DB) error {
-	return applyMigrations(ctx, database, storeMigrationsDir)
+	if err := applyMigrations(ctx, database, storeMigrationsDir); err != nil {
+		return err
+	}
+	return ensureDeviceMetadataColumns(ctx, database)
+}
+
+// deviceMetadataColumns son las columnas de metadata NO-clave del device propio (Device.PushName,
+// BusinessName, LID) añadidas a msg_enc_device después del esquema inicial. Se guardan CIFRADAS con la
+// DEK (BLOB de ciphertext, como el resto de la tabla); aquí solo se declara su forma en disco.
+var deviceMetadataColumns = []string{"push_name", "business_name", "lid"}
+
+// ensureDeviceMetadataColumns añade de forma IDEMPOTENTE las columnas de deviceMetadataColumns a
+// msg_enc_device si aún no existen. Es la migración para stores YA EMPAREJADOS creados antes de que la
+// tabla las declarara: para stores nuevos ya vienen en el CREATE TABLE (0001_init.sql) y este paso es
+// no-op.
+//
+// El runner (applyMigrations) re-ejecuta TODOS los .sql en cada arranque y NO lleva tabla de versión;
+// por eso un `ALTER TABLE ... ADD COLUMN` pelado en un .sql fallaría en el 2º arranque ("duplicate
+// column", y modernc SQLite sin CGO no soporta ADD COLUMN IF NOT EXISTS). Aquí el ALTER se GUARDA leyendo
+// PRAGMA table_info(msg_enc_device): solo se emite para las columnas ausentes, así reabrir el store dos
+// veces es seguro. Las columnas son nullable, así que un store viejo no re-empareja: la fila existente
+// queda con NULL y degrada al comportamiento previo hasta el próximo Device.Save.
+func ensureDeviceMetadataColumns(ctx context.Context, database *sql.DB) error {
+	rows, err := database.QueryContext(ctx, `PRAGMA table_info(msg_enc_device)`)
+	if err != nil {
+		return fmt.Errorf("db: leer columnas de msg_enc_device: %w", err)
+	}
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("db: escanear PRAGMA table_info(msg_enc_device): %w", err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("db: recorrer PRAGMA table_info(msg_enc_device): %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("db: cerrar PRAGMA table_info(msg_enc_device): %w", err)
+	}
+
+	for _, col := range deviceMetadataColumns {
+		if _, ok := existing[col]; ok {
+			continue // ya existe (store nuevo o 2º arranque): no reemitir el ALTER.
+		}
+		// Nombre de columna de una lista fija en código (no viene de entrada externa): la interpolación
+		// es segura y necesaria porque SQLite no admite placeholder para identificadores.
+		stmt := fmt.Sprintf(`ALTER TABLE msg_enc_device ADD COLUMN %s BLOB`, col)
+		if _, err := database.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("db: añadir columna %q a msg_enc_device: %w", col, err)
+		}
+	}
+	return nil
 }
 
 // MigrateMeta aplica el set "meta" (migrations/meta/*.sql → tablas sessions/sessions_v2) sobre

@@ -31,7 +31,13 @@ CREATE TABLE IF NOT EXISTS msg_enc_device (
     adv_details          BLOB    NOT NULL,   -- ciphertext de Account.Details
     adv_account_sig      BLOB    NOT NULL,   -- ciphertext de Account.AccountSignature
     adv_account_sig_key  BLOB    NOT NULL,   -- ciphertext de Account.AccountSignatureKey
-    adv_device_sig       BLOB    NOT NULL    -- ciphertext de Account.DeviceSignature
+    adv_device_sig       BLOB    NOT NULL,   -- ciphertext de Account.DeviceSignature
+    -- Metadata NO-clave del device propio, cifrada campo a campo con la DEK (igual que el resto).
+    -- NULLABLE: stores creados antes de esta columna la reciben vía ALTER guardado (db.go), y una
+    -- fila vieja sin el dato degrada al fallback (el "gafete" se repuebla en el próximo app-state).
+    push_name            BLOB,               -- ciphertext de Device.PushName (nombre de perfil)
+    business_name        BLOB,               -- ciphertext de Device.BusinessName
+    lid                  BLOB                -- ciphertext de Device.LID.String() ("" si zero)
 );
 
 -- Identidades Signal de los pares (IdentityStore). La columna upstream tiene CHECK length=32.
