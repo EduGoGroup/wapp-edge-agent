@@ -254,6 +254,9 @@ func runRestore(cfg config.Config, log sharedlogger.Logger) error {
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
 	gateway := waconn.NewListenGateway(database, log)
+	// Nombre visible de FALLBACK para anunciar presencia (Plan 013 §10.D): solo se usa si el store
+	// restaurado no trae ya el nombre real de la cuenta (ver ListenGateway.SetPushName).
+	gateway.SetPushName(cfg.PushName)
 	restore := newEscucha(ctx, cfg, log, database, custody, gateway)
 
 	log.Info("restaurando sesion persistida y manteniendo el socket vivo (envia un WhatsApp al numero para ver el InboundEvent; Ctrl-C para detener)",
@@ -330,7 +333,7 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	// Manager con escucha real (un listener por sesión) y pairing real (un Connector por sesión sobre SU
 	// store; el QRSink lo inyecta el plano de control POR emparejamiento para el polling async del QR).
 	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
-		sessionmgr.WithWhatsmeowListen(mux),
+		sessionmgr.WithWhatsmeowListen(mux, cfg.PushName),
 		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
 	)
 

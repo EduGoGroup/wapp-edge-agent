@@ -176,6 +176,33 @@ func TestLoad_EnvOnlyOverDefaults(t *testing.T) {
 	}
 }
 
+// TestLoad_PushName cubre el nuevo campo push_name (fallback de presencia, Plan 013 §10.D): default
+// no vacío, lectura del YAML y override por WAPP_AGENT_PUSH_NAME.
+func TestLoad_PushName(t *testing.T) {
+	// Default no vacío: SendPresence necesita un PushName; sin config debe haber un fallback razonable.
+	if defaults().PushName == "" {
+		t.Fatalf("push_name por defecto no debe ser vacío (fallback de presencia)")
+	}
+
+	path := writeTempYAML(t, "push_name: Cuenta Real\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+	if cfg.PushName != "Cuenta Real" {
+		t.Errorf("push_name desde YAML: got %q, want %q", cfg.PushName, "Cuenta Real")
+	}
+
+	t.Setenv(EnvPrefix+"PUSH_NAME", "Desde Env")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+	if cfg.PushName != "Desde Env" {
+		t.Errorf("env override push_name: got %q, want %q", cfg.PushName, "Desde Env")
+	}
+}
+
 func TestLoad_BadYAML(t *testing.T) {
 	path := writeTempYAML(t, "log_level: [unbalanced")
 

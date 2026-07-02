@@ -48,6 +48,13 @@ type ListenGateway struct {
 	// T2 (con SetReceiptHandler) para subir el estado a la nube; nil = se ignora. serve() lo pasa al
 	// Listener al arrancar el ciclo.
 	onReceipt func(domain.ReceiptEvent)
+
+	// pushName es el nombre visible de FALLBACK para anunciar presencia (§10.D). whatsmeow rechaza
+	// SendPresence si Store.PushName está vacío (el store recién restaurado, MP-02, no lo trae); sin
+	// presencia available WhatsApp no propaga los acuses. serve() lo aplica a Store.PushName SOLO si el
+	// store no conoce ya el nombre REAL de la cuenta (app-state), que siempre prevalece. Vacío = no se
+	// fuerza (si el store tampoco lo trae, SendPresence falla best-effort y la escucha sigue). Sin PII.
+	pushName string
 }
 
 var _ app.ListenGateway = (*ListenGateway)(nil)
@@ -72,6 +79,12 @@ func (g *ListenGateway) Correlator() *Correlator { return g.correlator }
 // Listen (al construir el gateway). El CloudLink lo usa en T2 para subir el estado; en T0 queda nil
 // (los acuses se mapean y se descartan silenciosamente hasta que T2 lo conecte).
 func (g *ListenGateway) SetReceiptHandler(fn func(domain.ReceiptEvent)) { g.onReceipt = fn }
+
+// SetPushName cablea el nombre visible de FALLBACK usado al anunciar presencia (§10.D) cuando el store
+// restaurado aún no conoce el nombre real de la cuenta. Se llama ANTES de Listen (al construir el
+// gateway). Vacío = no se fuerza ningún nombre (SendPresence quedará best-effort si el store tampoco lo
+// trae). No es secreto ni PII; no se loguea.
+func (g *ListenGateway) SetPushName(name string) { g.pushName = name }
 
 // Listen carga el device pareado, conecta el cliente always-on, registra el Listener (eventos ->
 // sink) y BLOQUEA manteniendo el socket vivo hasta que ctx se cancele. Devuelve nil al cancelarse
@@ -100,7 +113,19 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	listener.onReceipt = g.onReceipt
 	// §10.D: tras cada Connected anuncia presencia (available) sobre el cliente vivo para que WhatsApp
 	// PROPAGUE los acuses de entrega/lectura al companion. Best-effort: un fallo no tumba la escucha.
+	//
+	// PushName (hallazgo e2e Plan 013): whatsmeow rechaza SendPresence si Store.PushName está vacío
+	// ("can't send presence without PushName set"), y el store restaurado (MP-02) NO lo trae poblado.
+	// PREFERIMOS el nombre REAL: si whatsmeow ya lo aprendió (app-state), lo respetamos; solo si sigue
+	// vacío aplicamos el fallback configurado (g.pushName) en memoria (no se persiste: si el nombre real
+	// llega luego por app-state, whatsmeow lo sobreescribe). Sin fallback y sin nombre real, SendPresence
+	// fallará y quedará en WARN best-effort (la escucha no se rompe).
 	listener.onConnect = func() {
+		if client.Store != nil {
+			if name, set := resolvePushName(client.Store.PushName, g.pushName); set {
+				client.Store.PushName = name
+			}
+		}
 		if err := client.SendPresence(ctx, types.PresenceAvailable); err != nil {
 			g.log.Warn("listener: no se pudo anunciar presencia (available)", "error", err)
 		}
@@ -119,6 +144,21 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	<-ctx.Done()
 	g.log.Info("escucha 24/7 detenida: cancelación recibida, cerrando socket")
 	return nil
+}
+
+// resolvePushName decide qué nombre visible fijar en el store ANTES de anunciar presencia (§10.D).
+// PREFIERE el nombre real ya conocido por whatsmeow (current, aprendido del app-state): si está poblado
+// se respeta y NO se toca (set=false). Solo si el store aún no lo trae (store recién restaurado, MP-02)
+// se usa el fallback configurado (set=true). Sin fallback tampoco se fuerza nada (SendPresence quedará
+// best-effort). Puro: sin efectos, testeable sin cliente ni red.
+func resolvePushName(current, fallback string) (name string, set bool) {
+	if current != "" {
+		return current, false
+	}
+	if fallback != "" {
+		return fallback, true
+	}
+	return "", false
 }
 
 // setLiveClient publica (o limpia con nil) el cliente VIVO de la escucha bajo lock de escritura.

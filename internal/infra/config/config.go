@@ -49,6 +49,14 @@ type Config struct {
 	// NO es un invariante de seguridad: un POST /pair por encima del límite responde error claro, no
 	// crash. Se lee de WAPP_AGENT_MAX_SESSIONS (default 5).
 	MaxSessions int `yaml:"max_sessions"`
+	// PushName es el nombre visible (push name) que se ANUNCIA en la presencia (SendPresence available,
+	// Plan 013 §10.D) cuando el store restaurado aún no conoce el nombre REAL de la cuenta. whatsmeow
+	// rechaza SendPresence sin PushName ("can't send presence without PushName set"), y sin presencia
+	// available WhatsApp no propaga los acuses (delivered/read) al companion. FALLBACK, no override: el
+	// gateway solo lo usa si Store.PushName viene vacío (store recién restaurado); si whatsmeow ya conoce
+	// el nombre real de la cuenta (app-state), ese PREVALECE. No es secreto (no lleva PII/número). Se lee
+	// de WAPP_AGENT_PUSH_NAME (default "wApp"). Para el e2e conviene fijar el nombre real de la cuenta.
+	PushName string `yaml:"push_name"`
 	// ControlSocketPath es la ruta del Unix domain socket donde el núcleo expone el contrato /v1 del
 	// plano de control (ADR-0015): co-ubicado, SIN puerto de red. Default relativo al cwd, junto al
 	// db_path (ver defaults). Override por WAPP_AGENT_CONTROL_SOCKET_PATH (mismo overlay que el resto).
@@ -120,6 +128,7 @@ func defaults() Config {
 		DEKPath:           "dek.key",
 		DataDir:           defaultDataDir(),
 		MaxSessions:       5,
+		PushName:          "wApp",
 		ControlSocketPath: "wapp-edge.sock",
 	}
 }
@@ -149,6 +158,7 @@ func Load(path string) (Config, error) {
 	cfg.DEKPath = loader.GetString("DEK_PATH", cfg.DEKPath)
 	cfg.DataDir = loader.GetString("DATA_DIR", cfg.DataDir)
 	cfg.MaxSessions = loader.GetInt("MAX_SESSIONS", cfg.MaxSessions)
+	cfg.PushName = loader.GetString("PUSH_NAME", cfg.PushName)
 	cfg.ControlSocketPath = loader.GetString("CONTROL_SOCKET_PATH", cfg.ControlSocketPath)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)

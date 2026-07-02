@@ -79,7 +79,10 @@ type CloudLinkMux interface {
 // escucha rota s.setLiveSender(gateway.SendViaLiveClient) y el mux tiene registrado s.sendVia
 // (indirección estable, ver startListener), de modo que un SendText para la sesión X llega al cliente
 // VIVO de X (no a uno efímero, lección Plan 006). El register/unregister vive en startListener/Unlink.
-func WithWhatsmeowListen(mux CloudLinkMux) Option {
+//
+// pushName es el nombre visible de FALLBACK para anunciar presencia (Plan 013 §10.D): se aplica a cada
+// gateway y solo se usa si el store restaurado no conoce ya el nombre real de la cuenta (ver SetPushName).
+func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 	return func(m *Manager) {
 		m.cloudMux = mux
 		m.newListener = func(ctx context.Context, s *liveSession) (listenRunner, io.Closer, error) {
@@ -92,6 +95,10 @@ func WithWhatsmeowListen(mux CloudLinkMux) Option {
 				return nil, nil, fmt.Errorf("abrir store de sesión: %w", err)
 			}
 			gateway := whatsmeow.NewListenGateway(sdb, s.log)
+			// Nombre visible de FALLBACK para anunciar presencia (Plan 013 §10.D): whatsmeow rechaza
+			// SendPresence si el store restaurado no trae PushName. El gateway solo lo usa si el nombre
+			// real de la cuenta (app-state) aún no está; ese prevalece.
+			gateway.SetPushName(pushName)
 			sid := s.meta.SessionID
 			// Rota el live-sender de ESTE ciclo: el mux ya tiene registrado s.sendVia; aquí solo apunta la
 			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo). Usa la variante
