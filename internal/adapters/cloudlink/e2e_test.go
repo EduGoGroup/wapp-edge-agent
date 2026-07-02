@@ -91,7 +91,7 @@ func recvKind(t *testing.T, ctx context.Context, srv *serverDouble, what string,
 
 const e2eSessionID = "sess-t6"
 
-type sendCall struct{ to, text string }
+type sendCall struct{ commandID, to, text string }
 
 // e2eHarness cablea el Adapter MULTIPLEXOR real (cliente) contra el server-double (bufconn + insecure),
 // igual patrón que los tests de transporte de cloudlink. Registra una o varias sesiones y captura por
@@ -161,8 +161,8 @@ func (h *e2eHarness) register(sessionID string) {
 	h.mu.Lock()
 	h.sent[sessionID] = ch
 	h.mu.Unlock()
-	h.adapter.Register(sessionID, func(_ context.Context, to, text string) error {
-		ch <- sendCall{to: to, text: text}
+	h.adapter.Register(sessionID, func(_ context.Context, commandID, to, text string) error {
+		ch <- sendCall{commandID: commandID, to: to, text: text}
 		return nil
 	}, func() bool { return true })
 }
@@ -260,6 +260,10 @@ func TestE2E_CloudLinkAdapter_Flow(t *testing.T) {
 			if sc.to != "5491100000000" || sc.text != "respuesta de la nube" {
 				t.Errorf("Sender invocado con (%q,%q), inesperado", sc.to, sc.text)
 			}
+			// El command_id del SendText DEBE propagarse al sendFunc (Plan 013 §10.E: alimenta el Correlator).
+			if sc.commandID != cmdID {
+				t.Errorf("command_id propagado: got %q want %q", sc.commandID, cmdID)
+			}
 		case <-ctx.Done():
 			t.Fatalf("timeout: el Sender no fue invocado: %v", ctx.Err())
 		}
@@ -267,6 +271,40 @@ func TestE2E_CloudLinkAdapter_Flow(t *testing.T) {
 		ack := recvAck(t, ctx, h.srv, cmdID)
 		if !ack.GetOk() {
 			t.Errorf("Ack.ok: got false (err=%q) want true", ack.GetError())
+		}
+	})
+
+	// (b.2) ACUSE: SendReceipt(command_id, ReceiptEvent) -> EdgeToCloud{MessageReceipt} por el MISMO
+	// stream, con el mapeo de estado y el command_id de correlación (Plan 013 T2a §10.A/§10.E/§10.G).
+	t.Run("receipt_upload", func(t *testing.T) {
+		ts := time.Date(2026, 7, 2, 12, 0, 0, 0, time.UTC)
+		h.adapter.SendReceipt("cmd-send-ok", domain.ReceiptEvent{
+			MessageIDs: []string{"WAMID-AAA", "WAMID-BBB"},
+			Status:     domain.ReceiptRead,
+			Timestamp:  ts,
+			SessionID:  e2eSessionID,
+		})
+		msg := recvKind(t, ctx, h.srv, "MessageReceipt", func(m *cloudlinkv1.EdgeToCloud) bool {
+			return m.GetReceipt() != nil
+		})
+		if msg.GetSessionId() != e2eSessionID {
+			t.Errorf("session_id: got %q want %q", msg.GetSessionId(), e2eSessionID)
+		}
+		r := msg.GetReceipt()
+		if r.GetSessionId() != e2eSessionID {
+			t.Errorf("receipt.session_id: got %q want %q", r.GetSessionId(), e2eSessionID)
+		}
+		if r.GetCommandId() != "cmd-send-ok" {
+			t.Errorf("receipt.command_id: got %q want %q", r.GetCommandId(), "cmd-send-ok")
+		}
+		if r.GetStatus() != cloudlinkv1.ReceiptStatus_RECEIPT_STATUS_READ {
+			t.Errorf("receipt.status: got %v want READ", r.GetStatus())
+		}
+		if r.GetTimestamp() != ts.Unix() {
+			t.Errorf("receipt.timestamp: got %d want %d", r.GetTimestamp(), ts.Unix())
+		}
+		if got := r.GetMessageIds(); len(got) != 2 || got[0] != "WAMID-AAA" || got[1] != "WAMID-BBB" {
+			t.Errorf("receipt.message_ids: got %v want [WAMID-AAA WAMID-BBB]", got)
 		}
 	})
 

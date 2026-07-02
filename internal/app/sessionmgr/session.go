@@ -85,28 +85,30 @@ type liveSession struct {
 	// ciclo de (re)conexión (el gateway whatsmeow se recrea por ciclo, lección Plan 006: nada efímero).
 	// El multiplex CloudLink registra sendVia (indirección ESTABLE) UNA sola vez al arrancar; así un
 	// comando SendText siempre llega al cliente vivo ACTUAL de la sesión, no a uno muerto de un ciclo
-	// previo. nil entre ciclos / antes del primer Connect: sendVia devuelve ErrNoLiveSender.
-	liveSend func(ctx context.Context, to, text string) error
+	// previo. nil entre ciclos / antes del primer Connect: sendVia devuelve ErrNoLiveSender. Recibe el
+	// command_id del envío (Plan 013 §10.E) para alimentar la correlación command_id ↔ MessageID.
+	liveSend func(ctx context.Context, commandID, to, text string) error
 }
 
 // setLiveSender publica (o limpia con nil) el emisor por cliente vivo de ESTE ciclo de escucha. Lo
 // invoca el factory del listener en cada (re)conexión, apuntando al gateway recién creado.
-func (s *liveSession) setLiveSender(fn func(ctx context.Context, to, text string) error) {
+func (s *liveSession) setLiveSender(fn func(ctx context.Context, commandID, to, text string) error) {
 	s.mu.Lock()
 	s.liveSend = fn
 	s.mu.Unlock()
 }
 
 // sendVia despacha por el cliente vivo ACTUAL de la sesión (indirección estable que el multiplex
-// registra una vez). Si no hay ciclo de escucha activo (liveSend nil), devuelve ErrNoLiveSender.
-func (s *liveSession) sendVia(ctx context.Context, to, text string) error {
+// registra una vez), propagando el command_id para la correlación del acuse (Plan 013 §10.E). Si no hay
+// ciclo de escucha activo (liveSend nil), devuelve ErrNoLiveSender.
+func (s *liveSession) sendVia(ctx context.Context, commandID, to, text string) error {
 	s.mu.Lock()
 	fn := s.liveSend
 	s.mu.Unlock()
 	if fn == nil {
 		return ErrNoLiveSender
 	}
-	return fn(ctx, to, text)
+	return fn(ctx, commandID, to, text)
 }
 
 // arm prepara la sesión para su goroutine listener bajo lock: guarda su cancel (apagado ordenado /

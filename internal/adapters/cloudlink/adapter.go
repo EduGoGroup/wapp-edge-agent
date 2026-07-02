@@ -53,8 +53,10 @@ import (
 )
 
 // SendFunc es el callback de envío que el wiring conecta al despachador del Edge (cliente vivo de la
-// sesión). El adaptador lo invoca al recibir un comando SendText para ESA sesión (tras pasar el gate).
-type SendFunc = func(ctx context.Context, to, text string) error
+// sesión). El adaptador lo invoca al recibir un comando SendText para ESA sesión (tras pasar el gate),
+// pasándole el command_id del comando para que el despachador CORRELACIONE el envío (Plan 013 §10.E):
+// así el acuse (events.Receipt) posterior se puede etiquetar con ese command_id al subirlo.
+type SendFunc = func(ctx context.Context, commandID, to, text string) error
 
 // ValidatorFactory construye un lease.Validator FRESCO (estado independiente) para UNA sesión, o nil si
 // el gate de lease está desactivado (sin clave pública). Todas las sesiones del Edge comparten la MISMA
@@ -270,6 +272,48 @@ func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
 	in.Text, in.PushName, in.FromPn, in.FromLid = "", "", "", "" // no viajan en claro
 }
 
+// SendReceipt sube al cloud un ACUSE (delivered/read) de un mensaje SALIENTE por el ÚNICO stream del
+// Edge, como EdgeToCloud{MessageReceipt} (Plan 013 §8). Es el análogo, para acuses, de sessionSink.
+// Deliver (entrantes): lo cablea el wiring al SetReceiptHandler del gateway de cada sesión. El evt trae
+// el session_id ya etiquetado (por-sesión, patrón mux.SinkFor) y el command_id llega correlacionado
+// (vacío si no se correlacionó: sube como estado crudo por message_ids, no rompe). ZERO-KNOWLEDGE /
+// §10.G: solo viajan message_ids/status/timestamp/session_id/command_id — nada de contenido/PII. Si no
+// hay stream vivo, lo registra y descarta (outbox durable = follow-up), sin tumbar la escucha.
+func (a *Adapter) SendReceipt(commandID string, evt domain.ReceiptEvent) {
+	cl := a.currentClient()
+	if cl == nil {
+		a.log.Warn("CloudLink desconectado: MessageReceipt no reenviado (follow-up: outbox durable)",
+			"session_id", evt.SessionID, "status", string(evt.Status), "acked", len(evt.MessageIDs))
+		return
+	}
+	r := &cloudlinkv1.MessageReceipt{
+		SessionId:  evt.SessionID,
+		MessageIds: evt.MessageIDs,
+		Status:     receiptStatusToProto(evt.Status),
+		Timestamp:  evt.Timestamp.Unix(),
+		CommandId:  commandID,
+	}
+	a.send(cl, &cloudlinkv1.EdgeToCloud{
+		CommandId: uuid.NewString(),
+		SessionId: evt.SessionID,
+		Payload:   &cloudlinkv1.EdgeToCloud_Receipt{Receipt: r},
+	})
+}
+
+// receiptStatusToProto mapea el estado de dominio del acuse al enum del contrato (Plan 013 §10.A):
+// delivered→DELIVERED, read→READ; cualquier otro (no debería llegar: el enum de dominio es cerrado) cae
+// a UNSPECIFIED por seguridad.
+func receiptStatusToProto(s domain.ReceiptStatus) cloudlinkv1.ReceiptStatus {
+	switch s {
+	case domain.ReceiptDelivered:
+		return cloudlinkv1.ReceiptStatus_RECEIPT_STATUS_DELIVERED
+	case domain.ReceiptRead:
+		return cloudlinkv1.ReceiptStatus_RECEIPT_STATUS_READ
+	default:
+		return cloudlinkv1.ReceiptStatus_RECEIPT_STATUS_UNSPECIFIED
+	}
+}
+
 // Servidores JID de WhatsApp usados para clasificar un remitente como número o LID (Plan 010 §9).
 // Se replican como constantes locales (no se importa go.mau.fi/whatsmeow en este adaptador de
 // transporte) — los valores son los mismos que types.DefaultUserServer y types.HiddenUserServer.
@@ -418,7 +462,7 @@ func (a *Adapter) handleSendText(ctx context.Context, cl *client.Client, sid str
 		a.ack(cl, sid, cmdID, false, "lease no vigente")
 		return
 	}
-	if err := e.sendFunc(ctx, st.GetTo(), st.GetText()); err != nil {
+	if err := e.sendFunc(ctx, cmdID, st.GetTo(), st.GetText()); err != nil {
 		a.log.Error("CloudLink: SendText falló al despachar", "command_id", cmdID, "session_id", sid, "error", err)
 		a.ack(cl, sid, cmdID, false, err.Error())
 		return

@@ -55,6 +55,11 @@ type LiveSender interface {
 	// SendViaLiveClient despacha un texto a `to` (número crudo o JID) por el cliente vivo. Devuelve
 	// error si no hay sesión de escucha activa (sin cliente vivo) o si el envío falla.
 	SendViaLiveClient(ctx context.Context, to, text string) error
+	// SendViaLiveClientTracked despacha como SendViaLiveClient pero CORRELACIONA el envío con su
+	// command_id (Plan 013 §10.E): puebla el Correlator (command_id ↔ MessageID del SendResponse) para
+	// que, al llegar el events.Receipt, el acuse se etiquete con el command_id original. Devuelve el
+	// MessageID del envío. Es el camino que alimenta la subida de acuses correlacionados (T2a).
+	SendViaLiveClientTracked(ctx context.Context, commandID, to, text string) (string, error)
 }
 
 // Listen es el caso de uso. Sus dependencias son puertos (interfaces) para inyectar fakes en tests.

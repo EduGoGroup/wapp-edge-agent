@@ -26,6 +26,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	wappdb "github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 )
 
@@ -54,12 +55,17 @@ type listenFactory func(ctx context.Context, s *liveSession) (listenRunner, io.C
 // real de cloudlink, o el LogMux de diagnóstico). Interfaz estructural: sessionmgr no importa cloudlink.
 type CloudLinkMux interface {
 	// Register da de alta una sesión en el multiplex (register-on-start): send es su emisor por cliente
-	// vivo, hasDEK la presencia de la DEK (gate 2-de-2). El mux construye el estado de lease de la sesión.
-	Register(sessionID string, send func(ctx context.Context, to, text string) error, hasDEK func() bool)
+	// vivo (recibe el command_id del envío para la correlación del acuse, Plan 013 §10.E), hasDEK la
+	// presencia de la DEK (gate 2-de-2). El mux construye el estado de lease de la sesión.
+	Register(sessionID string, send func(ctx context.Context, commandID, to, text string) error, hasDEK func() bool)
 	// Unregister da de baja la sesión (unregister-on-unlink): sus comandos posteriores se ignoran.
 	Unregister(sessionID string)
 	// SinkFor devuelve el sink de SALIDA (entrantes->cloud) etiquetado con session_id.
 	SinkFor(sessionID string) app.InboundSink
+	// SendReceipt sube al cloud un ACUSE (delivered/read) de un saliente por el stream, etiquetado con la
+	// sesión (evt.SessionID) y correlacionado con el command_id del envío original (vacío = estado crudo).
+	// Es el análogo de SinkFor para acuses; lo cablea el factory al SetReceiptHandler del gateway (T2a).
+	SendReceipt(commandID string, evt domain.ReceiptEvent)
 }
 
 // WithWhatsmeowListen habilita Restore/startListener con la escucha REAL sobre whatsmeow Y la cablea al
@@ -86,10 +92,24 @@ func WithWhatsmeowListen(mux CloudLinkMux) Option {
 				return nil, nil, fmt.Errorf("abrir store de sesión: %w", err)
 			}
 			gateway := whatsmeow.NewListenGateway(sdb, s.log)
+			sid := s.meta.SessionID
 			// Rota el live-sender de ESTE ciclo: el mux ya tiene registrado s.sendVia; aquí solo apunta la
-			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo).
-			s.setLiveSender(gateway.SendViaLiveClient)
-			runner := app.NewListen(s.custody, gateway, mux.SinkFor(s.meta.SessionID))
+			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo). Usa la variante
+			// TRACKED (Plan 013 §10.E): cada SendText puebla el Correlator (command_id ↔ MessageID) para
+			// que el acuse posterior suba etiquetado con su command_id.
+			s.setLiveSender(func(ctx context.Context, commandID, to, text string) error {
+				_, err := gateway.SendViaLiveClientTracked(ctx, commandID, to, text)
+				return err
+			})
+			// Cablea la SALIDA de acuses de ESTA sesión (Plan 013 T2a): al llegar un events.Receipt, se
+			// etiqueta con el session_id, se correlaciona con el command_id del envío (Correlator) y se
+			// sube al cloud por el stream. Sin correlación (vencido/desconocido) sube como estado crudo.
+			gateway.SetReceiptHandler(func(evt domain.ReceiptEvent) {
+				evt.SessionID = sid
+				cmd, _ := gateway.Correlator().Lookup(evt.MessageIDs)
+				mux.SendReceipt(cmd, evt)
+			})
+			runner := app.NewListen(s.custody, gateway, mux.SinkFor(sid))
 			return runner, sdb, nil
 		}
 	}

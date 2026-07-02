@@ -59,13 +59,21 @@ func NewLogMux(log logger.Logger) *LogMux {
 }
 
 // Register es un no-op: el LogMux no gatea lease ni mantiene estado por sesión (solo loguea).
-func (m *LogMux) Register(sessionID string, _ func(ctx context.Context, to, text string) error, _ func() bool) {
+func (m *LogMux) Register(sessionID string, _ func(ctx context.Context, commandID, to, text string) error, _ func() bool) {
 	m.log.Info("CloudLink (LogMux): sesión registrada para diagnóstico (sin reenvío a la nube)", "session_id", sessionID)
 }
 
 // Unregister es un no-op simétrico a Register.
 func (m *LogMux) Unregister(sessionID string) {
 	m.log.Info("CloudLink (LogMux): sesión removida del diagnóstico", "session_id", sessionID)
+}
+
+// SendReceipt es el análogo de diagnóstico de Adapter.SendReceipt: no reenvía a la nube, solo loguea el
+// acuse (sin PII, §10.G) para verificar la captura+correlación en dev.
+func (m *LogMux) SendReceipt(commandID string, evt domain.ReceiptEvent) {
+	m.log.Info("CloudLink (LogMux): acuse capturado (sin reenvío a la nube)",
+		"session_id", evt.SessionID, "status", string(evt.Status),
+		"command_id", commandID, "acked", len(evt.MessageIDs), "correlacionado", commandID != "")
 }
 
 // SinkFor devuelve un LogSink que arrastra el session_id en cada línea (diagnóstico por sesión).

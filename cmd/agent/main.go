@@ -469,13 +469,20 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	// VIVO de la escucha (una sola conexión por sesión): con la misma identidad multi-dispositivo, un
 	// cliente efímero aparte reemplazaría la conexión y dejaría la escucha sorda. Si el gateway no
 	// expone un emisor vivo (defensivo), cae al sender efímero (NewClient+Connect+Disconnect por envío).
-	var sendFunc func(ctx context.Context, to, text string) error
+	var sendFunc func(ctx context.Context, commandID, to, text string) error
 	if liveSender, ok := any(gateway).(app.LiveSender); ok && gateway != nil {
-		sendFunc = func(ctx context.Context, to, text string) error { return liveSender.SendViaLiveClient(ctx, to, text) }
+		// Variante TRACKED (Plan 013 §10.E): el envío puebla el Correlator del gateway con el command_id
+		// para que el acuse posterior suba correlacionado.
+		sendFunc = func(ctx context.Context, commandID, to, text string) error {
+			_, err := liveSender.SendViaLiveClientTracked(ctx, commandID, to, text)
+			return err
+		}
 		log.Info("CloudLink: el envío reutilizará el CLIENTE VIVO de la escucha (conexión única por sesión)")
 	} else {
+		// Camino efímero (defensivo, sin cliente vivo): no hay Correlator que alimentar; el command_id se
+		// ignora y el acuse subiría como estado crudo.
 		sendUC := app.NewSend(custody, waconn.NewSender(database))
-		sendFunc = func(ctx context.Context, to, text string) error { return sendUC.Run(ctx, to, text) }
+		sendFunc = func(ctx context.Context, _ /*commandID*/, to, text string) error { return sendUC.Run(ctx, to, text) }
 	}
 
 	// El Adapter es un multiplexor (un stream por Edge). El camino legacy single-sesión registra LA
@@ -483,6 +490,14 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	// la del daemon multi-sesión (runServe), solo que aquí hay una sola sesión.
 	adapter := cloudlink.NewAdapter(cc, log, newValidator, cloudlink.WithCloudEncPubKey(cloudEncPub))
 	adapter.Register(cfg.CloudLink.SessionID, sendFunc, custody.Exists)
+	// Acuses (Plan 013 T2a): al llegar un events.Receipt, etiqueta con el session_id, correlaciona con el
+	// command_id del envío (Correlator del gateway vivo) y sube el MessageReceipt por el mismo stream.
+	sid := cfg.CloudLink.SessionID
+	gateway.SetReceiptHandler(func(evt domain.ReceiptEvent) {
+		evt.SessionID = sid
+		cmd, _ := gateway.Correlator().Lookup(evt.MessageIDs)
+		adapter.SendReceipt(cmd, evt)
+	})
 	go func() {
 		_ = adapter.Run(ctx)
 		_ = cc.Close()
