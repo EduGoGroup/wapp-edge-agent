@@ -45,9 +45,11 @@ import (
 	"github.com/EduGoGroup/wapp-cloudlink/lease"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
+	"github.com/EduGoGroup/wapp-shared/envelope"
 	"github.com/EduGoGroup/wapp-shared/logger"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 )
 
 // SendFunc es el callback de envío que el wiring conecta al despachador del Edge (cliente vivo de la
@@ -75,6 +77,13 @@ type Adapter struct {
 	newValidator ValidatorFactory // construye el Validator por sesión (nil => sin gate)
 	log          logger.Logger
 
+	// cloudEncPub es la clave pública X25519 (32B) de CIFRADO de la nube (Plan 011 §6.3). Si está
+	// presente, Deliver SELLA los campos sensibles (SensitivePayload) hacia esta pública con SealFor y
+	// los envía en IncomingMessage.EncPayload; si es nil, va el fallback claro (§10.H): los campos
+	// sensibles viajan planos y el mTLS sigue protegiendo el canal. Es ÚNICA por Edge (la nube tiene una
+	// sola pública de cifrado); todas las sesiones sellan hacia la misma.
+	cloudEncPub []byte
+
 	hbInterval time.Duration
 	baseDelay  time.Duration
 	maxDelay   time.Duration
@@ -95,6 +104,12 @@ func WithHeartbeatInterval(d time.Duration) Option {
 // WithBackoff fija la política de reconexión (base y tope). Por defecto 1s..60s.
 func WithBackoff(base, max time.Duration) Option {
 	return func(a *Adapter) { a.baseDelay, a.maxDelay = base, max }
+}
+
+// WithCloudEncPubKey fija la clave pública X25519 (32B) de cifrado de la nube para el sellado en
+// tránsito (Plan 011 §6.3). Si no se fija (o pub==nil), Deliver usa el fallback claro (§10.H).
+func WithCloudEncPubKey(pub []byte) Option {
+	return func(a *Adapter) { a.cloudEncPub = pub }
 }
 
 // NewAdapter construye el multiplexor CloudLink sobre una conexión gRPC ya establecida (cc).
@@ -163,7 +178,7 @@ func (a *Adapter) Unregister(sessionID string) {
 // SinkFor devuelve el sink de SALIDA (entrantes -> cloud) etiquetado con session_id. El sink escribe al
 // ÚNICO stream del Adapter; varios sinks (uno por sesión) comparten el mismo conducto.
 func (a *Adapter) SinkFor(sessionID string) app.InboundSink {
-	return &sessionSink{a: a, sessionID: sessionID}
+	return &sessionSink{a: a, sessionID: sessionID, cloudEncPub: a.cloudEncPub}
 }
 
 // entry resuelve el estado de una sesión bajo lock (nil si no está registrada).
@@ -176,8 +191,9 @@ func (a *Adapter) entry(sessionID string) *sessionEntry {
 // sessionSink implementa app.InboundSink para UNA sesión: etiqueta cada entrega con su session_id y la
 // escribe al único stream del Adapter (mux de salida).
 type sessionSink struct {
-	a         *Adapter
-	sessionID string
+	a           *Adapter
+	sessionID   string
+	cloudEncPub []byte // pública de cifrado de la nube (snapshot del Adapter); nil => fallback claro
 }
 
 var _ app.InboundSink = (*sessionSink)(nil)
@@ -185,6 +201,13 @@ var _ app.InboundSink = (*sessionSink)(nil)
 // Deliver mapea el InboundEvent a IncomingMessage etiquetado con session_id y lo reenvía por el stream.
 // ZERO-KNOWLEDGE: solo viaja contenido de negocio; no hay campo alguno para la DEK ni el store. Si no
 // hay stream vivo, lo registra y devuelve nil (no tumba el socket; outbox durable = follow-up).
+//
+// CIFRADO EN TRÁNSITO (Plan 011 §6.3/§10.E): si hay pública de cifrado de la nube (s.cloudEncPub),
+// los campos SENSIBLES (text/push_name/from_pn/from_lid) se serializan como un SensitivePayload proto,
+// se sellan con SealFor (X25519 anónimo) y viajan en EncPayload; los planos se vacían. Si no hay
+// pública o el sellado falla, se cae al FALLBACK CLARO (§10.H): los sensibles viajan planos y el mTLS
+// sigue protegiendo el canal (nunca se falla el reenvío por esto). Los NO sensibles (from/ts_unix/
+// wa_message_id/is_group/addressing_mode) van en claro SIEMPRE.
 func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error {
 	cl := s.a.currentClient()
 	if cl == nil {
@@ -193,20 +216,22 @@ func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error 
 		return nil
 	}
 	fromPN, fromLID := deriveContactRefs(evt.Sender, evt.SenderAlt)
+	in := &cloudlinkv1.IncomingMessage{
+		From:           evt.Sender, // se mantiene (compat, ADR-0005)
+		Text:           evt.Text,
+		TsUnix:         evt.Timestamp.Unix(),
+		WaMessageId:    evt.MessageID,
+		IsGroup:        evt.IsGroup,
+		PushName:       evt.PushName,
+		FromPn:         fromPN,
+		FromLid:        fromLID,
+		AddressingMode: evt.AddressingMode,
+	}
+	s.sealSensitive(in)
 	msg := &cloudlinkv1.EdgeToCloud{
 		CommandId: uuid.NewString(),
 		SessionId: s.sessionID,
-		Payload: &cloudlinkv1.EdgeToCloud_Incoming{Incoming: &cloudlinkv1.IncomingMessage{
-			From:           evt.Sender, // se mantiene (compat, ADR-0005)
-			Text:           evt.Text,
-			TsUnix:         evt.Timestamp.Unix(),
-			WaMessageId:    evt.MessageID,
-			IsGroup:        evt.IsGroup,
-			PushName:       evt.PushName,
-			FromPn:         fromPN,
-			FromLid:        fromLID,
-			AddressingMode: evt.AddressingMode,
-		}},
+		Payload:   &cloudlinkv1.EdgeToCloud_Incoming{Incoming: in},
 	}
 	if err := cl.Send(msg); err != nil {
 		s.a.log.Warn("CloudLink: fallo al reenviar InboundEvent (se descarta; follow-up: outbox)",
@@ -214,6 +239,35 @@ func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error 
 		return nil
 	}
 	return nil
+}
+
+// sealSensitive sella los campos SENSIBLES del IncomingMessage hacia la pública de cifrado de la nube
+// (Plan 011 §6.3/§10.E). Muta in EN SITIO: si el sellado tiene éxito, puebla in.EncPayload y vacía los
+// planos sensibles (text/push_name/from_pn/from_lid). Si no hay pública (nil) o el sellado falla, deja
+// los planos como están (FALLBACK CLARO §10.H) y NO propaga el error: el reenvío nunca se aborta por
+// esto (el mTLS ya protege el canal). Los campos NO sensibles no se tocan.
+func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
+	if s.cloudEncPub == nil {
+		return // fallback claro (§10.H): sin pública de cifrado, los sensibles viajan planos
+	}
+	sp := &cloudlinkv1.SensitivePayload{
+		Text:     in.GetText(),
+		PushName: in.GetPushName(),
+		FromPn:   in.GetFromPn(),
+		FromLid:  in.GetFromLid(),
+	}
+	raw, err := proto.Marshal(sp)
+	if err != nil {
+		s.a.log.Warn("CloudLink: fallo al serializar SensitivePayload; fallback claro (§10.H)", "error", err)
+		return
+	}
+	sealed, err := envelope.SealFor(s.cloudEncPub, raw)
+	if err != nil {
+		s.a.log.Warn("CloudLink: fallo al sellar SensitivePayload; fallback claro (§10.H)", "error", err)
+		return
+	}
+	in.EncPayload = sealed
+	in.Text, in.PushName, in.FromPn, in.FromLid = "", "", "", "" // no viajan en claro
 }
 
 // Servidores JID de WhatsApp usados para clasificar un remitente como número o LID (Plan 010 §9).

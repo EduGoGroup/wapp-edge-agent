@@ -1,6 +1,7 @@
 package enroll_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,11 +9,13 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -94,6 +97,7 @@ type fakeEnroll struct {
 	cloudlinkv1.UnimplementedEnrollmentServer
 	ca             testCA
 	failPermission bool
+	encPub         []byte // Plan 011: pública de cifrado de la nube incluida en la respuesta (si no nil)
 
 	mu          sync.Mutex
 	gotCN       string
@@ -134,9 +138,10 @@ func (f *fakeEnroll) EnrollEdge(_ context.Context, req *cloudlinkv1.EnrollEdgeRe
 		return nil, status.Error(codes.Internal, "firmar leaf: "+err.Error())
 	}
 	return &cloudlinkv1.EnrollEdgeResponse{
-		EdgeCertPem: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER}),
-		CaChainPem:  f.ca.pem,
-		TenantId:    "tenant-test",
+		EdgeCertPem:    pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: leafDER}),
+		CaChainPem:     f.ca.pem,
+		TenantId:       "tenant-test",
+		CloudEncPubkey: f.encPub,
 	}, nil
 }
 
@@ -277,5 +282,56 @@ func TestRun_MissingTLSCA_Errors(t *testing.T) {
 		enroll.WithDialOptions(grpc.WithContextDialer(dialer)))
 	if err == nil {
 		t.Fatalf("Run debió fallar sin tls_ca")
+	}
+}
+
+// TestRun_PersistsCloudEncPubKey verifica (Plan 011 §6.4) que el enrolamiento persiste la pública de
+// cifrado de la nube recibida en CloudEncPubKeyPath, codificada en base64 (una línea).
+func TestRun_PersistsCloudEncPubKey(t *testing.T) {
+	ca := newTestCA(t)
+	wantPub := make([]byte, 32)
+	for i := range wantPub {
+		wantPub[i] = byte(i + 1)
+	}
+	fake := &fakeEnroll{ca: ca, encPub: wantPub}
+	dialer := startServer(t, ca, fake)
+	cfg, _, _ := baseConfig(t, ca, "edge-enc")
+	encPath := filepath.Join(t.TempDir(), "cloud_enc_pub.b64")
+	cfg.CloudLink.CloudEncPubKeyPath = encPath
+
+	if err := enroll.Run(context.Background(), cfg, sharedlogger.New(),
+		enroll.WithDialOptions(grpc.WithContextDialer(dialer))); err != nil {
+		t.Fatalf("Run devolvió error inesperado: %v", err)
+	}
+
+	data, err := os.ReadFile(encPath)
+	if err != nil {
+		t.Fatalf("pública de cifrado no persistida: %v", err)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatalf("la pública persistida no es base64 válido: %v", err)
+	}
+	if !bytes.Equal(decoded, wantPub) {
+		t.Fatalf("pública persistida distinta: got %x want %x", decoded, wantPub)
+	}
+}
+
+// TestRun_NoCloudEncPubKey_NoFile verifica que si el Gateway no devuelve la pública, no se crea archivo
+// (fallback claro §10.H) y el enrolamiento no falla.
+func TestRun_NoCloudEncPubKey_NoFile(t *testing.T) {
+	ca := newTestCA(t)
+	fake := &fakeEnroll{ca: ca} // encPub nil
+	dialer := startServer(t, ca, fake)
+	cfg, _, _ := baseConfig(t, ca, "edge-noenc")
+	encPath := filepath.Join(t.TempDir(), "cloud_enc_pub.b64")
+	cfg.CloudLink.CloudEncPubKeyPath = encPath
+
+	if err := enroll.Run(context.Background(), cfg, sharedlogger.New(),
+		enroll.WithDialOptions(grpc.WithContextDialer(dialer))); err != nil {
+		t.Fatalf("Run devolvió error inesperado: %v", err)
+	}
+	if _, err := os.Stat(encPath); !os.IsNotExist(err) {
+		t.Fatalf("no debió crearse archivo de pública sin cloud_enc_pubkey: err=%v", err)
 	}
 }

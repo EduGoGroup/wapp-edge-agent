@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"net"
@@ -444,6 +445,13 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 		return logSink
 	}
 
+	cloudEncPub, err := loadCloudEncPubKey(cfg.CloudLink, log)
+	if err != nil {
+		log.Error("CloudLink: clave pública de cifrado de la nube inválida, cayendo a LogSink puro", "error", err)
+		_ = cc.Close()
+		return logSink
+	}
+
 	// SendFunc: conecta los comandos SendText de la nube al despachador del Edge. Prioriza el CLIENTE
 	// VIVO de la escucha (una sola conexión por sesión): con la misma identidad multi-dispositivo, un
 	// cliente efímero aparte reemplazaría la conexión y dejaría la escucha sorda. Si el gateway no
@@ -460,7 +468,7 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	// El Adapter es un multiplexor (un stream por Edge). El camino legacy single-sesión registra LA
 	// única sesión (cfg.CloudLink.SessionID) y usa SU sink etiquetado; la mecánica de mux es idéntica a
 	// la del daemon multi-sesión (runServe), solo que aquí hay una sola sesión.
-	adapter := cloudlink.NewAdapter(cc, log, newValidator)
+	adapter := cloudlink.NewAdapter(cc, log, newValidator, cloudlink.WithCloudEncPubKey(cloudEncPub))
 	adapter.Register(cfg.CloudLink.SessionID, sendFunc, custody.Exists)
 	go func() {
 		_ = adapter.Run(ctx)
@@ -469,7 +477,7 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 
 	log.Info("CloudLink habilitado: reenviando entrantes y atendiendo comandos cloud->edge",
 		"endpoint", cfg.CloudLink.Endpoint, "session_id", cfg.CloudLink.SessionID,
-		"lease_gate", newValidator != nil)
+		"lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil)
 	return cloudlink.NewTeeSink(adapter.SinkFor(cfg.CloudLink.SessionID), logSink)
 }
 
@@ -507,14 +515,21 @@ func buildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger) s
 		return cloudlink.NewLogMux(log)
 	}
 
-	adapter := cloudlink.NewAdapter(cc, log, newValidator)
+	cloudEncPub, err := loadCloudEncPubKey(cfg.CloudLink, log)
+	if err != nil {
+		log.Error("CloudLink: clave pública de cifrado de la nube inválida, cayendo a LogMux", "error", err)
+		_ = cc.Close()
+		return cloudlink.NewLogMux(log)
+	}
+
+	adapter := cloudlink.NewAdapter(cc, log, newValidator, cloudlink.WithCloudEncPubKey(cloudEncPub))
 	go func() {
 		_ = adapter.Run(ctx)
 		_ = cc.Close()
 	}()
 
 	log.Info("CloudLink habilitado (multi-sesión): un stream multiplexado por session_id",
-		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil)
+		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil)
 	return adapter
 }
 
@@ -558,4 +573,32 @@ func loadValidatorFactory(cl config.CloudLinkConfig, log sharedlogger.Logger) (c
 		return nil, fmt.Errorf("clave pública de lease con tamaño inválido: %d (esperado %d)", len(pub), ed25519.PublicKeySize)
 	}
 	return func() *lease.Validator { return lease.NewValidator(ed25519.PublicKey(pub)) }, nil
+}
+
+// loadCloudEncPubKey carga la clave pública X25519 (32B) de cifrado de la nube desde CloudEncPubKeyPath
+// para el sellado en tránsito (Plan 011 §6.3). Acepta la clave en base64 (formato de persistencia del
+// enrolamiento) o como 32 bytes crudos. Devuelve nil (fallback claro §10.H) si no hay ruta o el archivo
+// no existe; error solo si existe pero es ilegible o de tamaño inválido.
+func loadCloudEncPubKey(cl config.CloudLinkConfig, log sharedlogger.Logger) ([]byte, error) {
+	if cl.CloudEncPubKeyPath == "" {
+		log.Warn("CloudLink: sin clave pública de cifrado de la nube; sellado en tránsito DESACTIVADO (fallback claro §10.H)")
+		return nil, nil
+	}
+	raw, err := os.ReadFile(cl.CloudEncPubKeyPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Warn("CloudLink: cloud_enc_pubkey_path no existe aún; sellado en tránsito DESACTIVADO (fallback claro §10.H)",
+				"path", cl.CloudEncPubKeyPath)
+			return nil, nil
+		}
+		return nil, err
+	}
+	pub := raw
+	if decoded, decErr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(raw))); decErr == nil && len(decoded) == 32 {
+		pub = decoded
+	}
+	if len(pub) != 32 {
+		return nil, fmt.Errorf("clave pública de cifrado de la nube con tamaño inválido: %d (esperado 32)", len(pub))
+	}
+	return pub, nil
 }

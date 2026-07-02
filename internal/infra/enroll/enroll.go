@@ -23,6 +23,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -148,6 +149,11 @@ func Run(ctx context.Context, cfg config.Config, log sharedlogger.Logger, opts .
 	// AVISAMOS y conservamos la pre-provista (no se sobrescribe en silencio).
 	reconcileCA(cl.TLSCA, resp.GetCaChainPem(), log)
 
+	// Pública de cifrado de la nube (Plan 011 §6.4): si el Gateway la incluyó, se persiste en
+	// CloudEncPubKeyPath (base64, una línea) para que el daemon selle los sensibles en tránsito. Si no
+	// hay pública o no hay ruta configurada, se OMITE sin fallar (fallback claro §10.H en el reenvío).
+	persistCloudEncPubKey(cl.CloudEncPubKeyPath, resp.GetCloudEncPubkey(), log)
+
 	log.Info("enrolamiento completado: par mTLS persistido; `listen` ya puede usar mTLS",
 		"tenant_id", resp.GetTenantId(),
 		"edge_id", edgeID,
@@ -241,6 +247,26 @@ func reconcileCA(caPath string, gatewayChain []byte, log sharedlogger.Logger) {
 		log.Warn("enroll: el Gateway devolvió una cadena de CA distinta a la pre-provista; se CONSERVA la pre-provista (no se sobrescribe)",
 			"tls_ca", caPath)
 	}
+}
+
+// persistCloudEncPubKey persiste la pública de cifrado de la nube (Plan 011 §6.4) en path, en base64
+// (una línea, 0644 — material público). Es best-effort: si no hay pública o no hay ruta, no hace nada;
+// si falla la escritura, AVISA pero NO aborta el enrolamiento (el reenvío usará el fallback claro §10.H
+// hasta el próximo enrolamiento). El tamaño se valida al CARGARLA en el daemon.
+func persistCloudEncPubKey(path string, pub []byte, log sharedlogger.Logger) {
+	if len(pub) == 0 {
+		return
+	}
+	if path == "" {
+		log.Warn("enroll: el Gateway devolvió cloud_enc_pubkey pero no hay cloud_enc_pubkey_path configurado; se OMITE (fallback claro)")
+		return
+	}
+	encoded := []byte(base64.StdEncoding.EncodeToString(pub))
+	if err := writeFile(path, encoded, certFilePerm); err != nil {
+		log.Warn("enroll: no se pudo persistir cloud_enc_pubkey; el reenvío usará fallback claro (§10.H)", "path", path, "error", err)
+		return
+	}
+	log.Info("enroll: pública de cifrado de la nube persistida (sellado en tránsito habilitado)", "cloud_enc_pubkey_path", path)
 }
 
 // pemEqual compara dos materiales PEM por el conjunto de bloques DER que contienen (ignora

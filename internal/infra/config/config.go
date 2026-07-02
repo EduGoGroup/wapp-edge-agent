@@ -66,6 +66,11 @@ type CloudLinkConfig struct {
 	// LeasePubKeyPath es la ruta a la clave pública Ed25519 del emisor de leases (servidor). Si está
 	// presente, se activa el gate de lease (kill-switch); si no, no se gatea (dev).
 	LeasePubKeyPath string `yaml:"lease_pubkey_path"`
+	// CloudEncPubKeyPath es la ruta a la clave pública X25519 (32B) de CIFRADO de la nube (Plan 011
+	// §6.3/§6.4). Se puebla desde el enrolamiento (EnrollEdgeResponse.cloud_enc_pubkey). Si está
+	// presente, el Edge SELLA los campos sensibles del entrante hacia esta pública (SealFor) antes de
+	// reenviarlos; si no, va el fallback claro (§10.H). Persistida en base64 (una línea).
+	CloudEncPubKeyPath string `yaml:"cloud_enc_pubkey_path"`
 	// EnrollmentEndpoint es la dirección gRPC del servidor de enrolamiento del Gateway (subcomando
 	// `enroll`). En dev suele ser un puerto distinto al de Connect (p.ej. "localhost:8444"). El dial de
 	// enrolamiento usa TLS-de-servidor (NO mTLS): valida al Gateway con TLSCA. Vacío desactiva `enroll`.
@@ -124,6 +129,7 @@ func Load(path string) (Config, error) {
 	cfg.CloudLink.TLSCA = loader.GetString("CLOUDLINK_TLS_CA", cfg.CloudLink.TLSCA)
 	cfg.CloudLink.ServerName = loader.GetString("CLOUDLINK_SERVER_NAME", cfg.CloudLink.ServerName)
 	cfg.CloudLink.LeasePubKeyPath = loader.GetString("CLOUDLINK_LEASE_PUBKEY_PATH", cfg.CloudLink.LeasePubKeyPath)
+	cfg.CloudLink.CloudEncPubKeyPath = loader.GetString("CLOUDLINK_CLOUD_ENC_PUBKEY_PATH", cfg.CloudLink.CloudEncPubKeyPath)
 	cfg.CloudLink.EnrollmentEndpoint = loader.GetString("CLOUDLINK_ENROLLMENT_ENDPOINT", cfg.CloudLink.EnrollmentEndpoint)
 	cfg.CloudLink.ActivationCode = loader.GetString("CLOUDLINK_ACTIVATION_CODE", cfg.CloudLink.ActivationCode)
 	cfg.CloudLink.EdgeID = loader.GetString("CLOUDLINK_EDGE_ID", cfg.CloudLink.EdgeID)
