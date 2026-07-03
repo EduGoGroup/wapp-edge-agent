@@ -241,3 +241,43 @@ func (g *ListenGateway) sendViaLiveClient(ctx context.Context, commandID, to, te
 	}
 	return resp.ID, nil
 }
+
+// SendMediaViaLiveClientTracked envía un ARCHIVO (documento/imagen) REUTILIZANDO el cliente whatsmeow
+// VIVO de la escucha (Plan 017 §7), hermano de SendViaLiveClientTracked para media: DESCARGA el binario
+// de la presigned URL con net/http normal (SIN credenciales, SIN SDK S3 — la URL prefirmada ES la
+// capability, zero-knowledge ADR-0007), lo SUBE por el cliente vivo (client.Upload, que lo cifra con su
+// MediaKey para el destinatario) y despacha el Document/Image con el caption embebido (§9.I). Correlaciona
+// el envío con su command_id (§10.E) para que el acuse posterior (Plan 013) suba etiquetado. Devuelve el
+// MessageID del envío. Falla con error claro si no hay sesión de escucha activa (cliente nil). El cliente
+// vivo ya está autenticado: NO necesita la DEK (el media no se cifra con ella).
+func (g *ListenGateway) SendMediaViaLiveClientTracked(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) (string, error) {
+	g.mu.RLock()
+	client := g.client
+	g.mu.RUnlock()
+	if client == nil {
+		return "", fmt.Errorf("whatsapp: sin cliente vivo de escucha para enviar media (¿está corriendo `restore`/`listen`?)")
+	}
+
+	toJID, err := parseRecipient(to)
+	if err != nil {
+		return "", err
+	}
+	data, err := downloadMedia(ctx, presignedURL)
+	if err != nil {
+		return "", err
+	}
+	waMsg, err := buildMediaMessage(ctx, client, outgoing{
+		mediaData: data, filename: filename, mime: mime, kind: kind, caption: caption,
+	})
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.SendMessage(ctx, toJID, waMsg)
+	if err != nil {
+		return "", fmt.Errorf("whatsapp: enviar media por cliente vivo: %w", err)
+	}
+	if commandID != "" && g.correlator != nil {
+		g.correlator.Remember(commandID, resp.ID, resp.Timestamp)
+	}
+	return resp.ID, nil
+}

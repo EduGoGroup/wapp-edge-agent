@@ -31,6 +31,11 @@ import (
 type Sender interface {
 	// SendText envía text al destino to (número crudo o JID), descifrando el store con dek.
 	SendText(ctx context.Context, dek []byte, to, text string) error
+	// SendMedia envía un ARCHIVO (documento/imagen) al destino to. El adaptador DESCARGA el binario de
+	// la presigned URL (GET sin credenciales, Plan 017 §7), lo sube a WhatsApp y despacha el
+	// Document/Image con el caption embebido. dek se conserva por simetría (descifra el store; el media
+	// NO se cifra con ella).
+	SendMedia(ctx context.Context, dek []byte, to, presignedURL, filename, mime, kind, caption string) error
 }
 
 // Errores de validación del caso de uso (sin material sensible).
@@ -39,6 +44,8 @@ var (
 	ErrEmptyRecipient = errors.New("send: destino vacío")
 	// ErrEmptyText: el texto a enviar llegó vacío.
 	ErrEmptyText = errors.New("send: texto vacío")
+	// ErrEmptyMediaURL: la presigned URL del archivo llegó vacía.
+	ErrEmptyMediaURL = errors.New("send: presigned URL vacía")
 )
 
 // Send es el caso de uso. Sus dependencias son puertos (interfaces) para inyectar fakes en tests.
@@ -71,6 +78,30 @@ func (s *Send) Run(ctx context.Context, to, text string) error {
 
 	if err := s.sender.SendText(ctx, dek, to, text); err != nil {
 		return fmt.Errorf("send: %w", err)
+	}
+	return nil
+}
+
+// RunMedia valida las entradas, recupera la DEK de custodia y despacha un ARCHIVO (documento/imagen) al
+// destino (Plan 017 §7). Simétrico a Run: garantiza el borrado de la DEK de RAM al salir (defer zero) y
+// valida ANTES de tocar la custodia. El adaptador descarga la presigned URL (GET sin credenciales) y sube
+// el binario a WhatsApp; el caption viaja embebido en el mismo mensaje (§9.I).
+func (s *Send) RunMedia(ctx context.Context, to, presignedURL, filename, mime, kind, caption string) error {
+	if strings.TrimSpace(to) == "" {
+		return ErrEmptyRecipient
+	}
+	if strings.TrimSpace(presignedURL) == "" {
+		return ErrEmptyMediaURL
+	}
+
+	dek, err := s.custody.Load()
+	if err != nil {
+		return fmt.Errorf("send: cargar DEK de custodia: %w", err)
+	}
+	defer zeroBytes(dek)
+
+	if err := s.sender.SendMedia(ctx, dek, to, presignedURL, filename, mime, kind, caption); err != nil {
+		return fmt.Errorf("send media: %w", err)
 	}
 	return nil
 }

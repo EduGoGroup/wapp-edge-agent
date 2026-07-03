@@ -58,8 +58,9 @@ func NewLogMux(log logger.Logger) *LogMux {
 	return &LogMux{log: log}
 }
 
-// Register es un no-op: el LogMux no gatea lease ni mantiene estado por sesión (solo loguea).
-func (m *LogMux) Register(sessionID string, _ func(ctx context.Context, commandID, to, text string) error, _ func() bool) {
+// Register es un no-op: el LogMux no gatea lease ni mantiene estado por sesión (solo loguea). Acepta el
+// emisor de media (Plan 017) por firma, sin usarlo (diagnóstico sin reenvío).
+func (m *LogMux) Register(sessionID string, _ func(ctx context.Context, commandID, to, text string) error, _ func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error, _ func() bool) {
 	m.log.Info("CloudLink (LogMux): sesión registrada para diagnóstico (sin reenvío a la nube)", "session_id", sessionID)
 }
 

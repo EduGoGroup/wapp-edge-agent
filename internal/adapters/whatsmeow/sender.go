@@ -26,6 +26,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -49,6 +51,13 @@ const (
 	defaultFlushDelay = 1500 * time.Millisecond
 	// waServer es el sufijo del JID de usuario de WhatsApp cuando `to` viene como dígitos crudos.
 	waServer = "s.whatsapp.net"
+	// defaultDownloadTimeout acota la descarga del binario desde la presigned URL (Plan 017 §7). El
+	// Edge baja el archivo con net/http normal (SIN credenciales, SIN SDK S3): la URL prefirmada ES la
+	// capability. Un timeout evita que una URL lenta/colgada bloquee el ciclo de envío.
+	defaultDownloadTimeout = 30 * time.Second
+	// mediaKindImage es el discriminador (string) que la nube envía para elegir la rama ImageMessage;
+	// cualquier otro valor (incluido "document" y el UNSPECIFIED del proto) cae a DocumentMessage.
+	mediaKindImage = "image"
 )
 
 // Sender implementa app.Sender sobre whatsmeow efímero.
@@ -76,10 +85,27 @@ type dispatchFunc func(ctx context.Context, device *store.Device, msg outgoing, 
 
 var _ app.Sender = (*Sender)(nil)
 
-// outgoing describe un mensaje de texto listo para enviar a un JID destino, ya conectado el cliente.
+// outgoing describe un mensaje listo para enviar a un JID destino, ya conectado el cliente. text y los
+// campos media* son mutuamente excluyentes: si mediaData != nil es un envío de ARCHIVO (Document/Image
+// según kind), si no, un envío de TEXTO (Conversation). El caption viaja EMBEBIDO en el mismo mensaje
+// del archivo (Plan 017 §9.I), no como un segundo mensaje de texto.
 type outgoing struct {
 	to   types.JID
 	text string
+
+	// media (Plan 017 §7, re-portado de EduGo): binario YA descargado de la presigned URL por el Edge
+	// (GET sin credenciales). nil => envío de texto.
+	mediaData []byte
+	filename  string // nombre visible en WhatsApp (DocumentMessage.Title/FileName).
+	mime      string // "application/pdf", "image/png", …
+	kind      string // "document" | "image" (mediaKindImage discrimina la rama).
+	caption   string // texto descriptivo embebido (Document/Image Caption).
+}
+
+// mediaUploader abstrae client.Upload para poder testear buildMediaMessage con un fake sin socket real.
+// *wm.Client lo satisface (Upload(ctx, plaintext, appInfo) (UploadResponse, error)).
+type mediaUploader interface {
+	Upload(ctx context.Context, plaintext []byte, appInfo wm.MediaType) (wm.UploadResponse, error)
 }
 
 // NewSender construye el adaptador real sobre la BD propia del Edge (store cifrado por envío). La BD
@@ -116,6 +142,54 @@ func (s *Sender) SendText(ctx context.Context, dek []byte, to, text string) erro
 		return err
 	}
 	return s.dispatch(ctx, device, outgoing{to: toJID, text: text}, s.connectTimeout, s.flushDelay)
+}
+
+// SendMedia envía un ARCHIVO (documento/imagen) a `to` por el ciclo efímero, descifrando el store con
+// `dek`. Antes del envío DESCARGA el binario de la presigned URL con net/http normal (SIN credenciales,
+// SIN SDK S3): la URL prefirmada ES la capability (Plan 017 §7, zero-knowledge). El caption viaja
+// embebido en el mismo mensaje (§9.I). La DEK NO cifra el media (solo descifra el store); se conserva en
+// la firma por simetría con SendText.
+func (s *Sender) SendMedia(ctx context.Context, dek []byte, to, presignedURL, filename, mime, kind, caption string) error {
+	device, err := s.loadDevice(ctx, dek)
+	if err != nil {
+		return err
+	}
+	toJID, err := parseRecipient(to)
+	if err != nil {
+		return err
+	}
+	data, err := downloadMedia(ctx, presignedURL)
+	if err != nil {
+		return err
+	}
+	return s.dispatch(ctx, device, outgoing{
+		to: toJID, mediaData: data, filename: filename, mime: mime, kind: kind, caption: caption,
+	}, s.connectTimeout, s.flushDelay)
+}
+
+// downloadMedia baja el binario de la presigned URL con un net/http normal, SIN credenciales ni SDK S3
+// (Plan 017 §7): la URL prefirmada de corta vida transporta la autorización; el Edge NUNCA ve las claves
+// R2. Acota con un timeout propio (no derriba el ciclo de escucha) y falla claro ante status != 200.
+func downloadMedia(ctx context.Context, rawURL string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, defaultDownloadTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: construir GET de media: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: descargar media: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("whatsapp: descargar media: status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: leer media: %w", err)
+	}
+	return data, nil
 }
 
 // realLoadDevice es el loader PRODUCTIVO: construye el container cifrado con la DEK, resuelve el JID
@@ -163,10 +237,66 @@ func parseRecipient(to string) (types.JID, error) {
 	return jid, nil
 }
 
-// buildMessage arma el *waE2E.Message de TEXTO (Conversation). Recorte respecto a EduGo: sin rama
-// de PDF/Upload (el spike solo envía texto, RF-4).
+// buildMessage arma el *waE2E.Message de TEXTO (Conversation). La rama de media vive en
+// buildMediaMessage (necesita el cliente para Upload); messageFor elige según outgoing.
 func buildMessage(msg outgoing) *waE2E.Message {
 	return &waE2E.Message{Conversation: proto.String(msg.text)}
+}
+
+// messageFor elige el *waE2E.Message según el outgoing: si trae media la sube (Upload) y arma
+// Document/Image; si no, un Conversation de texto. Comparte la rama de media entre el ciclo efímero
+// (realDispatch) y el envío por cliente vivo (ListenGateway.SendMediaViaLiveClientTracked).
+func messageFor(ctx context.Context, up mediaUploader, msg outgoing) (*waE2E.Message, error) {
+	if msg.mediaData != nil {
+		return buildMediaMessage(ctx, up, msg)
+	}
+	return buildMessage(msg), nil
+}
+
+// mediaTypeForKind mapea el discriminador (string) al MediaType de whatsmeow para el Upload y devuelve
+// si la rama es imagen. "image" → MediaImage; cualquier otro valor (incluido "document" y el
+// UNSPECIFIED del proto) → MediaDocument (caso por defecto: PDF).
+func mediaTypeForKind(kind string) (mt wm.MediaType, isImage bool) {
+	if kind == mediaKindImage {
+		return wm.MediaImage, true
+	}
+	return wm.MediaDocument, false
+}
+
+// buildMediaMessage sube el binario (client.Upload, MediaDocument/MediaImage) y arma el DocumentMessage
+// (PDF) o ImageMessage con los campos del UploadResponse (URL/DirectPath/MediaKey/hashes/FileLength).
+// Copia-adaptación de edugo-api-messaging (rama PDF); el Caption embebido (§9.I) y la rama ImageMessage
+// son NUEVOS respecto a EduGo. whatsmeow cifra el binario con su MediaKey para el destinatario.
+func buildMediaMessage(ctx context.Context, up mediaUploader, msg outgoing) (*waE2E.Message, error) {
+	mt, isImage := mediaTypeForKind(msg.kind)
+	upload, err := up.Upload(ctx, msg.mediaData, mt)
+	if err != nil {
+		return nil, fmt.Errorf("whatsapp: subir media: %w", err)
+	}
+	if isImage {
+		return &waE2E.Message{ImageMessage: &waE2E.ImageMessage{
+			URL:           proto.String(upload.URL),
+			DirectPath:    proto.String(upload.DirectPath),
+			MediaKey:      upload.MediaKey,
+			FileEncSHA256: upload.FileEncSHA256,
+			FileSHA256:    upload.FileSHA256,
+			FileLength:    proto.Uint64(upload.FileLength),
+			Mimetype:      proto.String(msg.mime),
+			Caption:       proto.String(msg.caption),
+		}}, nil
+	}
+	return &waE2E.Message{DocumentMessage: &waE2E.DocumentMessage{
+		Title:         proto.String(msg.filename),
+		FileName:      proto.String(msg.filename),
+		Mimetype:      proto.String(msg.mime),
+		Caption:       proto.String(msg.caption),
+		URL:           proto.String(upload.URL),
+		DirectPath:    proto.String(upload.DirectPath),
+		MediaKey:      upload.MediaKey,
+		FileEncSHA256: upload.FileEncSHA256,
+		FileSHA256:    upload.FileSHA256,
+		FileLength:    proto.Uint64(upload.FileLength),
+	}}, nil
 }
 
 // realDispatch es el ciclo efímero PRODUCTIVO sobre whatsmeow. No se ejercita en los tests de este
@@ -195,7 +325,11 @@ func realDispatch(ctx context.Context, device *store.Device, msg outgoing, conne
 		return fmt.Errorf("whatsapp: la conexión efímera expiró tras %s", connectTimeout)
 	}
 
-	if _, err := client.SendMessage(ctx, msg.to, buildMessage(msg)); err != nil {
+	waMsg, err := messageFor(ctx, client, msg)
+	if err != nil {
+		return err
+	}
+	if _, err := client.SendMessage(ctx, msg.to, waMsg); err != nil {
 		return fmt.Errorf("whatsapp: enviar mensaje: %w", err)
 	}
 	return nil

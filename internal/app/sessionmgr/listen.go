@@ -54,10 +54,14 @@ type listenFactory func(ctx context.Context, s *liveSession) (listenRunner, io.C
 // (ADR-0016 §5) lo mantiene el propio mux: el Manager no conoce lease ni proto (lo satisface el Adapter
 // real de cloudlink, o el LogMux de diagnóstico). Interfaz estructural: sessionmgr no importa cloudlink.
 type CloudLinkMux interface {
-	// Register da de alta una sesión en el multiplex (register-on-start): send es su emisor por cliente
-	// vivo (recibe el command_id del envío para la correlación del acuse, Plan 013 §10.E), hasDEK la
-	// presencia de la DEK (gate 2-de-2). El mux construye el estado de lease de la sesión.
-	Register(sessionID string, send func(ctx context.Context, commandID, to, text string) error, hasDEK func() bool)
+	// Register da de alta una sesión en el multiplex (register-on-start): send es su emisor de TEXTO por
+	// cliente vivo y sendMedia su emisor de ARCHIVOS (Plan 017 §7; ambos reciben el command_id del envío
+	// para la correlación del acuse, Plan 013 §10.E), hasDEK la presencia de la DEK (gate 2-de-2). El mux
+	// construye el estado de lease de la sesión.
+	Register(sessionID string,
+		send func(ctx context.Context, commandID, to, text string) error,
+		sendMedia func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error,
+		hasDEK func() bool)
 	// Unregister da de baja la sesión (unregister-on-unlink): sus comandos posteriores se ignoran.
 	Unregister(sessionID string)
 	// SinkFor devuelve el sink de SALIDA (entrantes->cloud) etiquetado con session_id.
@@ -106,6 +110,14 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// que el acuse posterior suba etiquetado con su command_id.
 			s.setLiveSender(func(ctx context.Context, commandID, to, text string) error {
 				_, err := gateway.SendViaLiveClientTracked(ctx, commandID, to, text)
+				return err
+			})
+			// Rota también el emisor de ARCHIVOS de ESTE ciclo (Plan 017 §7): el mux tiene registrado
+			// s.sendViaMedia (indirección estable). SendMediaViaLiveClientTracked descarga la presigned URL
+			// (GET sin credenciales) y sube el binario por el MISMO cliente vivo, correlacionando por
+			// command_id para el acuse (Plan 013).
+			s.setLiveMediaSender(func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error {
+				_, err := gateway.SendMediaViaLiveClientTracked(ctx, commandID, to, presignedURL, filename, mime, kind, caption)
 				return err
 			})
 			// Cablea la SALIDA de acuses de ESTA sesión (Plan 013 T2a): al llegar un events.Receipt, se
@@ -186,7 +198,7 @@ func (m *Manager) startListener(s *liveSession) {
 	// sendVia es la indirección estable al cliente vivo (lo rota el factory en cada ciclo); custody.Exists
 	// alimenta el gate 2-de-2 por sesión. nil en tests que cablean newListener sin mux.
 	if m.cloudMux != nil {
-		m.cloudMux.Register(s.meta.SessionID, s.sendVia, s.custody.Exists)
+		m.cloudMux.Register(s.meta.SessionID, s.sendVia, s.sendViaMedia, s.custody.Exists)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.arm(cancel)

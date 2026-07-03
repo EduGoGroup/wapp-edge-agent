@@ -56,7 +56,7 @@ func newSealHarness(t *testing.T, ctx context.Context, opts ...Option) *e2eHarne
 	log := sharedlogger.New(sharedlogger.WithWriter(discardWriter{}), sharedlogger.WithJSON(true))
 	adapter := NewAdapter(cc, log, nil, append([]Option{WithHeartbeatInterval(time.Hour)}, opts...)...)
 
-	h := &e2eHarness{srv: srv, adapter: adapter, sent: make(map[string]chan sendCall)}
+	h := &e2eHarness{srv: srv, adapter: adapter, sent: make(map[string]chan sendCall), sentMedia: make(map[string]chan mediaCall)}
 	h.register(sealSessionID)
 	go func() { _ = adapter.Run(ctx) }()
 	select {

@@ -11,11 +11,16 @@ import (
 
 // fakeSender registra lo que recibió SendText y permite forzar un error.
 type fakeSender struct {
-	called  bool
-	gotDEK  []byte
-	gotTo   string
-	gotText string
-	sendErr error
+	called      bool
+	gotDEK      []byte
+	gotTo       string
+	gotText     string
+	gotMediaURL string
+	gotFilename string
+	gotMime     string
+	gotKind     string
+	gotCaption  string
+	sendErr     error
 }
 
 func (f *fakeSender) SendText(_ context.Context, dek []byte, to, text string) error {
@@ -24,6 +29,19 @@ func (f *fakeSender) SendText(_ context.Context, dek []byte, to, text string) er
 	f.gotDEK = append([]byte(nil), dek...)
 	f.gotTo = to
 	f.gotText = text
+	return f.sendErr
+}
+
+// SendMedia satisface el puerto app.Sender (Plan 017); registra lo recibido para las aserciones.
+func (f *fakeSender) SendMedia(_ context.Context, dek []byte, to, presignedURL, filename, mime, kind, caption string) error {
+	f.called = true
+	f.gotDEK = append([]byte(nil), dek...)
+	f.gotTo = to
+	f.gotMediaURL = presignedURL
+	f.gotFilename = filename
+	f.gotMime = mime
+	f.gotKind = kind
+	f.gotCaption = caption
 	return f.sendErr
 }
 

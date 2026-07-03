@@ -88,6 +88,11 @@ type liveSession struct {
 	// previo. nil entre ciclos / antes del primer Connect: sendVia devuelve ErrNoLiveSender. Recibe el
 	// command_id del envío (Plan 013 §10.E) para alimentar la correlación command_id ↔ MessageID.
 	liveSend func(ctx context.Context, commandID, to, text string) error
+	// liveMediaSend es el emisor de ARCHIVOS por cliente vivo (Plan 017 §7), hermano de liveSend: lo rota
+	// el factory del listener en cada ciclo apuntando al gateway recién creado. El multiplex registra
+	// sendViaMedia (indirección estable). nil entre ciclos / antes del primer Connect: sendViaMedia
+	// devuelve ErrNoLiveSender.
+	liveMediaSend func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error
 }
 
 // setLiveSender publica (o limpia con nil) el emisor por cliente vivo de ESTE ciclo de escucha. Lo
@@ -109,6 +114,27 @@ func (s *liveSession) sendVia(ctx context.Context, commandID, to, text string) e
 		return ErrNoLiveSender
 	}
 	return fn(ctx, commandID, to, text)
+}
+
+// setLiveMediaSender publica (o limpia con nil) el emisor de ARCHIVOS por cliente vivo de ESTE ciclo de
+// escucha (Plan 017 §7). Hermano de setLiveSender; lo invoca el factory del listener en cada (re)conexión.
+func (s *liveSession) setLiveMediaSender(fn func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error) {
+	s.mu.Lock()
+	s.liveMediaSend = fn
+	s.mu.Unlock()
+}
+
+// sendViaMedia despacha un ARCHIVO por el cliente vivo ACTUAL de la sesión (indirección estable que el
+// multiplex registra una vez), propagando el command_id para la correlación del acuse (Plan 013 §10.E). Si
+// no hay ciclo de escucha activo (liveMediaSend nil), devuelve ErrNoLiveSender.
+func (s *liveSession) sendViaMedia(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error {
+	s.mu.Lock()
+	fn := s.liveMediaSend
+	s.mu.Unlock()
+	if fn == nil {
+		return ErrNoLiveSender
+	}
+	return fn(ctx, commandID, to, presignedURL, filename, mime, kind, caption)
 }
 
 // arm prepara la sesión para su goroutine listener bajo lock: guarda su cancel (apagado ordenado /

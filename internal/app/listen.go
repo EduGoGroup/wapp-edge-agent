@@ -60,6 +60,11 @@ type LiveSender interface {
 	// que, al llegar el events.Receipt, el acuse se etiquete con el command_id original. Devuelve el
 	// MessageID del envío. Es el camino que alimenta la subida de acuses correlacionados (T2a).
 	SendViaLiveClientTracked(ctx context.Context, commandID, to, text string) (string, error)
+	// SendMediaViaLiveClientTracked despacha un ARCHIVO (documento/imagen) por el cliente vivo (Plan 017
+	// §7): DESCARGA el binario de la presigned URL (GET sin credenciales), lo sube a WhatsApp y despacha
+	// el Document/Image con el caption embebido. Correlaciona con el command_id igual que el de texto.
+	// Devuelve el MessageID del envío.
+	SendMediaViaLiveClientTracked(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) (string, error)
 }
 
 // Listen es el caso de uso. Sus dependencias son puertos (interfaces) para inyectar fakes en tests.

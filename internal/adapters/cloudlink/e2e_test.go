@@ -93,6 +93,10 @@ const e2eSessionID = "sess-t6"
 
 type sendCall struct{ commandID, to, text string }
 
+// mediaCall captura lo que el sendMediaFunc fake recibió (Plan 017): metadatos del archivo + presigned URL
+// (que en producción el despachador DESCARGA; el fake solo verifica el cableado del gate y del demux).
+type mediaCall struct{ commandID, to, url, filename, mime, kind, caption string }
+
 // e2eHarness cablea el Adapter MULTIPLEXOR real (cliente) contra el server-double (bufconn + insecure),
 // igual patrón que los tests de transporte de cloudlink. Registra una o varias sesiones y captura por
 // session_id lo que cada sendFunc fake despacha, para verificar el demux de entrada por sesión.
@@ -101,8 +105,9 @@ type e2eHarness struct {
 	stream  cloudlinkv1.CloudLink_ConnectServer
 	adapter *Adapter
 
-	mu   sync.Mutex
-	sent map[string]chan sendCall // session_id -> capturas (to,text) del sendFunc fake de esa sesión
+	mu        sync.Mutex
+	sent      map[string]chan sendCall  // session_id -> capturas (to,text) del sendFunc fake de esa sesión
+	sentMedia map[string]chan mediaCall // session_id -> capturas del sendMediaFunc fake de esa sesión
 }
 
 // newE2EHarness arma el multiplexor con el factory de Validator dado (nil => sin gate de lease) y
@@ -137,7 +142,7 @@ func newE2EHarness(t *testing.T, ctx context.Context, newValidator ValidatorFact
 	// conectar, el adapter emite el heartbeat inicial de cada una.
 	adapter := NewAdapter(cc, log, newValidator, WithHeartbeatInterval(time.Hour))
 
-	h := &e2eHarness{srv: srv, adapter: adapter, sent: make(map[string]chan sendCall)}
+	h := &e2eHarness{srv: srv, adapter: adapter, sent: make(map[string]chan sendCall), sentMedia: make(map[string]chan mediaCall)}
 	for _, id := range sessionIDs {
 		h.register(id)
 	}
@@ -158,11 +163,16 @@ func newE2EHarness(t *testing.T, ctx context.Context, newValidator ValidatorFact
 // canal y hasDEK=true (gate 2-de-2: la parte DEK presente).
 func (h *e2eHarness) register(sessionID string) {
 	ch := make(chan sendCall, 8)
+	mch := make(chan mediaCall, 8)
 	h.mu.Lock()
 	h.sent[sessionID] = ch
+	h.sentMedia[sessionID] = mch
 	h.mu.Unlock()
 	h.adapter.Register(sessionID, func(_ context.Context, commandID, to, text string) error {
 		ch <- sendCall{commandID: commandID, to: to, text: text}
+		return nil
+	}, func(_ context.Context, commandID, to, url, filename, mime, kind, caption string) error {
+		mch <- mediaCall{commandID: commandID, to: to, url: url, filename: filename, mime: mime, kind: kind, caption: caption}
 		return nil
 	}, func() bool { return true })
 }
@@ -172,6 +182,13 @@ func (h *e2eHarness) sentCh(sessionID string) chan sendCall {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.sent[sessionID]
+}
+
+// sentMediaCh devuelve el canal de capturas de envío de MEDIA de la sesión.
+func (h *e2eHarness) sentMediaCh(sessionID string) chan mediaCall {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sentMedia[sessionID]
 }
 
 // --- test e2e -----------------------------------------------------------------------------------
@@ -338,6 +355,116 @@ func TestE2E_CloudLinkAdapter_Flow(t *testing.T) {
 		select {
 		case sc := <-h.sentCh(e2eSessionID):
 			t.Fatalf("el Sender fue invocado pese al lease revocado: (%q,%q)", sc.to, sc.text)
+		default:
+		}
+	})
+}
+
+// TestE2E_CloudLinkAdapter_SendMedia ancla el cableado del comando SendMedia (Plan 017 §7) en el Adapter
+// real: (a) con lease VIGENTE, un CloudToEdge{SendMedia} invoca al sendMediaFunc de la sesión con los
+// metadatos correctos (to/filename/mime/caption + kind mapeado del MediaKind) y responde Ack{ok=true}; la
+// presigned URL se propaga tal cual (el despachador la DESCARGA, aquí solo se verifica el demux); (b) con
+// lease REVOCADO el emisor de media NO se invoca (kill-switch) y el Ack es {ok=false}.
+func TestE2E_CloudLinkAdapter_SendMedia(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	issuer, err := lease.NewIssuer(priv)
+	if err != nil {
+		t.Fatalf("NewIssuer: %v", err)
+	}
+	newValidator := func() *lease.Validator { return lease.NewValidator(pub) }
+
+	h := newE2EHarness(t, ctx, newValidator, e2eSessionID)
+
+	// Lease vigente para habilitar el envío de media.
+	luOK, err := issuer.Issue("edge-1", "tenant-1", time.Hour, 1)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+		CommandId: "cmd-lease-ok",
+		SessionId: e2eSessionID,
+		Payload:   &cloudlinkv1.CloudToEdge_LeaseUpdate{LeaseUpdate: luOK},
+	})
+
+	t.Run("sendmedia_document_ack_ok", func(t *testing.T) {
+		const cmdID = "cmd-media-ok"
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: cmdID,
+			SessionId: e2eSessionID,
+			Payload: &cloudlinkv1.CloudToEdge_SendMedia{SendMedia: &cloudlinkv1.SendMedia{
+				To:       "5491100000000",
+				Caption:  "acá va la lista de precios",
+				Mime:     "application/pdf",
+				Filename: "Lista de precios.pdf",
+				Kind:     cloudlinkv1.MediaKind_MEDIA_KIND_DOCUMENT,
+				Src:      &cloudlinkv1.SendMedia_PresignedUrl{PresignedUrl: "https://r2.example/wapp/media/lista.pdf?sig=abc"},
+			}},
+		})
+
+		select {
+		case mc := <-h.sentMediaCh(e2eSessionID):
+			if mc.to != "5491100000000" || mc.filename != "Lista de precios.pdf" || mc.mime != "application/pdf" {
+				t.Errorf("media invocada con metadatos inesperados: %+v", mc)
+			}
+			if mc.kind != "document" {
+				t.Errorf("kind: got %q want document", mc.kind)
+			}
+			if mc.caption != "acá va la lista de precios" {
+				t.Errorf("caption: got %q", mc.caption)
+			}
+			if mc.url != "https://r2.example/wapp/media/lista.pdf?sig=abc" {
+				t.Errorf("presigned URL no propagada tal cual: %q", mc.url)
+			}
+			if mc.commandID != cmdID {
+				t.Errorf("command_id propagado: got %q want %q", mc.commandID, cmdID)
+			}
+		case <-ctx.Done():
+			t.Fatalf("timeout: el emisor de media no fue invocado: %v", ctx.Err())
+		}
+
+		ack := recvAck(t, ctx, h.srv, cmdID)
+		if !ack.GetOk() {
+			t.Errorf("Ack.ok: got false (err=%q) want true", ack.GetError())
+		}
+	})
+
+	t.Run("lease_revoked_blocks_sendmedia", func(t *testing.T) {
+		luRevoke, err := issuer.Revoke("edge-1", "tenant-1")
+		if err != nil {
+			t.Fatalf("Revoke: %v", err)
+		}
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: "cmd-lease-revoke",
+			SessionId: e2eSessionID,
+			Payload:   &cloudlinkv1.CloudToEdge_LeaseUpdate{LeaseUpdate: luRevoke},
+		})
+
+		const cmdID = "cmd-media-blocked"
+		pushCloud(t, h.stream, &cloudlinkv1.CloudToEdge{
+			CommandId: cmdID,
+			SessionId: e2eSessionID,
+			Payload: &cloudlinkv1.CloudToEdge_SendMedia{SendMedia: &cloudlinkv1.SendMedia{
+				To:       "5491100000000",
+				Mime:     "image/png",
+				Filename: "orden.png",
+				Kind:     cloudlinkv1.MediaKind_MEDIA_KIND_IMAGE,
+				Src:      &cloudlinkv1.SendMedia_PresignedUrl{PresignedUrl: "https://r2.example/x"},
+			}},
+		})
+
+		ack := recvAck(t, ctx, h.srv, cmdID)
+		if ack.GetOk() {
+			t.Errorf("Ack.ok: got true want false (lease revocado debe bloquear el media)")
+		}
+		select {
+		case mc := <-h.sentMediaCh(e2eSessionID):
+			t.Fatalf("el emisor de media fue invocado pese al lease revocado: %+v", mc)
 		default:
 		}
 	})

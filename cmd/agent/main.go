@@ -473,11 +473,18 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	// cliente efímero aparte reemplazaría la conexión y dejaría la escucha sorda. Si el gateway no
 	// expone un emisor vivo (defensivo), cae al sender efímero (NewClient+Connect+Disconnect por envío).
 	var sendFunc func(ctx context.Context, commandID, to, text string) error
+	var sendMediaFunc func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error
 	if liveSender, ok := any(gateway).(app.LiveSender); ok && gateway != nil {
 		// Variante TRACKED (Plan 013 §10.E): el envío puebla el Correlator del gateway con el command_id
 		// para que el acuse posterior suba correlacionado.
 		sendFunc = func(ctx context.Context, commandID, to, text string) error {
 			_, err := liveSender.SendViaLiveClientTracked(ctx, commandID, to, text)
+			return err
+		}
+		// Emisor de ARCHIVOS por cliente vivo (Plan 017 §7): descarga la presigned URL (GET sin
+		// credenciales) y sube el binario por la misma conexión, correlacionando por command_id.
+		sendMediaFunc = func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error {
+			_, err := liveSender.SendMediaViaLiveClientTracked(ctx, commandID, to, presignedURL, filename, mime, kind, caption)
 			return err
 		}
 		log.Info("CloudLink: el envío reutilizará el CLIENTE VIVO de la escucha (conexión única por sesión)")
@@ -486,13 +493,16 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 		// ignora y el acuse subiría como estado crudo.
 		sendUC := app.NewSend(custody, waconn.NewSender(database))
 		sendFunc = func(ctx context.Context, _ /*commandID*/, to, text string) error { return sendUC.Run(ctx, to, text) }
+		sendMediaFunc = func(ctx context.Context, _ /*commandID*/, to, presignedURL, filename, mime, kind, caption string) error {
+			return sendUC.RunMedia(ctx, to, presignedURL, filename, mime, kind, caption)
+		}
 	}
 
 	// El Adapter es un multiplexor (un stream por Edge). El camino legacy single-sesión registra LA
 	// única sesión (cfg.CloudLink.SessionID) y usa SU sink etiquetado; la mecánica de mux es idéntica a
 	// la del daemon multi-sesión (runServe), solo que aquí hay una sola sesión.
 	adapter := cloudlink.NewAdapter(cc, log, newValidator, cloudlink.WithCloudEncPubKey(cloudEncPub))
-	adapter.Register(cfg.CloudLink.SessionID, sendFunc, custody.Exists)
+	adapter.Register(cfg.CloudLink.SessionID, sendFunc, sendMediaFunc, custody.Exists)
 	// Acuses (Plan 013 T2a): al llegar un events.Receipt, etiqueta con el session_id, correlaciona con el
 	// command_id del envío (Correlator del gateway vivo) y sube el MessageReceipt por el mismo stream.
 	sid := cfg.CloudLink.SessionID

@@ -58,6 +58,13 @@ import (
 // así el acuse (events.Receipt) posterior se puede etiquetar con ese command_id al subirlo.
 type SendFunc = func(ctx context.Context, commandID, to, text string) error
 
+// SendMediaFunc es el callback de envío de ARCHIVOS (Plan 017 §7), hermano de SendFunc para media: el
+// wiring lo conecta al despachador de media del cliente vivo (SendMediaViaLiveClientTracked). El adaptador
+// lo invoca al recibir un SendMedia para ESA sesión (tras pasar el gate de lease), pasándole el command_id
+// (para la correlación del acuse) y los metadatos del archivo; la presigned URL la DESCARGA el despachador
+// (GET sin credenciales), no viaja binario por gRPC.
+type SendMediaFunc = func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error
+
 // ValidatorFactory construye un lease.Validator FRESCO (estado independiente) para UNA sesión, o nil si
 // el gate de lease está desactivado (sin clave pública). Todas las sesiones del Edge comparten la MISMA
 // clave pública del servidor, pero cada una mantiene su PROPIO estado de lease (lease por sesión,
@@ -67,10 +74,11 @@ type ValidatorFactory func() *lease.Validator
 // sessionEntry es el estado por sesión dentro del multiplex: su emisor por cliente vivo, su Validator de
 // lease (propio) y su contador de heartbeat. El Adapter lo crea en Register y lo descarta en Unregister.
 type sessionEntry struct {
-	sendFunc  SendFunc
-	validator *lease.Validator // nil => sin gate de lease para esta sesión
-	hasDEK    func() bool      // proveedor del booleano del gate 2-de-2 (p.ej. custody.Exists)
-	leaseCtr  atomic.Int64     // contador de heartbeat de ESTA sesión (ancla de renovación)
+	sendFunc      SendFunc
+	sendMediaFunc SendMediaFunc    // emisor de ARCHIVOS por cliente vivo (Plan 017); nil => media no soportada
+	validator     *lease.Validator // nil => sin gate de lease para esta sesión
+	hasDEK        func() bool      // proveedor del booleano del gate 2-de-2 (p.ej. custody.Exists)
+	leaseCtr      atomic.Int64     // contador de heartbeat de ESTA sesión (ancla de renovación)
 }
 
 // Adapter gestiona el único stream Connect contra la nube y multiplexa N sesiones por session_id.
@@ -138,16 +146,17 @@ func NewAdapter(cc grpc.ClientConnInterface, log logger.Logger, newValidator Val
 	return a
 }
 
-// Register da de alta una sesión en el multiplex: send es su emisor por cliente vivo (lo conecta el
-// wiring al cliente VIVO de la escucha de esa sesión), hasDEK reporta la presencia de la DEK (gate
+// Register da de alta una sesión en el multiplex: send es su emisor de TEXTO por cliente vivo y sendMedia
+// su emisor de ARCHIVOS (Plan 017; nil => media no soportada por esa sesión), ambos conectados por el
+// wiring al cliente VIVO de la escucha de esa sesión; hasDEK reporta la presencia de la DEK (gate
 // 2-de-2). El Adapter construye un Validator de lease PROPIO para la sesión (estado independiente). Si
 // el stream ya está vivo, ancla la sesión con su Heartbeat inicial. Idempotente: re-registrar reemplaza
 // la entrada (reinicia su estado de lease/contador).
-func (a *Adapter) Register(sessionID string, send SendFunc, hasDEK func() bool) {
+func (a *Adapter) Register(sessionID string, send SendFunc, sendMedia SendMediaFunc, hasDEK func() bool) {
 	if hasDEK == nil {
 		hasDEK = func() bool { return true }
 	}
-	entry := &sessionEntry{sendFunc: send, hasDEK: hasDEK}
+	entry := &sessionEntry{sendFunc: send, sendMediaFunc: sendMedia, hasDEK: hasDEK}
 	if a.newValidator != nil {
 		entry.validator = a.newValidator()
 	}
@@ -438,6 +447,8 @@ func (a *Adapter) handleCommand(ctx context.Context, cl *client.Client, c2e *clo
 	switch {
 	case c2e.GetSendText() != nil:
 		a.handleSendText(ctx, cl, sid, e, c2e.GetCommandId(), c2e.GetSendText())
+	case c2e.GetSendMedia() != nil:
+		a.handleSendMedia(ctx, cl, sid, e, c2e.GetCommandId(), c2e.GetSendMedia())
 	case c2e.GetLeaseUpdate() != nil:
 		a.handleLeaseUpdate(sid, e, c2e.GetLeaseUpdate())
 	case c2e.GetPing() != nil:
@@ -468,6 +479,45 @@ func (a *Adapter) handleSendText(ctx context.Context, cl *client.Client, sid str
 		return
 	}
 	a.ack(cl, sid, cmdID, true, "")
+}
+
+// handleSendMedia aplica el gate de lease de ESA sesión (idéntico a handleSendText) y, si procede, despacha
+// el ARCHIVO vía su sendMediaFunc (Plan 017 §7), respondiendo con Ack. Si el lease no está vigente NO invoca
+// el emisor (kill-switch) y responde Ack{ok=false}. Si la sesión no tiene emisor de media (sendMediaFunc
+// nil), responde Ack{ok=false} sin paniquear. El discriminador MediaKind del proto se mapea a "document"/
+// "image"; la presigned URL la DESCARGA el despachador (GET sin credenciales), no viaja binario por gRPC.
+func (a *Adapter) handleSendMedia(ctx context.Context, cl *client.Client, sid string, e *sessionEntry, cmdID string, sm *cloudlinkv1.SendMedia) {
+	if e.validator != nil && !e.validator.CanOperate(e.hasDEK()) {
+		a.log.Warn("CloudLink: SendMedia BLOQUEADO por lease no vigente (kill-switch)",
+			"command_id", cmdID, "session_id", sid)
+		a.ack(cl, sid, cmdID, false, "lease no vigente")
+		return
+	}
+	if e.sendMediaFunc == nil {
+		a.log.Warn("CloudLink: SendMedia sin emisor de media configurado para la sesión (ignorado)",
+			"command_id", cmdID, "session_id", sid)
+		a.ack(cl, sid, cmdID, false, "media no soportada por esta sesión")
+		return
+	}
+	kind := mediaKindToString(sm.GetKind())
+	if err := e.sendMediaFunc(ctx, cmdID, sm.GetTo(), sm.GetPresignedUrl(), sm.GetFilename(), sm.GetMime(), kind, sm.GetCaption()); err != nil {
+		a.log.Error("CloudLink: SendMedia falló al despachar", "command_id", cmdID, "session_id", sid, "error", err)
+		a.ack(cl, sid, cmdID, false, err.Error())
+		return
+	}
+	a.ack(cl, sid, cmdID, true, "")
+}
+
+// mediaKindToString mapea el discriminador MediaKind del contrato al string del despachador del Edge
+// (Plan 017 §6): IMAGE→"image"; DOCUMENT y UNSPECIFIED→"document" (caso por defecto: PDF). El mime no
+// basta para elegir la rama Document vs Image, por eso el discriminador explícito.
+func mediaKindToString(k cloudlinkv1.MediaKind) string {
+	switch k {
+	case cloudlinkv1.MediaKind_MEDIA_KIND_IMAGE:
+		return "image"
+	default:
+		return "document"
+	}
 }
 
 // handleLeaseUpdate aplica un LeaseUpdate firmado al Validator de ESA sesión (verifica firma, expiración,
