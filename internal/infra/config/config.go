@@ -69,7 +69,7 @@ type Config struct {
 // CloudLinkConfig agrupa los parámetros del conducto CloudLink. Todos OPCIONALES: con Endpoint vacío
 // no se conecta a la nube (LogSink puro). El material cripto (cert/clave) vive fuera de git (.gitignore).
 type CloudLinkConfig struct {
-	// Endpoint es la dirección gRPC de la plataforma cloud (p.ej. "cloud.wapp.example:8443"). Vacío
+	// Endpoint es la dirección gRPC de la plataforma cloud (p.ej. "cloud.wapp.example:8101"). Vacío
 	// desactiva el conducto real.
 	Endpoint string `yaml:"endpoint"`
 	// SessionID identifica la sesión/teléfono dentro del Edge (multiplexado, ADR-0008).
@@ -90,7 +90,7 @@ type CloudLinkConfig struct {
 	// reenviarlos; si no, va el fallback claro (§10.H). Persistida en base64 (una línea).
 	CloudEncPubKeyPath string `yaml:"cloud_enc_pubkey_path"`
 	// EnrollmentEndpoint es la dirección gRPC del servidor de enrolamiento del Gateway (subcomando
-	// `enroll`). En dev suele ser un puerto distinto al de Connect (p.ej. "localhost:8444"). El dial de
+	// `enroll`). En dev suele ser un puerto distinto al de Connect (p.ej. "localhost:8102"). El dial de
 	// enrolamiento usa TLS-de-servidor (NO mTLS): valida al Gateway con TLSCA. Vacío desactiva `enroll`.
 	EnrollmentEndpoint string `yaml:"enrollment_endpoint"`
 	// ActivationCode es el código de activación emitido por el Gateway para autorizar el enrolamiento.
