@@ -3,7 +3,7 @@ module github.com/EduGoGroup/wapp-edge-agent
 go 1.26.0
 
 require (
-	github.com/EduGoGroup/wapp-cloudlink v0.4.0
+	github.com/EduGoGroup/wapp-cloudlink v0.5.0
 	github.com/EduGoGroup/wapp-shared/config v0.1.0
 	github.com/EduGoGroup/wapp-shared/envelope v0.1.0
 	github.com/EduGoGroup/wapp-shared/logger v0.1.0
