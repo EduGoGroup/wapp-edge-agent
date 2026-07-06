@@ -211,6 +211,21 @@ func TestHandleEvent_LoggedOut(t *testing.T) {
 	}
 }
 
+// TestHandleEvent_LoggedOut_HookDispara: si hay hook onLoggedOut cableado (Plan 020 T3), se invoca al
+// recibir *events.LoggedOut (para propagar el estado ZOMBIE al cloud). Sin hook no rompe (test anterior).
+func TestHandleEvent_LoggedOut_HookDispara(t *testing.T) {
+	l := NewListener(&spySink{}, quietLogger())
+	fired := 0
+	l.onLoggedOutHook = func() { fired++ }
+	l.handleEvent(context.Background(), &events.LoggedOut{OnConnect: false})
+	if l.State() != StateLoggedOut {
+		t.Fatalf("estado = %v, quería StateLoggedOut", l.State())
+	}
+	if fired != 1 {
+		t.Fatalf("onLoggedOutHook invocado %d veces, quería 1", fired)
+	}
+}
+
 // TestHandleEvent_Unknown: un evento no contemplado se ignora sin entregar nada ni entrar en pánico.
 func TestHandleEvent_Unknown(t *testing.T) {
 	sink := &spySink{}

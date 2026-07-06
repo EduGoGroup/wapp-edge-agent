@@ -79,6 +79,12 @@ type sessionEntry struct {
 	validator     *lease.Validator // nil => sin gate de lease para esta sesión
 	hasDEK        func() bool      // proveedor del booleano del gate 2-de-2 (p.ej. custody.Exists)
 	leaseCtr      atomic.Int64     // contador de heartbeat de ESTA sesión (ancla de renovación)
+	// selfJID/selfPN identifican el NÚMERO PROPIO de la sesión (Plan 020 T2, anti-self-loop): el JID crudo
+	// del device propio y su número en E.164 SIN '+' (derivado del JID). No son secretos (van en claro por el
+	// mTLS ya cifrado); permiten al Cloud saber a qué número pertenece la sesión al marcarla online. Vacíos si
+	// la sesión aún no está emparejada (JID desconocido): el Cloud tolera vacío.
+	selfJID string
+	selfPN  string
 }
 
 // Adapter gestiona el único stream Connect contra la nube y multiplexa N sesiones por session_id.
@@ -146,17 +152,24 @@ func NewAdapter(cc grpc.ClientConnInterface, log logger.Logger, newValidator Val
 	return a
 }
 
-// Register da de alta una sesión en el multiplex: send es su emisor de TEXTO por cliente vivo y sendMedia
-// su emisor de ARCHIVOS (Plan 017; nil => media no soportada por esa sesión), ambos conectados por el
-// wiring al cliente VIVO de la escucha de esa sesión; hasDEK reporta la presencia de la DEK (gate
-// 2-de-2). El Adapter construye un Validator de lease PROPIO para la sesión (estado independiente). Si
-// el stream ya está vivo, ancla la sesión con su Heartbeat inicial. Idempotente: re-registrar reemplaza
-// la entrada (reinicia su estado de lease/contador).
-func (a *Adapter) Register(sessionID string, send SendFunc, sendMedia SendMediaFunc, hasDEK func() bool) {
+// Register da de alta una sesión en el multiplex: selfJID es el JID crudo del device PROPIO de la sesión
+// (Plan 020 T2; "" si aún sin emparejar) del que se deriva el número propio (E.164 sin '+') que viaja en
+// cada Heartbeat; send es su emisor de TEXTO por cliente vivo y sendMedia su emisor de ARCHIVOS (Plan 017;
+// nil => media no soportada por esa sesión), ambos conectados por el wiring al cliente VIVO de la escucha
+// de esa sesión; hasDEK reporta la presencia de la DEK (gate 2-de-2). El Adapter construye un Validator de
+// lease PROPIO para la sesión (estado independiente). Si el stream ya está vivo, ancla la sesión con su
+// Heartbeat inicial. Idempotente: re-registrar reemplaza la entrada (reinicia su estado de lease/contador).
+func (a *Adapter) Register(sessionID, selfJID string, send SendFunc, sendMedia SendMediaFunc, hasDEK func() bool) {
 	if hasDEK == nil {
 		hasDEK = func() bool { return true }
 	}
-	entry := &sessionEntry{sendFunc: send, sendMediaFunc: sendMedia, hasDEK: hasDEK}
+	entry := &sessionEntry{
+		sendFunc:      send,
+		sendMediaFunc: sendMedia,
+		hasDEK:        hasDEK,
+		selfJID:       selfJID,             // JID crudo del device propio (Plan 020 T2); "" si aún sin emparejar.
+		selfPN:        selfPNFromJID(selfJID), // número propio E.164 sin '+'; "" si el JID no es un número.
+	}
 	if a.newValidator != nil {
 		entry.validator = a.newValidator()
 	}
@@ -376,6 +389,17 @@ func jidServer(jid string) string {
 	return ""
 }
 
+// selfPNFromJID deriva el número PROPIO (E.164 sin '+') del JID del device propio (Plan 020 T2). El JID
+// propio es un número real (server s.whatsapp.net): devuelve su user-part normalizada (sin server ni
+// device/agente). Si el JID viene vacío (sesión aún sin emparejar) o su server NO es de número (un LID u
+// otro), devuelve "" — el Cloud tolera vacío y NUNCA se reporta un LID como número.
+func selfPNFromJID(jid string) string {
+	if jid == "" || jidServer(jid) != serverPN {
+		return ""
+	}
+	return jidUser(jid)
+}
+
 // Run mantiene el único stream Connect vivo: conecta, recibe comandos (demux por session_id), late, y
 // reconecta con backoff + jitter ante cualquier caída. BLOQUEA hasta que ctx se cancele (devuelve nil
 // al cancelar limpio).
@@ -574,7 +598,46 @@ func (a *Adapter) sendHeartbeat(cl *client.Client, sessionID string, e *sessionE
 	a.send(cl, &cloudlinkv1.EdgeToCloud{
 		CommandId: uuid.NewString(),
 		SessionId: sessionID,
-		Payload:   &cloudlinkv1.EdgeToCloud_Heartbeat{Heartbeat: &cloudlinkv1.Heartbeat{LeaseCounter: ctr}},
+		// Plan 020 T2: cada latido lleva el número/JID propio para que el Cloud sepa a qué número pertenece
+		// la sesión al marcarla online (anti-self-loop). State UNSPECIFIED = latido de liveness normal.
+		Payload: &cloudlinkv1.EdgeToCloud_Heartbeat{Heartbeat: &cloudlinkv1.Heartbeat{
+			LeaseCounter: ctr,
+			SelfPn:       e.selfPN,
+			SelfJid:      e.selfJID,
+			State:        cloudlinkv1.SessionState_SESSION_STATE_UNSPECIFIED,
+		}},
+	})
+}
+
+// SendLoggedOut propaga al Cloud que WhatsApp CERRÓ la sesión (events.LoggedOut, Plan 020 T3): emite un
+// Heartbeat con State=LOGGED_OUT por el ÚNICO stream del Edge para que el Cloud pueda marcar la sesión como
+// ZOMBIE (distinto de un offline por caída de red). Se invoca desde el listener ANTES del teardown local,
+// mientras el stream aún está vivo. Reusa el mecanismo de heartbeat (currentClient() + send); si no hay
+// stream vivo lo registra y descarta (el Cloud lo detectará por ausencia de latidos). Incluye el número/JID
+// propio si se conoce (útil para diagnóstico y correlación del zombie).
+func (a *Adapter) SendLoggedOut(sessionID string) {
+	cl := a.currentClient()
+	if cl == nil {
+		a.log.Warn("CloudLink desconectado: LoggedOut no propagado (el Cloud lo verá por ausencia de latidos)",
+			"session_id", sessionID)
+		return
+	}
+	var selfPN, selfJID string
+	var ctr int64
+	if e := a.entry(sessionID); e != nil {
+		selfPN, selfJID = e.selfPN, e.selfJID
+		ctr = e.leaseCtr.Add(1)
+	}
+	a.log.Warn("CloudLink: propagando LoggedOut al Cloud (sesión zombie)", "session_id", sessionID)
+	a.send(cl, &cloudlinkv1.EdgeToCloud{
+		CommandId: uuid.NewString(),
+		SessionId: sessionID,
+		Payload: &cloudlinkv1.EdgeToCloud_Heartbeat{Heartbeat: &cloudlinkv1.Heartbeat{
+			LeaseCounter: ctr,
+			SelfPn:       selfPN,
+			SelfJid:      selfJID,
+			State:        cloudlinkv1.SessionState_SESSION_STATE_LOGGED_OUT,
+		}},
 	})
 }
 

@@ -45,3 +45,5 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
+
+replace github.com/EduGoGroup/wapp-cloudlink => ../../cloud/wapp-cloudlink

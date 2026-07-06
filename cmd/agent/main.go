@@ -502,7 +502,10 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	// única sesión (cfg.CloudLink.SessionID) y usa SU sink etiquetado; la mecánica de mux es idéntica a
 	// la del daemon multi-sesión (runServe), solo que aquí hay una sola sesión.
 	adapter := cloudlink.NewAdapter(cc, log, newValidator, cloudlink.WithCloudEncPubKey(cloudEncPub))
-	adapter.Register(cfg.CloudLink.SessionID, sendFunc, sendMediaFunc, custody.Exists)
+	// Camino single-sesión (listen/restore): el JID propio no está a mano aquí (la config solo trae el
+	// session_id); se registra con selfJID "" (el Cloud tolera vacío, Plan 020 T2). El número propio se
+	// reporta de raíz por el daemon multi-sesión (runServe/buildMux), donde s.meta.JID sí está poblado.
+	adapter.Register(cfg.CloudLink.SessionID, "", sendFunc, sendMediaFunc, custody.Exists)
 	// Acuses (Plan 013 T2a): al llegar un events.Receipt, etiqueta con el session_id, correlaciona con el
 	// command_id del envío (Correlator del gateway vivo) y sube el MessageReceipt por el mismo stream.
 	sid := cfg.CloudLink.SessionID
@@ -511,6 +514,8 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 		cmd, _ := gateway.Correlator().Lookup(evt.MessageIDs)
 		adapter.SendReceipt(cmd, evt)
 	})
+	// LoggedOut (Plan 020 T3): propaga el estado ZOMBIE al cloud cuando WhatsApp cierra la sesión.
+	gateway.SetLoggedOutHandler(func() { adapter.SendLoggedOut(sid) })
 	go func() {
 		_ = adapter.Run(ctx)
 		_ = cc.Close()

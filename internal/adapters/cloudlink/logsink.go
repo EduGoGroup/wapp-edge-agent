@@ -59,9 +59,15 @@ func NewLogMux(log logger.Logger) *LogMux {
 }
 
 // Register es un no-op: el LogMux no gatea lease ni mantiene estado por sesión (solo loguea). Acepta el
-// emisor de media (Plan 017) por firma, sin usarlo (diagnóstico sin reenvío).
-func (m *LogMux) Register(sessionID string, _ func(ctx context.Context, commandID, to, text string) error, _ func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error, _ func() bool) {
+// JID propio (Plan 020 T2) y el emisor de media (Plan 017) por firma, sin usarlos (diagnóstico sin reenvío).
+func (m *LogMux) Register(sessionID, _ /*selfJID*/ string, _ func(ctx context.Context, commandID, to, text string) error, _ func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error, _ func() bool) {
 	m.log.Info("CloudLink (LogMux): sesión registrada para diagnóstico (sin reenvío a la nube)", "session_id", sessionID)
+}
+
+// SendLoggedOut es el análogo de diagnóstico de Adapter.SendLoggedOut (Plan 020 T3): no reenvía a la nube,
+// solo loguea que la sesión se cerró (zombie) para verificar la propagación en dev.
+func (m *LogMux) SendLoggedOut(sessionID string) {
+	m.log.Warn("CloudLink (LogMux): LoggedOut capturado (sin reenvío a la nube)", "session_id", sessionID)
 }
 
 // Unregister es un no-op simétrico a Register.

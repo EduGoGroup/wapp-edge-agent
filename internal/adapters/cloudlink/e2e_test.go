@@ -168,7 +168,7 @@ func (h *e2eHarness) register(sessionID string) {
 	h.sent[sessionID] = ch
 	h.sentMedia[sessionID] = mch
 	h.mu.Unlock()
-	h.adapter.Register(sessionID, func(_ context.Context, commandID, to, text string) error {
+	h.adapter.Register(sessionID, "", func(_ context.Context, commandID, to, text string) error {
 		ch <- sendCall{commandID: commandID, to: to, text: text}
 		return nil
 	}, func(_ context.Context, commandID, to, url, filename, mime, kind, caption string) error {

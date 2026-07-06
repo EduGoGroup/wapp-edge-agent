@@ -49,6 +49,11 @@ type ListenGateway struct {
 	// Listener al arrancar el ciclo.
 	onReceipt func(domain.ReceiptEvent)
 
+	// onLoggedOut se invoca cuando WhatsApp CIERRA la sesión (events.LoggedOut, Plan 020 T3). El CloudLink lo
+	// cablea (con SetLoggedOutHandler) para propagar el estado ZOMBIE a la nube ANTES del teardown local;
+	// nil = se ignora. serve() lo pasa al Listener al arrancar el ciclo. No lleva PII.
+	onLoggedOut func()
+
 	// pushName es el nombre visible de FALLBACK para anunciar presencia (§10.D). whatsmeow rechaza
 	// SendPresence si Store.PushName está vacío (el store recién restaurado, MP-02, no lo trae); sin
 	// presencia available WhatsApp no propaga los acuses. serve() lo aplica a Store.PushName SOLO si el
@@ -79,6 +84,11 @@ func (g *ListenGateway) Correlator() *Correlator { return g.correlator }
 // Listen (al construir el gateway). El CloudLink lo usa en T2 para subir el estado; en T0 queda nil
 // (los acuses se mapean y se descartan silenciosamente hasta que T2 lo conecte).
 func (g *ListenGateway) SetReceiptHandler(fn func(domain.ReceiptEvent)) { g.onReceipt = fn }
+
+// SetLoggedOutHandler cablea el destino del cierre de sesión (events.LoggedOut) de esta sesión (Plan 020
+// T3). Se llama ANTES de Listen (al construir el gateway). El CloudLink lo usa para propagar el estado
+// ZOMBIE a la nube; nil = solo se loguea (comportamiento previo). No lleva PII.
+func (g *ListenGateway) SetLoggedOutHandler(fn func()) { g.onLoggedOut = fn }
 
 // SetPushName cablea el nombre visible de FALLBACK usado al anunciar presencia (§10.D) cuando el store
 // restaurado aún no conoce el nombre real de la cuenta. Se llama ANTES de Listen (al construir el
@@ -111,6 +121,8 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	listener := NewListener(sink, g.log)
 	// Acuses (delivered/read) → destino de la sesión (nil en T0; T2 lo cablea con SetReceiptHandler).
 	listener.onReceipt = g.onReceipt
+	// Cierre de sesión (LoggedOut) → destino de la sesión (Plan 020 T3): propaga el estado ZOMBIE a la nube.
+	listener.onLoggedOutHook = g.onLoggedOut
 	// §10.D: tras cada Connected anuncia presencia (available) sobre el cliente vivo para que WhatsApp
 	// PROPAGUE los acuses de entrega/lectura al companion. Best-effort: un fallo no tumba la escucha.
 	//

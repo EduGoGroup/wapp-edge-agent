@@ -65,6 +65,12 @@ type Listener struct {
 	// Es la costura de SALIDA del acuse (el análogo del InboundSink de los entrantes): el CloudLink la
 	// cablea en T2 para subir el estado a la nube. nil = se ignora sin romper la escucha. No lleva PII.
 	onReceipt func(domain.ReceiptEvent)
+
+	// onLoggedOut, si está definido, se invoca al recibir *events.LoggedOut (WhatsApp cerró el device),
+	// TRAS marcar el estado y loguear (Plan 020 T3). El CloudLink lo cablea para propagar el estado ZOMBIE
+	// a la nube mientras el stream aún vive. nil = solo se loguea (comportamiento previo). Corre FUERA del
+	// lock. No lleva PII. (Sufijo Hook para no colisionar con el método onLoggedOut.)
+	onLoggedOutHook func()
 }
 
 // NewListener construye el listener con el sink y el logger dados y el backoff por defecto del spike.
@@ -193,9 +199,15 @@ func (l *Listener) onDisconnected() {
 func (l *Listener) onLoggedOut(e *events.LoggedOut) {
 	l.mu.Lock()
 	l.state = StateLoggedOut
+	hook := l.onLoggedOutHook
 	l.mu.Unlock()
 	l.log.Error("listener: sesión cerrada por WhatsApp (LoggedOut); requiere re-emparejar",
 		"on_connect", e.OnConnect, "reason", e.Reason.String())
+	// Plan 020 T3: propaga el cierre al cloud (estado ZOMBIE) mientras el stream aún vive, ANTES del
+	// teardown local. El comportamiento local previo (logging/no re-pairing) no cambia. Corre fuera del lock.
+	if hook != nil {
+		hook()
+	}
 }
 
 // toInboundEvent extrae de un *events.Message los campos útiles de dominio. El cuerpo de texto sale

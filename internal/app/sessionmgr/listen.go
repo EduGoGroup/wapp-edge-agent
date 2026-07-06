@@ -54,11 +54,12 @@ type listenFactory func(ctx context.Context, s *liveSession) (listenRunner, io.C
 // (ADR-0016 §5) lo mantiene el propio mux: el Manager no conoce lease ni proto (lo satisface el Adapter
 // real de cloudlink, o el LogMux de diagnóstico). Interfaz estructural: sessionmgr no importa cloudlink.
 type CloudLinkMux interface {
-	// Register da de alta una sesión en el multiplex (register-on-start): send es su emisor de TEXTO por
-	// cliente vivo y sendMedia su emisor de ARCHIVOS (Plan 017 §7; ambos reciben el command_id del envío
-	// para la correlación del acuse, Plan 013 §10.E), hasDEK la presencia de la DEK (gate 2-de-2). El mux
-	// construye el estado de lease de la sesión.
-	Register(sessionID string,
+	// Register da de alta una sesión en el multiplex (register-on-start): selfJID es el JID crudo del device
+	// PROPIO de la sesión (Plan 020 T2; "" si aún sin emparejar) del que se deriva el número propio que viaja
+	// en cada Heartbeat (anti-self-loop); send es su emisor de TEXTO por cliente vivo y sendMedia su emisor de
+	// ARCHIVOS (Plan 017 §7; ambos reciben el command_id del envío para la correlación del acuse, Plan 013
+	// §10.E), hasDEK la presencia de la DEK (gate 2-de-2). El mux construye el estado de lease de la sesión.
+	Register(sessionID, selfJID string,
 		send func(ctx context.Context, commandID, to, text string) error,
 		sendMedia func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error,
 		hasDEK func() bool)
@@ -70,6 +71,10 @@ type CloudLinkMux interface {
 	// sesión (evt.SessionID) y correlacionado con el command_id del envío original (vacío = estado crudo).
 	// Es el análogo de SinkFor para acuses; lo cablea el factory al SetReceiptHandler del gateway (T2a).
 	SendReceipt(commandID string, evt domain.ReceiptEvent)
+	// SendLoggedOut propaga al cloud que WhatsApp CERRÓ la sesión (events.LoggedOut, Plan 020 T3): el cloud
+	// la marca ZOMBIE (distinto de un offline por caída de red). Lo cablea el factory al onLoggedOut del
+	// gateway; se emite ANTES del teardown local, mientras el stream aún vive.
+	SendLoggedOut(sessionID string)
 }
 
 // WithWhatsmeowListen habilita Restore/startListener con la escucha REAL sobre whatsmeow Y la cablea al
@@ -127,6 +132,11 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 				evt.SessionID = sid
 				cmd, _ := gateway.Correlator().Lookup(evt.MessageIDs)
 				mux.SendReceipt(cmd, evt)
+			})
+			// Plan 020 T3: al llegar un events.Receipt de cierre (events.LoggedOut), propaga el estado ZOMBIE
+			// al cloud por el mismo stream ANTES del teardown local, para distinguirlo de un offline por red.
+			gateway.SetLoggedOutHandler(func() {
+				mux.SendLoggedOut(sid)
 			})
 			runner := app.NewListen(s.custody, gateway, mux.SinkFor(sid))
 			return runner, sdb, nil
@@ -198,7 +208,8 @@ func (m *Manager) startListener(s *liveSession) {
 	// sendVia es la indirección estable al cliente vivo (lo rota el factory en cada ciclo); custody.Exists
 	// alimenta el gate 2-de-2 por sesión. nil en tests que cablean newListener sin mux.
 	if m.cloudMux != nil {
-		m.cloudMux.Register(s.meta.SessionID, s.sendVia, s.sendViaMedia, s.custody.Exists)
+		// Plan 020 T2: s.meta.JID es el JID propio de la sesión (poblado en 'active'; "" mientras 'pairing').
+		m.cloudMux.Register(s.meta.SessionID, s.meta.JID, s.sendVia, s.sendViaMedia, s.custody.Exists)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.arm(cancel)
