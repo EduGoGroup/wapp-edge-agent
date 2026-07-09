@@ -88,6 +88,15 @@ func main() {
 			"error", err, "data_dir", cfg.DataDir)
 	}
 
+	// Migración clean-slate hacia la BD ÚNICA (Plan 022 T1, ADR-0018 §8, fase 1): archiva el layout
+	// multi-sesión POR-DIRECTORIO (sessions/<id>/) bajo <data_dir>/_archived-pre-022/ y deja sessions/
+	// vacío. NO borra el árbol viejo (T6.5 lo lee para restaurar las sesiones ACTIVAS sin re-escanear).
+	// Idempotente (no-op si ya migró) y NO fatal: un fallo de E/S no impide arrancar (se loguea y sigue).
+	if err := edgemigrate.ArchiveLegacyPerSessionLayout(cfg.DataDir, log); err != nil {
+		log.Error("migración clean-slate a BD única de arranque falló (continuo de todas formas)",
+			"error", err, "data_dir", cfg.DataDir)
+	}
+
 	// Despacho de subcomandos. Sin argumento: bootstrap (arranque informativo).
 	if len(os.Args) > 1 && os.Args[1] == "pair" {
 		if err := runPair(context.Background(), cfg, log); err != nil {

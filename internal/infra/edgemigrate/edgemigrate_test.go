@@ -198,3 +198,146 @@ func TestDoesNotTouchOtherFiles(t *testing.T) {
 		t.Fatalf("el fichero ajeno se tocó: got=%q err=%v", got, err)
 	}
 }
+
+// --- Clean-slate a BD única (Plan 022 T1) ---
+
+// writeSessionDir crea un subdirectorio de sesión sessions/<id>/ con un store.db y un dek.key de
+// contenido conocido (helper de fixtures del layout multi-sesión por-directorio).
+func writeSessionDir(t *testing.T, sessionsDir, id string) {
+	t.Helper()
+	dir := filepath.Join(sessionsDir, id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("MkdirAll %s: %v", dir, err)
+	}
+	writeFile(t, filepath.Join(dir, "store.db"), "STORE-"+id)
+	writeFile(t, filepath.Join(dir, "dek.key"), "DEK-"+id)
+}
+
+// TestArchivesPerSessionLayout: con sessions/<id>/{store.db,dek.key} por sesión, la migración a BD única
+// mueve cada subdir a _archived-pre-022/sessions/<id>/ (contenido intacto — fuente de T6.5), deja sessions/
+// vacío y avisa por WARN. Nada se borra.
+func TestArchivesPerSessionLayout(t *testing.T) {
+	dataDir := t.TempDir()
+	sessionsDir := filepath.Join(dataDir, sessionsDirName)
+	id1 := "11111111-1111-4111-8111-111111111111"
+	id2 := "22222222-2222-4222-8222-222222222222"
+	writeSessionDir(t, sessionsDir, id1)
+	writeSessionDir(t, sessionsDir, id2)
+
+	var buf bytes.Buffer
+	if err := ArchiveLegacyPerSessionLayout(dataDir, newLogger(&buf)); err != nil {
+		t.Fatalf("ArchiveLegacyPerSessionLayout: %v", err)
+	}
+
+	// Los subdirs ya no están en sessions/.
+	for _, id := range []string{id1, id2} {
+		if fileExists(filepath.Join(sessionsDir, id)) {
+			t.Fatalf("el subdir de sesión %s no se archivó (sigue en sessions/)", id)
+		}
+	}
+	// Están archivados con su contenido intacto (movidos, NO borrados): T6.5 los leerá.
+	archived := filepath.Join(dataDir, archivePre022DirName, sessionsDirName)
+	for _, id := range []string{id1, id2} {
+		for name, want := range map[string]string{"store.db": "STORE-" + id, "dek.key": "DEK-" + id} {
+			got, err := os.ReadFile(filepath.Join(archived, id, name))
+			if err != nil {
+				t.Fatalf("leer archivado %s/%s: %v", id, name, err)
+			}
+			if string(got) != want {
+				t.Fatalf("contenido archivado %s/%s = %q, esperaba %q", id, name, got, want)
+			}
+		}
+	}
+	// sessions/ sigue existiendo, vacío.
+	if !fileExists(sessionsDir) {
+		t.Fatal("sessions/ debía seguir existiendo (vacío) tras archivar")
+	}
+	if entries, _ := os.ReadDir(sessionsDir); len(entries) != 0 {
+		t.Fatalf("sessions/ debía quedar vacío, tiene %d entradas", len(entries))
+	}
+	// WARN de re-emparejar emitido.
+	if !strings.Contains(buf.String(), "re-empareja") {
+		t.Fatalf("se esperaba un WARN de re-emparejar; logs:\n%s", buf.String())
+	}
+}
+
+// TestPerSessionArchiveIdempotent: una segunda ejecución (con _archived-pre-022/ ya creado) es no-op: NO
+// re-archiva ni vuelve a avisar, aunque el daemon haya creado una sesión NUEVA tras migrar.
+func TestPerSessionArchiveIdempotent(t *testing.T) {
+	dataDir := t.TempDir()
+	sessionsDir := filepath.Join(dataDir, sessionsDirName)
+	id1 := "11111111-1111-4111-8111-111111111111"
+	writeSessionDir(t, sessionsDir, id1)
+
+	var buf1 bytes.Buffer
+	if err := ArchiveLegacyPerSessionLayout(dataDir, newLogger(&buf1)); err != nil {
+		t.Fatalf("primera ejecución: %v", err)
+	}
+
+	// Simula que el daemon emparejó una sesión NUEVA tras la migración (no debe archivarse).
+	id2 := "22222222-2222-4222-8222-222222222222"
+	writeSessionDir(t, sessionsDir, id2)
+
+	var buf2 bytes.Buffer
+	if err := ArchiveLegacyPerSessionLayout(dataDir, newLogger(&buf2)); err != nil {
+		t.Fatalf("segunda ejecución: %v", err)
+	}
+	if strings.Contains(buf2.String(), "re-empareja") {
+		t.Fatalf("la 2ª ejecución NO debía volver a avisar; logs:\n%s", buf2.String())
+	}
+	// La sesión NUEVA sigue viva en sessions/ (no se archivó: marcador de idempotencia).
+	if !fileExists(filepath.Join(sessionsDir, id2)) {
+		t.Fatal("la sesión nueva NO debía archivarse en la 2ª corrida")
+	}
+	archived := filepath.Join(dataDir, archivePre022DirName, sessionsDirName)
+	if fileExists(filepath.Join(archived, id2)) {
+		t.Fatal("la sesión nueva no debía aparecer en el archivo")
+	}
+	if !fileExists(filepath.Join(archived, id1)) {
+		t.Fatal("la sesión vieja debía seguir archivada (no se toca el árbol de T6.5)")
+	}
+}
+
+// TestFreshInstallNoPerSessionArchive: en instalación limpia (sin sessions/) la migración a BD única NO
+// archiva nada ni avisa, pero SÍ deja el marcador _archived-pre-022/ para registrar que el paso corrió.
+// Regresión (idempotencia hacia adelante): una sesión emparejada DESPUÉS de la migración —el runtime aún
+// crea sessions/<id>/ hasta T3— no debe archivarse en el siguiente arranque.
+func TestFreshInstallNoPerSessionArchive(t *testing.T) {
+	dataDir := t.TempDir()
+
+	var buf bytes.Buffer
+	if err := ArchiveLegacyPerSessionLayout(dataDir, newLogger(&buf)); err != nil {
+		t.Fatalf("ArchiveLegacyPerSessionLayout (sin sessions/): %v", err)
+	}
+	// Nada archivado: no existe ningún subdir de sesión bajo el marcador.
+	if fileExists(filepath.Join(dataDir, archivePre022DirName, sessionsDirName)) {
+		t.Fatal("no debía archivar ninguna sesión en instalación limpia")
+	}
+	// Pero el marcador SÍ existe (sin él, una sesión pareada después se archivaría por error).
+	if !fileExists(filepath.Join(dataDir, archivePre022DirName)) {
+		t.Fatal("debía crearse el marcador _archived-pre-022/ para registrar que el paso corrió")
+	}
+	if strings.Contains(buf.String(), "re-empareja") {
+		t.Fatal("no debía avisar de re-emparejar en instalación limpia")
+	}
+
+	// Simula un emparejamiento posterior a la migración: aparece sessions/<newID>/store.db.
+	const newID = "11111111-1111-1111-1111-111111111111"
+	newSessionDir := filepath.Join(dataDir, sessionsDirName, newID)
+	if err := os.MkdirAll(newSessionDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll nueva sesión: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(newSessionDir, "store.db"), []byte("nueva"), 0o600); err != nil {
+		t.Fatalf("WriteFile store.db: %v", err)
+	}
+	var buf2 bytes.Buffer
+	if err := ArchiveLegacyPerSessionLayout(dataDir, newLogger(&buf2)); err != nil {
+		t.Fatalf("ArchiveLegacyPerSessionLayout (2ª corrida): %v", err)
+	}
+	if !fileExists(filepath.Join(newSessionDir, "store.db")) {
+		t.Fatal("la sesión creada tras la migración NO debía archivarse (marcador presente)")
+	}
+	if fileExists(filepath.Join(dataDir, archivePre022DirName, sessionsDirName, newID)) {
+		t.Fatal("la nueva sesión no debía moverse a _archived-pre-022/")
+	}
+}

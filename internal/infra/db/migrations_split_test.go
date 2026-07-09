@@ -13,7 +13,7 @@ var (
 		"msg_enc_device", "msg_enc_identities", "msg_enc_sessions",
 		"msg_enc_prekeys", "msg_enc_sender_keys",
 	}
-	metaTables = []string{"sessions", "sessions_v2"}
+	metaTables = []string{"sessions", "sessions_v2", "accounts", "devices"}
 )
 
 // TestMigrateStoreOnlyCreatesStoreTables: el set "store" crea SOLO las msg_enc_* y NO las de metadatos

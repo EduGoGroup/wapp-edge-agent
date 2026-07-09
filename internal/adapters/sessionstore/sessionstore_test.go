@@ -75,7 +75,7 @@ func TestUpsertPairingJIDIsNull(t *testing.T) {
 	// La columna jid debe ser NULL (no cadena vacía) para no chocar con el índice único parcial.
 	var jidNull bool
 	if err := database.QueryRowContext(ctx,
-		`SELECT jid IS NULL FROM sessions_v2 WHERE session_id = ?`, in.SessionID).Scan(&jidNull); err != nil {
+		`SELECT jid IS NULL FROM devices WHERE session_id = ?`, in.SessionID).Scan(&jidNull); err != nil {
 		t.Fatalf("consulta jid IS NULL: %v", err)
 	}
 	if !jidNull {
@@ -113,7 +113,7 @@ func TestUpsertUpdatesState(t *testing.T) {
 	}
 
 	var n int
-	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM sessions_v2 WHERE session_id=?`, id).Scan(&n); err != nil {
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices WHERE session_id=?`, id).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
@@ -362,5 +362,188 @@ func TestSessionStoreOnCentralMetaDB(t *testing.T) {
 	}
 	if got.SessionID != in.SessionID || got.JID != in.JID || got.State != in.State {
 		t.Fatalf("Get = %+v, esperaba %+v", got, in)
+	}
+}
+
+// --- Modelo cuenta↔dispositivo (Plan 022 T1) ---
+
+// TestUpsertProvisionalAccountWhenNoSelfPN: un device sin self_pn (en 'pairing', el número aún no se
+// conoce) cuelga de una cuenta PROVISIONAL con account_id = session_id y self_pn NULL.
+func TestUpsertProvisionalAccountWhenNoSelfPN(t *testing.T) {
+	ctx := context.Background()
+	store, database := newStore(t)
+
+	id := "11111111-1111-4111-8111-1111111111aa"
+	if err := store.Upsert(ctx, domain.Session{SessionID: id, State: domain.SessionStatePairing}); err != nil {
+		t.Fatalf("Upsert provisional: %v", err)
+	}
+
+	got, err := store.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.AccountID != id {
+		t.Fatalf("cuenta provisional: account_id = %q, esperaba el session_id %q", got.AccountID, id)
+	}
+	if got.SelfPN != "" {
+		t.Fatalf("cuenta provisional: self_pn = %q, esperaba vacío (NULL)", got.SelfPN)
+	}
+	if got.Role != domain.DeviceRolePrimary {
+		t.Fatalf("rol por defecto = %q, esperaba primary", got.Role)
+	}
+	// La columna self_pn debe ser NULL (no cadena vacía) para no chocar con UNIQUE(self_pn).
+	var selfPNNull bool
+	if err := database.QueryRowContext(ctx,
+		`SELECT self_pn IS NULL FROM accounts WHERE account_id = ?`, id).Scan(&selfPNNull); err != nil {
+		t.Fatalf("consulta self_pn IS NULL: %v", err)
+	}
+	if !selfPNNull {
+		t.Fatal("se esperaba self_pn NULL en la cuenta provisional")
+	}
+}
+
+// TestSameSelfPNSharesAccount: dos DISPOSITIVOS del MISMO número (misma self_pn, distinto session_id/jid)
+// cuelgan de la MISMA cuenta (un re-escaneo NO crea un silo nuevo). Es la asociación re-escaneo↔misma cuenta.
+func TestSameSelfPNSharesAccount(t *testing.T) {
+	ctx := context.Background()
+	store, database := newStore(t)
+
+	const selfPN = "56984467443"
+	devA := domain.Session{
+		SessionID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", JID: "jidA@s.whatsapp.net",
+		SelfPN: selfPN, State: domain.SessionStateActive,
+	}
+	devB := domain.Session{
+		SessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", JID: "jidB@s.whatsapp.net",
+		SelfPN: selfPN, State: domain.SessionStateActive,
+	}
+	if err := store.Upsert(ctx, devA); err != nil {
+		t.Fatalf("Upsert devA: %v", err)
+	}
+	if err := store.Upsert(ctx, devB); err != nil {
+		t.Fatalf("Upsert devB: %v", err)
+	}
+
+	gotA, err := store.Get(ctx, devA.SessionID)
+	if err != nil {
+		t.Fatalf("Get devA: %v", err)
+	}
+	gotB, err := store.Get(ctx, devB.SessionID)
+	if err != nil {
+		t.Fatalf("Get devB: %v", err)
+	}
+	if gotA.AccountID == "" || gotA.AccountID != gotB.AccountID {
+		t.Fatalf("misma self_pn debía dar el MISMO account_id: A=%q B=%q", gotA.AccountID, gotB.AccountID)
+	}
+	if gotA.SelfPN != selfPN || gotB.SelfPN != selfPN {
+		t.Fatalf("self_pn no se propagó: A=%q B=%q", gotA.SelfPN, gotB.SelfPN)
+	}
+
+	// Exactamente UNA cuenta para esa self_pn (no un silo por escaneo).
+	var accounts int
+	if err := database.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM accounts WHERE self_pn = ?`, selfPN).Scan(&accounts); err != nil {
+		t.Fatal(err)
+	}
+	if accounts != 1 {
+		t.Fatalf("cuentas para self_pn = %d, esperaba 1", accounts)
+	}
+
+	// GetByAccount devuelve los DOS dispositivos de la cuenta.
+	devs, err := store.GetByAccount(ctx, gotA.AccountID)
+	if err != nil {
+		t.Fatalf("GetByAccount: %v", err)
+	}
+	if len(devs) != 2 {
+		t.Fatalf("GetByAccount devolvió %d dispositivos, esperaba 2", len(devs))
+	}
+}
+
+// TestGetByAccountEmpty: una cuenta sin dispositivos (o inexistente) devuelve una lista vacía sin error.
+func TestGetByAccountEmpty(t *testing.T) {
+	ctx := context.Background()
+	store, _ := newStore(t)
+	devs, err := store.GetByAccount(ctx, "cuenta-inexistente")
+	if err != nil {
+		t.Fatalf("GetByAccount: %v", err)
+	}
+	if len(devs) != 0 {
+		t.Fatalf("GetByAccount de cuenta vacía = %d, esperaba 0", len(devs))
+	}
+}
+
+// TestDeleteByAccount: borra la cuenta y TODOS sus dispositivos de una vez (borrado por número); es
+// idempotente (borrar una cuenta ausente no es error).
+func TestDeleteByAccount(t *testing.T) {
+	ctx := context.Background()
+	store, database := newStore(t)
+
+	const selfPN = "56911112222"
+	a := domain.Session{SessionID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", JID: "c@x", SelfPN: selfPN, State: domain.SessionStateActive}
+	b := domain.Session{SessionID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", JID: "d@x", SelfPN: selfPN, State: domain.SessionStateActive}
+	if err := store.Upsert(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(ctx, a.SessionID)
+	if err != nil {
+		t.Fatalf("Get a: %v", err)
+	}
+
+	if err := store.DeleteByAccount(ctx, got.AccountID); err != nil {
+		t.Fatalf("DeleteByAccount: %v", err)
+	}
+	// Ni dispositivos ni cuenta quedan.
+	for _, id := range []string{a.SessionID, b.SessionID} {
+		if _, err := store.Get(ctx, id); !errors.Is(err, app.ErrSessionNotFound) {
+			t.Fatalf("tras DeleteByAccount, Get(%s) = %v, esperaba ErrSessionNotFound", id, err)
+		}
+	}
+	var accounts int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE account_id = ?`, got.AccountID).Scan(&accounts); err != nil {
+		t.Fatal(err)
+	}
+	if accounts != 0 {
+		t.Fatalf("cuentas tras DeleteByAccount = %d, esperaba 0", accounts)
+	}
+	// Idempotente: borrar de nuevo no es error.
+	if err := store.DeleteByAccount(ctx, got.AccountID); err != nil {
+		t.Fatalf("DeleteByAccount idempotente: %v", err)
+	}
+}
+
+// TestReUpsertKeepsAccountStable: re-upsertar el MISMO device (promoción pairing→active con su self_pn)
+// no duplica la cuenta ni el device y conserva el account_id.
+func TestReUpsertKeepsAccountStable(t *testing.T) {
+	ctx := context.Background()
+	store, database := newStore(t)
+
+	id := "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+	const selfPN = "56933334444"
+	if err := store.Upsert(ctx, domain.Session{SessionID: id, State: domain.SessionStatePairing}); err != nil {
+		t.Fatalf("Upsert #1 (pairing, provisional): %v", err)
+	}
+	// Promoción: ahora se conoce el número (self_pn) y el JID.
+	if err := store.Upsert(ctx, domain.Session{
+		SessionID: id, JID: "e@s.whatsapp.net", SelfPN: selfPN, State: domain.SessionStateActive,
+	}); err != nil {
+		t.Fatalf("Upsert #2 (active con self_pn): %v", err)
+	}
+
+	got, err := store.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.State != domain.SessionStateActive || got.SelfPN != selfPN {
+		t.Fatalf("tras promoción: state=%q self_pn=%q, esperaba active / %s", got.State, got.SelfPN, selfPN)
+	}
+	var devices int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM devices WHERE session_id = ?`, id).Scan(&devices); err != nil {
+		t.Fatal(err)
+	}
+	if devices != 1 {
+		t.Fatalf("filas de device = %d, esperaba 1 (upsert, no duplicado)", devices)
 	}
 }

@@ -1,16 +1,22 @@
-// Package sessionstore persiste los METADATOS DE NEGOCIO de las sesiones del Edge (tabla
-// `sessions_v2`, ADR-0016/Plan 008) y resuelve el device pareado del store cifrado para el backfill
-// del arranque.
+// Package sessionstore persiste los METADATOS DE NEGOCIO del Edge sobre la BD ÚNICA (Plan 022 T1,
+// ADR-0018): el modelo CUENTA↔DISPOSITIVO (`accounts` ⨝ `devices`, que reemplaza a `sessions_v2`) y
+// resuelve el device pareado del store cifrado para el backfill del arranque.
 //
-// A diferencia de cryptostore (que cifra campo a campo el material whatsmeow con la DEK), aquí todo
-// va EN CLARO: session_id, jid, estado, store_dir y timestamps son metadatos de negocio, no secretos
-// (CLAUDE.md raíz §1: el zero-knowledge protege credenciales/llaves, no el contenido de negocio). El
-// material cripto sigue exclusivamente en las tablas msg_enc_* (de un store.db POR SESIÓN, ADR-0016 §2).
+// A diferencia de cryptostore (que cifra campo a campo el material whatsmeow con la DEK), aquí todo va
+// EN CLARO: session_id, account_id, self_pn, jid, estado, rol y timestamps son metadatos de negocio, no
+// secretos (CLAUDE.md raíz §1: el zero-knowledge protege credenciales/llaves, no el contenido de negocio).
+// El material cripto sigue exclusivamente en las tablas msg_enc_* (cifradas con la DEK POR DISPOSITIVO, T2).
 //
-// MULTI-SESIÓN (ADR-0016 §3): la clave es el `session_id` (UUIDv4 opaco), NO el JID. El JID es un
-// atributo OPCIONAL (NULL mientras la sesión está en 'pairing'; ÚNICO cuando no es NULL, vía el índice
-// parcial ux_sessions_jid). El esquema lo retira la 0003; la tabla `sessions` (0002, jid PK) queda
-// vacía y sin uso.
+// MODELO (ADR-0018 §2): la identidad canónica del DISPOSITIVO es `session_id` (UUIDv4 opaco); cada device
+// cuelga de una CUENTA (número, `self_pn`). Un re-escaneo del mismo número es otro device de la MISMA
+// cuenta (misma self_pn ⇒ mismo account_id). El JID es un atributo OPCIONAL (NULL mientras 'pairing';
+// ÚNICO cuando no es NULL vía el índice parcial ux_devices_jid). El esquema lo crea la 0004.
+//
+// COMPATIBILIDAD T1↔T3 (green sin trabajo de runtime): el puerto app.SessionStore (Upsert/List/ListActive/
+// Get/Delete) se conserva INTACTO para que pairing/listen/restore/unlink compilen sin cambios. El campo
+// domain.Session.StoreDir se DERIVA (`sessions/<session_id>`) en vez de persistirse (ya no hay columna
+// store_dir). Los métodos por CUENTA (GetByAccount/DeleteByAccount) son EXTRA sobre el tipo concreto, no
+// del puerto (no rompen los fakes de los tests). La unificación List/ListActive vive en el helper `list`.
 package sessionstore
 
 import (
@@ -18,74 +24,202 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 )
 
-// Store implementa app.SessionStore sobre la tabla `sessions_v2` (SQLite, en claro). La BD debe estar
-// YA migrada (db.Migrate aplica 0003_sessions_multi.sql).
+// sessionsDirName es el nombre del directorio histórico por sesión; se usa SOLO para DERIVAR el campo
+// domain.Session.StoreDir (`sessions/<session_id>`), ya que la 0004 retiró la columna store_dir. Cuando
+// los consumidores runtime migren a la BD única (T3) esta derivación desaparece.
+const sessionsDirName = "sessions"
+
+// deviceSelect proyecta un DISPOSITIVO junto con los datos de su CUENTA (⨝ accounts). Compartido por
+// List/ListActive/Get/GetByAccount; scan() materializa estas columnas (en este orden) a domain.Session.
+const deviceSelect = `SELECT d.session_id, d.account_id, a.self_pn, a.display_name, d.jid, d.state, d.role,
+	   d.paired_at, d.updated_at
+	  FROM devices d JOIN accounts a ON a.account_id = d.account_id`
+
+// Store implementa app.SessionStore sobre la BD ÚNICA (tablas `accounts`/`devices`, en claro). La BD debe
+// estar YA migrada (db.MigrateMeta aplica 0004_accounts_devices.sql; foreign_keys=ON para la FK device→cuenta).
 type Store struct {
 	db *sql.DB
 }
 
 var _ app.SessionStore = (*Store)(nil)
 
-// New construye el Store sobre la BD de metadatos del Edge.
+// New construye el Store sobre la BD del Edge.
 func New(db *sql.DB) *Store {
 	return &Store{db: db}
 }
 
-// Upsert inserta o actualiza la sesión por su `session_id` (clave primaria). Idempotente: re-upsertar
-// el mismo session_id actualiza jid/estado/store_dir/timestamps sin crear filas duplicadas. El JID es
-// opcional: vacío se persiste como NULL (sesión en 'pairing'); paired_at cero también como NULL. Los
-// time.Time se persisten como epoch-segundos (INTEGER), como el resto del store.
+// Upsert inserta o actualiza el DISPOSITIVO por su `session_id` (clave primaria), asegurando su CUENTA en
+// la misma transacción (la FK devices.account_id→accounts exige la cuenta primero). Idempotente. El JID y
+// paired_at son opcionales (vacío/cero ⇒ NULL). Resolución de cuenta (resolveAccount):
+//   - AccountID explícito ⇒ se upsertea esa cuenta.
+//   - self_pn presente ⇒ misma self_pn ⇒ MISMO account_id (re-escaneo cuelga de la cuenta existente).
+//   - sin self_pn ni account_id (device en 'pairing') ⇒ cuenta PROVISIONAL por dispositivo (account_id =
+//     session_id, self_pn NULL); T3 la re-vincula a la cuenta real al conocer el número.
 func (s *Store) Upsert(ctx context.Context, sess domain.Session) error {
 	if sess.SessionID == "" {
 		return fmt.Errorf("sessionstore: session_id vacío")
 	}
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO sessions_v2 (session_id, jid, state, store_dir, paired_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sessionstore: abrir transacción de upsert: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op tras Commit; revierte cuenta+device si algo falla.
+
+	accountID, err := resolveAccount(ctx, tx, sess)
+	if err != nil {
+		return err
+	}
+
+	role := sess.Role
+	if role == "" {
+		role = domain.DeviceRolePrimary
+	}
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO devices (session_id, account_id, jid, state, role, paired_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(session_id) DO UPDATE SET
+		   account_id = excluded.account_id,
 		   jid        = excluded.jid,
 		   state      = excluded.state,
-		   store_dir  = excluded.store_dir,
+		   role       = excluded.role,
 		   paired_at  = excluded.paired_at,
 		   updated_at = excluded.updated_at`,
-		sess.SessionID, nullableJID(sess.JID), string(sess.State), sess.StoreDir,
-		nullableUnix(sess.PairedAt), unix(sess.UpdatedAt))
-	if err != nil {
-		return fmt.Errorf("sessionstore: upsert de sesión: %w", err)
+		sess.SessionID, accountID, nullableJID(sess.JID), string(sess.State), role,
+		nullableUnix(sess.PairedAt), unix(sess.UpdatedAt)); err != nil {
+		return fmt.Errorf("sessionstore: upsert de device: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sessionstore: commit de upsert: %w", err)
 	}
 	return nil
 }
 
-// List devuelve TODAS las sesiones persistidas, ordenadas de forma determinista (updated_at, luego
-// session_id). Incluye las de cualquier estado (pairing/active/loggedout).
+// resolveAccount asegura la fila `accounts` a la que colgar el device (dentro de la MISMA tx) y devuelve
+// su account_id. Ver reglas en Upsert.
+func resolveAccount(ctx context.Context, tx *sql.Tx, sess domain.Session) (string, error) {
+	updatedAt := unix(sess.UpdatedAt)
+	switch {
+	case sess.AccountID != "":
+		if err := upsertAccount(ctx, tx, sess.AccountID, sess.SelfPN, sess.DisplayName, updatedAt); err != nil {
+			return "", err
+		}
+		return sess.AccountID, nil
+
+	case sess.SelfPN != "":
+		var id string
+		err := tx.QueryRowContext(ctx, `SELECT account_id FROM accounts WHERE self_pn = ?`, sess.SelfPN).Scan(&id)
+		switch {
+		case err == nil:
+			// La cuenta ya existe: misma self_pn ⇒ mismo account_id. Refresca datos sin tocar self_pn/created_at.
+			if err := touchAccount(ctx, tx, id, sess.DisplayName, updatedAt); err != nil {
+				return "", err
+			}
+			return id, nil
+		case errors.Is(err, sql.ErrNoRows):
+			id = uuid.NewString()
+			if err := insertAccount(ctx, tx, id, sess.SelfPN, sess.DisplayName, updatedAt); err != nil {
+				return "", err
+			}
+			return id, nil
+		default:
+			return "", fmt.Errorf("sessionstore: resolver cuenta por self_pn: %w", err)
+		}
+
+	default:
+		// Provisional: cuenta por dispositivo mientras el número no se conoce (device en 'pairing').
+		if err := upsertAccount(ctx, tx, sess.SessionID, "", sess.DisplayName, updatedAt); err != nil {
+			return "", err
+		}
+		return sess.SessionID, nil
+	}
+}
+
+// upsertAccount inserta o actualiza una cuenta por account_id (self_pn/display_name/updated_at); created_at
+// se fija solo en el alta. Se usa para la cuenta explícita y la provisional (self_pn vacío ⇒ NULL).
+func upsertAccount(ctx context.Context, tx *sql.Tx, id, selfPN, displayName string, updatedAt int64) error {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO accounts (account_id, self_pn, display_name, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(account_id) DO UPDATE SET
+		   self_pn      = excluded.self_pn,
+		   display_name = excluded.display_name,
+		   updated_at   = excluded.updated_at`,
+		id, nullableStr(selfPN), nullableStr(displayName), updatedAt, updatedAt); err != nil {
+		return fmt.Errorf("sessionstore: upsert de cuenta: %w", err)
+	}
+	return nil
+}
+
+// insertAccount da de alta una cuenta NUEVA (self_pn ya verificado inexistente); created_at = updated_at.
+func insertAccount(ctx context.Context, tx *sql.Tx, id, selfPN, displayName string, updatedAt int64) error {
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO accounts (account_id, self_pn, display_name, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?)`,
+		id, nullableStr(selfPN), nullableStr(displayName), updatedAt, updatedAt); err != nil {
+		return fmt.Errorf("sessionstore: crear cuenta: %w", err)
+	}
+	return nil
+}
+
+// touchAccount refresca updated_at (y display_name si viene) de una cuenta existente SIN tocar
+// self_pn/created_at. COALESCE es portable SQLite/Postgres.
+func touchAccount(ctx context.Context, tx *sql.Tx, id, displayName string, updatedAt int64) error {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE accounts SET display_name = COALESCE(?, display_name), updated_at = ? WHERE account_id = ?`,
+		nullableStr(displayName), updatedAt, id); err != nil {
+		return fmt.Errorf("sessionstore: actualizar cuenta: %w", err)
+	}
+	return nil
+}
+
+// List devuelve TODOS los dispositivos persistidos (cualquier estado), orden determinista (updated_at,
+// luego session_id). Unifica su implementación con ListActive vía list().
 func (s *Store) List(ctx context.Context) ([]domain.Session, error) {
-	return s.query(ctx,
-		`SELECT session_id, jid, state, store_dir, paired_at, updated_at
-		   FROM sessions_v2 ORDER BY updated_at, session_id`)
+	return s.list(ctx, false)
 }
 
-// ListActive devuelve solo las sesiones en estado 'active' (las que el arranque debe restaurar,
-// design §6/T4). Mismo orden determinista que List.
+// ListActive devuelve solo los dispositivos en estado 'active' (los que el arranque debe restaurar). Mismo
+// orden determinista que List.
 func (s *Store) ListActive(ctx context.Context) ([]domain.Session, error) {
-	return s.query(ctx,
-		`SELECT session_id, jid, state, store_dir, paired_at, updated_at
-		   FROM sessions_v2 WHERE state = ? ORDER BY updated_at, session_id`,
-		string(domain.SessionStateActive))
+	return s.list(ctx, true)
 }
 
-// query ejecuta un SELECT que proyecta las columnas de sessions_v2 y materializa las filas a
-// domain.Session (compartido por List/ListActive).
+// list es la implementación UNIFICADA de List/ListActive (design §T1: `List(activeOnly)`): con
+// activeOnly filtra por state='active'; si no, devuelve todos. El puerto app.SessionStore conserva las
+// dos firmas públicas (List/ListActive) para no romper a los consumidores runtime (T3).
+func (s *Store) list(ctx context.Context, activeOnly bool) ([]domain.Session, error) {
+	if activeOnly {
+		return s.query(ctx, deviceSelect+` WHERE d.state = ? ORDER BY d.updated_at, d.session_id`,
+			string(domain.SessionStateActive))
+	}
+	return s.query(ctx, deviceSelect+` ORDER BY d.updated_at, d.session_id`)
+}
+
+// GetByAccount devuelve TODOS los dispositivos de una cuenta (1..4 por número), orden determinista. Es la
+// lectura por CUENTA (design §T1) que apoya el failover/borrado por número (T5); vacío si la cuenta no
+// tiene dispositivos.
+func (s *Store) GetByAccount(ctx context.Context, accountID string) ([]domain.Session, error) {
+	return s.query(ctx, deviceSelect+` WHERE d.account_id = ? ORDER BY d.updated_at, d.session_id`, accountID)
+}
+
+// query ejecuta un SELECT con la proyección deviceSelect y materializa las filas a domain.Session.
 func (s *Store) query(ctx context.Context, q string, args ...any) ([]domain.Session, error) {
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("sessionstore: listar sesiones: %w", err)
+		return nil, fmt.Errorf("sessionstore: listar dispositivos: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
@@ -98,16 +232,14 @@ func (s *Store) query(ctx context.Context, q string, args ...any) ([]domain.Sess
 		out = append(out, sess)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sessionstore: iterar sesiones: %w", err)
+		return nil, fmt.Errorf("sessionstore: iterar dispositivos: %w", err)
 	}
 	return out, nil
 }
 
-// Get devuelve la sesión con ese `session_id`, o app.ErrSessionNotFound si no existe.
+// Get devuelve el dispositivo con ese `session_id` (⨝ su cuenta), o app.ErrSessionNotFound si no existe.
 func (s *Store) Get(ctx context.Context, sessionID string) (domain.Session, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT session_id, jid, state, store_dir, paired_at, updated_at
-		   FROM sessions_v2 WHERE session_id = ?`, sessionID)
+	row := s.db.QueryRowContext(ctx, deviceSelect+` WHERE d.session_id = ?`, sessionID)
 	sess, err := scan(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Session{}, app.ErrSessionNotFound
@@ -118,12 +250,35 @@ func (s *Store) Get(ctx context.Context, sessionID string) (domain.Session, erro
 	return sess, nil
 }
 
-// Delete elimina la fila de negocio de la sesión con ese `session_id`. Idempotente: borrar un
-// session_id ausente NO es error (DELETE ... WHERE no afecta filas). Es la parte de metadatos del
-// borrado quirúrgico (design §7/T5); el material cripto y la DEK los limpia el Manager aparte.
+// Delete elimina el DISPOSITIVO con ese `session_id`. Idempotente (borrar uno ausente no es error). Es la
+// parte de metadatos del borrado quirúrgico por dispositivo (design §7); la cuenta y el material cripto/DEK
+// los limpia el Manager aparte. TODO(T3): el borrado transaccional que también purga la cuenta vacía y las
+// filas msg_enc_* vive en Manager.Unlink; aquí solo se retira la fila del device.
 func (s *Store) Delete(ctx context.Context, sessionID string) error {
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM sessions_v2 WHERE session_id = ?`, sessionID); err != nil {
-		return fmt.Errorf("sessionstore: borrar sesión: %w", err)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM devices WHERE session_id = ?`, sessionID); err != nil {
+		return fmt.Errorf("sessionstore: borrar device: %w", err)
+	}
+	return nil
+}
+
+// DeleteByAccount borra una CUENTA entera y sus dispositivos (borrado por número) de forma transaccional.
+// Es la contraparte por-cuenta de Delete (design §T1); idempotente (una cuenta ausente no es error). No
+// toca material cripto/DEK (eso lo orquesta el Manager en T3).
+func (s *Store) DeleteByAccount(ctx context.Context, accountID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sessionstore: abrir transacción de borrado por cuenta: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM devices WHERE account_id = ?`, accountID); err != nil {
+		return fmt.Errorf("sessionstore: borrar dispositivos de la cuenta: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE account_id = ?`, accountID); err != nil {
+		return fmt.Errorf("sessionstore: borrar cuenta: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sessionstore: commit de borrado por cuenta: %w", err)
 	}
 	return nil
 }
@@ -133,35 +288,45 @@ type scanner interface {
 	Scan(dest ...any) error
 }
 
-// scan mapea una fila (session_id, jid, state, store_dir, paired_at, updated_at) a domain.Session.
-// jid y paired_at son NULLABLE: un NULL en jid se materializa como cadena vacía (sesión en pairing) y
-// un NULL en paired_at como el cero de Go.
+// scan mapea una fila de deviceSelect (session_id, account_id, self_pn, display_name, jid, state, role,
+// paired_at, updated_at) a domain.Session. self_pn/display_name/jid/paired_at son NULLABLE (NULL ⇒ vacío/
+// cero). StoreDir se DERIVA de `sessions/<session_id>` (ya no hay columna store_dir).
 func scan(sc scanner) (domain.Session, error) {
 	var (
-		sessionID, state, storeDir string
-		jid                        sql.NullString
-		pairedAt                   sql.NullInt64
-		updatedAt                  int64
+		sessionID, accountID, state, role string
+		selfPN, displayName, jid          sql.NullString
+		pairedAt                          sql.NullInt64
+		updatedAt                         int64
 	)
-	if err := sc.Scan(&sessionID, &jid, &state, &storeDir, &pairedAt, &updatedAt); err != nil {
+	if err := sc.Scan(&sessionID, &accountID, &selfPN, &displayName, &jid, &state, &role,
+		&pairedAt, &updatedAt); err != nil {
 		return domain.Session{}, err
 	}
 	return domain.Session{
-		SessionID: sessionID,
-		JID:       jid.String, // "" si NULL
-		State:     domain.SessionState(state),
-		StoreDir:  storeDir,
-		PairedAt:  fromNullableUnix(pairedAt),
-		UpdatedAt: fromUnix(updatedAt),
+		SessionID:   sessionID,
+		AccountID:   accountID,
+		SelfPN:      selfPN.String,      // "" si NULL
+		DisplayName: displayName.String, // "" si NULL
+		JID:         jid.String,         // "" si NULL
+		State:       domain.SessionState(state),
+		Role:        role,
+		StoreDir:    filepath.Join(sessionsDirName, sessionID), // derivado (design §T1; TODO(T3): retirar)
+		PairedAt:    fromNullableUnix(pairedAt),
+		UpdatedAt:   fromUnix(updatedAt),
 	}, nil
 }
 
-// nullableJID convierte un JID a un valor SQL: NULL si está vacío (sesión en pairing), el JID si no.
+// nullableJID convierte un JID a un valor SQL: NULL si está vacío (device en pairing), el JID si no.
 func nullableJID(jid string) any {
-	if jid == "" {
+	return nullableStr(jid)
+}
+
+// nullableStr convierte una cadena a un valor SQL: NULL si está vacía, la cadena si no.
+func nullableStr(s string) any {
+	if s == "" {
 		return nil
 	}
-	return jid
+	return s
 }
 
 // nullableUnix convierte un time.Time a un epoch-segundos SQL: NULL si es cero, el epoch si no.
@@ -197,8 +362,8 @@ func fromNullableUnix(sec sql.NullInt64) time.Time {
 }
 
 // Locator implementa app.PairedDeviceLocator: resuelve el JID del device pareado en el store CIFRADO
-// (msg_enc_device) SIN descifrar material, envolviendo cryptostore.FirstDeviceJID. Lo usa
-// RestoreSessions para backfillear el registro cuando la BD fue pareada antes de existir `sessions_v2`.
+// (msg_enc_device) SIN descifrar material, envolviendo cryptostore.FirstDeviceJID. Lo usa RestoreSessions
+// para backfillear el registro cuando la BD fue pareada antes de existir el registro de negocio.
 type Locator struct {
 	db *sql.DB
 }
