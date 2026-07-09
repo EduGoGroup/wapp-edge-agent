@@ -2,6 +2,7 @@ package sessionmgr
 
 import (
 	"context"
+	"database/sql"
 	"sync"
 	"time"
 
@@ -13,11 +14,13 @@ import (
 
 // Manager es el registro vivo de N sesiones del Edge (design §1). Posee el ciclo de vida de cada
 // sesión y, dado un session_id, resuelve su custodia/store/cliente/listener. Concurrencia sin broker
-// (ADR-0003): un map protegido por sync.Mutex y, a partir de T4, una goroutine listener por sesión
-// gobernada por context.Context con su cancel + un WaitGroup para el apagado ordenado (design §10.I).
+// (ADR-0003): un map protegido por sync.Mutex y una goroutine listener por sesión gobernada por
+// context.Context con su cancel + un WaitGroup para el apagado ordenado (design §10.I).
 //
-// ESQUELETO T1: aquí va el armazón (map + mutex + custodia por sesión + apagado). La lógica de
-// Pair/Restore/Unlink llega en T3/T4/T5; este tipo NO la implementa todavía.
+// BD ÚNICA (Plan 022 T3): el Pair/Restore/Unlink operan sobre una sola *sql.DB COMPARTIDA (campo db,
+// inyectada por WithSharedDB) — Container whatsmeow compartido + msg_enc_* per-device + metadatos — en
+// vez del modelo `.db`-por-sesión retirado. El borrado quirúrgico purga metadatos, DEK y material cifrado
+// sin dejar huérfanos (decisión §10.I).
 type Manager struct {
 	// mu protege live (y, en T4+, los arranques/paradas de listeners).
 	mu sync.Mutex
@@ -26,11 +29,25 @@ type Manager struct {
 	// wg espera a que todas las goroutines listener terminen en el apagado (Stop).
 	wg sync.WaitGroup
 
-	// layout es la única fuente de rutas por sesión (sessions/<id>/store.db + keys/<id>.key; la DEK vive
-	// DESACOPLADA del directorio de store desde Plan 022 §3/§10.C).
+	// layout resuelve la ruta de la DEK por sesión (keys/<id>.key). Desde Plan 022 T3 (BD única) ya NO
+	// hay directorio ni store.db por sesión: el store vive en la BD compartida `db`; la custodia de la DEK
+	// sigue DESACOPLADA en disco (Plan 022 §3/§10.C), y es lo único que el Layout resuelve en runtime.
 	layout Layout
-	// sessions persiste los metadatos de negocio (tabla sessions_v2); fuente para Persisted().
+	// sessions persiste los metadatos de negocio (tablas accounts/devices de la BD única); fuente para
+	// Persisted(). El runtime T3 aprovecha además sus métodos por-dispositivo/cuenta vía type-assert
+	// (cascadeStore/accountStore) para el borrado quirúrgico sin huérfanos.
 	sessions app.SessionStore
+
+	// db es la BD ÚNICA COMPARTIDA del Edge (Plan 022 T3, decisión §10.A): una sola *sql.DB de la que
+	// cuelgan los metadatos (accounts/devices), el Container whatsmeow compartido (whatsmeow_*) y el store
+	// cifrado per-device (msg_enc_*). El Manager NO la posee (la abre/cierra el daemon, apagado ordenado);
+	// aquí solo se referencia para el pairing (Container compartido), el listener per-device y el borrado
+	// quirúrgico del material cifrado (cryptostore.DeleteDevice). nil en los tests con factories fake (sin
+	// BD real): el borrado cifrado se omite de forma segura. Lo inyecta WithSharedDB.
+	db *sql.DB
+	// dbDialect es el motor con el que se abrió `db` (DialectSQLite|DialectPostgres): se pasa tal cual a
+	// cryptostore/whatsmeow para que emitan el SQL correcto. Lo inyecta WithSharedDB junto a db.
+	dbDialect string
 	// max es el límite suave de sesiones simultáneas (WAPP_AGENT_MAX_SESSIONS, design §10.G).
 	max int
 	// log es el logger raíz; cada liveSession derivará un hijo con session_id/jid (design §10.J).
@@ -96,6 +113,45 @@ func WithListenerBackoff(base, max time.Duration) Option {
 			m.backoffMax = max
 		}
 	}
+}
+
+// WithSharedDB inyecta la BD ÚNICA COMPARTIDA del Edge y su dialecto (Plan 022 T3, decisión §10.A). Es
+// la costura que "enciende" el modelo BD única en runtime: el pairing construye su Container per-device
+// sobre ESTA db, el listener carga cada device por SU JID sobre ELLA, y el borrado quirúrgico purga el
+// material cifrado (msg_enc_*/whatsmeow_*) aquí. En producción la abre/cierra el daemon (apagado ordenado);
+// el Manager solo la referencia. Sin esta opción (tests con factories fake) el Manager opera sin BD real:
+// el borrado del material cifrado se OMITE de forma segura (la limpieza de DEK/metadatos sigue vigente).
+func WithSharedDB(db *sql.DB, dialect string) Option {
+	return func(m *Manager) {
+		m.db = db
+		m.dbDialect = dialect
+	}
+}
+
+// cascadeStore es el subconjunto del sessionstore concreto para el borrado transaccional POR DISPOSITIVO
+// (device + cuenta vacía en una tx, sin huérfanos). El puerto app.SessionStore solo expone Delete; el
+// runtime T3 prefiere DeleteDeviceCascade cuando el store lo implementa (type-assert), y cae a Delete con
+// los fakes en memoria de los tests (que no purgan la cuenta).
+type cascadeStore interface {
+	DeleteDeviceCascade(ctx context.Context, sessionID string) error
+}
+
+// accountStore es el subconjunto del sessionstore concreto para el borrado POR CUENTA (número): listar los
+// dispositivos de la cuenta y borrarlos junto a la cuenta en una tx. Lo usa Manager.UnlinkAccount vía
+// type-assert; los fakes en memoria no lo implementan (UnlinkAccount devuelve error claro con ellos).
+type accountStore interface {
+	GetByAccount(ctx context.Context, accountID string) ([]domain.Session, error)
+	DeleteByAccount(ctx context.Context, accountID string) error
+}
+
+// deleteDeviceMeta borra la fila de metadatos del dispositivo id purgando la cuenta si queda vacía
+// (DeleteDeviceCascade) cuando el store lo soporta; si no (fakes en memoria), cae al Delete simple del
+// puerto app.SessionStore. Compartido por Unlink y cleanupPairing (cero huérfanos de metadatos).
+func (m *Manager) deleteDeviceMeta(ctx context.Context, id string) error {
+	if cs, ok := m.sessions.(cascadeStore); ok {
+		return cs.DeleteDeviceCascade(ctx, id)
+	}
+	return m.sessions.Delete(ctx, id)
 }
 
 // custodyFor resuelve la custodia DEK de UNA sesión: NewFileCustody apuntando a Layout.DEKPath(id)

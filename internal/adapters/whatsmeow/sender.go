@@ -108,11 +108,12 @@ type mediaUploader interface {
 	Upload(ctx context.Context, plaintext []byte, appInfo wm.MediaType) (wm.UploadResponse, error)
 }
 
-// NewSender construye el adaptador real sobre la BD propia del Edge (store cifrado por envío). La BD
-// debe estar YA migrada (tablas whatsmeow_* y msg_enc_*) y con una sesión pareada (T3).
-func NewSender(db *sql.DB) *Sender {
+// NewSender construye el adaptador real sobre la BD ÚNICA del Edge (store cifrado por envío, Plan 022
+// T3). La BD debe estar YA migrada (tablas whatsmeow_* y msg_enc_*) y con una sesión pareada; dialect es
+// el motor con el que se abrió (DialectSQLite|DialectPostgres, fin del "sqlite" hardcodeado).
+func NewSender(db *sql.DB, dialect string) *Sender {
 	return &Sender{
-		loadDevice:     realLoadDevice(db),
+		loadDevice:     realLoadDevice(db, dialect),
 		dispatch:       realDispatch,
 		connectTimeout: defaultConnectTimeout,
 		flushDelay:     defaultFlushDelay,
@@ -192,14 +193,14 @@ func downloadMedia(ctx context.Context, rawURL string) ([]byte, error) {
 	return data, nil
 }
 
-// realLoadDevice es el loader PRODUCTIVO: construye el container cifrado con la DEK, resuelve el JID
-// de la sesión pareada y carga el device EXISTENTE. Devuelve error si la DEK no construye el
-// container, no hay sesión pareada o el store quedó vacío. NO loguea la DEK ni el material del store.
-func realLoadDevice(db *sql.DB) loadDeviceFunc {
+// realLoadDevice es el loader PRODUCTIVO single-sesión (legacy): sobre la BD ÚNICA compartida (Plan 022
+// T3) construye el container per-device (OpenDeviceContainer con el dialecto de config, fin del "sqlite"
+// hardcodeado), resuelve el ÚNICO JID pareado (FirstDeviceJID) y carga ese device. Devuelve error si la
+// DEK no construye el container, no hay sesión pareada o el store quedó vacío. NO loguea la DEK ni el
+// material del store. El listener MULTI-device usa realLoadDeviceByJID (carga por SU JID).
+func realLoadDevice(db *sql.DB, dialect string) loadDeviceFunc {
 	return func(ctx context.Context, dek []byte) (*store.Device, error) {
-		// Store del Edge = SQLite embebido (ADR-0002): dialecto explícito (Plan 022 T0), fin del "sqlite"
-		// hardcodeado dentro del cryptostore.
-		container, err := cryptostore.NewEncryptedContainer(ctx, db, cryptostore.DialectSQLite, dek)
+		container, err := cryptostore.OpenDeviceContainer(ctx, db, dialect, dek)
 		if err != nil {
 			return nil, fmt.Errorf("whatsapp: construir store cifrado: %w", err)
 		}
@@ -213,6 +214,35 @@ func realLoadDevice(db *sql.DB) loadDeviceFunc {
 		}
 		if device == nil {
 			return nil, fmt.Errorf("whatsapp: no hay device pareado para la sesión")
+		}
+		return device, nil
+	}
+}
+
+// realLoadDeviceByJID es el loader PRODUCTIVO per-device sobre la BD ÚNICA compartida (Plan 022 T3): a
+// diferencia de realLoadDevice (que resuelve el ÚNICO device pareado con FirstDeviceJID), carga el
+// device CONCRETO cuyo JID ya conoce el registro (devices.jid). Es el que usa el listener MULTI-device:
+// N devices comparten la BD y cada uno se carga por SU JID con SU DEK (msg_enc_* aislado por JID; cruzar
+// DEKs FALLA, T2). NO loguea la DEK ni el material del store.
+func realLoadDeviceByJID(db *sql.DB, dialect, jidStr string) loadDeviceFunc {
+	return func(ctx context.Context, dek []byte) (*store.Device, error) {
+		if jidStr == "" {
+			return nil, fmt.Errorf("whatsapp: sin JID de device para cargar (sesión sin emparejar)")
+		}
+		jid, err := types.ParseJID(jidStr)
+		if err != nil {
+			return nil, fmt.Errorf("whatsapp: JID de device inválido: %w", err)
+		}
+		container, err := cryptostore.OpenDeviceContainer(ctx, db, dialect, dek)
+		if err != nil {
+			return nil, fmt.Errorf("whatsapp: construir store cifrado: %w", err)
+		}
+		device, err := cryptostore.LoadDevice(ctx, container, jid)
+		if err != nil {
+			return nil, fmt.Errorf("whatsapp: cargar device de la sesión: %w", err)
+		}
+		if device == nil {
+			return nil, fmt.Errorf("whatsapp: no hay device pareado para el JID de la sesión")
 		}
 		return device, nil
 	}

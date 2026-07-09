@@ -13,8 +13,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 
+	"go.mau.fi/whatsmeow/types"
+
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 )
 
@@ -24,33 +26,25 @@ import (
 // capa de persistencia.
 var ErrSessionNotFound = errors.New("sessionmgr: sesión no encontrada")
 
-// Unlink desvincula y BORRA QUIRÚRGICAMENTE la sesión id, fiel a la secuencia de design §7:
+// Unlink desvincula y BORRA QUIRÚRGICAMENTE el dispositivo id, fiel a la secuencia de design §7 sobre la
+// BD ÚNICA (decisión §10.I, cero huérfanos):
 //
-//  1. saca la sesión del registro vivo (bajo m.mu) y, si tenía listener, cancela SU goroutine y espera
-//     a que cierre (waitDone) — eso cierra su *sql.DB vía el defer del listener (§10.I), sin tocar a las
-//     demás sesiones (cancel FUERA del lock, como Stop);
-//  2. limpia la DEK de ESA sesión (custodyFor(id).Clear()), NO la ranura global;
-//  3. borra su fila de metadatos (sessionStore.Delete);
-//  4. borra su directorio en disco (store.db + dek.key) con os.RemoveAll(SessionDir(id)).
+//  1. saca la sesión del registro vivo (bajo m.mu) y, si tenía listener, cancela SU goroutine y espera a
+//     que cierre (waitDone), sin tocar a las demás sesiones (cancel FUERA del lock, como Stop);
+//  2. limpia la DEK de ESE device (custodyFor(id).Clear()), NO una ranura global;
+//  3. purga su material CIFRADO por JID (cryptostore.DeleteDevice: msg_enc_* + whatsmeow_*) de la BD única;
+//  4. borra su fila de metadatos y, si la CUENTA queda vacía, también la cuenta, en una TX
+//     (deleteDeviceMeta → DeleteDeviceCascade). YA NO hay directorio/store.db por sesión que borrar.
 //
 // Si la sesión NO existe (ni viva ni persistida) devuelve ErrSessionNotFound (→ 404) SIN efectos
 // colaterales (el chequeo precede a cualquier borrado). Los pasos de limpieza son best-effort: cada uno
 // se intenta aunque otro falle (para minimizar restos) y los errores se agregan (errors.Join) y se
 // loguean; un fallo de limpieza se propaga (→ 5xx en el plano de control) sin dejar la sesión a medias.
 func (m *Manager) Unlink(ctx context.Context, id string) error {
-	// 1. Sacar la sesión del registro vivo bajo el lock; cancelar/esperar FUERA del lock (no sostener
-	//    m.mu mientras se une la goroutine). Tras el delete, List()/Health() ya no la ven.
-	m.mu.Lock()
-	s, live := m.live[id]
+	// 1. Sacar la sesión del registro vivo y unir SOLO su goroutine (cancel/espera fuera del lock).
+	jid, live := m.stopLive(id)
 	if live {
-		delete(m.live, id)
-	}
-	m.mu.Unlock()
-
-	if live {
-		s.stop()     // cancela el context de ESA sesión (idempotente; no afecta a las demás)
-		s.waitDone() // une SOLO su goroutine; al retornar, su *sql.DB ya se cerró (defer del listener)
-		s.log.Info("sesión desvinculada: listener detenido, procediendo al borrado quirúrgico")
+		m.log.Info("sesión desvinculada: listener detenido, procediendo al borrado quirúrgico", "session_id", id)
 	}
 
 	// Unregister-on-unlink: saca la sesión del multiplex CloudLink para que sus comandos posteriores se
@@ -59,41 +53,31 @@ func (m *Manager) Unlink(ctx context.Context, id string) error {
 		m.cloudMux.Unregister(id)
 	}
 
-	// 2. Existencia: si no estaba viva, confirmar que existe en metadatos antes de borrar nada. Así un
-	//    id inexistente devuelve ErrSessionNotFound (→ 404) sin efectos colaterales. Una sesión viva ya
-	//    existía por definición: se procede directo a la limpieza.
+	// 2. Existencia: si no estaba viva, confirmar que existe en metadatos antes de borrar nada (id
+	//    inexistente ⇒ ErrSessionNotFound → 404, sin efectos colaterales). Se aprovecha para conocer su JID
+	//    (necesario para purgar el material cifrado). Una sesión viva ya trae su JID de s.meta.
 	if !live {
-		if _, err := m.sessions.Get(ctx, id); err != nil {
+		sess, err := m.sessions.Get(ctx, id)
+		if err != nil {
 			if errors.Is(err, app.ErrSessionNotFound) {
 				return fmt.Errorf("%w: %s", ErrSessionNotFound, id)
 			}
 			return fmt.Errorf("sessionmgr: verificar sesión a desvincular: %w", err)
 		}
+		jid = sess.JID
 	}
 
-	// 3-5. Limpieza per-sesión best-effort (DEK de la entrada + fila + directorio). Se intentan todos
-	//      los pasos aunque uno falle (minimiza restos); los errores se agregan y se loguean.
+	// 3-4. Limpieza best-effort per-device (DEK + material cifrado por JID + fila/cuenta transaccional). Se
+	//      intentan todos los pasos aunque uno falle (minimiza restos); los errores se agregan y se loguean.
 	var errs []error
-
-	custody, err := m.custodyFor(id)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("resolver custodia: %w", err))
-	} else if cl, ok := custody.(interface{ Clear() error }); ok {
-		// Clear abstrae el backend de custodia (el futuro KeystoreCustody NO vive bajo el dir): por eso
-		// es un paso PROPIO, no redundante con el RemoveAll del directorio. Idempotente.
-		if err := cl.Clear(); err != nil {
-			errs = append(errs, fmt.Errorf("limpiar DEK: %w", err))
-		}
+	if err := m.clearDEK(id); err != nil {
+		errs = append(errs, err)
 	}
-
-	if err := m.sessions.Delete(ctx, id); err != nil {
+	if err := m.deleteCryptoMaterial(ctx, jid); err != nil {
+		errs = append(errs, err)
+	}
+	if err := m.deleteDeviceMeta(ctx, id); err != nil {
 		errs = append(errs, fmt.Errorf("borrar fila de metadatos: %w", err))
-	}
-
-	if dir, err := m.layout.SessionDir(id); err != nil {
-		errs = append(errs, fmt.Errorf("resolver dir de sesión: %w", err))
-	} else if err := os.RemoveAll(dir); err != nil {
-		errs = append(errs, fmt.Errorf("borrar dir de sesión: %w", err))
 	}
 
 	if len(errs) > 0 {
@@ -103,5 +87,108 @@ func (m *Manager) Unlink(ctx context.Context, id string) error {
 	}
 
 	m.log.Info("sessionmgr: sesión borrada quirúrgicamente", "session_id", id)
+	return nil
+}
+
+// UnlinkAccount desvincula y BORRA QUIRÚRGICAMENTE la CUENTA accountID entera y TODOS sus dispositivos
+// (borrado por número, design §7/§10.I): por cada device cancela su listener vivo, lo saca del mux y purga
+// su DEK y su material cifrado (msg_enc_*/whatsmeow_*); al final borra la cuenta y sus devices en una TX
+// (DeleteByAccount). Cero huérfanos. Devuelve ErrSessionNotFound si la cuenta no tiene dispositivos.
+//
+// Requiere un sessionstore concreto con soporte por-cuenta (GetByAccount/DeleteByAccount); con los fakes
+// en memoria de los tests (que no lo implementan) devuelve un error de cableado claro. Es la contraparte
+// por-cuenta de Unlink, base del borrado por número (T5) y forward-compatible con el plano de control.
+func (m *Manager) UnlinkAccount(ctx context.Context, accountID string) error {
+	as, ok := m.sessions.(accountStore)
+	if !ok {
+		return fmt.Errorf("sessionmgr: el store no soporta borrado por cuenta (GetByAccount/DeleteByAccount)")
+	}
+	devices, err := as.GetByAccount(ctx, accountID)
+	if err != nil {
+		return fmt.Errorf("sessionmgr: listar dispositivos de la cuenta: %w", err)
+	}
+	if len(devices) == 0 {
+		return fmt.Errorf("%w: cuenta %s", ErrSessionNotFound, accountID)
+	}
+
+	var errs []error
+	for _, dev := range devices {
+		jid, live := m.stopLive(dev.SessionID)
+		if !live {
+			jid = dev.JID
+		}
+		if m.cloudMux != nil {
+			m.cloudMux.Unregister(dev.SessionID)
+		}
+		if err := m.clearDEK(dev.SessionID); err != nil {
+			errs = append(errs, err)
+		}
+		if err := m.deleteCryptoMaterial(ctx, jid); err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// Metadatos: borra TODOS los devices + la cuenta en una transacción (cero huérfanos).
+	if err := as.DeleteByAccount(ctx, accountID); err != nil {
+		errs = append(errs, fmt.Errorf("borrar cuenta y dispositivos: %w", err))
+	}
+
+	if len(errs) > 0 {
+		joined := errors.Join(errs...)
+		m.log.Warn("sessionmgr: borrado por cuenta con errores de limpieza", "account_id", accountID, "error", joined)
+		return fmt.Errorf("sessionmgr: borrar cuenta %s: %w", accountID, joined)
+	}
+	m.log.Info("sessionmgr: cuenta borrada quirúrgicamente", "account_id", accountID, "dispositivos", len(devices))
+	return nil
+}
+
+// stopLive saca la sesión id del registro vivo (bajo lock), cancela su listener y espera a que su
+// goroutine cierre (waitDone), TODO fuera del lock (no sostener m.mu mientras se une la goroutine). No
+// afecta a las demás sesiones. Devuelve el JID de la sesión que estaba viva (para el borrado cifrado) y
+// si estaba viva.
+func (m *Manager) stopLive(id string) (jid string, live bool) {
+	m.mu.Lock()
+	s, ok := m.live[id]
+	if ok {
+		delete(m.live, id)
+	}
+	m.mu.Unlock()
+	if !ok {
+		return "", false
+	}
+	s.stop()
+	s.waitDone()
+	return s.meta.JID, true
+}
+
+// clearDEK limpia la DEK custodiada del device id (best-effort). Clear abstrae el backend de custodia (el
+// futuro KeystoreCustody NO vive bajo el dir): es un paso PROPIO del borrado quirúrgico. Idempotente.
+func (m *Manager) clearDEK(id string) error {
+	custody, err := m.custodyFor(id)
+	if err != nil {
+		return fmt.Errorf("resolver custodia: %w", err)
+	}
+	if cl, ok := custody.(interface{ Clear() error }); ok {
+		if err := cl.Clear(); err != nil {
+			return fmt.Errorf("limpiar DEK: %w", err)
+		}
+	}
+	return nil
+}
+
+// deleteCryptoMaterial purga el material CIFRADO del device de JID jid (msg_enc_* + whatsmeow_*) de la BD
+// única (cryptostore.DeleteDevice, idempotente). No-op si el device no tiene JID (nunca emparejado) o si
+// no hay BD real (tests con factories fake sin WithSharedDB). NO requiere la DEK (solo borra ciphertext).
+func (m *Manager) deleteCryptoMaterial(ctx context.Context, jid string) error {
+	if jid == "" || m.db == nil {
+		return nil
+	}
+	parsed, err := types.ParseJID(jid)
+	if err != nil {
+		return fmt.Errorf("parsear jid para borrado cifrado: %w", err)
+	}
+	if err := cryptostore.DeleteDevice(ctx, m.db, m.dbDialect, parsed); err != nil {
+		return fmt.Errorf("borrar material cifrado: %w", err)
+	}
 	return nil
 }

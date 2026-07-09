@@ -48,7 +48,8 @@ func TestUpsertGetRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
-	if got.SessionID != in.SessionID || got.JID != in.JID || got.State != in.State || got.StoreDir != in.StoreDir {
+	// StoreDir YA NO se deriva (Plan 022 T3, BD única): se compara todo lo demás.
+	if got.SessionID != in.SessionID || got.JID != in.JID || got.State != in.State {
 		t.Fatalf("Get = %+v, esperaba %+v", got, in)
 	}
 	if !got.PairedAt.Equal(paired) || !got.UpdatedAt.Equal(updated) {
@@ -545,5 +546,100 @@ func TestReUpsertKeepsAccountStable(t *testing.T) {
 	}
 	if devices != 1 {
 		t.Fatalf("filas de device = %d, esperaba 1 (upsert, no duplicado)", devices)
+	}
+}
+
+// TestUpsertRebindPurgesProvisionalAccount (Plan 022 T3): al RE-VINCULAR un device por self_pn en
+// PairSuccess (provisional account_id=session_id → cuenta real por self_pn), la cuenta provisional que
+// queda vacía se PURGA en la misma tx (cero huérfanos, decisión §10.I).
+func TestUpsertRebindPurgesProvisionalAccount(t *testing.T) {
+	ctx := context.Background()
+	store, database := newStore(t)
+
+	id := "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab"
+	// 1. Pairing: cuenta PROVISIONAL account_id=session_id (self_pn NULL).
+	if err := store.Upsert(ctx, domain.Session{SessionID: id, State: domain.SessionStatePairing}); err != nil {
+		t.Fatalf("Upsert provisional: %v", err)
+	}
+	// 2. PairSuccess: se conoce el número → re-vincula por self_pn a una cuenta real.
+	const selfPN = "56999998888"
+	if err := store.Upsert(ctx, domain.Session{
+		SessionID: id, JID: "x@s.whatsapp.net", SelfPN: selfPN, State: domain.SessionStateActive,
+	}); err != nil {
+		t.Fatalf("Upsert active (rebind): %v", err)
+	}
+
+	got, err := store.Get(ctx, id)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.AccountID == id {
+		t.Fatal("tras re-vincular por self_pn, el device NO debería seguir en la cuenta provisional (=session_id)")
+	}
+	// La cuenta provisional (account_id=session_id) quedó vacía y debe estar PURGADA.
+	var provisional int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE account_id = ?`, id).Scan(&provisional); err != nil {
+		t.Fatal(err)
+	}
+	if provisional != 0 {
+		t.Fatalf("la cuenta provisional debería estar purgada, quedan %d", provisional)
+	}
+	// Exactamente UNA cuenta (la real por self_pn), sin huérfanos.
+	var total int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("debería quedar solo la cuenta real, hay %d", total)
+	}
+}
+
+// TestDeleteDeviceCascade (Plan 022 T3): borra el device y purga su cuenta SOLO si queda vacía (una tx).
+// Con dos devices del mismo número, borrar uno conserva la cuenta; borrar el segundo la purga. Idempotente.
+func TestDeleteDeviceCascade(t *testing.T) {
+	ctx := context.Background()
+	store, database := newStore(t)
+
+	const selfPN = "56900001111"
+	a := domain.Session{SessionID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa01", JID: "a1@x", SelfPN: selfPN, State: domain.SessionStateActive}
+	b := domain.Session{SessionID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbb01", JID: "b1@x", SelfPN: selfPN, State: domain.SessionStateActive}
+	if err := store.Upsert(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Upsert(ctx, b); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := store.Get(ctx, a.SessionID)
+	acc := got.AccountID
+
+	// Borrar A: la cuenta sigue viva (B la comparte).
+	if err := store.DeleteDeviceCascade(ctx, a.SessionID); err != nil {
+		t.Fatalf("DeleteDeviceCascade(A): %v", err)
+	}
+	if _, err := store.Get(ctx, a.SessionID); !errors.Is(err, app.ErrSessionNotFound) {
+		t.Fatalf("A debería estar borrado, got %v", err)
+	}
+	var accounts int
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE account_id=?`, acc).Scan(&accounts); err != nil {
+		t.Fatal(err)
+	}
+	if accounts != 1 {
+		t.Fatalf("la cuenta compartida no debería borrarse mientras B exista, count=%d", accounts)
+	}
+
+	// Borrar B: ahora la cuenta queda vacía y se purga.
+	if err := store.DeleteDeviceCascade(ctx, b.SessionID); err != nil {
+		t.Fatalf("DeleteDeviceCascade(B): %v", err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE account_id=?`, acc).Scan(&accounts); err != nil {
+		t.Fatal(err)
+	}
+	if accounts != 0 {
+		t.Fatalf("la cuenta debería purgarse al borrar el último device, count=%d", accounts)
+	}
+
+	// Idempotente: borrar un ausente no es error.
+	if err := store.DeleteDeviceCascade(ctx, a.SessionID); err != nil {
+		t.Fatalf("DeleteDeviceCascade idempotente: %v", err)
 	}
 }

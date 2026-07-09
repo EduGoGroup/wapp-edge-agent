@@ -12,8 +12,9 @@ import (
 // cifrado (envelope rechaza != 32 B), y StartConnection devuelve error SIN abrir canal ni conectar
 // (no se filtra nada, no se toca la BD).
 func TestStartConnection_BadDEK_Error(t *testing.T) {
-	c := NewConnector(nil)                                             // db no se llega a tocar: la DEK inválida falla antes.
-	_, err := c.StartConnection(context.Background(), []byte("corta")) // != 32 bytes
+	// db/dialecto no se llegan a tocar: la DEK inválida (!= 32 bytes) falla al construir el envelope antes.
+	c := NewConnector(nil, "sqlite")
+	_, err := c.StartConnection(context.Background(), []byte("corta"))
 	if err == nil {
 		t.Fatal("StartConnection con DEK inválida debía fallar")
 	}

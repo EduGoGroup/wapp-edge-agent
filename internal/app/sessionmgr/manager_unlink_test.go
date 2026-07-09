@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -87,17 +85,11 @@ func (s *unlinkStore) has(id string) bool {
 	return ok
 }
 
-// seedOnDisk materializa en disco lo que el borrado quirúrgico debe limpiar: el directorio de la
-// sesión, su DEK (vía la custodia real) y un store.db de relleno. Devuelve el dir de la sesión.
-func seedOnDisk(t *testing.T, m *Manager, id string) string {
+// seedDEK sella la DEK del device id vía su custodia real. En el modelo BD ÚNICA (Plan 022 T3) es lo
+// ÚNICO en disco que el borrado quirúrgico debe limpiar por sesión: ya no hay directorio ni store.db por
+// sesión (el store vive en la BD compartida; el material cifrado lo purga cryptostore.DeleteDevice).
+func seedDEK(t *testing.T, m *Manager, id string) {
 	t.Helper()
-	dir, err := m.layout.SessionDir(id)
-	if err != nil {
-		t.Fatalf("SessionDir(%s): %v", id, err)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatalf("mkdir %s: %v", dir, err)
-	}
 	custody, err := m.custodyFor(id)
 	if err != nil {
 		t.Fatalf("custodyFor(%s): %v", id, err)
@@ -105,14 +97,6 @@ func seedOnDisk(t *testing.T, m *Manager, id string) string {
 	if err := custody.Store(bytes.Repeat([]byte{0x11}, 32)); err != nil {
 		t.Fatalf("Store DEK %s: %v", id, err)
 	}
-	storeDB, err := m.layout.StoreDB(id)
-	if err != nil {
-		t.Fatalf("StoreDB(%s): %v", id, err)
-	}
-	if err := os.WriteFile(storeDB, []byte("store-db-relleno"), 0o600); err != nil {
-		t.Fatalf("escribir store.db %s: %v", id, err)
-	}
-	return dir
 }
 
 // TestManager_Unlink_SurgicalIsolation (DoD T5, design §7): con 2 sesiones VIVAS (A y B), Unlink(A)
@@ -129,8 +113,8 @@ func TestManager_Unlink_SurgicalIsolation(t *testing.T) {
 	fab := newFakeFabric()
 	m.newListener = fab.factory
 
-	dirA := seedOnDisk(t, m, uuidA)
-	dirB := seedOnDisk(t, m, uuidB)
+	seedDEK(t, m, uuidA)
+	seedDEK(t, m, uuidB)
 
 	if err := m.Restore(context.Background()); err != nil {
 		t.Fatalf("Restore: %v", err)
@@ -150,16 +134,13 @@ func TestManager_Unlink_SurgicalIsolation(t *testing.T) {
 	if store.has(uuidA) {
 		t.Fatal("la fila de metadatos de A debería estar borrada")
 	}
-	if _, err := os.Stat(dirA); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("el directorio de A debería estar borrado, stat err=%v", err)
-	}
 	custA, _ := m.custodyFor(uuidA)
 	if custA.Exists() {
 		t.Fatal("la DEK de A debería estar borrada")
 	}
-	// El listener de A fue cancelado y unido: exactamente UN store cerrado (el de A). El de B sigue vivo.
+	// El listener de A fue cancelado y unido: exactamente UN store (fake) cerrado (el de A). El de B sigue vivo.
 	if got := fab.closes.Load(); got != 1 {
-		t.Fatalf("Unlink(A) debería cerrar SOLO el store de A, cerró %d", got)
+		t.Fatalf("Unlink(A) debería cerrar SOLO el listener de A, cerró %d", got)
 	}
 
 	// --- B intacta y operativa ---
@@ -169,9 +150,6 @@ func TestManager_Unlink_SurgicalIsolation(t *testing.T) {
 	if !store.has(uuidB) {
 		t.Fatal("la fila de B no debería haberse tocado")
 	}
-	if _, err := os.Stat(dirB); err != nil {
-		t.Fatalf("el directorio de B debería seguir existiendo, stat err=%v", err)
-	}
 	custB, _ := m.custodyFor(uuidB)
 	if !custB.Exists() {
 		t.Fatal("la DEK de B no debería haberse tocado")
@@ -180,7 +158,7 @@ func TestManager_Unlink_SurgicalIsolation(t *testing.T) {
 	// Apagado: solo queda B; Stop la cierra (segundo close).
 	m.Stop()
 	if got := fab.closes.Load(); got != 2 {
-		t.Fatalf("tras Stop deberían haberse cerrado 2 stores en total (A en Unlink + B en Stop), got %d", got)
+		t.Fatalf("tras Stop deberían haberse cerrado 2 listeners en total (A en Unlink + B en Stop), got %d", got)
 	}
 }
 
@@ -196,11 +174,7 @@ func TestManager_Unlink_NotFound(t *testing.T) {
 		t.Fatalf("Unlink de inexistente debería dar ErrSessionNotFound, got %v", err)
 	}
 
-	// Sin efectos colaterales: ni se creó el dir del inexistente, ni se tocó la fila de A.
-	dirC := filepath.Join(base, "sessions", uuidC)
-	if _, err := os.Stat(dirC); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Unlink not-found no debería crear el dir %s, stat err=%v", dirC, err)
-	}
+	// Sin efectos colaterales: no se tocó la fila de A.
 	if !store.has(uuidA) {
 		t.Fatal("Unlink de un id ajeno no debería tocar la fila de A")
 	}
@@ -216,16 +190,13 @@ func TestManager_Unlink_PersistedNotLive(t *testing.T) {
 	})
 	m := NewManager(NewLayout(base), store, 5, testLogger())
 
-	dirA := seedOnDisk(t, m, uuidA)
+	seedDEK(t, m, uuidA)
 
 	if err := m.Unlink(context.Background(), uuidA); err != nil {
 		t.Fatalf("Unlink(A persistida no-viva): %v", err)
 	}
 	if store.has(uuidA) {
 		t.Fatal("la fila de A debería estar borrada")
-	}
-	if _, err := os.Stat(dirA); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("el directorio de A debería estar borrado, stat err=%v", err)
 	}
 	custA, _ := m.custodyFor(uuidA)
 	if custA.Exists() {

@@ -53,15 +53,16 @@ type Connector struct {
 
 var _ app.Connector = (*Connector)(nil)
 
-// NewConnector construye el conector real sobre la BD propia del Edge. La BD debe estar YA migrada
-// (tablas whatsmeow_* y msg_enc_*; ver internal/infra/db). Cada pairing crea su propio container
-// cifrado sobre esta misma conexión.
-func NewConnector(db *sql.DB) *Connector {
+// NewConnector construye el conector real sobre la BD ÚNICA compartida del Edge (Plan 022 T3). La BD
+// debe estar YA migrada (tablas whatsmeow_* y msg_enc_*; ver internal/infra/db); dialect es el motor con
+// el que se abrió (DialectSQLite|DialectPostgres). Cada pairing crea SU container cifrado per-device
+// (OpenDeviceContainer) sobre esta MISMA conexión compartida (N devices, 1 *sql.DB).
+func NewConnector(db *sql.DB, dialect string) *Connector {
 	return &Connector{
 		newContainer: func(ctx context.Context, dek []byte) (store.DeviceContainer, error) {
-			// Store del Edge = SQLite embebido (ADR-0002): se pasa el dialecto explícito en vez del
-			// "sqlite" que antes hardcodeaba el cryptostore (Plan 022 T0).
-			return cryptostore.NewEncryptedContainer(ctx, db, cryptostore.DialectSQLite, dek)
+			// BD única compartida (Plan 022 §10.A): container per-device con la DEK del pairing, sobre la
+			// BD abierta con el dialecto de config (fin del "sqlite" hardcodeado), vía OpenDeviceContainer.
+			return cryptostore.OpenDeviceContainer(ctx, db, dialect, dek)
 		},
 		signalBuffer:      8,
 		activationTimeout: defaultActivationTimeout,

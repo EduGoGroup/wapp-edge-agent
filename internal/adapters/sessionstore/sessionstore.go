@@ -12,11 +12,12 @@
 // cuenta (misma self_pn ⇒ mismo account_id). El JID es un atributo OPCIONAL (NULL mientras 'pairing';
 // ÚNICO cuando no es NULL vía el índice parcial ux_devices_jid). El esquema lo crea la 0004.
 //
-// COMPATIBILIDAD T1↔T3 (green sin trabajo de runtime): el puerto app.SessionStore (Upsert/List/ListActive/
-// Get/Delete) se conserva INTACTO para que pairing/listen/restore/unlink compilen sin cambios. El campo
-// domain.Session.StoreDir se DERIVA (`sessions/<session_id>`) en vez de persistirse (ya no hay columna
-// store_dir). Los métodos por CUENTA (GetByAccount/DeleteByAccount) son EXTRA sobre el tipo concreto, no
-// del puerto (no rompen los fakes de los tests). La unificación List/ListActive vive en el helper `list`.
+// PUERTO ESTABLE + EXTRAS T3: el puerto app.SessionStore (Upsert/List/ListActive/Get/Delete) se conserva
+// INTACTO para que pairing/listen/restore/unlink y los fakes compilen sin cambios. El campo
+// domain.Session.StoreDir YA NO se deriva ni se persiste (Plan 022 T3, BD única: no hay directorio por
+// sesión). Los métodos EXTRA sobre el tipo concreto —por CUENTA (GetByAccount/DeleteByAccount) y el borrado
+// transaccional por dispositivo (DeleteDeviceCascade)— los usa el runtime T3 vía type-assert (no rompen los
+// fakes de los tests). La unificación List/ListActive vive en el helper `list`.
 package sessionstore
 
 import (
@@ -24,7 +25,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,11 +33,6 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 )
-
-// sessionsDirName es el nombre del directorio histórico por sesión; se usa SOLO para DERIVAR el campo
-// domain.Session.StoreDir (`sessions/<session_id>`), ya que la 0004 retiró la columna store_dir. Cuando
-// los consumidores runtime migren a la BD única (T3) esta derivación desaparece.
-const sessionsDirName = "sessions"
 
 // deviceSelect proyecta un DISPOSITIVO junto con los datos de su CUENTA (⨝ accounts). Compartido por
 // List/ListActive/Get/GetByAccount; scan() materializa estas columnas (en este orden) a domain.Session.
@@ -76,6 +71,16 @@ func (s *Store) Upsert(ctx context.Context, sess domain.Session) error {
 	}
 	defer func() { _ = tx.Rollback() }() // no-op tras Commit; revierte cuenta+device si algo falla.
 
+	// Cuenta ANTERIOR del device (si ya existía): al RE-VINCULAR por self_pn en PairSuccess (Plan 022 T3),
+	// el device pasa de su cuenta PROVISIONAL (account_id=session_id) a la cuenta real (por self_pn); la
+	// provisional queda vacía y hay que purgarla en la MISMA tx para no dejar cuentas huérfanas (§10.I).
+	var prevAccountID string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT account_id FROM devices WHERE session_id = ?`, sess.SessionID).Scan(&prevAccountID); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("sessionstore: leer cuenta previa del device: %w", err)
+	}
+
 	accountID, err := resolveAccount(ctx, tx, sess)
 	if err != nil {
 		return err
@@ -101,8 +106,33 @@ func (s *Store) Upsert(ctx context.Context, sess domain.Session) error {
 		return fmt.Errorf("sessionstore: upsert de device: %w", err)
 	}
 
+	// Re-vinculación: si el device cambió de cuenta y la anterior quedó SIN dispositivos, purgarla.
+	if prevAccountID != "" && prevAccountID != accountID {
+		if err := deleteAccountIfEmpty(ctx, tx, prevAccountID); err != nil {
+			return err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("sessionstore: commit de upsert: %w", err)
+	}
+	return nil
+}
+
+// deleteAccountIfEmpty borra la cuenta accountID SOLO si ya no tiene dispositivos (dentro de la tx dada).
+// Es la purga de la cuenta provisional que queda vacía al re-vincular un device por self_pn (cero
+// huérfanos, §10.I). No-op si la cuenta aún tiene dispositivos.
+func deleteAccountIfEmpty(ctx context.Context, tx *sql.Tx, accountID string) error {
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM devices WHERE account_id = ?`, accountID).Scan(&n); err != nil {
+		return fmt.Errorf("sessionstore: contar dispositivos de la cuenta previa: %w", err)
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE account_id = ?`, accountID); err != nil {
+		return fmt.Errorf("sessionstore: purgar cuenta previa vacía: %w", err)
 	}
 	return nil
 }
@@ -251,12 +281,54 @@ func (s *Store) Get(ctx context.Context, sessionID string) (domain.Session, erro
 }
 
 // Delete elimina el DISPOSITIVO con ese `session_id`. Idempotente (borrar uno ausente no es error). Es la
-// parte de metadatos del borrado quirúrgico por dispositivo (design §7); la cuenta y el material cripto/DEK
-// los limpia el Manager aparte. TODO(T3): el borrado transaccional que también purga la cuenta vacía y las
-// filas msg_enc_* vive en Manager.Unlink; aquí solo se retira la fila del device.
+// parte de metadatos del borrado quirúrgico por dispositivo (design §7); la cuenta vacía se purga aparte
+// (DeleteDeviceCascade) y el material cripto/DEK los limpia el Manager. Se conserva para consumidores del
+// puerto app.SessionStore (que solo expone Delete); el runtime T3 usa DeleteDeviceCascade.
 func (s *Store) Delete(ctx context.Context, sessionID string) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM devices WHERE session_id = ?`, sessionID); err != nil {
 		return fmt.Errorf("sessionstore: borrar device: %w", err)
+	}
+	return nil
+}
+
+// DeleteDeviceCascade borra el DISPOSITIVO `session_id` y, si su CUENTA queda SIN dispositivos, borra
+// también la cuenta — todo en una TRANSACCIÓN (Plan 022 T3, decisión §10.I: cero huérfanos en metadatos).
+// Es la parte de metadatos del borrado quirúrgico por dispositivo que usa Manager.Unlink; el material
+// cifrado (msg_enc_*/whatsmeow_*) y la DEK los limpia el Manager aparte (cryptostore.DeleteDevice +
+// custody.Clear). Idempotente: borrar un session_id ausente no es error (no toca cuentas).
+func (s *Store) DeleteDeviceCascade(ctx context.Context, sessionID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sessionstore: abrir transacción de borrado por dispositivo: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }() // no-op tras Commit.
+
+	var accountID string
+	err = tx.QueryRowContext(ctx, `SELECT account_id FROM devices WHERE session_id = ?`, sessionID).Scan(&accountID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // ausente: idempotente, nada que borrar.
+	}
+	if err != nil {
+		return fmt.Errorf("sessionstore: resolver cuenta del dispositivo a borrar: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM devices WHERE session_id = ?`, sessionID); err != nil {
+		return fmt.Errorf("sessionstore: borrar device: %w", err)
+	}
+
+	var remaining int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM devices WHERE account_id = ?`, accountID).Scan(&remaining); err != nil {
+		return fmt.Errorf("sessionstore: contar dispositivos de la cuenta: %w", err)
+	}
+	if remaining == 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM accounts WHERE account_id = ?`, accountID); err != nil {
+			return fmt.Errorf("sessionstore: borrar cuenta vacía: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("sessionstore: commit de borrado por dispositivo: %w", err)
 	}
 	return nil
 }
@@ -290,7 +362,8 @@ type scanner interface {
 
 // scan mapea una fila de deviceSelect (session_id, account_id, self_pn, display_name, jid, state, role,
 // paired_at, updated_at) a domain.Session. self_pn/display_name/jid/paired_at son NULLABLE (NULL ⇒ vacío/
-// cero). StoreDir se DERIVA de `sessions/<session_id>` (ya no hay columna store_dir).
+// cero). StoreDir YA NO se deriva (Plan 022 T3, BD única): no hay directorio por sesión; el campo queda
+// vacío (el modelo `.db`-por-sesión se retiró).
 func scan(sc scanner) (domain.Session, error) {
 	var (
 		sessionID, accountID, state, role string
@@ -310,7 +383,6 @@ func scan(sc scanner) (domain.Session, error) {
 		JID:         jid.String,         // "" si NULL
 		State:       domain.SessionState(state),
 		Role:        role,
-		StoreDir:    filepath.Join(sessionsDirName, sessionID), // derivado (design §T1; TODO(T3): retirar)
 		PairedAt:    fromNullableUnix(pairedAt),
 		UpdatedAt:   fromUnix(updatedAt),
 	}, nil

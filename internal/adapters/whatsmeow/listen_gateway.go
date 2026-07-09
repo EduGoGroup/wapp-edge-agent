@@ -11,6 +11,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-shared/logger"
@@ -65,14 +66,28 @@ type ListenGateway struct {
 var _ app.ListenGateway = (*ListenGateway)(nil)
 var _ app.LiveLogout = (*ListenGateway)(nil)
 
-// NewListenGateway construye el gateway real sobre la BD propia del Edge. La BD debe estar YA migrada
-// y con una sesión pareada (T3).
-func NewListenGateway(db *sql.DB, log logger.Logger) *ListenGateway {
+// newListenGateway es el constructor común: recibe el loader de device ya parametrizado (single-sesión
+// vs. per-device) y arma el gateway con su Correlator por sesión (§10.E).
+func newListenGateway(loadDevice loadDeviceFunc, log logger.Logger) *ListenGateway {
 	return &ListenGateway{
-		loadDevice: realLoadDevice(db),
+		loadDevice: loadDevice,
 		log:        log,
 		correlator: NewCorrelator(0, 0), // tope/TTL por defecto (§10.E).
 	}
+}
+
+// NewListenGateway construye el gateway real SINGLE-SESIÓN (legacy runRestore/listen) sobre la BD del
+// Edge en SQLite: resuelve el ÚNICO device pareado (FirstDeviceJID). La BD debe estar YA migrada y con
+// una sesión pareada. El daemon MULTI-device (serve) usa NewListenGatewayForDevice.
+func NewListenGateway(db *sql.DB, log logger.Logger) *ListenGateway {
+	return newListenGateway(realLoadDevice(db, cryptostore.DialectSQLite), log)
+}
+
+// NewListenGatewayForDevice construye el gateway real per-device sobre la BD ÚNICA COMPARTIDA (Plan 022
+// T3): carga el device CONCRETO por SU jid (devices.jid) con SU DEK y el dialecto de config. Es el que
+// cablea el Manager por cada sesión activa al restaurar/parear (N devices, 1 *sql.DB compartida).
+func NewListenGatewayForDevice(db *sql.DB, dialect, jid string, log logger.Logger) *ListenGateway {
+	return newListenGateway(realLoadDeviceByJID(db, dialect, jid), log)
 }
 
 // Correlator expone el mapa de correlación command_id ↔ MessageID de esta sesión (uno por gateway ⇒

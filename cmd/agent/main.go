@@ -54,6 +54,11 @@ import (
 // Version identifica la build del Edge Agent.
 const Version = "0.1.0-bootstrap"
 
+// singleDBFileName es el nombre de la BD ÚNICA del Edge (Plan 022 T3) bajo data_dir cuando el dialecto es
+// SQLite y no se pasó un DSN explícito. Aloja metadatos (accounts/devices) + whatsmeow_* + msg_enc_* en un
+// solo fichero (retira el modelo de sessions.db meta + store.db por sesión).
+const singleDBFileName = "edge.db"
+
 func main() {
 	path := os.Getenv("WAPP_AGENT_CONFIG")
 	if path == "" {
@@ -176,7 +181,7 @@ func runPair(ctx context.Context, cfg config.Config, log sharedlogger.Logger) er
 	}
 	defer func() { _ = database.Close() }()
 
-	connector := waconn.NewConnector(database)
+	connector := waconn.NewConnector(database, db.DialectSQLite)
 	qrSink := control.NewTerminalQRSink(os.Stdout)
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
 
@@ -230,7 +235,7 @@ func runSend(ctx context.Context, cfg config.Config, log sharedlogger.Logger, to
 	defer func() { _ = database.Close() }()
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
-	sender := waconn.NewSender(database)
+	sender := waconn.NewSender(database, db.DialectSQLite)
 
 	log.Info("envio: despachando texto a WhatsApp",
 		"to", to, "db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
@@ -321,16 +326,25 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// BD CENTRAL de metadatos multi-sesión (<data_dir>/sessions.db, tabla sessions_v2). El store cifrado
-	// y la DEK viven POR SESIÓN bajo <data_dir>/sessions/<id>/ (ADR-0016); el Manager los resuelve.
-	metaPath := filepath.Join(cfg.DataDir, "sessions.db")
-	metaDB, err := db.OpenAndMigrateMeta(ctx, metaPath)
-	if err != nil {
-		return fmt.Errorf("serve: abrir/migrar la BD de metadatos %q: %w", metaPath, err)
+	// BD ÚNICA del Edge (Plan 022 T3, decisión §10.A): una sola *sql.DB con TODO — metadatos de negocio
+	// (accounts/devices), el Container whatsmeow COMPARTIDO (whatsmeow_*) y el store cifrado per-device
+	// (msg_enc_*). Dialecto/DSN CONMUTABLES por config (T0): SQLite embebido por defecto (fichero bajo
+	// data_dir), Postgres solo por cadena. Migra AMBOS sets (store + meta) sobre la MISMA BD. La DEK sigue
+	// custodiada POR DISPOSITIVO bajo <data_dir>/keys/<id>.key (DESACOPLADA de la BD, §3/§10.C).
+	dbDSN := cfg.DBDSN
+	if cfg.DBDialect == db.DialectSQLite && dbDSN == "" {
+		dbDSN = filepath.Join(cfg.DataDir, singleDBFileName)
 	}
-	defer func() { _ = metaDB.Close() }()
+	database, err := db.Open(ctx, cfg.DBDialect, dbDSN)
+	if err != nil {
+		return fmt.Errorf("serve: abrir la BD única (dialecto %q): %w", cfg.DBDialect, err)
+	}
+	defer func() { _ = database.Close() }()
+	if err := db.Migrate(ctx, database); err != nil {
+		return fmt.Errorf("serve: migrar la BD única: %w", err)
+	}
 
-	sessions := sessionstore.New(metaDB)
+	sessions := sessionstore.New(database)
 	layout := sessionmgr.NewLayout(cfg.DataDir)
 
 	// Multiplexor CloudLink REAL (T7): UN solo stream Connect por Edge que multiplexa N sesiones por
@@ -339,9 +353,11 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	// registra cada sesión (live-sender + presencia de DEK) al arrancar su listener y la quita en Unlink.
 	mux := buildMux(ctx, cfg, log)
 
-	// Manager con escucha real (un listener por sesión) y pairing real (un Connector por sesión sobre SU
-	// store; el QRSink lo inyecta el plano de control POR emparejamiento para el polling async del QR).
+	// Manager con la BD ÚNICA compartida (WithSharedDB): escucha real per-device (un listener por device
+	// que carga por SU JID sobre la BD compartida) y pairing real (Container per-device sobre la MISMA BD;
+	// el QRSink lo inyecta el plano de control POR emparejamiento para el polling async del QR).
 	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
+		sessionmgr.WithSharedDB(database, cfg.DBDialect),
 		sessionmgr.WithWhatsmeowListen(mux, cfg.PushName),
 		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
 	)
@@ -500,7 +516,7 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	} else {
 		// Camino efímero (defensivo, sin cliente vivo): no hay Correlator que alimentar; el command_id se
 		// ignora y el acuse subiría como estado crudo.
-		sendUC := app.NewSend(custody, waconn.NewSender(database))
+		sendUC := app.NewSend(custody, waconn.NewSender(database, db.DialectSQLite))
 		sendFunc = func(ctx context.Context, _ /*commandID*/, to, text string) error { return sendUC.Run(ctx, to, text) }
 		sendMediaFunc = func(ctx context.Context, _ /*commandID*/, to, presignedURL, filename, mime, kind, caption string) error {
 			return sendUC.RunMedia(ctx, to, presignedURL, filename, mime, kind, caption)

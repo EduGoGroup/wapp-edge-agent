@@ -11,6 +11,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/logsink"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/logger"
 )
 
@@ -34,7 +35,12 @@ func TestRunServe_ArranqueYCierre(t *testing.T) {
 
 	socket := filepath.Join(dir, "edge.sock")
 	cfg := config.Config{
-		LogLevel:          "error", // silencioso: el test no inspecciona logs
+		LogLevel: "error", // silencioso: el test no inspecciona logs
+		// Plan 022 T3: runServe abre la BD ÚNICA (<data_dir>/edge.db) con dialecto conmutable; en producción
+		// config.Load defaultea DBDialect="sqlite", pero este test construye Config a mano, así que hay que
+		// fijar DataDir + DBDialect explícitamente (antes runServe usaba DataDir para sessions.db meta).
+		DataDir:           dir,
+		DBDialect:         db.DialectSQLite,
 		DBPath:            filepath.Join(dir, "edge.db"),
 		DEKPath:           filepath.Join(dir, "dek.key"),
 		ControlSocketPath: socket,

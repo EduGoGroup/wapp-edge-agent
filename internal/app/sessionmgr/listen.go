@@ -27,7 +27,6 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
-	wappdb "github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 )
 
 // ErrListenNotConfigured: se llamó a Restore sin haber inyectado el factory de escucha (falta
@@ -78,10 +77,11 @@ type CloudLinkMux interface {
 }
 
 // WithWhatsmeowListen habilita Restore/startListener con la escucha REAL sobre whatsmeow Y la cablea al
-// multiplexor CloudLink (T7): por cada sesión abre SU store.db (Layout.StoreDB(id)), construye un
-// ListenGateway sobre esa *sql.DB y un app.Listen que carga la DEK de la sesión (custodia inyectada) y
-// mantiene el socket vivo, reenviando los entrantes al sink ETIQUETADO de esa sesión (mux.SinkFor(id)).
-// El *sql.DB se devuelve como io.Closer para el apagado ordenado.
+// multiplexor CloudLink (T7): por cada sesión monta un ListenGateway per-device sobre la BD ÚNICA
+// COMPARTIDA (m.db) que carga el device CONCRETO de la sesión por SU JID (s.meta.JID) con SU DEK, y un
+// app.Listen que mantiene el socket vivo reenviando los entrantes al sink ETIQUETADO (mux.SinkFor(id)).
+// Ya NO abre un store.db por sesión (Plan 022 §10.A): N devices comparten una sola *sql.DB. El io.Closer
+// del apagado ordenado es nil porque la BD compartida la posee el daemon (NO se cierra por-listener, §10.I).
 //
 // MULTIPLEX (ADR-0008: un stream por Edge): el mux es ÚNICO; SinkFor(id) etiqueta la salida con el
 // session_id y el lease es por sesión (lo mantiene el mux). El live-sender se EXPONE así: cada ciclo de
@@ -94,16 +94,14 @@ type CloudLinkMux interface {
 func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 	return func(m *Manager) {
 		m.cloudMux = mux
-		m.newListener = func(ctx context.Context, s *liveSession) (listenRunner, io.Closer, error) {
-			storePath, err := m.layout.StoreDB(s.meta.SessionID)
-			if err != nil {
-				return nil, nil, fmt.Errorf("resolver store de sesión: %w", err)
+		m.newListener = func(_ context.Context, s *liveSession) (listenRunner, io.Closer, error) {
+			if m.db == nil {
+				return nil, nil, fmt.Errorf("BD única compartida no configurada (usa WithSharedDB)")
 			}
-			sdb, err := wappdb.OpenSessionStore(ctx, storePath)
-			if err != nil {
-				return nil, nil, fmt.Errorf("abrir store de sesión: %w", err)
-			}
-			gateway := whatsmeow.NewListenGateway(sdb, s.log)
+			// BD ÚNICA COMPARTIDA (Plan 022 §10.A): el gateway carga el device de ESTA sesión por SU JID
+			// (s.meta.JID) con SU DEK sobre la db compartida (N devices, 1 *sql.DB). El *sql.DB NO se cierra
+			// por-listener: lo posee el daemon (apagado ordenado §10.I), por eso el io.Closer es nil.
+			gateway := whatsmeow.NewListenGatewayForDevice(m.db, m.dbDialect, s.meta.JID, s.log)
 			// Nombre visible de FALLBACK para anunciar presencia (Plan 013 §10.D): whatsmeow rechaza
 			// SendPresence si el store restaurado no trae PushName. El gateway solo lo usa si el nombre
 			// real de la cuenta (app-state) aún no está; ese prevalece.
@@ -139,7 +137,7 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 				mux.SendLoggedOut(sid)
 			})
 			runner := app.NewListen(s.custody, gateway, mux.SinkFor(sid))
-			return runner, sdb, nil
+			return runner, nil, nil
 		}
 	}
 }

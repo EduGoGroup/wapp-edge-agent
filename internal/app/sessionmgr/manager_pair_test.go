@@ -45,24 +45,26 @@ type discardQR struct{}
 
 func (discardQR) ShowQR(string) error { return nil }
 
-// newPairTestManager arma un Manager con un sessionstore REAL (sessions.db en un tempdir) y el factory
-// de pairing dado (un fake). Devuelve también el store y el Layout para inspeccionar el resultado.
+// newPairTestManager arma un Manager con un sessionstore REAL sobre la BD ÚNICA (un solo edge.db en un
+// tempdir con metadatos + msg_enc_* + whatsmeow_*, Plan 022 T3) compartida vía WithSharedDB, y el factory
+// de pairing dado (un fake que ignora la BD). Devuelve también el store y el Layout para inspeccionar.
 func newPairTestManager(t *testing.T, factory pairFactory) (*Manager, *sessionstore.Store, Layout) {
 	t.Helper()
 	base := filepath.Join(t.TempDir(), "edge-data")
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		t.Fatalf("crear data_dir: %v", err)
 	}
-	metaDB, err := wappdb.OpenAndMigrateMeta(context.Background(), filepath.Join(base, "sessions.db"))
+	database, err := wappdb.OpenAndMigrate(context.Background(), filepath.Join(base, "edge.db"))
 	if err != nil {
-		t.Fatalf("abrir/migrar sessions.db: %v", err)
+		t.Fatalf("abrir/migrar la BD única: %v", err)
 	}
-	t.Cleanup(func() { _ = metaDB.Close() })
+	t.Cleanup(func() { _ = database.Close() })
 
 	layout := NewLayout(base)
-	m := NewManager(layout, sessionstore.New(metaDB), 5, testLogger())
+	m := NewManager(layout, sessionstore.New(database), 5, testLogger(),
+		WithSharedDB(database, wappdb.DialectSQLite))
 	m.newPairer = factory
-	return m, sessionstore.New(metaDB), layout
+	return m, sessionstore.New(database), layout
 }
 
 // sealingFactory devuelve un factory que, en cada llamada, sella una DEK distinta y un JID distinto
@@ -122,19 +124,14 @@ func TestManager_Pair_Happy(t *testing.T) {
 	if row.JID != res.WaJID {
 		t.Fatalf("jid de la fila %q != resultado %q", row.JID, res.WaJID)
 	}
-	if want := filepath.Join("sessions", row.SessionID); row.StoreDir != want {
-		t.Fatalf("store_dir esperado %q, got %q", want, row.StoreDir)
-	}
 	if row.PairedAt.IsZero() {
 		t.Fatalf("paired_at no debería ser cero tras PairSuccess")
 	}
 
-	dir, _ := layout.SessionDir(row.SessionID)
-	store, _ := layout.StoreDB(row.SessionID)
+	// BD única (Plan 022 T3): ya NO hay directorio ni store.db por sesión; solo la DEK custodiada persiste.
 	dek, _ := layout.DEKPath(row.SessionID)
-	if !fileExists(t, dir) || !fileExists(t, store) || !fileExists(t, dek) {
-		t.Fatalf("faltan artefactos: dir=%v store=%v dek=%v",
-			fileExists(t, dir), fileExists(t, store), fileExists(t, dek))
+	if !fileExists(t, dek) {
+		t.Fatalf("falta la DEK custodiada de la sesión")
 	}
 
 	if got := m.List(); len(got) != 1 {
@@ -196,14 +193,11 @@ func TestManager_Pair_AntiClobber(t *testing.T) {
 	if !bytes.Equal(dek1, dek1After) {
 		t.Fatalf("la DEK de la 1ª sesión cambió tras el 2º pair (pisado)")
 	}
-	dir1, _ := layout.SessionDir(id1)
-	dir2, _ := layout.SessionDir(id2)
-	if !fileExists(t, dir1) || !fileExists(t, dir2) {
-		t.Fatalf("deberían existir ambos directorios de sesión")
-	}
+	// BD única (Plan 022 T3): cada sesión tiene SU DEK custodiada (keys/<id>.key), sin directorio por sesión.
+	dek1Path, _ := layout.DEKPath(id1)
 	dek2Path, _ := layout.DEKPath(id2)
-	if !fileExists(t, dek2Path) {
-		t.Fatalf("la 2ª sesión debería tener su propia dek.key")
+	if !fileExists(t, dek1Path) || !fileExists(t, dek2Path) {
+		t.Fatalf("cada sesión debería tener su propia DEK custodiada")
 	}
 
 	if got := m.List(); len(got) != 2 {

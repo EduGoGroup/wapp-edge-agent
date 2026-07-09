@@ -16,15 +16,15 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/google/uuid"
+	"go.mau.fi/whatsmeow/types"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
-	wappdb "github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 )
 
 // ErrPairingNotConfigured: se llamó a Pair sin haber inyectado el factory de pairing (falta
@@ -38,33 +38,35 @@ type pairRunner interface {
 	Run(ctx context.Context) (app.PairResult, error)
 }
 
-// pairFactory construye el pairRunner para una sesión concreta: recibe SU custodia DEK, la *sql.DB de SU
-// store ya abierto/migrado y el QRSink de ESTE emparejamiento (inyectado POR llamada para que el plano
-// de control haga polling async del QR sin compartir un sink global). El factory decide qué connector
-// (real o fake) cablear.
+// pairFactory construye el pairRunner para una sesión concreta: recibe SU custodia DEK, la *sql.DB del
+// store (Plan 022 T3: la BD ÚNICA COMPARTIDA del Manager, no un .db por sesión) y el QRSink de ESTE
+// emparejamiento (inyectado POR llamada para que el plano de control haga polling async del QR sin
+// compartir un sink global). El factory decide qué connector (real o fake) cablear.
 type pairFactory func(custody app.KeyCustody, storeDB *sql.DB, qr app.QRSink) pairRunner
 
-// WithWhatsmeowPairing habilita Manager.Pair con el pairing REAL sobre whatsmeow: por cada sesión
-// construye un Connector sobre su store (whatsmeow.NewConnector) y un app.Pair que pinta el QR en el
-// QRSink que Manager.Pair recibe POR llamada y acota el flujo con timeout. La DEK la genera/sella
-// app.Pair en la dek.key de la sesión. El QRSink ya NO es global: lo provee cada POST /v1/sessions/pair
-// (un MemoryQRSink propio) para que el polling del QR sea por-emparejamiento.
+// WithWhatsmeowPairing habilita Manager.Pair con el pairing REAL sobre whatsmeow: construye un Connector
+// sobre la BD ÚNICA COMPARTIDA (whatsmeow.NewConnector con el dialecto del Manager) que monta el Container
+// per-device con la DEK del pairing, y un app.Pair que pinta el QR en el QRSink que Manager.Pair recibe
+// POR llamada y acota el flujo con timeout. La DEK la genera/sella app.Pair en keys/<id>.key. El QRSink ya
+// NO es global: lo provee cada POST /v1/sessions/pair (un MemoryQRSink propio) para el polling por-emparejamiento.
 func WithWhatsmeowPairing(timeout time.Duration) Option {
 	return func(m *Manager) {
 		m.newPairer = func(custody app.KeyCustody, storeDB *sql.DB, qr app.QRSink) pairRunner {
-			connector := whatsmeow.NewConnector(storeDB)
+			connector := whatsmeow.NewConnector(storeDB, m.dbDialect)
 			return app.NewPair(connector, qr, custody, app.WithTimeout(timeout))
 		}
 	}
 }
 
-// Pair empareja un teléfono NUEVO y lo deja registrado, fiel a la secuencia de design §5. Devuelve el
-// JID emparejado (app.PairResult) y NUNCA la DEK (invariante zero-knowledge, ADR-0007). Es atómico de
-// cara al registro: si algo falla tras provisionar el directorio/DEK/fila, limpia TODO (Clear DEK + rm
-// dir + Delete fila) y no deja restos.
+// Pair empareja un teléfono NUEVO y lo deja registrado, fiel a la secuencia de design §7 (BD ÚNICA).
+// Devuelve el JID emparejado (app.PairResult) y NUNCA la DEK (invariante zero-knowledge, ADR-0007). Es
+// atómico de cara al registro: si algo falla tras registrar la fila/sellar la DEK, limpia TODO (Clear
+// DEK + purga del material cifrado si ya se persistió + borrado transaccional de la fila) sin dejar restos
+// ni cuentas huérfanas. YA NO provisiona directorio ni store.db por sesión: el store vive en la BD ÚNICA
+// COMPARTIDA (m.db), sobre la que el Connector monta el Container per-device (Plan 022 §10.A).
 //
-// Anti-pisado (objetivo del plan): el session_id es un UUIDv4 nuevo en cada llamada, así que el dir,
-// la DEK y la fila son propios; un segundo Pair no puede sobrescribir al primero (MP-01 por construcción).
+// Anti-pisado (objetivo del plan): el session_id es un UUIDv4 nuevo en cada llamada, así que la DEK y la
+// fila son propias; un segundo Pair no puede sobrescribir al primero (MP-01 por construcción).
 //
 // El QRSink lo provee el llamante (el plano de control inyecta un MemoryQRSink propio del emparejamiento
 // para hacer polling async del QR; ver control/server/pair.go). app.Pair publica cada QR rotado ahí; la
@@ -77,78 +79,57 @@ func (m *Manager) Pair(ctx context.Context, qr app.QRSink) (app.PairResult, erro
 	// 1. Identidad canónica de la sesión ANTES de conocer el JID (ADR-0016 §3, design §10.B).
 	id := uuid.NewString()
 
-	sessionDir, err := m.layout.SessionDir(id)
-	if err != nil {
-		return app.PairResult{}, fmt.Errorf("sessionmgr: resolver dir de sesión: %w", err)
-	}
-	relDir, err := m.layout.RelSessionDir(id)
-	if err != nil {
-		return app.PairResult{}, fmt.Errorf("sessionmgr: resolver dir relativo de sesión: %w", err)
-	}
-
-	// 2. Provisionar el directorio de la sesión y abrir/migrar su store cifrado (set "store").
-	if err := os.MkdirAll(sessionDir, 0o700); err != nil {
-		return app.PairResult{}, fmt.Errorf("sessionmgr: crear dir de sesión: %w", err)
-	}
-	storeDBPath, err := m.layout.StoreDB(id)
-	if err != nil {
-		_ = os.RemoveAll(sessionDir)
-		return app.PairResult{}, fmt.Errorf("sessionmgr: resolver store de sesión: %w", err)
-	}
-	storeDB, err := wappdb.OpenSessionStore(ctx, storeDBPath)
-	if err != nil {
-		_ = os.RemoveAll(sessionDir)
-		return app.PairResult{}, fmt.Errorf("sessionmgr: abrir store de sesión: %w", err)
-	}
-	// El store solo se usa durante el pairing (T3 no mantiene cliente vivo; eso es T4/Restore): se
-	// cierra SIEMPRE al salir para no filtrar la conexión. En éxito, T4 reabre el store para el listener.
-	defer func() { _ = storeDB.Close() }()
-
-	// 3. Custodia DEK de ESTA sesión (FileCustody sobre Layout.DEKPath(id)). app.Pair sellará la DEK aquí.
+	// 2. Custodia DEK de ESTA sesión (FileCustody sobre keys/<id>.key, DESACOPLADA del store — §3/§10.C).
+	//    app.Pair sellará la DEK aquí al PairSuccess.
 	custody, err := m.custodyFor(id)
 	if err != nil {
-		_ = os.RemoveAll(sessionDir)
 		return app.PairResult{}, fmt.Errorf("sessionmgr: resolver custodia de sesión: %w", err)
 	}
 
-	// 4. Registrar la sesión en 'pairing' (jid=NULL): el número se descubre recién en PairSuccess.
+	// 3. Registrar la sesión en 'pairing' (jid=NULL, cuenta PROVISIONAL account_id=session_id, self_pn
+	//    NULL): el número se descubre recién en PairSuccess.
 	now := time.Now().UTC()
 	pairingMeta := domain.Session{
 		SessionID: id,
 		State:     domain.SessionStatePairing,
-		StoreDir:  relDir,
 		UpdatedAt: now,
 	}
 	if err := m.sessions.Upsert(ctx, pairingMeta); err != nil {
-		m.cleanupPairing(ctx, id, sessionDir, custody)
+		m.cleanupPairing(ctx, id, "", custody)
 		return app.PairResult{}, fmt.Errorf("sessionmgr: registrar sesión en pairing: %w", err)
 	}
 
-	// 5. Correr el pairing (QR → escaneo → Connected) sobre el store/custodia de la sesión. app.Pair
-	//    genera y sella la DEK; al volver sin error, el JID ya es conocido.
-	res, err := m.newPairer(custody, storeDB, qr).Run(ctx)
+	// 4. Correr el pairing (QR → escaneo → Connected) sobre el Container COMPARTIDO (m.db) y la custodia de
+	//    la sesión. app.Pair genera y sella la DEK; al volver sin error, el JID ya es conocido.
+	res, err := m.newPairer(custody, m.db, qr).Run(ctx)
 	if err != nil {
-		// Fallo/cancelación/timeout: sin restos (DEK + dir + fila).
-		m.cleanupPairing(ctx, id, sessionDir, custody)
+		// Fallo/cancelación/timeout ANTES de conocer el JID: sin restos (DEK + fila + cuenta provisional
+		// vacía). No hay material cifrado que purgar: el device aún no se persistió (Device.Save es en éxito).
+		m.cleanupPairing(ctx, id, "", custody)
 		return app.PairResult{}, fmt.Errorf("sessionmgr: emparejar sesión: %w", err)
 	}
 
-	// 5.a. PairSuccess: promover a 'active' con el JID y el instante de emparejamiento.
+	// 5. PairSuccess: promover a 'active' con el JID y RE-VINCULAR por self_pn (decisión §10.A/I): el número
+	//    propio se DERIVA del JID recién conocido, de modo que un re-escaneo del MISMO número cuelgue de la
+	//    MISMA cuenta (sessionstore.resolveAccount por self_pn) en vez de quedarse en el silo provisional;
+	//    la cuenta provisional que queda vacía la purga el propio Upsert (cero huérfanos).
 	paired := time.Now().UTC()
 	activeMeta := domain.Session{
 		SessionID: id,
 		JID:       res.WaJID,
+		SelfPN:    selfPNFromJID(res.WaJID),
 		State:     domain.SessionStateActive,
-		StoreDir:  relDir,
 		PairedAt:  paired,
 		UpdatedAt: paired,
 	}
 	if err := m.sessions.Upsert(ctx, activeMeta); err != nil {
-		m.cleanupPairing(ctx, id, sessionDir, custody)
+		// Aquí el device SÍ se persistió cifrado (whatsmeow lo guardó al PairSuccess): purga también su
+		// material por JID (msg_enc_*/whatsmeow_*) para no dejar huérfanos (§10.I).
+		m.cleanupPairing(ctx, id, res.WaJID, custody)
 		return app.PairResult{}, fmt.Errorf("sessionmgr: promover sesión a active: %w", err)
 	}
 
-	// 5.b. Registrar la sesión como VIVA y arrancar su escucha (placeholder en T3; T4 la implementa).
+	// 6. Registrar la sesión como VIVA y arrancar su escucha always-on (real vía WithWhatsmeowListen).
 	s := &liveSession{
 		meta:    activeMeta,
 		custody: custody,
@@ -157,28 +138,46 @@ func (m *Manager) Pair(ctx context.Context, qr app.QRSink) (app.PairResult, erro
 	m.mu.Lock()
 	m.live[id] = s
 	m.mu.Unlock()
-	m.startListener(s) // arranca la escucha always-on de la sesión (real en T4; ver listen.go).
+	m.startListener(s)
 
 	// Invariante: solo el JID + el session_id salen del núcleo; la DEK queda sellada en la custodia de la
 	// sesión y NUNCA cruza (ADR-0007). El session_id permite al plano de control correlacionar el pairing.
 	return app.PairResult{WaJID: res.WaJID, SessionID: id}, nil
 }
 
-// cleanupPairing revierte TODO lo provisionado por un pairing que no llegó a 'active' (design §5): la
-// DEK custodiada (Clear, abstrae el backend para el futuro KeystoreCustody que NO vive bajo el dir),
-// el directorio de la sesión (store.db + dek.key) y la fila de metadatos. Best-effort: cada fallo se
-// loguea pero no aborta los demás pasos, para no dejar restos a medias. No devuelve error: el llamante
-// ya propaga la causa raíz del fallo de pairing.
-func (m *Manager) cleanupPairing(ctx context.Context, id, sessionDir string, custody app.KeyCustody) {
+// cleanupPairing revierte TODO lo provisionado por un pairing que no llegó a 'active' (design §7, BD única):
+// la DEK custodiada (Clear), el material cifrado del device SI ya se había persistido (jid != "" ⇒
+// cryptostore.DeleteDevice sobre msg_enc_*/whatsmeow_*) y la fila de metadatos (borrado transaccional que
+// purga también la cuenta provisional vacía). YA NO borra directorio de sesión (no existe con la BD única).
+// Best-effort: cada fallo se loguea pero no aborta los demás pasos. No devuelve error: el llamante ya
+// propaga la causa raíz del fallo de pairing.
+func (m *Manager) cleanupPairing(ctx context.Context, id, jid string, custody app.KeyCustody) {
 	if cl, ok := custody.(interface{ Clear() error }); ok {
 		if err := cl.Clear(); err != nil {
 			m.log.Warn("sessionmgr: limpiar DEK del pairing fallido", "session_id", id, "error", err)
 		}
 	}
-	if err := os.RemoveAll(sessionDir); err != nil {
-		m.log.Warn("sessionmgr: limpiar dir del pairing fallido", "session_id", id, "error", err)
+	// Material cifrado del device: SOLO si el pairing llegó a persistirlo (jid conocido) y hay BD real.
+	if jid != "" && m.db != nil {
+		if parsed, perr := types.ParseJID(jid); perr != nil {
+			m.log.Warn("sessionmgr: JID inválido al limpiar el pairing fallido", "session_id", id, "error", perr)
+		} else if err := cryptostore.DeleteDevice(ctx, m.db, m.dbDialect, parsed); err != nil {
+			m.log.Warn("sessionmgr: limpiar material cifrado del pairing fallido", "session_id", id, "error", err)
+		}
 	}
-	if err := m.sessions.Delete(ctx, id); err != nil {
+	if err := m.deleteDeviceMeta(ctx, id); err != nil {
 		m.log.Warn("sessionmgr: borrar fila del pairing fallido", "session_id", id, "error", err)
 	}
+}
+
+// selfPNFromJID deriva el número propio (self_pn, E.164 sin '+') a partir del JID de WhatsApp recién
+// pareado: el JID de un teléfono es "<numero>[:<device>]@s.whatsapp.net" y su parte User ES el número.
+// Devuelve "" si el JID no parsea (entonces la cuenta queda provisional hasta conocer el número). No es
+// secreto (es metadato de negocio); no se loguea aquí.
+func selfPNFromJID(jidStr string) string {
+	jid, err := types.ParseJID(jidStr)
+	if err != nil {
+		return ""
+	}
+	return jid.User
 }
