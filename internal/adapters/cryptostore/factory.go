@@ -123,7 +123,9 @@ func DeleteDevice(ctx context.Context, db *sql.DB, dialect string, jid types.JID
 	//    whatsmeow_* si la BD nunca pareó); DeleteDevice solo necesita el JID (DELETE ... WHERE jid=?).
 	//    dialect (Plan 022 T0): el mismo motor con el que se abrió la BD; ya NO se asume "sqlite".
 	inner := sqlstore.NewWithDB(db, dialect, nil)
-	if err := inner.Upgrade(ctx); err != nil {
+	// Mismo candado por *sql.DB que el arranque (ver upgrade.go): un borrado quirúrgico sobre la BD única
+	// podría solaparse con la construcción de otro Container y volver a correr el CREATE TABLE en paralelo.
+	if err := upgradeWhatsmeowSchema(ctx, inner, db); err != nil {
 		return fmt.Errorf("cryptostore: upgrade esquema whatsmeow para borrado: %w", err)
 	}
 	jidCopy := jid

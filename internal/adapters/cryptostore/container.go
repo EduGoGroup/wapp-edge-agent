@@ -40,7 +40,10 @@ var _ store.DeviceContainer = (*cryptoContainer)(nil)
 // correcto por motor.
 func newCryptoContainer(ctx context.Context, db *sql.DB, dialect string, env *envelope.Envelope) (*cryptoContainer, error) {
 	inner := sqlstore.NewWithDB(db, dialect, nil)
-	if err := inner.Upgrade(ctx); err != nil {
+	// Serializado POR *sql.DB (ver upgrade.go): sobre la BD única compartida, N listeners arrancan a la vez
+	// y construyen su Container concurrentemente; sin este candado el CREATE TABLE de whatsmeow_version
+	// choca ("already exists") y degrada la sesión con un WARN espurio + backoff en el arranque en frío.
+	if err := upgradeWhatsmeowSchema(ctx, inner, db); err != nil {
 		return nil, fmt.Errorf("upgrade esquema whatsmeow: %w", err)
 	}
 	return &cryptoContainer{inner: inner, db: db, env: env}, nil
