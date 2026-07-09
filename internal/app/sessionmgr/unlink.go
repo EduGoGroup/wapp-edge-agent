@@ -98,6 +98,20 @@ func (m *Manager) Unlink(ctx context.Context, id string) error {
 // Requiere un sessionstore concreto con soporte por-cuenta (GetByAccount/DeleteByAccount); con los fakes
 // en memoria de los tests (que no lo implementan) devuelve un error de cableado claro. Es la contraparte
 // por-cuenta de Unlink, base del borrado por número (T5) y forward-compatible con el plano de control.
+//
+// AGREGACIÓN POR CUENTA EN CLOUDLINK (Plan 022 T6, decisión §10.J): "revocar por número = revocar sus N
+// devices" se materializa AQUÍ, en el Edge, iterando los devices de la cuenta y sacando CADA session_id del
+// multiplex (m.cloudMux.Unregister). Es correcto por capas: el proto CloudLink (v0.6.0) multiplexa y lleva
+// lease POR session_id (ADR-0008 §"un stream", ADR-0016 §5); NO existe una noción de cuenta ni un frame de
+// revocación agregable por número en el contrato — el account↔device lo conoce solo el Edge (tablas
+// accounts/devices), no el mux (que es deliberadamente ciego a la cuenta).
+//
+// TODO(cloud, follow-up Plan 022 T6 · ver ../../docs/piezas/03-plataforma-cloud.md): para revocar una CUENTA
+// entera DESDE LA NUBE (kill-switch por número, no por sesión) el Cloud debe hoy hacer FAN-OUT de N
+// LeaseUpdate{revoked}, uno por cada session_id del número (mapeo cuenta→sesiones que ya vive en el fleet del
+// Cloud). Si se quiere un frame agregable de primera clase (p. ej. AccountLeaseUpdate por account_id/self_pn,
+// o revocación por número en un solo mensaje), el corte es del repo cloud/proto y se ANOTA como plan aparte:
+// NO se amplía este tramo al cloud (regla dura T6). El Edge ya deja el otro lado listo (Unregister por device).
 func (m *Manager) UnlinkAccount(ctx context.Context, accountID string) error {
 	as, ok := m.sessions.(accountStore)
 	if !ok {
