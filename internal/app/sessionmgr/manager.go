@@ -26,7 +26,8 @@ type Manager struct {
 	// wg espera a que todas las goroutines listener terminen en el apagado (Stop).
 	wg sync.WaitGroup
 
-	// layout es la única fuente de rutas por sesión (sessions/<id>/{store.db,dek.key}).
+	// layout es la única fuente de rutas por sesión (sessions/<id>/store.db + keys/<id>.key; la DEK vive
+	// DESACOPLADA del directorio de store desde Plan 022 §3/§10.C).
 	layout Layout
 	// sessions persiste los metadatos de negocio (tabla sessions_v2); fuente para Persisted().
 	sessions app.SessionStore

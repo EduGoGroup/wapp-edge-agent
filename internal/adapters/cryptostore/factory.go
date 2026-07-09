@@ -9,6 +9,13 @@ package cryptostore
 // el Envelope la mantiene dentro del AEAD. El llamante genera la DEK con CSPRNG, construye el
 // container, ejecuta el pairing y borra la DEK de RAM al sellarla.
 //
+// PER-DEVICE, CERO DEK GLOBAL (Plan 022 §3/§10.B, decisión A): cada container enlaza el envelope de UN
+// solo dispositivo. Ya NO hay "una DEK por Container/store": sobre una BD ÚNICA compartida se construyen
+// N containers, UNO por dispositivo, cada uno con SU DEK. Las tablas msg_enc_* se llavean por JID/our_jid
+// del device (sin session_id), así que la DEK de un dispositivo no descifra las filas de otro (GCM no
+// autentica). La topología (BD compartida vs. .db por fichero) NO cambia esta capa: el envelope siempre
+// va enlazado al device en construcción (ver OpenDeviceContainer en session.go).
+//
 // Copia-adaptación de edugo-api-messaging/internal/infra/cryptostore (ADR-0004): renombrado al
 // namespace wApp, envelope -> wapp-shared/envelope, dialecto SQLite en vez de PostgreSQL.
 
@@ -34,10 +41,15 @@ const (
 	DialectPostgres = wappdb.DialectPostgres
 )
 
-// NewEncryptedContainer construye un store.DeviceContainer que cifra TODO el material sensible
-// de whatsmeow (claves del Device + stores de sesión) con AES-256-GCM bajo la DEK dada, sobre
-// una BD YA migrada (las tablas whatsmeow_* las crea sqlstore.Upgrade aquí; las msg_enc_* las
-// crea internal/infra/db).
+// NewEncryptedContainer es el constructor PER-DEVICE del store cifrado: devuelve un
+// store.DeviceContainer que cifra TODO el material sensible de whatsmeow (claves del Device + stores de
+// sesión) con AES-256-GCM bajo la DEK de UN dispositivo, sobre una BD YA migrada (las tablas whatsmeow_*
+// las crea sqlstore.Upgrade aquí; las msg_enc_* las crea internal/infra/db).
+//
+// UNO POR DISPOSITIVO, CERO DEK GLOBAL (Plan 022 §10.B): para operar N dispositivos sobre una BD ÚNICA
+// COMPARTIDA se invoca N veces —una por device— con la MISMA db y la DEK de CADA device (ver
+// OpenDeviceContainer). No existe un container "del store" que cifre para varios devices: el envelope
+// queda enlazado en construcción y las filas msg_enc_* se aíslan por JID.
 //
 // dek DEBE medir exactamente 32 bytes (envelope.DEKSize); en caso contrario devuelve error sin
 // tocar la BD. El container resultante se pasa a NewDeviceForPairing (o a whatsmeow vía el

@@ -38,11 +38,13 @@ func TestLayout_Paths(t *testing.T) {
 		t.Fatalf("StoreDB: got %q, want %q", store, want)
 	}
 
+	// La DEK vive DESACOPLADA del directorio de store (Plan 022 §3/§10.C): <data_dir>/keys/<id>.key,
+	// ya NO en sessions/<id>/dek.key.
 	dek, err := l.DEKPath(uuidA)
 	if err != nil {
 		t.Fatalf("DEKPath error: %v", err)
 	}
-	if want := filepath.Join(base, "sessions", uuidA, "dek.key"); dek != want {
+	if want := filepath.Join(base, "keys", uuidA+".key"); dek != want {
 		t.Fatalf("DEKPath: got %q, want %q", dek, want)
 	}
 }

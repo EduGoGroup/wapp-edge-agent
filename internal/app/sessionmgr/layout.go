@@ -19,8 +19,14 @@ const (
 	sessionsDirName = "sessions"
 	// storeDBName es el Container whatsmeow cifrado de la sesión.
 	storeDBName = "store.db"
-	// dekFileName es la DEK de la sesión (0600), custodiada por FileCustody.
-	dekFileName = "dek.key"
+	// keysDirName aloja las DEK por session_id, DESACOPLADAS del directorio de store (Plan 022 §3/§10.C):
+	// <data_dir>/keys/<session_id>.key (0600). Al no colgar del árbol de store, la custodia deja de
+	// depender del layout del store (que T3 retira al pasar a la BD única) y puede migrar al keystore del
+	// SO sin tocar rutas de store; además el borrado quirúrgico de la DEK (custody.Clear) es un paso
+	// propio, independiente del rm del store.
+	keysDirName = "keys"
+	// dekFileExt es la extensión del fichero de DEK por sesión (<session_id>.key).
+	dekFileExt = ".key"
 )
 
 // uuidPattern valida el formato UUID canónico (8-4-4-4-12 hex). El session_id es SIEMPRE un UUIDv4
@@ -77,13 +83,17 @@ func (l Layout) StoreDB(id string) (string, error) {
 	return filepath.Join(dir, storeDBName), nil
 }
 
-// DEKPath devuelve <data_dir>/sessions/<id>/dek.key (DEK de la sesión, custodiada por FileCustody).
+// DEKPath devuelve <data_dir>/keys/<session_id>.key (DEK de la sesión, custodiada por FileCustody).
+//
+// DESACOPLADA del directorio de store (Plan 022 §3/§10.C): ya NO vive en sessions/<id>/dek.key. Así la
+// DEK no depende del layout del store (que T3 retira con la BD única) y su borrado quirúrgico (Clear) es
+// un paso propio, no redundante con el rm del árbol de store. Valida el UUID directamente (misma barrera
+// anti-escape que SessionDir: un UUID no contiene separadores de ruta ni ".."), sin colgar de SessionDir.
 func (l Layout) DEKPath(id string) (string, error) {
-	dir, err := l.SessionDir(id)
-	if err != nil {
-		return "", err
+	if !validSessionID(id) {
+		return "", fmt.Errorf("layout: session_id inválido (se esperaba UUID): %q", id)
 	}
-	return filepath.Join(dir, dekFileName), nil
+	return filepath.Join(l.dataDir, keysDirName, id+dekFileExt), nil
 }
 
 // validSessionID indica si id es un UUID canónico utilizable como nombre de directorio seguro.

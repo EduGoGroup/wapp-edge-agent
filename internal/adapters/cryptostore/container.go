@@ -25,9 +25,9 @@ import (
 )
 
 type cryptoContainer struct {
-	inner *sqlstore.Container // contenedor real (de él cuelgan los SQLStore por device)
+	inner *sqlstore.Container // Container whatsmeow (de él cuelgan los SQLStore por device); puede ser COMPARTIDO
 	db    *sql.DB             // conexión cruda (tablas msg_enc_* propias)
-	env   *envelope.Envelope
+	env   *envelope.Envelope  // envelope de la DEK de UN dispositivo (Plan 022 T2: per-device, NUNCA global)
 }
 
 var _ store.DeviceContainer = (*cryptoContainer)(nil)
