@@ -33,8 +33,12 @@ import (
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
-// Version identifica la build del supervisor.
-const Version = "0.1.0-ctl"
+// Version identifica la build del supervisor. Se inyecta en release vía
+// -ldflags "-X main.Version=$(git describe --tags --always --dirty)" (ver
+// Makefile, Plan 023 · T0). DEBE seguir siendo `var` (no `const`): ldflags -X
+// solo sobre-escribe variables de string. El literal es el fallback de dev
+// cuando se compila sin ldflags. La versión aparece en el log de arranque.
+var Version = "0.1.0-ctl"
 
 func main() {
 	addr := flag.String("addr", envOr("WAPP_CTL_ADDR", "127.0.0.1:8765"), "dirección loopback donde sirve el supervisor (host:puerto)")

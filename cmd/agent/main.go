@@ -51,8 +51,13 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Version identifica la build del Edge Agent.
-const Version = "0.1.0-bootstrap"
+// Version identifica la build del Edge Agent. Se inyecta en release vía
+// -ldflags "-X main.Version=$(git describe --tags --always --dirty)" (ver
+// Makefile, Plan 023 · T0). DEBE seguir siendo `var` (no `const`): ldflags -X
+// solo sobre-escribe variables de string. El literal de abajo es el fallback de
+// dev cuando se compila sin ldflags (go run/build directos, CI). La versión
+// resultante viaja a /v1/health (server.Config.Version) y a los logs de arranque.
+var Version = "0.1.0-bootstrap"
 
 // singleDBFileName es el nombre de la BD ÚNICA del Edge (Plan 022 T3) bajo data_dir cuando el dialecto es
 // SQLite y no se pasó un DSN explícito. Aloja metadatos (accounts/devices) + whatsmeow_* + msg_enc_* en un
