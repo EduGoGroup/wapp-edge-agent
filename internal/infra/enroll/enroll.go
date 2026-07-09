@@ -154,6 +154,14 @@ func Run(ctx context.Context, cfg config.Config, log sharedlogger.Logger, opts .
 	// hay pública o no hay ruta configurada, se OMITE sin fallar (fallback claro §10.H en el reenvío).
 	persistCloudEncPubKey(cl.CloudEncPubKeyPath, resp.GetCloudEncPubkey(), log)
 
+	// Endpoint de runtime CloudLink (Plan 026 T3, cierra follow-up 023): se DERIVA del host del
+	// enrollment_endpoint + el puerto de runtime (cfg.CloudLink.RuntimePort, default 8101) y se PERSISTE en
+	// el archivo de estado <data_dir>/cloudlink-endpoint para que `serve` levante el stream sin que un
+	// no-técnico edite el config.yaml. El proto de enroll (EnrollEdgeResponse) NO devuelve un endpoint de
+	// runtime, así que derivar es la única vía sin tocar el contrato. Best-effort (no aborta el enroll: el
+	// par mTLS ya está persistido); un fallo se AVISA con la instrucción manual.
+	persistRuntimeEndpoint(cfg, log)
+
 	log.Info("enrolamiento completado: par mTLS persistido; `listen` ya puede usar mTLS",
 		"tenant_id", resp.GetTenantId(),
 		"edge_id", edgeID,
@@ -267,6 +275,71 @@ func persistCloudEncPubKey(path string, pub []byte, log sharedlogger.Logger) {
 		return
 	}
 	log.Info("enroll: pública de cifrado de la nube persistida (sellado en tránsito habilitado)", "cloud_enc_pubkey_path", path)
+}
+
+// persistRuntimeEndpoint deriva el Endpoint de runtime CloudLink y lo persiste en el archivo de estado
+// del data_dir (Plan 026 T3, cierra follow-up 023) para que `serve` lo relea sin edición manual del
+// config.yaml (config.Load lo lee como fallback vía RuntimeEndpointStatePath).
+//
+// DERIVACIÓN (NO ASUMIR — verificado contra el proto: EnrollEdgeResponse solo trae edge_cert_pem/
+// ca_chain_pem/tenant_id/cloud_enc_pubkey, sin endpoint de runtime): host(EnrollmentEndpoint) + ":" +
+// RuntimePort (default config.DefaultCloudLinkRuntimePort). Mantiene el contrato cloudlink intacto (sin
+// release de módulo). Si el operador ya fijó un Endpoint explícito (YAML/env), se RESPETA y no se
+// sobrescribe. Best-effort: cualquier fallo se AVISA con la instrucción manual pero NO aborta el enroll
+// (el par mTLS ya quedó en disco; re-enrolar exigiría un código nuevo). Material PÚBLICO (host:puerto).
+func persistRuntimeEndpoint(cfg config.Config, log sharedlogger.Logger) {
+	cl := cfg.CloudLink
+	if cl.Endpoint != "" {
+		log.Info("enroll: endpoint de runtime ya configurado explícitamente; no se deriva ni sobrescribe",
+			"endpoint", cl.Endpoint)
+		return
+	}
+	if cfg.DataDir == "" {
+		// Sin data_dir no hay ubicación estable donde persistir el estado (config.Load siempre lo
+		// absolutiza en el flujo real; esto solo pasa en llamadas directas sin data_dir).
+		log.Warn("enroll: sin data_dir; no se persiste el endpoint de runtime (configúralo en cloudlink.endpoint)")
+		return
+	}
+	runtimePort := cl.RuntimePort
+	if runtimePort == "" {
+		runtimePort = config.DefaultCloudLinkRuntimePort
+	}
+	endpoint, err := deriveRuntimeEndpoint(cl.EnrollmentEndpoint, runtimePort)
+	if err != nil {
+		log.Warn("enroll: no se pudo derivar el endpoint de runtime; configúralo a mano en cloudlink.endpoint del config.yaml",
+			"enrollment_endpoint", cl.EnrollmentEndpoint, "runtime_port", runtimePort, "error", err)
+		return
+	}
+	path := config.RuntimeEndpointStatePath(cfg.DataDir)
+	if err := writeFile(path, []byte(endpoint+"\n"), certFilePerm); err != nil {
+		log.Warn("enroll: no se pudo persistir el endpoint de runtime; configúralo a mano en cloudlink.endpoint del config.yaml",
+			"endpoint", endpoint, "path", path, "error", err)
+		return
+	}
+	log.Info("enroll: endpoint de runtime derivado y persistido; `serve` levantará el stream sin edición manual",
+		"endpoint", endpoint, "path", path)
+}
+
+// deriveRuntimeEndpoint construye el endpoint de runtime "host:runtimePort" a partir del endpoint de
+// enrolamiento "host[:puerto]" (Plan 026 T3): se queda con el HOST del enrollment_endpoint (descartando su
+// puerto de enroll) y le pega el puerto de runtime. Soporta host con o sin puerto e IPv6 (net.JoinHostPort
+// entre corchetes). Devuelve error si no hay enrollment_endpoint o si el host queda vacío.
+func deriveRuntimeEndpoint(enrollmentEndpoint, runtimePort string) (string, error) {
+	if enrollmentEndpoint == "" {
+		return "", errors.New("enrollment_endpoint vacío")
+	}
+	if runtimePort == "" {
+		return "", errors.New("runtime_port vacío")
+	}
+	host, _, err := net.SplitHostPort(enrollmentEndpoint)
+	if err != nil {
+		// El endpoint de enrolamiento vino sin puerto (p.ej. "gateway.tudominio.com"): úsalo como host.
+		host = enrollmentEndpoint
+	}
+	if host == "" {
+		return "", fmt.Errorf("host vacío en enrollment_endpoint %q", enrollmentEndpoint)
+	}
+	return net.JoinHostPort(host, runtimePort), nil
 }
 
 // pemEqual compara dos materiales PEM por el conjunto de bloques DER que contienen (ignora

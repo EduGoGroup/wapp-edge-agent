@@ -335,3 +335,54 @@ func TestRun_NoCloudEncPubKey_NoFile(t *testing.T) {
 		t.Fatalf("no debió crearse archivo de pública sin cloud_enc_pubkey: err=%v", err)
 	}
 }
+
+// TestRun_PersistsRuntimeEndpoint verifica que tras un enroll exitoso se DERIVA y PERSISTE el endpoint de
+// runtime en <data_dir>/cloudlink-endpoint (Plan 026 T3, cierra follow-up 023): host del
+// enrollment_endpoint + puerto de runtime, sin tocar el proto (que no devuelve endpoint de runtime).
+func TestRun_PersistsRuntimeEndpoint(t *testing.T) {
+	ca := newTestCA(t)
+	fake := &fakeEnroll{ca: ca}
+	dialer := startServer(t, ca, fake)
+	cfg, _, _ := baseConfig(t, ca, "edge-endpoint")
+	// EnrollmentEndpoint realista (el dial usa el bufconn dialer y ServerName=localhost, así que el
+	// valor del endpoint solo alimenta la DERIVACIÓN, no el transporte).
+	cfg.CloudLink.EnrollmentEndpoint = "gateway.tudominio.com:8102"
+	cfg.CloudLink.RuntimePort = "8101"
+	cfg.DataDir = t.TempDir()
+
+	if err := enroll.Run(context.Background(), cfg, sharedlogger.New(),
+		enroll.WithDialOptions(grpc.WithContextDialer(dialer))); err != nil {
+		t.Fatalf("Run devolvió error inesperado: %v", err)
+	}
+
+	statePath := config.RuntimeEndpointStatePath(cfg.DataDir)
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("estado del endpoint no persistido en %q: %v", statePath, err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "gateway.tudominio.com:8101" {
+		t.Fatalf("endpoint de runtime persistido = %q, want %q", got, "gateway.tudominio.com:8101")
+	}
+}
+
+// TestRun_ExplicitEndpoint_NotOverwritten verifica que si el operador ya fijó un Endpoint explícito, el
+// enroll lo RESPETA y no escribe el archivo de estado (no sobrescribe una configuración deliberada).
+func TestRun_ExplicitEndpoint_NotOverwritten(t *testing.T) {
+	ca := newTestCA(t)
+	fake := &fakeEnroll{ca: ca}
+	dialer := startServer(t, ca, fake)
+	cfg, _, _ := baseConfig(t, ca, "edge-explicit")
+	cfg.CloudLink.EnrollmentEndpoint = "gateway.tudominio.com:8102"
+	cfg.CloudLink.Endpoint = "otra.nube:9999" // explícito: debe respetarse
+	cfg.DataDir = t.TempDir()
+
+	if err := enroll.Run(context.Background(), cfg, sharedlogger.New(),
+		enroll.WithDialOptions(grpc.WithContextDialer(dialer))); err != nil {
+		t.Fatalf("Run devolvió error inesperado: %v", err)
+	}
+
+	statePath := config.RuntimeEndpointStatePath(cfg.DataDir)
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("no debió persistirse el estado del endpoint con Endpoint explícito: err=%v", err)
+	}
+}

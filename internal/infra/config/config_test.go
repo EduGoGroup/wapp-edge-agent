@@ -18,15 +18,20 @@ func writeTempYAML(t *testing.T, content string) string {
 }
 
 func TestLoad_Defaults(t *testing.T) {
-	// Sin archivo y sin entorno: deben quedar los valores por defecto. El data_dir sale del default
-	// sagrado (defaultDataDir) y Load lo absolutiza; como defaultDataDir ya es absoluto y filepath.Abs
-	// es idempotente, la estructura cargada coincide con defaults().
+	// Sin archivo y sin entorno: deben quedar los valores por defecto. Se aísla el data_dir a un temp dir
+	// vacío (WAPP_AGENT_DATA_DIR) para que la prueba sea HERMÉTICA: Load lee, si existe, el estado del
+	// endpoint de runtime bajo data_dir (Plan 026 T3), y un enroll real en el home por defecto lo haría
+	// no-determinista. El comportamiento del default sagrado se cubre en TestDefaultDataDir_AbsoluteInHome.
+	dataDir := t.TempDir()
+	t.Setenv(EnvPrefix+"DATA_DIR", dataDir)
+
 	cfg, err := Load(filepath.Join(t.TempDir(), "no-existe.yaml"))
 	if err != nil {
 		t.Fatalf("Load devolvio error inesperado: %v", err)
 	}
 
 	want := defaults()
+	want.DataDir = dataDir // el override de entorno reemplaza el default sagrado
 	if cfg != want {
 		t.Fatalf("defaults: got %+v, want %+v", cfg, want)
 	}
@@ -432,5 +437,77 @@ func TestLoad_CloudLinkTLSEnvOnlyOverDefaults(t *testing.T) {
 	}
 	if cfg.CloudLink.LeasePubKeyPath != "" {
 		t.Errorf("LeasePubKeyPath default vacío: got %q", cfg.CloudLink.LeasePubKeyPath)
+	}
+}
+
+// TestLoad_RuntimePortDefaultAndOverride cubre el puerto de runtime (Plan 026 T3): default 8101 y
+// override por WAPP_AGENT_CLOUDLINK_RUNTIME_PORT.
+func TestLoad_RuntimePortDefaultAndOverride(t *testing.T) {
+	// Default sin YAML ni env.
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.CloudLink.RuntimePort != DefaultCloudLinkRuntimePort {
+		t.Fatalf("RuntimePort default: got %q, want %q", cfg.CloudLink.RuntimePort, DefaultCloudLinkRuntimePort)
+	}
+
+	// Override por entorno.
+	t.Setenv(EnvPrefix+"CLOUDLINK_RUNTIME_PORT", "9443")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.CloudLink.RuntimePort != "9443" {
+		t.Fatalf("RuntimePort override: got %q, want %q", cfg.CloudLink.RuntimePort, "9443")
+	}
+}
+
+// TestLoad_RuntimeEndpointStateFallback verifica que `serve` (config.Load) RELEE el endpoint de runtime
+// persistido por el enroll en <data_dir>/cloudlink-endpoint cuando no viene por YAML/env (Plan 026 T3,
+// cierra follow-up 023): así el stream se levanta sin edición manual del config.yaml.
+func TestLoad_RuntimeEndpointStateFallback(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv(EnvPrefix+"DATA_DIR", dataDir)
+	if err := os.WriteFile(RuntimeEndpointStatePath(dataDir), []byte("gateway.tudominio.com:8101\n"), 0o644); err != nil {
+		t.Fatalf("escribir estado del endpoint: %v", err)
+	}
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.CloudLink.Endpoint != "gateway.tudominio.com:8101" {
+		t.Fatalf("endpoint releído del estado: got %q, want %q", cfg.CloudLink.Endpoint, "gateway.tudominio.com:8101")
+	}
+}
+
+// TestLoad_ExplicitEndpointWinsOverState verifica la PRECEDENCIA: un Endpoint explícito (YAML o env) gana
+// sobre el archivo de estado persistido (el fallback solo aplica cuando el endpoint está vacío).
+func TestLoad_ExplicitEndpointWinsOverState(t *testing.T) {
+	dataDir := t.TempDir()
+	t.Setenv(EnvPrefix+"DATA_DIR", dataDir)
+	if err := os.WriteFile(RuntimeEndpointStatePath(dataDir), []byte("persistido:8101\n"), 0o644); err != nil {
+		t.Fatalf("escribir estado del endpoint: %v", err)
+	}
+
+	// YAML explícito gana.
+	yamlPath := writeTempYAML(t, "cloudlink:\n  endpoint: \"desde-yaml:7000\"\n")
+	cfg, err := Load(yamlPath)
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.CloudLink.Endpoint != "desde-yaml:7000" {
+		t.Fatalf("endpoint YAML debe ganar al estado: got %q", cfg.CloudLink.Endpoint)
+	}
+
+	// Env explícito gana.
+	t.Setenv(EnvPrefix+"CLOUDLINK_ENDPOINT", "desde-env:7001")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.CloudLink.Endpoint != "desde-env:7001" {
+		t.Fatalf("endpoint env debe ganar al estado: got %q", cfg.CloudLink.Endpoint)
 	}
 }

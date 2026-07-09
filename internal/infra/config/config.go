@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	sharedconfig "github.com/EduGoGroup/wapp-shared/config"
 )
@@ -16,6 +17,26 @@ import (
 // EnvPrefix es el prefijo aplicado a las variables de entorno del Edge Agent.
 // Por ejemplo, la clave LOG_LEVEL se lee de la variable WAPP_AGENT_LOG_LEVEL.
 const EnvPrefix = "WAPP_AGENT_"
+
+// DefaultCloudLinkRuntimePort es el puerto por defecto del stream de runtime CloudLink (Connect, mTLS)
+// con el que el enroll DERIVA el Endpoint tras enrolar (Plan 026 T3): topología de prod design §1
+// (:8101 CloudLink / :8102 enroll). El proto de enroll no devuelve endpoint de runtime, así que se
+// deriva del host del endpoint de enrolamiento con este puerto (configurable por RuntimePort).
+const DefaultCloudLinkRuntimePort = "8101"
+
+// runtimeEndpointStateFile es el nombre del archivo de estado bajo data_dir donde el enroll persiste el
+// Endpoint de runtime derivado (Plan 026 T3, cierra follow-up 023) para que `serve` lo relea sin edición
+// manual del config.yaml. Material PÚBLICO (host:puerto), nunca secretos.
+const runtimeEndpointStateFile = "cloudlink-endpoint"
+
+// RuntimeEndpointStatePath devuelve la ruta ESTABLE del archivo de estado del Endpoint de runtime dentro
+// del data_dir (Plan 026 T3): <data_dir>/cloudlink-endpoint. El enroll lo ESCRIBE tras derivar el endpoint
+// y config.Load lo LEE como fallback cuando el Endpoint no viene por YAML/env. Ambos (enroll vía wapp-ctl y
+// el hijo `agent serve`) resuelven el MISMO data_dir (env compartido o defaultDataDir por SO), así que la
+// ruta coincide entre escritura y lectura sin depender del CWD.
+func RuntimeEndpointStatePath(dataDir string) string {
+	return filepath.Join(dataDir, runtimeEndpointStateFile)
+}
 
 // Config agrupa los parametros minimos de arranque del Edge Agent.
 type Config struct {
@@ -112,6 +133,12 @@ type CloudLinkConfig struct {
 	// `enroll`). En dev suele ser un puerto distinto al de Connect (p.ej. "localhost:8102"). El dial de
 	// enrolamiento usa TLS-de-servidor (NO mTLS): valida al Gateway con TLSCA. Vacío desactiva `enroll`.
 	EnrollmentEndpoint string `yaml:"enrollment_endpoint"`
+	// RuntimePort es el PUERTO del stream de runtime CloudLink (Connect, mTLS) con el que se DERIVA el
+	// Endpoint tras enrolar (Plan 026 T3, cierra follow-up 023): host(EnrollmentEndpoint) + ":" +
+	// RuntimePort. Por defecto "8101" (topología de prod, design §1: :8101 CloudLink / :8102 enroll). El
+	// proto de enroll (EnrollEdgeResponse) NO devuelve un endpoint de runtime, así que se deriva del host
+	// del endpoint de enrolamiento manteniendo el contrato intacto. Se lee de WAPP_AGENT_CLOUDLINK_RUNTIME_PORT.
+	RuntimePort string `yaml:"runtime_port"`
 	// ActivationCode es el código de activación emitido por el Gateway para autorizar el enrolamiento.
 	// De un solo uso. Se puede pasar también como argumento: `agent enroll <codigo>`.
 	ActivationCode string `yaml:"activation_code"`
@@ -151,6 +178,7 @@ func defaults() Config {
 		MultiDevicePerAccount: 1,
 		PushName:              "wApp",
 		ControlSocketPath:     "wapp-edge.sock",
+		CloudLink:             CloudLinkConfig{RuntimePort: DefaultCloudLinkRuntimePort},
 	}
 }
 
@@ -195,6 +223,13 @@ func Load(path string) (Config, error) {
 	cfg.CloudLink.EnrollmentEndpoint = loader.GetString("CLOUDLINK_ENROLLMENT_ENDPOINT", cfg.CloudLink.EnrollmentEndpoint)
 	cfg.CloudLink.ActivationCode = loader.GetString("CLOUDLINK_ACTIVATION_CODE", cfg.CloudLink.ActivationCode)
 	cfg.CloudLink.EdgeID = loader.GetString("CLOUDLINK_EDGE_ID", cfg.CloudLink.EdgeID)
+	cfg.CloudLink.RuntimePort = loader.GetString("CLOUDLINK_RUNTIME_PORT", cfg.CloudLink.RuntimePort)
+
+	// Puerto de runtime CloudLink por defecto (Plan 026 T3): si nadie lo fijó (YAML/env), "8101"
+	// (topología de prod, design §1). Con él el enroll deriva y persiste el Endpoint de runtime.
+	if cfg.CloudLink.RuntimePort == "" {
+		cfg.CloudLink.RuntimePort = DefaultCloudLinkRuntimePort
+	}
 
 	// Dialecto de BD (Plan 022 T0): solo "sqlite" (default) o "postgres". Se valida aquí para fallar
 	// pronto ante un valor tecleado mal (YAML/env) en vez de arrastrarlo hasta abrir la BD.
@@ -213,6 +248,19 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("config: no se pudo resolver data_dir %q a ruta absoluta: %w", cfg.DataDir, err)
 	}
 	cfg.DataDir = absDataDir
+
+	// Endpoint de runtime PERSISTIDO por el enroll (Plan 026 T3, cierra follow-up 023): si nadie fijó el
+	// Endpoint por YAML/env (lo normal en el kit: viene comentado), se lee del archivo de estado
+	// <data_dir>/cloudlink-endpoint que el enroll escribió al derivarlo del enrollment_endpoint. Así
+	// `serve` levanta el stream contra la nube SIN que un no-técnico edite el config.yaml. Es un FALLBACK
+	// de menor prioridad: un Endpoint explícito (YAML o env WAPP_AGENT_CLOUDLINK_ENDPOINT) siempre gana.
+	// Best-effort: si el archivo no existe (aún no se enroló) o no se puede leer, se queda vacío (el Edge
+	// cae a LogSink/LogMux, igual que antes). Solo material PÚBLICO (host:puerto), nunca secretos.
+	if cfg.CloudLink.Endpoint == "" {
+		if data, readErr := os.ReadFile(RuntimeEndpointStatePath(cfg.DataDir)); readErr == nil {
+			cfg.CloudLink.Endpoint = strings.TrimSpace(string(data))
+		}
+	}
 
 	// Failover multi-dispositivo por número (Plan 022 T5, §10.F): CLAMP a [1,4]. 1 = off (un device vivo
 	// por número, comportamiento actual); 4 = tope de WhatsApp (1 principal + 4 vinculados). Valores fuera

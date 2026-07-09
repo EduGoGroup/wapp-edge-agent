@@ -32,5 +32,8 @@ cloudlink:
   tls_key: "edge.key"
   cloud_enc_pubkey_path: "cloud_enc.pub"
 
-  # endpoint (runtime CloudLink) se rellena TRAS enrolar, al conectar a la nube:
-  # endpoint: "gateway.wapp.example:443"
+  # endpoint (runtime CloudLink) NO se edita a mano: el enroll lo DERIVA del host de
+  # enrollment_endpoint + el puerto de runtime (default 8101) y lo persiste en el estado
+  # <data_dir>/cloudlink-endpoint (Plan 026 T3). `serve` lo relee solo. Para forzar otro
+  # puerto de runtime: runtime_port abajo (o WAPP_AGENT_CLOUDLINK_RUNTIME_PORT).
+  # runtime_port: "8101"

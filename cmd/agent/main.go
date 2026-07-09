@@ -49,6 +49,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 )
 
 // Version identifica la build del Edge Agent. Se inyecta en release vía
@@ -545,7 +546,7 @@ func buildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 		return logSink
 	}
 
-	cc, err := grpc.NewClient(cfg.CloudLink.Endpoint, grpc.WithTransportCredentials(creds))
+	cc, err := grpc.NewClient(cfg.CloudLink.Endpoint, cloudLinkDialOpts(creds)...)
 	if err != nil {
 		log.Error("CloudLink: no se pudo crear el cliente gRPC, cayendo a LogSink puro", "error", err)
 		return logSink
@@ -645,7 +646,7 @@ func buildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger) s
 		return cloudlink.NewLogMux(log)
 	}
 
-	cc, err := grpc.NewClient(cfg.CloudLink.Endpoint, grpc.WithTransportCredentials(creds))
+	cc, err := grpc.NewClient(cfg.CloudLink.Endpoint, cloudLinkDialOpts(creds)...)
 	if err != nil {
 		log.Error("CloudLink: no se pudo crear el cliente gRPC, cayendo a LogMux", "error", err)
 		return cloudlink.NewLogMux(log)
@@ -674,6 +675,29 @@ func buildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger) s
 	log.Info("CloudLink habilitado (multi-sesión): un stream multiplexado por session_id",
 		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil)
 	return adapter
+}
+
+// cloudLinkKeepalive es la política de keepalive de TRANSPORTE del cliente gRPC del stream CloudLink
+// (Plan 026 T3, design §4.a). Envía un PING de HTTP/2 cada Time y espera Timeout por el ACK antes de dar
+// la conexión por muerta; PermitWithoutStream mantiene el keepalive incluso sin RPC activas (el stream
+// bidi puede estar quieto sin tráfico). Detecta cortes de NAT/red ANTES que el Ping app-level y el
+// backoff, que se CONSERVAN (no se eliminan): el backoff sigue gobernando la reconexión. Time=30s es >
+// que la MinTime=15s del server (otro tramo, cloud-platform) para NO ser expulsado con GOAWAY
+// too_many_pings.
+var cloudLinkKeepalive = keepalive.ClientParameters{
+	Time:                30 * time.Second,
+	Timeout:             10 * time.Second,
+	PermitWithoutStream: true,
+}
+
+// cloudLinkDialOpts arma las DialOptions del dial de runtime CloudLink: las transport-credentials
+// (mTLS/insecure) más el keepalive de transporte (cloudLinkKeepalive). Compartido por buildSink
+// (single-sesión) y buildMux (multi-sesión) para no duplicar la política.
+func cloudLinkDialOpts(creds credentials.TransportCredentials) []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(creds),
+		grpc.WithKeepaliveParams(cloudLinkKeepalive),
+	}
 }
 
 // clientCreds construye las transport-credentials del dial CloudLink: mTLS si están las tres rutas
