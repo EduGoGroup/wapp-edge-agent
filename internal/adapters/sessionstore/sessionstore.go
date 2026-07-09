@@ -355,6 +355,20 @@ func (s *Store) DeleteByAccount(ctx context.Context, accountID string) error {
 	return nil
 }
 
+// SetRole actualiza el ROL (primary|standby) del DISPOSITIVO session_id (failover multi-dispositivo por
+// número, Plan 022 T5): la promoción de un standby a primary cuando el primary cae/expira (LoggedOut). El
+// rol es metadato de NEGOCIO EN CLARO (como state): JAMÁS material criptográfico (zero-knowledge intacto).
+// Idempotente y no transaccional (una sola fila); refresca updated_at. Borrar/actualizar un session_id
+// ausente no es error (no afecta filas). Lo usa Manager.promoteStandbyForAccount vía type-assert (roleStore).
+func (s *Store) SetRole(ctx context.Context, sessionID string, role domain.DeviceRole) error {
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE devices SET role = ?, updated_at = ? WHERE session_id = ?`,
+		string(role), time.Now().UTC().Unix(), sessionID); err != nil {
+		return fmt.Errorf("sessionstore: actualizar rol del device: %w", err)
+	}
+	return nil
+}
+
 // scanner abstrae *sql.Row y *sql.Rows (ambos exponen Scan) para compartir el mapeo fila->Session.
 type scanner interface {
 	Scan(dest ...any) error

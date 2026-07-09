@@ -159,6 +159,33 @@ db_path: /from/yaml.db
 	}
 }
 
+// TestLoad_MultiDevicePerAccount_Clamp (Plan 022 T5, §10.F): la opción es off por defecto (1) y se CLAMP a
+// [1,4] — un valor por debajo sube a 1 y uno por encima del tope de WhatsApp baja a 4 (guardarraíl, no error).
+func TestLoad_MultiDevicePerAccount_Clamp(t *testing.T) {
+	// Default: off (1).
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load default: %v", err)
+	}
+	if cfg.MultiDevicePerAccount != 1 {
+		t.Fatalf("default MultiDevicePerAccount debería ser 1 (off), got %d", cfg.MultiDevicePerAccount)
+	}
+
+	cases := map[string]int{"0": 1, "-3": 1, "1": 1, "3": 3, "4": 4, "9": 4}
+	for env, want := range cases {
+		t.Run("env="+env, func(t *testing.T) {
+			t.Setenv(EnvPrefix+"MULTIDEVICE_PER_ACCOUNT", env)
+			cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+			if err != nil {
+				t.Fatalf("Load(%s): %v", env, err)
+			}
+			if cfg.MultiDevicePerAccount != want {
+				t.Fatalf("MULTIDEVICE_PER_ACCOUNT=%s → got %d, want %d (clamp [1,4])", env, cfg.MultiDevicePerAccount, want)
+			}
+		})
+	}
+}
+
 func TestLoad_EnvOnlyOverDefaults(t *testing.T) {
 	// Sin archivo: el entorno debe sobreescribir los defaults.
 	t.Setenv(EnvPrefix+"DEK_PATH", "/only/env/dek.key")

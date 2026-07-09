@@ -114,30 +114,49 @@ func (m *Manager) Pair(ctx context.Context, qr app.QRSink) (app.PairResult, erro
 	//    MISMA cuenta (sessionstore.resolveAccount por self_pn) en vez de quedarse en el silo provisional;
 	//    la cuenta provisional que queda vacía la purga el propio Upsert (cero huérfanos).
 	paired := time.Now().UTC()
+	selfPN := selfPNFromJID(res.WaJID)
+
+	// Rol + cupo + registro vivo ATÓMICOS bajo m.mu (failover T5, design §6/§10.F): se decide el rol
+	// (primary/standby) del device y se verifica el cupo de devices VIVOS del número, y se registra la
+	// sesión en el MISMO tramo con lock, para que dos pairs del mismo número no den dos primarys ni excedan
+	// el cupo. Con el default 1 (off), el 2.º device vivo del mismo número se RECHAZA (ErrAccountAtCapacity).
+	m.mu.Lock()
+	role, capErr := m.assignRoleLocked(selfPN, id)
+	if capErr != nil {
+		m.mu.Unlock()
+		// El device ya se persistió cifrado al PairSuccess: purga su material por JID + DEK + fila (§10.I).
+		m.cleanupPairing(ctx, id, res.WaJID, custody)
+		return app.PairResult{}, fmt.Errorf("sessionmgr: emparejar sesión: %w", capErr)
+	}
 	activeMeta := domain.Session{
 		SessionID: id,
 		JID:       res.WaJID,
-		SelfPN:    selfPNFromJID(res.WaJID),
+		SelfPN:    selfPN,
 		State:     domain.SessionStateActive,
+		Role:      role,
 		PairedAt:  paired,
 		UpdatedAt: paired,
 	}
-	if err := m.sessions.Upsert(ctx, activeMeta); err != nil {
-		// Aquí el device SÍ se persistió cifrado (whatsmeow lo guardó al PairSuccess): purga también su
-		// material por JID (msg_enc_*/whatsmeow_*) para no dejar huérfanos (§10.I).
-		m.cleanupPairing(ctx, id, res.WaJID, custody)
-		return app.PairResult{}, fmt.Errorf("sessionmgr: promover sesión a active: %w", err)
-	}
-
-	// 6. Registrar la sesión como VIVA y arrancar su escucha always-on (real vía WithWhatsmeowListen).
 	s := &liveSession{
 		meta:    activeMeta,
 		custody: custody,
 		log:     m.log.With("session_id", id, "jid", res.WaJID),
 	}
-	m.mu.Lock()
 	m.live[id] = s
 	m.mu.Unlock()
+
+	// 6. Persistir la fila 'active' (con su rol). Si falla, revertir el registro vivo y limpiar TODO: el
+	//    device SÍ se persistió cifrado (whatsmeow lo guardó al PairSuccess), así que se purga su material
+	//    por JID (msg_enc_*/whatsmeow_*) para no dejar huérfanos (§10.I).
+	if err := m.sessions.Upsert(ctx, activeMeta); err != nil {
+		m.mu.Lock()
+		delete(m.live, id)
+		m.mu.Unlock()
+		m.cleanupPairing(ctx, id, res.WaJID, custody)
+		return app.PairResult{}, fmt.Errorf("sessionmgr: promover sesión a active: %w", err)
+	}
+
+	// 7. Arrancar la escucha always-on (real vía WithWhatsmeowListen).
 	m.startListener(s)
 
 	// Invariante: solo el JID + el session_id salen del núcleo; la DEK queda sellada en la custodia de la

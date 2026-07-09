@@ -131,10 +131,13 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 				cmd, _ := gateway.Correlator().Lookup(evt.MessageIDs)
 				mux.SendReceipt(cmd, evt)
 			})
-			// Plan 020 T3: al llegar un events.Receipt de cierre (events.LoggedOut), propaga el estado ZOMBIE
-			// al cloud por el mismo stream ANTES del teardown local, para distinguirlo de un offline por red.
+			// Plan 022 T5 (reusa Plan 020 T3): al llegar events.LoggedOut, el Manager PROPAGA el estado ZOMBIE
+			// al cloud (distinguible de un offline por red) Y PERSISTE devices.state='loggedout' localmente (lo
+			// que T4 dejó pendiente), no renueva lease (sale del mux) y, si era el primary, promueve un standby.
+			// El re-escaneo del mismo número recae en la MISMA cuenta (self_pn). Corre en la goroutine del
+			// listener: onLoggedOut NO cancela/espera su propia goroutine (deadlock); el socket lo cierra Stop().
 			gateway.SetLoggedOutHandler(func() {
-				mux.SendLoggedOut(sid)
+				m.onLoggedOut(s)
 			})
 			runner := app.NewListen(s.custody, gateway, mux.SinkFor(sid))
 			return runner, nil, nil

@@ -50,6 +50,14 @@ type Manager struct {
 	dbDialect string
 	// max es el límite suave de sesiones simultáneas (WAPP_AGENT_MAX_SESSIONS, design §10.G).
 	max int
+	// multiDevicePerAccount es el número de DISPOSITIVOS VIVOS permitidos por CUENTA (número), base del
+	// failover multi-dispositivo por número (Plan 022 T5, design §6/§10.F). Default 1 (un device operativo
+	// por número; comportamiento actual). Con >1 (tope 4) el Manager admite N devices vivos del mismo
+	// número: 1 primary + standbys, y promueve un standby si el primary cae/expira (LoggedOut). Lo gobierna
+	// Pair (assignRoleLocked): rechaza el pairing que excedería el cupo del número. CAVEAT (requisito del
+	// plan §10.F): multi-device es RESILIENCIA, NO SIGILO — más companions = más huella, no menos baneo;
+	// por eso va OFF por defecto. Lo inyecta WithMultiDevicePerAccount (clamp [1,4]).
+	multiDevicePerAccount int
 	// log es el logger raíz; cada liveSession derivará un hijo con session_id/jid (design §10.J).
 	log sharedlogger.Logger
 
@@ -87,13 +95,14 @@ type Option func(*Manager)
 // WithWhatsmeowPairing para habilitar Manager.Pair).
 func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlogger.Logger, opts ...Option) *Manager {
 	m := &Manager{
-		live:        make(map[string]*liveSession),
-		layout:      layout,
-		sessions:    sessions,
-		max:         max,
-		log:         log,
-		backoffBase: 1 * time.Second,
-		backoffMax:  60 * time.Second,
+		live:                  make(map[string]*liveSession),
+		layout:                layout,
+		sessions:              sessions,
+		max:                   max,
+		multiDevicePerAccount: 1, // off por defecto: un device vivo por número (design §10.F). WithMultiDevicePerAccount lo sube.
+		log:                   log,
+		backoffBase:           1 * time.Second,
+		backoffMax:            60 * time.Second,
 	}
 	for _, o := range opts {
 		o(m)
@@ -112,6 +121,23 @@ func WithListenerBackoff(base, max time.Duration) Option {
 		if max > 0 {
 			m.backoffMax = max
 		}
+	}
+}
+
+// WithMultiDevicePerAccount fija el cupo de DISPOSITIVOS VIVOS por CUENTA (número) del failover multi-
+// dispositivo (Plan 022 T5, design §6/§10.F). En producción lo cablea cmd/agent desde
+// WAPP_AGENT_MULTIDEVICE_PER_ACCOUNT; los tests lo suben para ejercitar 2 devices vivos + promoción. Se
+// CLAMP a [1,4] (1 = off, comportamiento actual; 4 = tope de WhatsApp). CAVEAT (§10.F): multi-device es
+// RESILIENCIA, NO SIGILO — más companions = más huella; por eso el default (NewManager) es 1.
+func WithMultiDevicePerAccount(n int) Option {
+	return func(m *Manager) {
+		if n < 1 {
+			n = 1
+		}
+		if n > 4 {
+			n = 4
+		}
+		m.multiDevicePerAccount = n
 	}
 }
 

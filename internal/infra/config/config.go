@@ -58,6 +58,16 @@ type Config struct {
 	// NO es un invariante de seguridad: un POST /pair por encima del límite responde error claro, no
 	// crash. Se lee de WAPP_AGENT_MAX_SESSIONS (default 5).
 	MaxSessions int `yaml:"max_sessions"`
+	// MultiDevicePerAccount es el número de DISPOSITIVOS VIVOS que se permiten por CUENTA (número), base
+	// del failover multi-dispositivo por número (Plan 022 T5, design §6/§10.F). Default 1 (comportamiento
+	// actual: un device operativo por número). Con >1 el Manager permite N devices vivos del mismo número
+	// (1 primary + standbys); el standby se promueve si el primary cae/expira (LoggedOut). Tope 4 (límite
+	// de WhatsApp: 1 principal + 4 vinculados); se CLAMP a [1,4] al cargar.
+	//
+	// CAVEAT (requisito del plan): multi-device es RESILIENCIA, NO SIGILO. Más dispositivos NO reducen el
+	// riesgo de baneo — al contrario, más companions = más huella. Por eso va OFF por defecto (1) y no se
+	// debe incentivar agotar los 4 slots. Se lee de WAPP_AGENT_MULTIDEVICE_PER_ACCOUNT.
+	MultiDevicePerAccount int `yaml:"multidevice_per_account"`
 	// PushName es el nombre visible (push name) que se ANUNCIA en la presencia (SendPresence available,
 	// Plan 013 §10.D) cuando el store restaurado aún no conoce el nombre REAL de la cuenta. whatsmeow
 	// rechaza SendPresence sin PushName ("can't send presence without PushName set"), y sin presencia
@@ -131,15 +141,16 @@ func defaultDataDir() string {
 // defaults devuelve la configuracion con valores por defecto sensatos.
 func defaults() Config {
 	return Config{
-		LogLevel:          "info",
-		LogJSON:           false,
-		DBPath:            "wapp-edge.db",
-		DEKPath:           "dek.key",
-		DBDialect:         "sqlite",
-		DataDir:           defaultDataDir(),
-		MaxSessions:       5,
-		PushName:          "wApp",
-		ControlSocketPath: "wapp-edge.sock",
+		LogLevel:              "info",
+		LogJSON:               false,
+		DBPath:                "wapp-edge.db",
+		DEKPath:               "dek.key",
+		DBDialect:             "sqlite",
+		DataDir:               defaultDataDir(),
+		MaxSessions:           5,
+		MultiDevicePerAccount: 1,
+		PushName:              "wApp",
+		ControlSocketPath:     "wapp-edge.sock",
 	}
 }
 
@@ -170,6 +181,7 @@ func Load(path string) (Config, error) {
 	cfg.DBDSN = loader.GetString("DB_DSN", cfg.DBDSN)
 	cfg.DataDir = loader.GetString("DATA_DIR", cfg.DataDir)
 	cfg.MaxSessions = loader.GetInt("MAX_SESSIONS", cfg.MaxSessions)
+	cfg.MultiDevicePerAccount = loader.GetInt("MULTIDEVICE_PER_ACCOUNT", cfg.MultiDevicePerAccount)
 	cfg.PushName = loader.GetString("PUSH_NAME", cfg.PushName)
 	cfg.ControlSocketPath = loader.GetString("CONTROL_SOCKET_PATH", cfg.ControlSocketPath)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
@@ -201,6 +213,17 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("config: no se pudo resolver data_dir %q a ruta absoluta: %w", cfg.DataDir, err)
 	}
 	cfg.DataDir = absDataDir
+
+	// Failover multi-dispositivo por número (Plan 022 T5, §10.F): CLAMP a [1,4]. 1 = off (un device vivo
+	// por número, comportamiento actual); 4 = tope de WhatsApp (1 principal + 4 vinculados). Valores fuera
+	// de rango (0, negativos, >4) se saturan en vez de fallar el arranque (guardarraíl, no invariante de
+	// seguridad). RESILIENCIA, no sigilo: no se debe subir sin necesidad operativa (más huella).
+	if cfg.MultiDevicePerAccount < 1 {
+		cfg.MultiDevicePerAccount = 1
+	}
+	if cfg.MultiDevicePerAccount > 4 {
+		cfg.MultiDevicePerAccount = 4
+	}
 
 	return cfg, nil
 }

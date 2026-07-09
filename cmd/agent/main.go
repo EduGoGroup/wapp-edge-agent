@@ -360,6 +360,8 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 		sessionmgr.WithSharedDB(database, cfg.DBDialect),
 		sessionmgr.WithWhatsmeowListen(mux, cfg.PushName),
 		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
+		// Failover multi-dispositivo por número (Plan 022 T5, §10.F): off por defecto (1). RESILIENCIA, no sigilo.
+		sessionmgr.WithMultiDevicePerAccount(cfg.MultiDevicePerAccount),
 	)
 
 	if err := mgr.Restore(ctx); err != nil {
