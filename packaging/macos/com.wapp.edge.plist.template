@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent POR-USUARIO del Edge de wApp (Plan 023 · T3). Se instala en
+  ~/Library/LaunchAgents/com.wapp.edge.plist y arranca al INICIAR SESIÓN.
+
+  NUNCA LaunchDaemon: la DEK vive en el Keychain del USUARIO (T2); un daemon de
+  sistema (contexto root) no lo vería. Los marcadores (WAPP_CTL_BIN, DATA_DIR,
+  CONFIG_PATH, AGENT_BIN, STDOUT_LOG, STDERR_LOG, entre dobles arrobas) los
+  sustituye install-launchagent.sh (y el test Go RenderPlist) con rutas ABSOLUTAS
+  — launchd NO expande ~ ni $HOME en los valores del plist.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.wapp.edge</string>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>@@WAPP_CTL_BIN@@</string>
+		<string>--no-open</string>
+		<string>--autostart</string>
+	</array>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>WAPP_AGENT_CONFIG</key>
+		<string>@@CONFIG_PATH@@</string>
+		<key>WAPP_AGENT_DATA_DIR</key>
+		<string>@@DATA_DIR@@</string>
+		<key>WAPP_CTL_AGENT_BIN</key>
+		<string>@@AGENT_BIN@@</string>
+	</dict>
+
+	<key>WorkingDirectory</key>
+	<string>@@DATA_DIR@@</string>
+
+	<key>StandardOutPath</key>
+	<string>@@STDOUT_LOG@@</string>
+
+	<key>StandardErrorPath</key>
+	<string>@@STDERR_LOG@@</string>
+</dict>
+</plist>

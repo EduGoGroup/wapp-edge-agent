@@ -46,6 +46,7 @@ func main() {
 	socketFlag := flag.String("socket", "", "ruta del Unix socket /v1 del núcleo (default: cfg.ControlSocketPath del config)")
 	pidFile := flag.String("pid-file", "", "ruta del PID/lock file anti-duplicado (default: <socket>.pid)")
 	noOpen := flag.Bool("no-open", false, "no abrir el navegador automáticamente al arrancar")
+	autostart := flag.Bool("autostart", false, "arrancar el núcleo (agent serve) automáticamente al iniciar (lo usa el LaunchAgent, Plan 023 · T3); por defecto el núcleo se arranca bajo demanda por POST /v1/daemon/start")
 	flag.Parse()
 
 	// Config del Edge: MISMA fuente y overlay que el núcleo (WAPP_AGENT_CONFIG / config.yaml + WAPP_AGENT_*).
@@ -89,6 +90,20 @@ func main() {
 
 	log.Info("wapp-ctl: supervisor arriba",
 		"addr", *addr, "socket", socketPath, "agent_bin", *agentBin, "version", Version)
+
+	// Autoarranque del núcleo (Plan 023 · T3): bajo el LaunchAgent por-usuario queremos recepción 24/7 y que
+	// el Restore del Plan 022 corra al iniciar sesión. Start es idempotente (si el núcleo ya corre no hace
+	// nada) y BLOQUEA sondeando readiness, así que va en goroutine para no retrasar el select de cierre.
+	// Corre TRAS el login (LaunchAgent), con el Keychain del usuario ya disponible para la DEK (T2).
+	if *autostart {
+		go func() {
+			if err := sup.Start(ctx); err != nil {
+				log.Error("wapp-ctl: no se pudo autoarrancar el núcleo; arráncalo por POST /v1/daemon/start", "error", err)
+				return
+			}
+			log.Info("wapp-ctl: núcleo autoarrancado (agent serve) — recepción 24/7 y Restore del Plan 022 en curso")
+		}()
+	}
 
 	if !*noOpen {
 		openBrowser("http://"+*addr, log)
