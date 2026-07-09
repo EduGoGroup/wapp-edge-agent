@@ -593,18 +593,43 @@ func (a *Adapter) heartbeatAll(cl *client.Client) {
 	}
 }
 
+// heartbeatStateFor es el ÚNICO punto de mapeo Edge→Cloud del ESTADO (Plan 022 T4, design §4/§10.D):
+// traduce el estado de NEGOCIO/ciclo de vida del device (domain.SessionState) al estado de LÍNEA del
+// Heartbeat (cloudlinkv1.SessionState) que el Cloud usa para DERIVAR fleet_sessions.state. La tabla
+// canónica (con los estados que NO emiten latido) vive en el doc de domain.SessionState; aquí solo los
+// que llegan a viajar por el wire:
+//
+//	domain.SessionState | wire Heartbeat.State        | Cloud fleet_sessions.state (derivado)
+//	--------------------+-----------------------------+--------------------------------------
+//	active              | SESSION_STATE_UNSPECIFIED   | online   (liveness: latido presente)
+//	loggedout           | SESSION_STATE_LOGGED_OUT    | loggedout / zombie (WhatsApp cerró)
+//	(pairing/suspended) | —no emiten latido—          | offline  (derivado por AUSENCIA)
+//
+// El proto (v0.6.0) solo modela dos valores de línea explícitos: `online`/`offline` NO son estados de
+// línea, los deriva el Cloud por presencia/ausencia de latidos. Por eso todo estado distinto de loggedout
+// que llegase a emitir un latido se reporta como UNSPECIFIED (liveness normal); pairing/suspended no
+// emiten latido (sin socket / listener parado) y el Cloud los ve offline. El estado es metadato de
+// NEGOCIO: JAMÁS material criptográfico (zero-knowledge intacto).
+func heartbeatStateFor(s domain.SessionState) cloudlinkv1.SessionState {
+	if s == domain.SessionStateLoggedOut {
+		return cloudlinkv1.SessionState_SESSION_STATE_LOGGED_OUT
+	}
+	return cloudlinkv1.SessionState_SESSION_STATE_UNSPECIFIED
+}
+
 func (a *Adapter) sendHeartbeat(cl *client.Client, sessionID string, e *sessionEntry) {
 	ctr := e.leaseCtr.Add(1)
 	a.send(cl, &cloudlinkv1.EdgeToCloud{
 		CommandId: uuid.NewString(),
 		SessionId: sessionID,
 		// Plan 020 T2: cada latido lleva el número/JID propio para que el Cloud sepa a qué número pertenece
-		// la sesión al marcarla online (anti-self-loop). State UNSPECIFIED = latido de liveness normal.
+		// la sesión al marcarla online (anti-self-loop). Un latido periódico corresponde a una sesión
+		// `active` en el Edge → estado de línea UNSPECIFIED (liveness normal) vía el mapeo unificado (T4).
 		Payload: &cloudlinkv1.EdgeToCloud_Heartbeat{Heartbeat: &cloudlinkv1.Heartbeat{
 			LeaseCounter: ctr,
 			SelfPn:       e.selfPN,
 			SelfJid:      e.selfJID,
-			State:        cloudlinkv1.SessionState_SESSION_STATE_UNSPECIFIED,
+			State:        heartbeatStateFor(domain.SessionStateActive),
 		}},
 	})
 }
@@ -636,7 +661,8 @@ func (a *Adapter) SendLoggedOut(sessionID string) {
 			LeaseCounter: ctr,
 			SelfPn:       selfPN,
 			SelfJid:      selfJID,
-			State:        cloudlinkv1.SessionState_SESSION_STATE_LOGGED_OUT,
+			// devices.state='loggedout' → estado de línea LOGGED_OUT (zombie) vía el mapeo unificado (T4).
+			State: heartbeatStateFor(domain.SessionStateLoggedOut),
 		}},
 	})
 }

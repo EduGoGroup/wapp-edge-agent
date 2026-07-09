@@ -2,9 +2,34 @@ package domain
 
 import "time"
 
-// SessionState es el estado de NEGOCIO de un dispositivo vinculado del Edge (no es estado de socket:
-// eso lo gestiona el listener en RAM). Persiste en `devices.state` (BD única, Plan 022) para que el
-// arranque (Manager.Restore) sepa qué restaurar sin descifrar el store.
+// SessionState es el estado de NEGOCIO (ciclo de vida) de un dispositivo vinculado del Edge (no es estado
+// de socket: eso lo gestiona el listener en RAM). Persiste en `devices.state` (BD única, Plan 022) para
+// que el arranque (Manager.Restore) sepa qué restaurar sin descifrar el store. Es un VALOR DE PRIMERA
+// CLASE con cuatro estados y una máquina de estados lineal (Plan 022 §4/§10.D, ADR-0018):
+//
+//	pairing ──PairSuccess──▶ active ──Suspender──▶ suspended
+//	   │                       │  ▲                    │
+//	   │(falla/expira)         │  └──Reanudar─────────┘
+//	   ▼                       ▼
+//	(DELETE device)        loggedout  ◀──events.LoggedOut (desde active o suspended)
+//
+// MAPEO Edge ↔ Cloud (documentado; NO se fusionan los vocabularios, se ALINEAN — design §4). El Cloud
+// `fleet_sessions.state` (`online|offline|loggedout`) es SALUD DE FLEET DERIVADA del stream CloudLink, no
+// el ciclo de vida; se deriva por presencia/ausencia de latidos (Heartbeat). El wire real (proto CloudLink
+// v0.6.0) solo modela DOS valores de línea explícitos (UNSPECIFIED, LOGGED_OUT); `online`/`offline` no
+// viajan, los infiere el Cloud. La traducción a estado de línea vive en el punto de propagación
+// (cloudlink.heartbeatStateFor). Tabla:
+//
+//	Edge devices.state | Heartbeat.State (wire)      | Cloud fleet_sessions.state (derivado)
+//	-------------------+-----------------------------+--------------------------------------
+//	pairing            | (no emite: sin socket vivo) | offline / ausente (aún no anclada)
+//	active             | SESSION_STATE_UNSPECIFIED   | online (liveness: latido presente)
+//	suspended          | (no emite: listener parado) | offline (por AUSENCIA de latidos)
+//	loggedout          | SESSION_STATE_LOGGED_OUT    | loggedout / zombie (WhatsApp cerró)
+//
+// pairing y suspended NO tienen representación de línea propia: no emiten latido y el Cloud los ve
+// `offline` (indistinguibles de una caída de red a nivel de protocolo — es salud de fleet, no ciclo de
+// vida). El estado es metadato de NEGOCIO EN CLARO: JAMÁS material criptográfico (zero-knowledge intacto).
 type SessionState string
 
 const (
@@ -12,10 +37,17 @@ const (
 	// ya provisionados, JID aún desconocido hasta PairSuccess). No se restaura al arrancar; se
 	// promueve a active en PairSuccess o se limpia si el pairing falla/expira (ADR-0016 §3, design §5).
 	SessionStatePairing SessionState = "pairing"
-	// SessionStateActive: sesión vinculada y operable (se restaura al arrancar).
+	// SessionStateActive: sesión vinculada y operable (se restaura al arrancar). Único estado que emite
+	// latido normal (liveness) → el Cloud la deriva `online`.
 	SessionStateActive SessionState = "active"
+	// SessionStateSuspended: sesión vinculada pero PAUSADA a propósito (Suspender en el systray, o standby
+	// que no opera — failover T5). El listener se detiene: cesan los latidos y el Cloud la deriva `offline`
+	// por AUSENCIA (no hay estado de línea `suspended` en el proto). Reanudable a `active` sin re-escanear;
+	// distinta de `loggedout` (aquí la sesión de WhatsApp sigue viva, solo no se opera).
+	SessionStateSuspended SessionState = "suspended"
 	// SessionStateLoggedOut: WhatsApp cerró la sesión (events.LoggedOut). NO se re-empareja
-	// automáticamente (RF-6); requiere un nuevo pairing manual.
+	// automáticamente (RF-6); requiere un nuevo pairing manual. Propaga estado de línea LOGGED_OUT
+	// (zombie) al Cloud por el mismo stream antes del teardown (Plan 020 T3).
 	SessionStateLoggedOut SessionState = "loggedout"
 )
 
@@ -60,7 +92,8 @@ type Session struct {
 	// vacío mientras el estado es 'pairing' (el número se descubre recién en PairSuccess); cuando no
 	// está vacío es ÚNICO entre dispositivos (índice parcial ux_devices_jid).
 	JID string
-	// State es el estado de negocio (pairing / active / suspended / loggedout).
+	// State es el estado de negocio del ciclo de vida (pairing / active / suspended / loggedout). Ver la
+	// máquina de estados y el mapeo Edge↔Cloud en el doc de SessionState.
 	State SessionState
 	// Role es el rol del dispositivo dentro de su cuenta (primary/standby, failover T5). Default primary.
 	Role DeviceRole
