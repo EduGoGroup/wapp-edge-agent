@@ -35,6 +35,10 @@ const (
 	codeMethodNotAllowed = "method_not_allowed"
 	codeInternal         = "internal"
 	codeConflict         = "conflict"
+	// codeInvalidRequest: el cuerpo/params de la petición son inválidos (Plan 023 · T1, POST /v1/enroll).
+	codeInvalidRequest = "invalid_request"
+	// codeEnrollFailed: el enrolamiento contra el Gateway falló (dial/CA/activation code) (Plan 023 · T1).
+	codeEnrollFailed = "enroll_failed"
 )
 
 // writeError responde con el envelope de error y el status HTTP indicado. Reusable por todos los

@@ -227,3 +227,24 @@ func Load(path string) (Config, error) {
 
 	return cfg, nil
 }
+
+// DefaultConfigPath devuelve la ruta ESTABLE del config.yaml del Edge dentro del data_dir sagrado
+// (Plan 023 · T1): <data_dir>/config.yaml. Cierra el gotcha del CWD — MP-02 lo cerró para el data_dir
+// (D2, absolutización); aquí se extiende al ARCHIVO de config, que hasta ahora se buscaba relativo al
+// CWD ("config.yaml") y por tanto dependía de desde dónde se lanzara el proceso.
+//
+// Resuelve el data_dir igual que Load —override WAPP_AGENT_DATA_DIR, y si no el default por SO
+// (defaultDataDir)— SIN depender del CWD, y lo absolutiza. El instalador y el LaunchAgent (T3/T4)
+// además fijan WAPP_AGENT_CONFIG a este mismo valor; cuando esa variable está presente, el arranque
+// (cmd/agent, cmd/wapp-ctl) la respeta y no llama aquí. El archivo puede no existir aún: Load lo trata
+// como opcional (defaults + env), así que apuntar a una ruta inexistente en instalación limpia es seguro.
+func DefaultConfigPath() string {
+	dir := os.Getenv(EnvPrefix + "DATA_DIR")
+	if dir == "" {
+		dir = defaultDataDir()
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	return filepath.Join(dir, "config.yaml")
+}

@@ -67,7 +67,10 @@ const singleDBFileName = "edge.db"
 func main() {
 	path := os.Getenv("WAPP_AGENT_CONFIG")
 	if path == "" {
-		path = "config.yaml"
+		// Ruta estable <data_dir>/config.yaml (Plan 023 · T1): cierra el gotcha del CWD (antes se buscaba
+		// "config.yaml" relativo al directorio desde el que se lanzara el proceso). El instalador/LaunchAgent
+		// además fijan WAPP_AGENT_CONFIG a este mismo valor.
+		path = config.DefaultConfigPath()
 	}
 
 	cfg, err := config.Load(path)
@@ -392,6 +395,8 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	srv.Handle(http.MethodGet, "/v1/logs", logsink.Handler(sink))
 	srv.RegisterPairing(mgr) // POST /v1/sessions/pair → Manager.Pair (async; QR por polling)
 	srv.RegisterUnlink(mgr)  // DELETE /v1/sessions/{id} → Manager.Unlink(session_id)
+	// GET /v1/enroll/status + POST /v1/enroll (onboarding sin terminal, Plan 023 · T1).
+	srv.RegisterEnroll(enrollPort{cfg: cfg, log: log})
 
 	ln, err := srv.Listen()
 	if err != nil {
@@ -441,6 +446,56 @@ func (m managerInventory) Persisted(ctx context.Context) ([]domain.Session, erro
 func (m managerInventory) Health(id string) (string, bool) {
 	h, ok := m.mgr.Health(id)
 	return h.String(), ok
+}
+
+// enrollPort adapta el enroll REAL (internal/infra/enroll) al puerto del plano de control
+// (server.RegisterEnroll, Plan 023 · T1): ejecuta el mismo enrolamiento que `agent enroll <codigo>`
+// REUSANDO enroll.Run —no lo reimplementa— y reporta si el par mTLS ya vive en disco. Guarda la config
+// del núcleo para poblar EnrollmentEndpoint/TLSCA/rutas destino; por HTTP solo llega el activation code.
+// Zero-knowledge: enroll.Run persiste el par mTLS + cloud_enc_pubkey, NUNCA la DEK.
+type enrollPort struct {
+	cfg config.Config
+	log sharedlogger.Logger
+}
+
+// Enrolled reporta si el par mTLS (cert + clave) ya está presente en disco: la señal de "primera
+// ejecución" que la web usa para elegir entre la pantalla enrolar y el dashboard.
+func (p enrollPort) Enrolled() bool {
+	return mtlsFileExists(p.cfg.CloudLink.TLSCert) && mtlsFileExists(p.cfg.CloudLink.TLSKey)
+}
+
+// Enroll valida las precondiciones de bootstrap (endpoint + TLSCA pre-provistos y rutas destino) y
+// delega en enroll.Run con el activation code recibido. Mismas validaciones que runEnroll (subcomando
+// CLI), para dar un mensaje claro en la web en vez de un fallo opaco del dial.
+func (p enrollPort) Enroll(ctx context.Context, activationCode string) error {
+	cfg := p.cfg
+	cfg.CloudLink.ActivationCode = strings.TrimSpace(activationCode)
+
+	if cfg.CloudLink.EnrollmentEndpoint == "" {
+		return fmt.Errorf("falta enrollment_endpoint (bootstrap del paquete): configura cloudlink.enrollment_endpoint")
+	}
+	if cfg.CloudLink.TLSCA == "" {
+		return fmt.Errorf("falta tls_ca: la CA que valida al Gateway debe estar pre-provista antes de enrolar")
+	}
+	if cfg.CloudLink.TLSCert == "" || cfg.CloudLink.TLSKey == "" {
+		return fmt.Errorf("faltan rutas destino tls_cert/tls_key donde persistir la credencial mTLS")
+	}
+	if cfg.CloudLink.ActivationCode == "" {
+		return fmt.Errorf("falta el código de activación")
+	}
+
+	p.log.Info("enroll web: enrolando el Edge contra el Gateway",
+		"endpoint", cfg.CloudLink.EnrollmentEndpoint, "tls_cert", cfg.CloudLink.TLSCert)
+	return enroll.Run(ctx, cfg, p.log)
+}
+
+// mtlsFileExists indica si path apunta a un archivo REGULAR existente (no directorio, no vacío en ruta).
+func mtlsFileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
 }
 
 // runEnroll cablea el subcomando `enroll`: lee el código de activación de cfg o de os.Args

@@ -18,6 +18,35 @@
     </header>
 
     <main>
+      <!-- ===================== Enrolar (onboarding sin terminal, Plan 023 · T1) =====================
+        Primera ejecución: si el núcleo aún no tiene credencial mTLS (GET /v1/enroll/status → enrolled:false),
+        app.js muestra ESTA tarjeta y oculta el dashboard (sesiones/emparejar/logs). Al enrolar con el
+        activation code (POST /v1/enroll, que reusa el enroll real del núcleo) se conmuta al dashboard.
+        La llave privada se genera y persiste SOLO en este equipo (zero-knowledge; nunca viaja a la nube). -->
+      <section id="section-enroll" class="card hidden">
+        <div class="card-head">
+          <h2>Enrolar este equipo</h2>
+          <span class="badge badge-warn">Sin credencial</span>
+        </div>
+        <p class="detail">
+          Este Edge todavía no está enrolado en la nube de wApp. Introduce el
+          <strong>activation code</strong> del panel para generar la credencial segura del equipo.
+          La llave privada se genera y se queda <strong>solo en este equipo</strong> (nunca viaja a la nube).
+        </p>
+        <form id="enroll-form" class="enroll-form" autocomplete="off">
+          <input
+            id="enroll-code"
+            type="text"
+            inputmode="text"
+            spellcheck="false"
+            placeholder="Activation code"
+            aria-label="Activation code"
+          />
+          <button id="enroll-submit" type="submit">Enrolar</button>
+        </form>
+        <p id="enroll-status" class="detail muted"></p>
+      </section>
+
       <!-- ===================== Estado del daemon ===================== -->
       <section id="section-daemon" class="card">
         <div class="card-head">

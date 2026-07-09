@@ -37,11 +37,22 @@ const el = {
   pairQr: $("pair-qr"),
   logsState: $("logs-state"),
   logs: $("logs"),
+  // Onboarding / enrolar (Plan 023 · T1) + secciones del dashboard (para conmutar la vista).
+  enrollSection: $("section-enroll"),
+  enrollForm: $("enroll-form"),
+  enrollCode: $("enroll-code"),
+  enrollSubmit: $("enroll-submit"),
+  enrollStatus: $("enroll-status"),
+  sectionSessions: $("section-sessions"),
+  sectionPair: $("section-pair"),
+  sectionLogs: $("section-logs"),
 };
 
 // Estado de la UI (no del daemon): nos sirve para no relanzar sondeos/streams en cada tick.
 const ui = {
   daemonRunning: false, // último estado conocido del núcleo
+  daemonHealthy: false, // último 'healthy' conocido (para consultar el enroll status en la transición)
+  enrolled: true, // ¿hay credencial mTLS? default true = dashboard; el núcleo lo confirma en /v1/enroll/status
   pollingPair: false, // hay un emparejamiento en curso
   pairTimer: null, // setInterval del poll de pairing
   lastQr: "", // último data-URL pintado (para no recargar la <img> si no rotó)
@@ -112,6 +123,16 @@ function applyDaemonState(s) {
   } else {
     el.btnPair.disabled = ui.pollingPair; // habilitado salvo que ya haya un pairing en curso
   }
+
+  // Onboarding (T1): cuando el núcleo pasa a healthy, consulta si ya hay credencial mTLS para decidir
+  // entre la pantalla "enrolar" y el dashboard. Solo se consulta en la TRANSICIÓN a healthy (no en cada
+  // tick); applyView refleja la vista vigente en cada llamada.
+  const healthy = running && !!s.healthy;
+  if (healthy && !ui.daemonHealthy) {
+    fetchEnrollStatus();
+  }
+  ui.daemonHealthy = healthy;
+  applyView();
 }
 
 // setDaemonControls habilita/inhabilita los botones Arrancar/Detener de forma exclusiva.
@@ -129,6 +150,85 @@ function degradeCoreSections() {
   el.pairStatus.textContent = "Arranca el daemon antes de emparejar.";
   el.pairStatus.className = "detail muted";
   el.pairQrWrap.classList.add("hidden");
+}
+
+// ----------------------------- Onboarding / enrolar (Plan 023 · T1) -----------------------------
+
+// applyView alterna entre la pantalla "enrolar" (sin credencial) y el dashboard. Solo oculta el
+// dashboard cuando el núcleo está vivo Y sabemos que NO hay credencial; en cualquier otro caso (daemon
+// caído, credencial presente o estado aún desconocido) deja el dashboard como hasta ahora (con su propio
+// degradado si el núcleo cae), para no regresar a los usuarios ya enrolados a una pantalla en blanco.
+function applyView() {
+  const onboarding = ui.daemonRunning && ui.enrolled === false;
+  toggleSection(el.enrollSection, onboarding);
+  toggleSection(el.sectionSessions, !onboarding);
+  toggleSection(el.sectionPair, !onboarding);
+  toggleSection(el.sectionLogs, !onboarding);
+}
+
+// toggleSection muestra u oculta una <section> con la clase .hidden (no-op si el nodo no existe).
+function toggleSection(node, show) {
+  if (node) node.classList.toggle("hidden", !show);
+}
+
+// fetchEnrollStatus pregunta al núcleo si ya hay credencial mTLS (GET /v1/enroll/status). Un 503 (daemon
+// caído a mitad) deja el estado como estaba (se reintenta en la próxima transición a healthy); cualquier
+// otro fallo es fail-open al dashboard, para no atrapar al usuario en una pantalla en blanco.
+async function fetchEnrollStatus() {
+  try {
+    const res = await fetch("/v1/enroll/status", { cache: "no-store" });
+    if (res.status === 503) return; // daemon down
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json(); // {enrolled: bool}
+    ui.enrolled = !!data.enrolled;
+  } catch (_err) {
+    ui.enrolled = true; // fail-open: ante la duda, muestra el dashboard
+  }
+  applyView();
+}
+
+// submitEnroll envía el activation code a POST /v1/enroll (reusa el enroll REAL del núcleo). Al éxito
+// marca enrolled y conmuta al dashboard; los errores se explican en la propia pantalla sin recargar.
+async function submitEnroll(ev) {
+  ev.preventDefault();
+  const code = el.enrollCode.value.trim();
+  if (!code) {
+    setEnrollStatus("Introduce el activation code que te dio el panel.", true);
+    return;
+  }
+  el.enrollSubmit.disabled = true;
+  setEnrollStatus("Enrolando este equipo contra la nube…", false);
+  try {
+    const res = await fetch("/v1/enroll", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ activation_code: code }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 503) {
+      setEnrollStatus("El servicio no está disponible. Arranca el daemon e inténtalo de nuevo.", true);
+      el.enrollSubmit.disabled = false;
+      return;
+    }
+    if (!res.ok) {
+      const msg = data && data.error ? data.error.message || data.error.code : "HTTP " + res.status;
+      throw new Error(msg);
+    }
+    ui.enrolled = true;
+    el.enrollCode.value = "";
+    setEnrollStatus("✅ Equipo enrolado. Ya puedes emparejar un teléfono.", false);
+    applyView();
+  } catch (err) {
+    setEnrollStatus("⚠️ No se pudo enrolar: " + err.message, true);
+    el.enrollSubmit.disabled = false;
+  }
+}
+
+// setEnrollStatus escribe el mensaje de estado de la pantalla enrolar (isError pinta en tono de error).
+function setEnrollStatus(msg, isError) {
+  if (!el.enrollStatus) return;
+  el.enrollStatus.textContent = msg;
+  el.enrollStatus.className = "detail" + (isError ? " notice-error" : " muted");
 }
 
 // ----------------------------- Arrancar / Detener -----------------------------
@@ -473,6 +573,7 @@ el.btnStop.addEventListener("click", stopDaemon);
 el.btnPair.addEventListener("click", startPairing);
 el.btnRefreshSessions.addEventListener("click", refreshSessions);
 el.sessionsBody.addEventListener("click", onSessionsClick);
+el.enrollForm.addEventListener("submit", submitEnroll); // onboarding sin terminal (T1)
 
 // Primer sondeo inmediato + bucle de estado cada 3s (el supervisor siempre responde aunque el núcleo
 // esté caído, así que este loop nunca deja la UI en blanco).

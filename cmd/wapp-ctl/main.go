@@ -52,7 +52,8 @@ func main() {
 	// De ahí sale la ruta del socket, para no inventar otra fuente (el hijo `agent serve` la lee igual).
 	cfgPath := os.Getenv("WAPP_AGENT_CONFIG")
 	if cfgPath == "" {
-		cfgPath = "config.yaml"
+		// Misma ruta estable que el núcleo (Plan 023 · T1): <data_dir>/config.yaml, no relativa al CWD.
+		cfgPath = config.DefaultConfigPath()
 	}
 	cfg, err := config.Load(cfgPath)
 	if err != nil {

@@ -141,6 +141,19 @@ td { word-break: break-all; }
   padding: 8px;
 }
 
+/* ---------- Onboarding / enrolar (Plan 023, T1) ---------- */
+.enroll-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.enroll-form input {
+  flex: 1 1 16rem;
+  font: inherit;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--ink);
+}
+.enroll-form input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 /* ---------- Logs ---------- */
 .logs {
   margin: 0;
