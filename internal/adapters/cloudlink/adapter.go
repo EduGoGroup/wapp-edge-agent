@@ -167,7 +167,7 @@ func (a *Adapter) Register(sessionID, selfJID string, send SendFunc, sendMedia S
 		sendFunc:      send,
 		sendMediaFunc: sendMedia,
 		hasDEK:        hasDEK,
-		selfJID:       selfJID,             // JID crudo del device propio (Plan 020 T2); "" si aún sin emparejar.
+		selfJID:       selfJID,                // JID crudo del device propio (Plan 020 T2); "" si aún sin emparejar.
 		selfPN:        selfPNFromJID(selfJID), // número propio E.164 sin '+'; "" si el JID no es un número.
 	}
 	if a.newValidator != nil {
