@@ -1,0 +1,36 @@
+# Bootstrap del Edge de wApp — kit PORTABLE Windows/Linux (Plan 024 · T0).
+#
+# A diferencia del bootstrap de macOS (packaging/macos/bootstrap/config.yaml.template), que
+# usa marcadores @@DATA_DIR@@ sustituidos por el `postinstall` del .pkg con rutas ABSOLUTAS,
+# este kit se descomprime y se ejecuta desde una carpeta cualquiera del usuario. Por eso las
+# rutas de credenciales son RELATIVAS a esa carpeta (== CWD / WorkingDirectory) y `data_dir`
+# se OMITE a propósito para que el Edge use su RUTA SAGRADA por SO (Windows %AppData%\wApp\edge,
+# Linux ~/.config/wApp/edge; ver internal/infra/config/config.go:defaultDataDir). No fijes
+# data_dir aquí: reintroduce el gotcha del CWD. El wrapper de autoarranque (Plan 024 · T1)
+# fija WAPP_AGENT_CONFIG / WAPP_AGENT_DATA_DIR y el WorkingDirectory estables.
+#
+# El instalador arma este archivo desde la plantilla sustituyendo solo @@ENROLLMENT_ENDPOINT@@
+# (make dist-* / ENROLLMENT_ENDPOINT=host:puerto).
+#
+# ⛔ ZERO-KNOWLEDGE (ADR-0007 / R6): aquí SOLO viaja material PÚBLICO — el TLSCA de bootstrap y
+# el endpoint de enrolamiento. El enroll genera y custodia el par mTLS en local; la DEK vive en
+# el keystore del SO (archivo 0600 en v1, DPAPI/Secret Service en T2). NUNCA pongas aquí
+# activation_code, tls_key, ni un tls_cert con material real.
+
+log_level: "info"
+
+cloudlink:
+  # Bootstrap de confianza pre-provisto en el paquete: valida el TLS-de-servidor del Gateway
+  # durante el enroll. Reemplaza por el endpoint real de tu nube al construir el artefacto
+  # (ENROLLMENT_ENDPOINT=host:puerto make dist-...) o pásalo por WAPP_AGENT_CLOUDLINK_ENROLLMENT_ENDPOINT.
+  enrollment_endpoint: "@@ENROLLMENT_ENDPOINT@@"
+  tls_ca: "ca.pem"
+
+  # DESTINOS donde el enroll ESCRIBIRÁ la credencial mTLS y la pubkey de la nube (relativos a la
+  # carpeta de ejecución). NO viajan en el paquete: los genera/persiste el enroll en ESTE equipo.
+  tls_cert: "edge.crt"
+  tls_key: "edge.key"
+  cloud_enc_pubkey_path: "cloud_enc.pub"
+
+  # endpoint (runtime CloudLink) se rellena TRAS enrolar, al conectar a la nube:
+  # endpoint: "gateway.wapp.example:443"

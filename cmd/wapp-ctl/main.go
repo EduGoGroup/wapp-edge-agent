@@ -203,14 +203,22 @@ func newCoreProxy(socketPath string, log sharedlogger.Logger) *httputil.ReverseP
 // defaultAgentBin resuelve la ruta del binario núcleo: primero el hermano "agent" junto al ejecutable de
 // wapp-ctl (caso dev: `go build ./cmd/...` deja ambos juntos); si no existe, "agent" a secas (PATH). El
 // flag --agent-bin / env WAPP_CTL_AGENT_BIN lo sobreescribe.
+//
+// En Windows el binario núcleo se compila como "agent.exe" (ver Makefile, sufijo .exe del build_target),
+// así que el hermano a resolver es "agent.exe"; sin este ajuste el layout hermano no resolvía en Windows
+// (Plan 024 · T0). El fallback de PATH usa el mismo nombre por-SO.
 func defaultAgentBin() string {
+	name := "agent"
+	if runtime.GOOS == "windows" {
+		name = "agent.exe"
+	}
 	if exe, err := os.Executable(); err == nil {
-		cand := filepath.Join(filepath.Dir(exe), "agent")
+		cand := filepath.Join(filepath.Dir(exe), name)
 		if fi, statErr := os.Stat(cand); statErr == nil && !fi.IsDir() {
 			return cand
 		}
 	}
-	return "agent"
+	return name
 }
 
 // openBrowser abre la URL en el navegador del SO. Best-effort, NO bloqueante, NO fatal (si no puede,

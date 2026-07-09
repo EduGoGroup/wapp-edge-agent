@@ -149,6 +149,59 @@ dmg: pkg
 	hdiutil create -volname "wApp Edge" -srcfolder $(PKG_OUT) -ov -format UDZO $(DMG_OUT)
 	@echo "OK: $(DMG_OUT)"
 
+# --- Artefactos portables Windows/Linux (Plan 024 · T0) --------------------
+# .zip (Windows) / .tar.gz (Linux) con los 2 binarios (layout hermano, .exe en Windows) +
+# bootstrap PÚBLICO (ca.pem + config.yaml) + README mínimo. TODO pure-Go (CGO=0): el Keychain
+# es //go:build darwin, no alcanza a Win/Linux → el cross-build sale gratis desde el Mac.
+#
+# Insumos bootstrap: se REUSA el ca.pem público de macOS ($(BOOTSTRAP_DIR), TLSCA OS-agnóstico,
+# fuente única) pero el config.yaml sale de una plantilla PROPIA (packaging/common): la de macOS
+# lleva marcadores @@DATA_DIR@@ que sustituye el postinstall del .pkg con rutas absolutas; el kit
+# portable se descomprime en cualquier carpeta, así que usa rutas relativas y omite data_dir
+# (RUTA SAGRADA por SO). Zero-knowledge (R6): se corre verify-zero-knowledge.sh sobre el staging.
+COMMON_DIR          ?= packaging/common
+# Endpoint de enrolamiento embebido en el config de bootstrap. Override:
+# `make dist-linux-amd64 ENROLLMENT_ENDPOINT=gateway.tu-nube:8102`.
+ENROLLMENT_ENDPOINT ?= gateway.wapp.example:8102
+DIST_STAGE          := build/dist
+ZIP_OUT             := $(DISTDIR)/wapp-edge-$(VERSION)-windows-amd64.zip
+TGZ_OUT             := $(DISTDIR)/wapp-edge-$(VERSION)-linux-amd64.tar.gz
+
+# dist_stage(os,arch,stage): copia los 2 binarios (con .exe en windows) + ca.pem público +
+# config.yaml (endpoint sustituido) + README.txt al staging, y corre la guarda zero-knowledge.
+define dist_stage
+	rm -rf $(3)
+	mkdir -p $(3)
+	cp $(DISTDIR)/$(1)-$(2)/agent$(if $(filter windows,$(1)),.exe,) $(3)/
+	cp $(DISTDIR)/$(1)-$(2)/wapp-ctl$(if $(filter windows,$(1)),.exe,) $(3)/
+	cp $(BOOTSTRAP_DIR)/ca.pem $(3)/ca.pem
+	sed 's|@@ENROLLMENT_ENDPOINT@@|$(ENROLLMENT_ENDPOINT)|g' $(COMMON_DIR)/config.yaml.template > $(3)/config.yaml
+	cp $(COMMON_DIR)/README.txt $(3)/README.txt
+	bash $(PKG_MACOS)/verify-zero-knowledge.sh $(3)
+endef
+
+## dist-windows-amd64: artefacto portable .zip (Win amd64) — 2 binarios + bootstrap público.
+.PHONY: dist-windows-amd64
+dist-windows-amd64: build-windows-amd64
+	$(call dist_stage,windows,amd64,$(DIST_STAGE)/windows-amd64)
+	@mkdir -p $(DISTDIR)
+	rm -f $(ZIP_OUT)
+	cd $(DIST_STAGE)/windows-amd64 && zip -q -X -r "$(abspath $(ZIP_OUT))" .
+	@echo "OK: $(ZIP_OUT)"
+
+## dist-linux-amd64: artefacto portable .tar.gz (Linux amd64) — 2 binarios + bootstrap público.
+.PHONY: dist-linux-amd64
+dist-linux-amd64: build-linux-amd64
+	$(call dist_stage,linux,amd64,$(DIST_STAGE)/linux-amd64)
+	@mkdir -p $(DISTDIR)
+	rm -f $(TGZ_OUT)
+	tar -C $(DIST_STAGE)/linux-amd64 -czf $(TGZ_OUT) .
+	@echo "OK: $(TGZ_OUT)"
+
+## dist-all: ambos artefactos portables (Windows .zip + Linux .tar.gz).
+.PHONY: dist-all
+dist-all: dist-windows-amd64 dist-linux-amd64
+
 ## clean: elimina los directorios de salida (dist/ y el staging del .pkg).
 .PHONY: clean
 clean:
