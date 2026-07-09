@@ -168,7 +168,10 @@ ZIP_OUT             := $(DISTDIR)/wapp-edge-$(VERSION)-windows-amd64.zip
 TGZ_OUT             := $(DISTDIR)/wapp-edge-$(VERSION)-linux-amd64.tar.gz
 
 # dist_stage(os,arch,stage): copia los 2 binarios (con .exe en windows) + ca.pem público +
-# config.yaml (endpoint sustituido) + README.txt al staging, y corre la guarda zero-knowledge.
+# config.yaml (endpoint sustituido) + README.txt + los artefactos de autoarranque por-SO
+# (packaging/<os>/, Plan 024 · T1) al staging, y corre la guarda zero-knowledge.
+# Los artefactos de autostart son PÚBLICOS (scripts/plantillas sin secretos): Windows lleva
+# run-edge.cmd + install/uninstall-autostart.ps1; Linux la unit template + install/uninstall-autostart.sh.
 define dist_stage
 	rm -rf $(3)
 	mkdir -p $(3)
@@ -177,6 +180,8 @@ define dist_stage
 	cp $(BOOTSTRAP_DIR)/ca.pem $(3)/ca.pem
 	sed 's|@@ENROLLMENT_ENDPOINT@@|$(ENROLLMENT_ENDPOINT)|g' $(COMMON_DIR)/config.yaml.template > $(3)/config.yaml
 	cp $(COMMON_DIR)/README.txt $(3)/README.txt
+	cp packaging/$(1)/* $(3)/
+	$(if $(filter linux,$(1)),chmod +x $(3)/install-autostart.sh $(3)/uninstall-autostart.sh,)
 	bash $(PKG_MACOS)/verify-zero-knowledge.sh $(3)
 endef
 

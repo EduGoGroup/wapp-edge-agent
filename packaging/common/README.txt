@@ -7,6 +7,9 @@ Este paquete contiene:
   - config.yaml      Configuracion de arranque (endpoint de enrolamiento + CA publica).
   - ca.pem           Certificado publico de confianza (TLSCA). No es secreto.
   - README.txt       Este archivo.
+  Windows:  run-edge.cmd, install-autostart.ps1, uninstall-autostart.ps1
+  Linux:    wapp-edge.service.template, install-autostart.sh, uninstall-autostart.sh
+            (activan que el Edge arranque solo al iniciar sesion — ver "ARRANCAR SOLO").
 
 COMO ARRANCARLO
 ---------------
@@ -22,6 +25,19 @@ COMO ARRANCARLO
 6. Listo: envia y recibe un WhatsApp para probar.
 
 Deja la ventana/terminal abierta: el Edge debe seguir corriendo para enviar y recibir.
+
+ARRANCAR SOLO (sobrevivir a un reinicio)
+----------------------------------------
+Para que el Edge vuelva a arrancar solo cada vez que enciendes el equipo:
+  - Windows: en la carpeta del kit, ejecuta en PowerShell:
+       powershell -ExecutionPolicy Bypass -File install-autostart.ps1
+       (para desactivarlo: uninstall-autostart.ps1)
+  - Linux:   en una terminal, dentro de la carpeta:
+       chmod +x install-autostart.sh && ./install-autostart.sh
+       (para desactivarlo: ./uninstall-autostart.sh)
+Los registros (logs) quedan en:
+  - Windows: %AppData%\wApp\edge\logs\edge.log
+  - Linux:   ~/.config/wApp/edge/logs/edge.log
 
 El guion completo (paso a paso, resolucion de problemas y como sobrevivir a un reinicio)
 lo entrega aparte quien te paso este paquete.

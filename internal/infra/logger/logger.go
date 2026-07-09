@@ -3,9 +3,11 @@
 package logger
 
 import (
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 
 	edgeconfig "github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
@@ -33,15 +35,49 @@ func NewWithSink(cfg edgeconfig.Config, sink io.Writer) sharedlogger.Logger {
 // base (stdout en produccion) y, si sink != nil, tambien a sink mediante io.MultiWriter. Es
 // unexportada y parametriza base para poder testear el tee sin tocar el stdout real del proceso.
 func newWithWriters(cfg edgeconfig.Config, base, sink io.Writer) sharedlogger.Logger {
-	w := base
+	writers := []io.Writer{base}
 	if sink != nil {
-		w = io.MultiWriter(base, sink)
+		writers = append(writers, sink)
+	}
+	if fw := fileWriter(); fw != nil {
+		writers = append(writers, fw)
+	}
+	w := base
+	if len(writers) > 1 {
+		w = io.MultiWriter(writers...)
 	}
 	return sharedlogger.New(
 		sharedlogger.WithLevel(ParseLevel(cfg.LogLevel)),
 		sharedlogger.WithJSON(cfg.LogJSON),
 		sharedlogger.WithWriter(w),
 	)
+}
+
+// fileWriter abre, cuando la env WAPP_LOG_FILE está seteada, el archivo de log del Edge para
+// escribir ADEMÁS de stdout (y del ring-buffer de /v1/logs). Lo fijan los lanzadores de
+// autoarranque de Windows/Linux (Plan 024 · T1) con WAPP_LOG_FILE=<data_dir>/logs/edge.log; en
+// macOS NO se setea (el LaunchAgent ya redirige stdout/stderr vía StandardOutPath), evitando el
+// doble log. Tanto wapp-ctl como su hijo `agent serve` heredan la env (os.Environ) y abren el
+// MISMO archivo en O_APPEND: sus líneas se intercalan sin truncarse — aceptable para el kit de
+// test delegado. Si el path no se puede crear/abrir, degrada a solo-stdout con un aviso a stderr
+// (NO rompe el arranque). El handle vive lo que dura el proceso (daemon 24/7); no se cierra.
+func fileWriter() io.Writer {
+	path := strings.TrimSpace(os.Getenv("WAPP_LOG_FILE"))
+	if path == "" {
+		return nil
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			fmt.Fprintf(os.Stderr, "logger: no se pudo crear el dir de WAPP_LOG_FILE %q: %v (log solo a stdout)\n", path, err)
+			return nil
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "logger: no se pudo abrir WAPP_LOG_FILE %q: %v (log solo a stdout)\n", path, err)
+		return nil
+	}
+	return f
 }
 
 // ParseLevel traduce un nivel textual (debug, info, warn/warning, error) al

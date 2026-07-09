@@ -1,0 +1,26 @@
+# systemd USER unit del Edge de wApp (Plan 024 · T1).
+# Se instala en ~/.config/systemd/user/wapp-edge.service y arranca al INICIAR SESION
+# (o en el arranque si `loginctl enable-linger $USER`). Los marcadores @@INSTALL_DIR@@ y
+# @@DATA_DIR@@ los sustituye install-autostart.sh con rutas ABSOLUTAS (systemd no expande
+# ~ ni $HOME en Environment=/ExecStart=).
+#
+# USER unit (no de sistema): la DEK vive en el keystore del USUARIO (archivo 0600 en v1);
+# un servicio de sistema (root) no la veria. Arranca wapp-ctl (supervisor), NO agent directo.
+[Unit]
+Description=wApp Edge (nucleo WhatsApp 24/7)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@@INSTALL_DIR@@/wapp-ctl --no-open --autostart
+WorkingDirectory=@@DATA_DIR@@
+Environment=WAPP_AGENT_DATA_DIR=@@DATA_DIR@@
+Environment=WAPP_AGENT_CONFIG=@@DATA_DIR@@/config.yaml
+Environment=WAPP_CTL_AGENT_BIN=@@INSTALL_DIR@@/agent
+Environment=WAPP_LOG_FILE=@@DATA_DIR@@/logs/edge.log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
