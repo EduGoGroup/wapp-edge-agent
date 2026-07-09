@@ -52,6 +52,7 @@ func newBDUnicaManager(t *testing.T) (*Manager, *sessionstore.Store, *sql.DB) {
 	store := sessionstore.New(database)
 	m := NewManager(NewLayout(base), store, 5, testLogger(),
 		WithSharedDB(database, wappdb.DialectSQLite))
+	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 	return m, store, database
 }
 

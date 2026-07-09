@@ -72,6 +72,14 @@ type Manager struct {
 	// Restore lo exige y startListener registra la sesión SIN escucha (warn) si falta.
 	newListener listenFactory
 
+	// newCustody construye la custodia DEK de UNA sesión dado el path de su DEK (Layout.DEKPath(id)).
+	// Default = keycustody.NewFileCustody, que resuelve el backend POR PLATAFORMA en compilación (Plan
+	// 023 T2): Keychain en darwin, archivo plano en el resto. Se inyecta como factory —en vez de llamar
+	// al constructor concreto en custodyFor— para que los tests cablen un DOBLE en memoria y no toquen el
+	// Keychain REAL de la máquina (headless, determinista, sin efectos globales). Producción usa el
+	// default; NUNCA es nil (NewManager lo fija). Mismo patrón que newPairer/newListener.
+	newCustody func(path string) app.KeyCustody
+
 	// cloudMux es el multiplexor CloudLink del Edge (UN stream, N sesiones, ADR-0008): el Manager
 	// registra cada sesión al arrancar su listener (Restore/Pair) y la quita al desvincularla (Unlink).
 	// Lo inyecta WithWhatsmeowListen junto al factory de escucha. nil en los tests que cablean newListener
@@ -103,6 +111,10 @@ func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlog
 		log:                   log,
 		backoffBase:           1 * time.Second,
 		backoffMax:            60 * time.Second,
+		// Default de producción: el backend real de custodia (Keychain en darwin, archivo en el resto),
+		// seleccionado por build-tag en keycustody. Un wrapper porque NewFileCustody devuelve un tipo
+		// concreto y el campo es del puerto app.KeyCustody. Los tests lo sustituyen por un doble en memoria.
+		newCustody: func(path string) app.KeyCustody { return keycustody.NewFileCustody(path) },
 	}
 	for _, o := range opts {
 		o(m)
@@ -188,7 +200,7 @@ func (m *Manager) custodyFor(id string) (app.KeyCustody, error) {
 	if err != nil {
 		return nil, err
 	}
-	return keycustody.NewFileCustody(path), nil
+	return m.newCustody(path), nil
 }
 
 // List devuelve los metadatos de las sesiones VIVAS (registro en RAM). Vacío al arranque, antes de

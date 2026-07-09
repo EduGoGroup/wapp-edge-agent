@@ -131,6 +131,7 @@ func newListenManager(t *testing.T, active []domain.Session) (*Manager, *fakeFab
 		WithListenerBackoff(1*time.Millisecond, 5*time.Millisecond))
 	fab := newFakeFabric()
 	m.newListener = fab.factory
+	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 	return m, fab
 }
 

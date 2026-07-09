@@ -56,6 +56,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	wappdb "github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 	"github.com/EduGoGroup/wapp-shared/envelope"
@@ -104,7 +105,16 @@ var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]
 // NO es fatal para el arranque (como la fase 1): el llamante loguea el error y continúa. Idempotente: una
 // 2.ª corrida es no-op sobre los dirs ya purgados. dialect es el motor de `database` (hoy SQLite embebido;
 // el árbol archivado es SIEMPRE SQLite por fichero).
-func RestoreArchivedActiveSessions(ctx context.Context, dataDir string, database *sql.DB, dialect string, log sharedlogger.Logger) error {
+//
+// La custodia de la DEK re-ubicada se resuelve por un factory inyectable (Option): en producción es el
+// backend real (Keychain en darwin / archivo en el resto, Plan 023 T2); los tests inyectan un doble en
+// memoria para NO tocar el Keychain REAL de la máquina (headless, sin contaminar).
+func RestoreArchivedActiveSessions(ctx context.Context, dataDir string, database *sql.DB, dialect string, log sharedlogger.Logger, opts ...Option) error {
+	o := defaultRestoreOpts()
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	// El árbol archivado es SIEMPRE SQLite por fichero y la copia usa SQL SQLite (INSERT OR IGNORE): si la BD
 	// única corre en Postgres, este tramo NO soporta el traslado SQLite→Postgres (fuera de alcance de T6.5).
 	// Se anota y se sale limpio (no-op): las sesiones se re-escanean sobre Postgres (clean-slate de la fase 1).
@@ -138,7 +148,7 @@ func RestoreArchivedActiveSessions(ctx context.Context, dataDir string, database
 		}
 		sessionDir := filepath.Join(archivedSessions, id)
 
-		outcome := restoreOneSession(ctx, dataDir, database, store, id, sessionDir, log)
+		outcome := restoreOneSession(ctx, dataDir, database, store, id, sessionDir, log, o.newCustody)
 		switch outcome {
 		case outcomeRestored:
 			restored++
@@ -154,6 +164,32 @@ func RestoreArchivedActiveSessions(ctx context.Context, dataDir string, database
 	return nil
 }
 
+// custodyFactory construye la custodia de una DEK dada la ruta de su archivo legacy (keys/<id>.key). Por
+// defecto keycustody.NewFileCustody (Keychain en darwin / archivo en el resto, Plan 023 T2).
+type custodyFactory func(path string) app.KeyCustody
+
+// restoreOpts agrupa las dependencias inyectables de la restauración (hoy solo la custodia de la DEK).
+type restoreOpts struct {
+	newCustody custodyFactory
+}
+
+// Option configura RestoreArchivedActiveSessions. Variádico ⇒ los call-sites de producción (cmd/agent) no
+// cambian; solo los tests pasan opciones.
+type Option func(*restoreOpts)
+
+// WithCustodyFactory sustituye el backend de custodia de la DEK re-ubicada. Los tests inyectan un doble en
+// memoria para no tocar el Keychain REAL de la máquina; producción usa el default (Keychain/archivo).
+func WithCustodyFactory(f func(path string) app.KeyCustody) Option {
+	return func(o *restoreOpts) { o.newCustody = f }
+}
+
+// defaultRestoreOpts fija el backend real de custodia (Keychain en darwin / archivo en el resto).
+func defaultRestoreOpts() restoreOpts {
+	return restoreOpts{
+		newCustody: func(path string) app.KeyCustody { return keycustody.NewFileCustody(path) },
+	}
+}
+
 // sessionOutcome clasifica el resultado de migrar UN device archivado (para el resumen y los tests).
 type sessionOutcome int
 
@@ -166,7 +202,7 @@ const (
 // restoreOneSession migra un único device archivado (sessions/<id>/). Devuelve su desenlace. NUNCA rompe
 // una sesión buena ni aborta a las demás: cualquier fallo cae al fallback (conservando el archivo).
 func restoreOneSession(ctx context.Context, dataDir string, database *sql.DB, store *sessionstore.Store,
-	id, sessionDir string, log sharedlogger.Logger) sessionOutcome {
+	id, sessionDir string, log sharedlogger.Logger, newCustody custodyFactory) sessionOutcome {
 
 	storePath := filepath.Join(sessionDir, legacyStoreDBName)
 	dekPath := filepath.Join(sessionDir, legacyDEKName)
@@ -233,7 +269,7 @@ func restoreOneSession(ctx context.Context, dataDir string, database *sql.DB, st
 		log.Warn("edgemigrate: no se pudo resolver la ruta de la DEK; se conserva el archivo", "session_id", id, "error", derr)
 		return outcomeSkipped
 	}
-	if err := keycustody.NewFileCustody(dekDst).Store(dek); err != nil {
+	if err := newCustody(dekDst).Store(dek); err != nil {
 		log.Warn("edgemigrate: no se pudo custodiar la DEK; se conserva el archivo", "session_id", id, "error", err)
 		return outcomeSkipped
 	}

@@ -59,6 +59,7 @@ func newFailoverManager(t *testing.T, limit int, factory pairFactory) (*Manager,
 	m := NewManager(NewLayout(base), store, 5, testLogger(),
 		WithSharedDB(database, wappdb.DialectSQLite),
 		WithMultiDevicePerAccount(limit))
+	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 	m.newPairer = factory
 	m.newListener = newFakeFabric().factory
 	return m, store, database

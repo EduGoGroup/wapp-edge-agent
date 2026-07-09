@@ -23,6 +23,7 @@ func testLogger() sharedlogger.Logger {
 func TestManager_CustodyPerSession(t *testing.T) {
 	base := filepath.Join(t.TempDir(), "edge-data")
 	m := NewManager(NewLayout(base), nil, 5, testLogger())
+	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 
 	custA, err := m.custodyFor(uuidA)
 	if err != nil {

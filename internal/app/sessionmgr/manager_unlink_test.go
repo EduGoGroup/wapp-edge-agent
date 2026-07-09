@@ -112,6 +112,7 @@ func TestManager_Unlink_SurgicalIsolation(t *testing.T) {
 		WithListenerBackoff(1*time.Millisecond, 5*time.Millisecond))
 	fab := newFakeFabric()
 	m.newListener = fab.factory
+	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 
 	seedDEK(t, m, uuidA)
 	seedDEK(t, m, uuidB)
@@ -168,6 +169,7 @@ func TestManager_Unlink_NotFound(t *testing.T) {
 	base := t.TempDir()
 	store := newUnlinkStore(activeSession(uuidA, "a@s.whatsapp.net"))
 	m := NewManager(NewLayout(base), store, 5, testLogger())
+	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 
 	err := m.Unlink(context.Background(), uuidC)
 	if !errors.Is(err, ErrSessionNotFound) {
@@ -189,6 +191,7 @@ func TestManager_Unlink_PersistedNotLive(t *testing.T) {
 		SessionID: uuidA, State: domain.SessionStatePairing, StoreDir: "sessions/" + uuidA,
 	})
 	m := NewManager(NewLayout(base), store, 5, testLogger())
+	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 
 	seedDEK(t, m, uuidA)
 

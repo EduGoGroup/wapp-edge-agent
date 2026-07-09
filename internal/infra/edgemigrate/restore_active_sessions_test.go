@@ -163,7 +163,7 @@ func TestRestore_TwoDevicesTwoNumbers(t *testing.T) {
 
 	database := openUnifiedDB(t, dataDir)
 	var buf bytes.Buffer
-	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, newLogger(&buf)); err != nil {
+	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, newLogger(&buf), WithCustodyFactory(newMemCustodyFactory())); err != nil {
 		t.Fatalf("RestoreArchivedActiveSessions: %v", err)
 	}
 
@@ -245,7 +245,7 @@ func TestRestore_CrossDEKStillFails(t *testing.T) {
 
 	database := openUnifiedDB(t, dataDir)
 	var buf bytes.Buffer
-	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, newLogger(&buf)); err != nil {
+	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, newLogger(&buf), WithCustodyFactory(newMemCustodyFactory())); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	// La DEK del device 2 NO debe abrir el material del device 1 (cruce de DEKs = fallo, no regresa T2).
@@ -266,7 +266,7 @@ func TestRestore_ExpiredDeviceFallback(t *testing.T) {
 
 	database := openUnifiedDB(t, dataDir)
 	var buf bytes.Buffer
-	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, newLogger(&buf)); err != nil {
+	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, newLogger(&buf), WithCustodyFactory(newMemCustodyFactory())); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	store := sessionstore.New(database)
@@ -310,10 +310,10 @@ func TestRestore_Idempotent(t *testing.T) {
 	database := openUnifiedDB(t, dataDir)
 	var buf bytes.Buffer
 	log := newLogger(&buf)
-	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, log); err != nil {
+	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, log, WithCustodyFactory(newMemCustodyFactory())); err != nil {
 		t.Fatalf("Restore #1: %v", err)
 	}
-	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, log); err != nil {
+	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectSQLite, log, WithCustodyFactory(newMemCustodyFactory())); err != nil {
 		t.Fatalf("Restore #2 (idempotente): %v", err)
 	}
 
@@ -337,7 +337,7 @@ func TestRestore_NoArchive_NoOp(t *testing.T) {
 	dataDir := t.TempDir()
 	database := openUnifiedDB(t, dataDir)
 	var buf bytes.Buffer
-	if err := RestoreArchivedActiveSessions(context.Background(), dataDir, database, wappdb.DialectSQLite, newLogger(&buf)); err != nil {
+	if err := RestoreArchivedActiveSessions(context.Background(), dataDir, database, wappdb.DialectSQLite, newLogger(&buf), WithCustodyFactory(newMemCustodyFactory())); err != nil {
 		t.Fatalf("Restore sin archivo debería ser no-op, got: %v", err)
 	}
 	all, err := sessionstore.New(database).List(context.Background())
@@ -358,7 +358,7 @@ func TestRestore_PostgresDialect_NoOp(t *testing.T) {
 	seedArchivedSession(t, dataDir, tid3, "333333333:1@s.whatsapp.net", dek, dek)
 	database := openUnifiedDB(t, dataDir)
 	var buf bytes.Buffer
-	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectPostgres, newLogger(&buf)); err != nil {
+	if err := RestoreArchivedActiveSessions(ctx, dataDir, database, wappdb.DialectPostgres, newLogger(&buf), WithCustodyFactory(newMemCustodyFactory())); err != nil {
 		t.Fatalf("Restore(Postgres) debería ser no-op sin error: %v", err)
 	}
 	// No migró nada (guard) y CONSERVÓ el archivo.

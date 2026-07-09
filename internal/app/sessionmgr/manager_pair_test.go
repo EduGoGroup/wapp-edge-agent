@@ -63,6 +63,7 @@ func newPairTestManager(t *testing.T, factory pairFactory) (*Manager, *sessionst
 	layout := NewLayout(base)
 	m := NewManager(layout, sessionstore.New(database), 5, testLogger(),
 		WithSharedDB(database, wappdb.DialectSQLite))
+	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 	m.newPairer = factory
 	return m, sessionstore.New(database), layout
 }
@@ -82,25 +83,11 @@ func sealingFactory() pairFactory {
 	}
 }
 
-// fileExists indica si path existe (helper de aserción).
-func fileExists(t *testing.T, path string) bool {
-	t.Helper()
-	_, err := os.Stat(path)
-	if err == nil {
-		return true
-	}
-	if errors.Is(err, os.ErrNotExist) {
-		return false
-	}
-	t.Fatalf("stat %q: %v", path, err)
-	return false
-}
-
 // TestManager_Pair_Happy: un pairing exitoso registra la sesión (pairing→active) y materializa
 // dir + store.db + dek.key, con el JID en la fila (design §5 / DoD T3).
 func TestManager_Pair_Happy(t *testing.T) {
 	ctx := context.Background()
-	m, sessions, layout := newPairTestManager(t, sealingFactory())
+	m, sessions, _ := newPairTestManager(t, sealingFactory())
 
 	res, err := m.Pair(ctx, discardQR{})
 	if err != nil {
@@ -129,8 +116,13 @@ func TestManager_Pair_Happy(t *testing.T) {
 	}
 
 	// BD única (Plan 022 T3): ya NO hay directorio ni store.db por sesión; solo la DEK custodiada persiste.
-	dek, _ := layout.DEKPath(row.SessionID)
-	if !fileExists(t, dek) {
+	// La custodia es del PUERTO (Keychain en darwin / archivo plano en el resto, Plan 023 T2): se verifica
+	// por Exists(), no por artefacto en disco (en darwin la DEK ya NO es un archivo).
+	cust, err := m.custodyFor(row.SessionID)
+	if err != nil {
+		t.Fatalf("custodyFor(%s): %v", row.SessionID, err)
+	}
+	if !cust.Exists() {
 		t.Fatalf("falta la DEK custodiada de la sesión")
 	}
 
@@ -143,7 +135,7 @@ func TestManager_Pair_Happy(t *testing.T) {
 // dos dir, dos DEK, dos filas) y el segundo NO toca al primero (causa raíz de MP-01 eliminada).
 func TestManager_Pair_AntiClobber(t *testing.T) {
 	ctx := context.Background()
-	m, sessions, layout := newPairTestManager(t, sealingFactory())
+	m, sessions, _ := newPairTestManager(t, sealingFactory())
 
 	res1, err := m.Pair(ctx, discardQR{})
 	if err != nil {
@@ -193,10 +185,13 @@ func TestManager_Pair_AntiClobber(t *testing.T) {
 	if !bytes.Equal(dek1, dek1After) {
 		t.Fatalf("la DEK de la 1ª sesión cambió tras el 2º pair (pisado)")
 	}
-	// BD única (Plan 022 T3): cada sesión tiene SU DEK custodiada (keys/<id>.key), sin directorio por sesión.
-	dek1Path, _ := layout.DEKPath(id1)
-	dek2Path, _ := layout.DEKPath(id2)
-	if !fileExists(t, dek1Path) || !fileExists(t, dek2Path) {
+	// BD única (Plan 022 T3): cada sesión tiene SU DEK custodiada, sin directorio por sesión. Se verifica
+	// por el PUERTO (Exists), no por archivo en disco (en darwin la DEK vive en el Keychain, Plan 023 T2).
+	cust2, err := m.custodyFor(id2)
+	if err != nil {
+		t.Fatalf("custodyFor(%s): %v", id2, err)
+	}
+	if !cust1.Exists() || !cust2.Exists() {
 		t.Fatalf("cada sesión debería tener su propia DEK custodiada")
 	}
 

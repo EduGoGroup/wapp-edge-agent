@@ -1,3 +1,5 @@
+//go:build !darwin
+
 package keycustody_test
 
 import (
