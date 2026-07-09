@@ -49,14 +49,43 @@ const (
 	metaMigrationsDir = "migrations/meta"
 )
 
-// Open abre (creando si hace falta) el store SQLite en path con permisos 0600 y deja la
-// conexión lista: journal_mode=WAL, foreign_keys=ON, busy_timeout=5s.
+// Dialectos SQL soportados por Open (Plan 022 T0, design §5). El default del Edge es SQLite embebido
+// pure-Go (ADR-0002); Postgres es OPCIONAL y solo se enlaza al compilar con el build-tag `postgres`
+// (ver db_postgres.go / db_nopostgres.go): el binario default nunca importa un driver Postgres.
+const (
+	DialectSQLite   = "sqlite"
+	DialectPostgres = "postgres"
+)
+
+// Open abre la BD ÚNICA del Edge según el dialecto (Plan 022 T0, design §5). Es el punto de entrada
+// CONMUTABLE por config (WAPP_AGENT_DB_DIALECT + WAPP_AGENT_DB_DSN):
 //
-// Fija SetMaxOpenConns(1): PRAGMA foreign_keys es por-conexión en SQLite, así que limitar el
-// pool a una conexión garantiza que el pragma aplicado aquí rige TODAS las operaciones (evita
-// que database/sql abra conexiones nuevas sin el pragma). Es suficiente para el daemon del Edge,
-// que serializa la escritura del store cifrado.
-func Open(path string) (*sql.DB, error) {
+//   - DialectSQLite (default, "" también): abre/crea el fichero SQLite en dsn con permisos 0600 y deja
+//     la conexión lista (journal_mode=WAL, foreign_keys=ON, busy_timeout=5s) con UN único escritor
+//     (SetMaxOpenConns(1)). Driver modernc.org/sqlite (CGO-free, pure-Go): el .db NO se cifra a nivel
+//     de página; el cryptostore cifra cada campo sensible con la DEK.
+//   - DialectPostgres: abre la conexión con el driver enlazado SOLO bajo el build-tag `postgres`
+//     (openPostgres en db_postgres.go); pool con los defaults de database/sql (Postgres gestiona su
+//     propia concurrencia, SIN el escritor único de SQLite). Sin el tag devuelve ErrPostgresNotCompiled.
+//
+// WAL/PRAGMA y el escritor único son EXCLUSIVOS de SQLite (no existen en Postgres); Open los aplica
+// solo en la rama SQLite.
+func Open(ctx context.Context, dialect, dsn string) (*sql.DB, error) {
+	switch dialect {
+	case DialectSQLite, "":
+		return openSQLite(ctx, dsn)
+	case DialectPostgres:
+		return openPostgres(ctx, dsn)
+	default:
+		return nil, fmt.Errorf("db: dialecto no soportado: %q", dialect)
+	}
+}
+
+// openSQLite implementa Open para el motor SQLite embebido (pure-Go). Fija SetMaxOpenConns(1): PRAGMA
+// foreign_keys es por-conexión en SQLite, así que limitar el pool a una conexión garantiza que el
+// pragma aplicado aquí rige TODAS las operaciones (evita que database/sql abra conexiones nuevas sin el
+// pragma) y serializa la escritura del store cifrado (suficiente para el daemon del Edge).
+func openSQLite(ctx context.Context, path string) (*sql.DB, error) {
 	// Garantiza el fichero con 0600 ANTES de que SQLite lo cree con permisos del umask.
 	f, err := os.OpenFile(path, os.O_CREATE, 0o600)
 	if err != nil {
@@ -78,7 +107,7 @@ func Open(path string) (*sql.DB, error) {
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA busy_timeout=5000",
 	} {
-		if _, err := database.Exec(pragma); err != nil {
+		if _, err := database.ExecContext(ctx, pragma); err != nil {
 			_ = database.Close()
 			return nil, fmt.Errorf("db: %q: %w", pragma, err)
 		}
@@ -235,9 +264,12 @@ func OpenAndMigrateMeta(ctx context.Context, path string) (*sql.DB, error) {
 	return openAndApply(ctx, path, MigrateMeta)
 }
 
-// openAndApply abre el .db en path y le aplica migrate (un set o ambos); cierra la conexión si falla.
+// openAndApply abre el .db SQLite en path y le aplica migrate (un set o ambos); cierra la conexión si
+// falla. Los helpers OpenAndMigrate/OpenSessionStore/OpenAndMigrateMeta son la vía por FICHERO SQLite
+// (per-sesión / central, ADR-0016 §4): abren siempre en DialectSQLite. La unificación a BD única
+// dialecto-aware (Open(ctx, cfg.DBDialect, cfg.DBDSN)) la cablea T1 sobre esta misma base.
 func openAndApply(ctx context.Context, path string, migrate func(context.Context, *sql.DB) error) (*sql.DB, error) {
-	database, err := Open(path)
+	database, err := Open(ctx, DialectSQLite, path)
 	if err != nil {
 		return nil, err
 	}

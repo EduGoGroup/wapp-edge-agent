@@ -25,7 +25,7 @@ func TestDeviceMetadata_RoundTrip(t *testing.T) {
 	}
 
 	db1 := openAt(t, path)
-	cont1, err := newCryptoContainer(ctx, db1, env)
+	cont1, err := newCryptoContainer(ctx, db1, DialectSQLite, env)
 	if err != nil {
 		t.Fatalf("newCryptoContainer: %v", err)
 	}
@@ -62,7 +62,7 @@ func TestDeviceMetadata_RoundTrip(t *testing.T) {
 	// Reabrir con la MISMA DEK y verificar el round-trip.
 	db2 := openAt(t, path)
 	defer func() { _ = db2.Close() }()
-	cont2, err := newCryptoContainer(ctx, db2, env)
+	cont2, err := newCryptoContainer(ctx, db2, DialectSQLite, env)
 	if err != nil {
 		t.Fatalf("newCryptoContainer (reabrir): %v", err)
 	}
@@ -98,7 +98,7 @@ func TestDeviceMetadata_EmptyDegrades(t *testing.T) {
 	}
 
 	db1 := openAt(t, path)
-	cont1, err := newCryptoContainer(ctx, db1, env)
+	cont1, err := newCryptoContainer(ctx, db1, DialectSQLite, env)
 	if err != nil {
 		t.Fatalf("newCryptoContainer: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestDeviceMetadata_EmptyDegrades(t *testing.T) {
 
 	db2 := openAt(t, path)
 	defer func() { _ = db2.Close() }()
-	cont2, err := newCryptoContainer(ctx, db2, env)
+	cont2, err := newCryptoContainer(ctx, db2, DialectSQLite, env)
 	if err != nil {
 		t.Fatalf("newCryptoContainer (reabrir): %v", err)
 	}
@@ -193,7 +193,7 @@ func TestMigrateStore_LegacyStoreGetsColumns(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
 
-	raw, err := wappdb.Open(path)
+	raw, err := wappdb.Open(ctx, wappdb.DialectSQLite, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

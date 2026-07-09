@@ -40,7 +40,7 @@ func TestDeleteDevice_RemovesAllPerJIDRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)
 	}
-	if err := DeleteDevice(ctx, db, parsed); err != nil {
+	if err := DeleteDevice(ctx, db, DialectSQLite, parsed); err != nil {
 		t.Fatalf("DeleteDevice: %v", err)
 	}
 
@@ -55,7 +55,7 @@ func TestDeleteDevice_RemovesAllPerJIDRows(t *testing.T) {
 	}
 
 	// Idempotente: borrar de nuevo (ya ausente) no es error.
-	if err := DeleteDevice(ctx, db, parsed); err != nil {
+	if err := DeleteDevice(ctx, db, DialectSQLite, parsed); err != nil {
 		t.Fatalf("DeleteDevice idempotente: %v", err)
 	}
 }
@@ -68,7 +68,7 @@ func TestDeleteDevice_EmptyDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseJID: %v", err)
 	}
-	if err := DeleteDevice(context.Background(), db, jid); err != nil {
+	if err := DeleteDevice(context.Background(), db, DialectSQLite, jid); err != nil {
 		t.Fatalf("DeleteDevice sobre BD vacía: %v", err)
 	}
 }

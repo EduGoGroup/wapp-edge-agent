@@ -29,7 +29,7 @@ func TestDBFileIsCiphertext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cont, err := newCryptoContainer(ctx, db, env)
+	cont, err := newCryptoContainer(ctx, db, DialectSQLite, env)
 	if err != nil {
 		t.Fatalf("newCryptoContainer: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestDBFileIsCiphertext(t *testing.T) {
 // TestDBFileHasOwnerOnlyPerms verifica que el .db se crea con permisos 0600 (solo el dueño).
 func TestDBFileHasOwnerOnlyPerms(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
-	db, err := wappdb.Open(path)
+	db, err := wappdb.Open(context.Background(), wappdb.DialectSQLite, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

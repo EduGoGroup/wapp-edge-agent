@@ -33,7 +33,9 @@ func OpenSessionContainer(ctx context.Context, storePath string, dek []byte) (st
 	if err != nil {
 		return nil, nil, fmt.Errorf("cryptostore: abrir store de sesión %q: %w", storePath, err)
 	}
-	container, err := NewEncryptedContainer(ctx, sdb, dek)
+	// El store por sesión es un fichero SQLite (ADR-0016 §4): OpenSessionStore abre en DialectSQLite, así
+	// que el container cifrado usa el mismo motor. La conmutación a la BD única dialecto-aware la cablea T1.
+	container, err := NewEncryptedContainer(ctx, sdb, DialectSQLite, dek)
 	if err != nil {
 		_ = sdb.Close()
 		return nil, nil, err

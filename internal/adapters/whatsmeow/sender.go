@@ -1,7 +1,7 @@
 // Package whatsmeow — adaptador Sender (RF-4, design §3 fila 5): ejecuta el envío efímero a
 // WhatsApp. Por CADA envío:
 //
-//  1. cryptostore.NewEncryptedContainer(ctx, db, dek)  -> store cifrado con la DEK custodiada (RAM).
+//  1. cryptostore.NewEncryptedContainer(ctx, db, dialect, dek) -> store cifrado con la DEK custodiada (RAM).
 //  2. cryptostore.FirstDeviceJID(ctx, db)              -> JID de la única sesión pareada del Edge.
 //  3. cryptostore.LoadDevice(ctx, container, jid)       -> carga el device EXISTENTE de esa sesión.
 //  4. whatsmeow.NewClient(device, Noop)                 -> cliente efímero (logger silencioso).
@@ -197,7 +197,9 @@ func downloadMedia(ctx context.Context, rawURL string) ([]byte, error) {
 // container, no hay sesión pareada o el store quedó vacío. NO loguea la DEK ni el material del store.
 func realLoadDevice(db *sql.DB) loadDeviceFunc {
 	return func(ctx context.Context, dek []byte) (*store.Device, error) {
-		container, err := cryptostore.NewEncryptedContainer(ctx, db, dek)
+		// Store del Edge = SQLite embebido (ADR-0002): dialecto explícito (Plan 022 T0), fin del "sqlite"
+		// hardcodeado dentro del cryptostore.
+		container, err := cryptostore.NewEncryptedContainer(ctx, db, cryptostore.DialectSQLite, dek)
 		if err != nil {
 			return nil, fmt.Errorf("whatsapp: construir store cifrado: %w", err)
 		}

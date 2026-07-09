@@ -18,10 +18,20 @@ import (
 	"errors"
 	"fmt"
 
+	wappdb "github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 	"github.com/EduGoGroup/wapp-shared/envelope"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
+)
+
+// Dialectos SQL del store cifrado, re-exportados desde internal/infra/db (Plan 022 T0) para que los
+// consumidores del paquete (adaptador whatsmeow) pasen el dialecto sin importar el paquete db solo por
+// la constante. Hoy el store del Edge es SQLite embebido (ADR-0002); Postgres queda disponible para la
+// BD única dialecto-aware que cablea T1.
+const (
+	DialectSQLite   = wappdb.DialectSQLite
+	DialectPostgres = wappdb.DialectPostgres
 )
 
 // NewEncryptedContainer construye un store.DeviceContainer que cifra TODO el material sensible
@@ -32,12 +42,15 @@ import (
 // dek DEBE medir exactamente 32 bytes (envelope.DEKSize); en caso contrario devuelve error sin
 // tocar la BD. El container resultante se pasa a NewDeviceForPairing (o a whatsmeow vía el
 // Device) para que el pairing persista cifrado.
-func NewEncryptedContainer(ctx context.Context, db *sql.DB, dek []byte) (store.DeviceContainer, error) {
+//
+// dialect (Plan 022 T0) es el motor con el que se abrió la BD (DialectSQLite|DialectPostgres): se pasa
+// tal cual a whatsmeow (sqlstore) para que emita el SQL correcto. Ya NO se asume "sqlite".
+func NewEncryptedContainer(ctx context.Context, db *sql.DB, dialect string, dek []byte) (store.DeviceContainer, error) {
 	env, err := envelope.NewEnvelope(dek)
 	if err != nil {
 		return nil, fmt.Errorf("cryptostore: construir envelope con la DEK: %w", err)
 	}
-	c, err := newCryptoContainer(ctx, db, env)
+	c, err := newCryptoContainer(ctx, db, dialect, env)
 	if err != nil {
 		return nil, fmt.Errorf("cryptostore: construir container cifrado: %w", err)
 	}
@@ -93,10 +106,11 @@ func LoadDevice(ctx context.Context, container store.DeviceContainer, jid types.
 // SINGLE-SESIÓN (verdad de campo 2026-06-27): hoy el Edge custodia una sola sesión; este borrado por
 // JID es correcto y forward-compatible para el multi-sesión per-JID que resolverá MP-01 (no asume que
 // haya una sola, borra exactamente la del JID dado).
-func DeleteDevice(ctx context.Context, db *sql.DB, jid types.JID) error {
+func DeleteDevice(ctx context.Context, db *sql.DB, dialect string, jid types.JID) error {
 	// 1. whatsmeow_* (no sensible): delega al Container nativo. Upgrade es idempotente (crea las tablas
 	//    whatsmeow_* si la BD nunca pareó); DeleteDevice solo necesita el JID (DELETE ... WHERE jid=?).
-	inner := sqlstore.NewWithDB(db, "sqlite", nil)
+	//    dialect (Plan 022 T0): el mismo motor con el que se abrió la BD; ya NO se asume "sqlite".
+	inner := sqlstore.NewWithDB(db, dialect, nil)
 	if err := inner.Upgrade(ctx); err != nil {
 		return fmt.Errorf("cryptostore: upgrade esquema whatsmeow para borrado: %w", err)
 	}

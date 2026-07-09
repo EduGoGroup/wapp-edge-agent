@@ -88,7 +88,7 @@ func TestMigrate0002CreatesSessions(t *testing.T) {
 func TestMigrate0002OnDBWithOnly0001(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
-	database, err := Open(path)
+	database, err := Open(ctx, DialectSQLite, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -185,7 +185,7 @@ func withMigrationsFS(t *testing.T, replacement fs.FS) {
 func TestMigrateFailsWhenDirMissing(t *testing.T) {
 	withMigrationsFS(t, fstest.MapFS{}) // sin "migrations/"
 	path := filepath.Join(t.TempDir(), "store.db")
-	database, err := Open(path)
+	database, err := Open(context.Background(), DialectSQLite, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,7 +202,7 @@ func TestMigrateFailsWhenReadFileErrors(t *testing.T) {
 	}
 	withMigrationsFS(t, readFileErrFS{mapFS})
 	path := filepath.Join(t.TempDir(), "store.db")
-	database, err := Open(path)
+	database, err := Open(context.Background(), DialectSQLite, path)
 	if err != nil {
 		t.Fatal(err)
 	}

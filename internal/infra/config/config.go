@@ -34,6 +34,15 @@ type Config struct {
 	// LEGACY (Plan 008): ruta PLANA single-sesión heredada. El modelo multi-sesión deriva la DEK por
 	// sesión de DataDir (sessions/<id>/dek.key); se conserva solo para la migración clean-slate.
 	DEKPath string `yaml:"dek_path"`
+	// DBDialect selecciona el motor SQL de la BD del Edge (Plan 022 T0, design §5): "sqlite" (default,
+	// embebido pure-Go, ADR-0002) o "postgres" (solo por cadena y solo si el binario se compiló con el
+	// build-tag `postgres`; nunca bundleado en el Edge). Es la base del dialecto CONMUTABLE: T1 cablea
+	// este valor a la apertura de la BD única. Se lee de WAPP_AGENT_DB_DIALECT.
+	DBDialect string `yaml:"db_dialect"`
+	// DBDSN es la cadena de conexión de la BD única cuando el dialecto la requiere (Postgres:
+	// "postgres://user:pass@host:5432/db?sslmode=..."). En SQLite queda vacío: la ruta del fichero la
+	// deriva el layout desde DataDir. Se lee de WAPP_AGENT_DB_DSN.
+	DBDSN string `yaml:"db_dsn"`
 	// DataDir es el directorio base del Edge (ADR-0016 §4): aloja el layout multi-sesión
 	// (<data_dir>/sessions/<session_id>/{store.db,dek.key}), la BD de metadatos y el socket de control.
 	// El Layout (internal/app/sessionmgr) deriva de aquí todas las rutas por sesión; nadie las arma a
@@ -126,6 +135,7 @@ func defaults() Config {
 		LogJSON:           false,
 		DBPath:            "wapp-edge.db",
 		DEKPath:           "dek.key",
+		DBDialect:         "sqlite",
 		DataDir:           defaultDataDir(),
 		MaxSessions:       5,
 		PushName:          "wApp",
@@ -156,6 +166,8 @@ func Load(path string) (Config, error) {
 	cfg.LogJSON = loader.GetBool("LOG_JSON", cfg.LogJSON)
 	cfg.DBPath = loader.GetString("DB_PATH", cfg.DBPath)
 	cfg.DEKPath = loader.GetString("DEK_PATH", cfg.DEKPath)
+	cfg.DBDialect = loader.GetString("DB_DIALECT", cfg.DBDialect)
+	cfg.DBDSN = loader.GetString("DB_DSN", cfg.DBDSN)
 	cfg.DataDir = loader.GetString("DATA_DIR", cfg.DataDir)
 	cfg.MaxSessions = loader.GetInt("MAX_SESSIONS", cfg.MaxSessions)
 	cfg.PushName = loader.GetString("PUSH_NAME", cfg.PushName)
@@ -171,6 +183,14 @@ func Load(path string) (Config, error) {
 	cfg.CloudLink.EnrollmentEndpoint = loader.GetString("CLOUDLINK_ENROLLMENT_ENDPOINT", cfg.CloudLink.EnrollmentEndpoint)
 	cfg.CloudLink.ActivationCode = loader.GetString("CLOUDLINK_ACTIVATION_CODE", cfg.CloudLink.ActivationCode)
 	cfg.CloudLink.EdgeID = loader.GetString("CLOUDLINK_EDGE_ID", cfg.CloudLink.EdgeID)
+
+	// Dialecto de BD (Plan 022 T0): solo "sqlite" (default) o "postgres". Se valida aquí para fallar
+	// pronto ante un valor tecleado mal (YAML/env) en vez de arrastrarlo hasta abrir la BD.
+	switch cfg.DBDialect {
+	case "sqlite", "postgres":
+	default:
+		return Config{}, fmt.Errorf("config: db_dialect no soportado %q (usa \"sqlite\" o \"postgres\")", cfg.DBDialect)
+	}
 
 	// D2 (MP-02): ancla data_dir a ruta ABSOLUTA una sola vez, venga del default sagrado, del YAML o del
 	// override WAPP_AGENT_DATA_DIR. filepath.Abs es idempotente (una ruta ya absoluta se devuelve limpia)

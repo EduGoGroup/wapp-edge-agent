@@ -41,7 +41,7 @@ func TestRoundTrip_EncryptedStore(t *testing.T) {
 
 	// --- FASE 1: persistir cifrado ---
 	db1 := openAt(t, path)
-	cont1, err := newCryptoContainer(ctx, db1, env)
+	cont1, err := newCryptoContainer(ctx, db1, DialectSQLite, env)
 	if err != nil {
 		t.Fatalf("newCryptoContainer: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestRoundTrip_EncryptedStore(t *testing.T) {
 
 	// --- FASE 2: reabrir con la MISMA DEK y verificar round-trip ---
 	db2 := openAt(t, path)
-	cont2, err := newCryptoContainer(ctx, db2, env)
+	cont2, err := newCryptoContainer(ctx, db2, DialectSQLite, env)
 	if err != nil {
 		t.Fatalf("newCryptoContainer (reabrir): %v", err)
 	}
@@ -163,7 +163,7 @@ func TestRoundTrip_EncryptedStore(t *testing.T) {
 	}
 	db3 := openAt(t, path)
 	defer func() { _ = db3.Close() }()
-	contBad, err := newCryptoContainer(ctx, db3, badEnv)
+	contBad, err := newCryptoContainer(ctx, db3, DialectSQLite, badEnv)
 	if err != nil {
 		t.Fatalf("newCryptoContainer (bad dek): %v", err)
 	}

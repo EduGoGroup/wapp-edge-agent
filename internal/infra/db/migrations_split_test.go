@@ -22,7 +22,7 @@ var (
 func TestMigrateStoreOnlyCreatesStoreTables(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
-	database, err := Open(path)
+	database, err := Open(ctx, DialectSQLite, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestMigrateStoreOnlyCreatesStoreTables(t *testing.T) {
 func TestMigrateMetaOnlyCreatesMetaTables(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "sessions.db")
-	database, err := Open(path)
+	database, err := Open(ctx, DialectSQLite, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}

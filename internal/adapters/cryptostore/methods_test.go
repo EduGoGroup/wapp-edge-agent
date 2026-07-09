@@ -23,7 +23,7 @@ func pairedDevice(t *testing.T) (*cryptoContainer, *store.Device) {
 	t.Helper()
 	ctx := context.Background()
 	db, _ := openTestDB(t)
-	raw, err := NewEncryptedContainer(ctx, db, newDEK(t))
+	raw, err := NewEncryptedContainer(ctx, db, DialectSQLite, newDEK(t))
 	if err != nil {
 		t.Fatalf("NewEncryptedContainer: %v", err)
 	}
@@ -49,7 +49,7 @@ func pairedDevice(t *testing.T) (*cryptoContainer, *store.Device) {
 func TestStoreOps_DBErrors(t *testing.T) {
 	ctx := context.Background()
 	db, _ := openTestDB(t)
-	raw, err := NewEncryptedContainer(ctx, db, newDEK(t))
+	raw, err := NewEncryptedContainer(ctx, db, DialectSQLite, newDEK(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +124,7 @@ func TestStoreOps_DBErrors(t *testing.T) {
 
 func TestNewEncryptedContainer_BadDEKSize(t *testing.T) {
 	db, _ := openTestDB(t)
-	if _, err := NewEncryptedContainer(context.Background(), db, []byte("corta")); err == nil {
+	if _, err := NewEncryptedContainer(context.Background(), db, DialectSQLite, []byte("corta")); err == nil {
 		t.Fatal("una DEK que no mide 32 bytes debía fallar")
 	}
 }
@@ -192,7 +192,7 @@ func TestDeleteDevice(t *testing.T) {
 func TestPutDevice_RequiresJID(t *testing.T) {
 	ctx := context.Background()
 	db, _ := openTestDB(t)
-	raw, err := NewEncryptedContainer(ctx, db, newDEK(t))
+	raw, err := NewEncryptedContainer(ctx, db, DialectSQLite, newDEK(t))
 	if err != nil {
 		t.Fatal(err)
 	}

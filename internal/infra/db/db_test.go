@@ -9,7 +9,7 @@ import (
 
 func TestOpenSetsPragmasAndPerms(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
-	database, err := Open(path)
+	database, err := Open(context.Background(), DialectSQLite, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -21,6 +21,12 @@ func TestOpenSetsPragmasAndPerms(t *testing.T) {
 	}
 	if perm := info.Mode().Perm(); perm != 0o600 {
 		t.Errorf("permisos = %o, esperaba 600", perm)
+	}
+
+	// SQLite: escritor único (pool limitado a 1) para que el PRAGMA foreign_keys por-conexión rija
+	// todas las operaciones y se serialice la escritura del store cifrado (Plan 022 T0, design §9).
+	if n := database.Stats().MaxOpenConnections; n != 1 {
+		t.Errorf("SetMaxOpenConns(SQLite) = %d, esperaba 1 (escritor único)", n)
 	}
 
 	var journal string
@@ -45,7 +51,7 @@ func TestOpenPreexistingFileGetsChmodded(t *testing.T) {
 	if err := os.WriteFile(path, nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	database, err := Open(path)
+	database, err := Open(context.Background(), DialectSQLite, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -59,7 +65,7 @@ func TestOpenPreexistingFileGetsChmodded(t *testing.T) {
 func TestOpenFailsOnUnwritablePath(t *testing.T) {
 	// Directorio padre inexistente: os.OpenFile falla y Open propaga el error.
 	path := filepath.Join(t.TempDir(), "no-existe", "store.db")
-	if _, err := Open(path); err == nil {
+	if _, err := Open(context.Background(), DialectSQLite, path); err == nil {
 		t.Fatal("Open debía fallar con un directorio padre inexistente")
 	}
 }
@@ -67,7 +73,7 @@ func TestOpenFailsOnUnwritablePath(t *testing.T) {
 func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
-	database, err := Open(path)
+	database, err := Open(ctx, DialectSQLite, path)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -121,7 +127,7 @@ func TestOpenFailsOnCorruptFile(t *testing.T) {
 	if err := os.WriteFile(path, []byte("esto no es una base de datos sqlite valida"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	db, err := Open(path)
+	db, err := Open(context.Background(), DialectSQLite, path)
 	if err == nil {
 		_ = db.Close()
 		t.Fatal("Open sobre un fichero corrupto debía fallar en el PRAGMA")
@@ -132,7 +138,7 @@ func TestOpenFailsOnCorruptFile(t *testing.T) {
 // ya cerrada).
 func TestMigrateFailsOnClosedDB(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
-	db, err := Open(path)
+	db, err := Open(context.Background(), DialectSQLite, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +154,7 @@ func TestMigrateFailsOnClosedDB(t *testing.T) {
 // NOT EXISTS NO suprime la colisión con un índice del mismo nombre.
 func TestOpenAndMigrateFailsWhenMigrationConflicts(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
-	pre, err := Open(path)
+	pre, err := Open(context.Background(), DialectSQLite, path)
 	if err != nil {
 		t.Fatal(err)
 	}

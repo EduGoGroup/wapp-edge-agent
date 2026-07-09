@@ -21,7 +21,7 @@ func TestUpstreamSchemaRejectsCiphertext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newCryptoContainer(ctx, db, env); err != nil {
+	if _, err := newCryptoContainer(ctx, db, DialectSQLite, env); err != nil {
 		t.Fatalf("newCryptoContainer: %v", err)
 	}
 

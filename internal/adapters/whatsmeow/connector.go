@@ -59,7 +59,9 @@ var _ app.Connector = (*Connector)(nil)
 func NewConnector(db *sql.DB) *Connector {
 	return &Connector{
 		newContainer: func(ctx context.Context, dek []byte) (store.DeviceContainer, error) {
-			return cryptostore.NewEncryptedContainer(ctx, db, dek)
+			// Store del Edge = SQLite embebido (ADR-0002): se pasa el dialecto explícito en vez del
+			// "sqlite" que antes hardcodeaba el cryptostore (Plan 022 T0).
+			return cryptostore.NewEncryptedContainer(ctx, db, cryptostore.DialectSQLite, dek)
 		},
 		signalBuffer:      8,
 		activationTimeout: defaultActivationTimeout,

@@ -33,11 +33,13 @@ type cryptoContainer struct {
 var _ store.DeviceContainer = (*cryptoContainer)(nil)
 
 // newCryptoContainer construye el decorator sobre una BD YA migrada (las msg_enc_* las crea el
-// runner de migración, internal/infra/db). Construye el *sqlstore.Container interno con dialecto
-// "sqlite" y ejecuta Upgrade (idempotente) para crear las tablas whatsmeow_* no sensibles de las
-// que cuelgan los SQLStore por device.
-func newCryptoContainer(ctx context.Context, db *sql.DB, env *envelope.Envelope) (*cryptoContainer, error) {
-	inner := sqlstore.NewWithDB(db, "sqlite", nil)
+// runner de migración, internal/infra/db). Construye el *sqlstore.Container interno con el dialecto
+// dado (Plan 022 T0: ya NO hardcodea "sqlite"; el llamante pasa DialectSQLite|DialectPostgres) y
+// ejecuta Upgrade (idempotente) para crear las tablas whatsmeow_* no sensibles de las que cuelgan los
+// SQLStore por device. El dialecto es el mismo que abrió la BD (Open) para que whatsmeow emita el SQL
+// correcto por motor.
+func newCryptoContainer(ctx context.Context, db *sql.DB, dialect string, env *envelope.Envelope) (*cryptoContainer, error) {
+	inner := sqlstore.NewWithDB(db, dialect, nil)
 	if err := inner.Upgrade(ctx); err != nil {
 		return nil, fmt.Errorf("upgrade esquema whatsmeow: %w", err)
 	}

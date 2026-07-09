@@ -203,6 +203,53 @@ func TestLoad_PushName(t *testing.T) {
 	}
 }
 
+// TestLoad_DBDialectAndDSN cubre el dialecto conmutable (Plan 022 T0): default "sqlite" y DSN vacío,
+// lectura desde YAML y override por WAPP_AGENT_DB_DIALECT / WAPP_AGENT_DB_DSN.
+func TestLoad_DBDialectAndDSN(t *testing.T) {
+	// Default: sqlite embebido, sin DSN.
+	if defaults().DBDialect != "sqlite" {
+		t.Fatalf("db_dialect por defecto: got %q, want \"sqlite\"", defaults().DBDialect)
+	}
+	if defaults().DBDSN != "" {
+		t.Fatalf("db_dsn por defecto debe ser vacío: got %q", defaults().DBDSN)
+	}
+
+	path := writeTempYAML(t, "db_dialect: postgres\ndb_dsn: postgres://u:p@h:5432/d\n")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+	if cfg.DBDialect != "postgres" {
+		t.Errorf("db_dialect desde YAML: got %q, want \"postgres\"", cfg.DBDialect)
+	}
+	if cfg.DBDSN != "postgres://u:p@h:5432/d" {
+		t.Errorf("db_dsn desde YAML: got %q", cfg.DBDSN)
+	}
+
+	// Env override sobre el YAML.
+	t.Setenv(EnvPrefix+"DB_DIALECT", "sqlite")
+	t.Setenv(EnvPrefix+"DB_DSN", "/from/env.db")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("Load devolvio error inesperado: %v", err)
+	}
+	if cfg.DBDialect != "sqlite" {
+		t.Errorf("env override db_dialect: got %q, want \"sqlite\"", cfg.DBDialect)
+	}
+	if cfg.DBDSN != "/from/env.db" {
+		t.Errorf("env override db_dsn: got %q", cfg.DBDSN)
+	}
+}
+
+// TestLoad_DBDialectInvalid: un dialecto no soportado (YAML/env) falla en Load, no se arrastra a abrir
+// la BD.
+func TestLoad_DBDialectInvalid(t *testing.T) {
+	path := writeTempYAML(t, "db_dialect: mysql\n")
+	if _, err := Load(path); err == nil {
+		t.Fatal("Load debía fallar con un db_dialect no soportado")
+	}
+}
+
 func TestLoad_BadYAML(t *testing.T) {
 	path := writeTempYAML(t, "log_level: [unbalanced")
 
