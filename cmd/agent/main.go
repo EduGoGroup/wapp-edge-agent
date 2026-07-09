@@ -344,6 +344,16 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 		return fmt.Errorf("serve: migrar la BD única: %w", err)
 	}
 
+	// Migración FASE 2 hacia la BD ÚNICA (Plan 022 T6.5, ADR-0018 §8, §10.K): restaura las sesiones
+	// ACTIVAS que la fase 1 archivó en _archived-pre-022/ (JID+DEK+msg_enc_*) SIN re-escanear, con la
+	// MISMA DEK per-device (keys/<id>.key) y mismo JID. Corre DESPUÉS de migrar el esquema (tablas listas)
+	// y ANTES de Restore (que arranca un listener por device activo ya presente). NO fatal: un fallo se
+	// loguea y se continúa; los devices caducados/fallidos caen al re-escaneo sin tumbar a los demás.
+	if err := edgemigrate.RestoreArchivedActiveSessions(ctx, cfg.DataDir, database, cfg.DBDialect, log); err != nil {
+		log.Error("serve: restauración de sesiones activas archivadas (T6.5) falló (continuo de todas formas)",
+			"error", err, "data_dir", cfg.DataDir)
+	}
+
 	sessions := sessionstore.New(database)
 	layout := sessionmgr.NewLayout(cfg.DataDir)
 
