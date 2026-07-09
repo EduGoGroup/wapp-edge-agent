@@ -11,6 +11,8 @@
 # Directorios de salida
 bin/
 dist/
+# staging de make pkg/dmg (Plan 023 T4): payload + scripts + .pkg intermedio
+build/
 
 # Entornos y secretos
 .env

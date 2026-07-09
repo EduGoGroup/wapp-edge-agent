@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Distribution del instalador del Edge de wApp (Plan 023 · T4). Instalación POR-USUARIO, bajo el HOME y
+  SIN root: la DEK vive en el Keychain del usuario (T2), invisible para un daemon/instalación de sistema.
+  Los `domains` restringen el destino al home del usuario actual (Installer muestra "solo para mí").
+  SIN firma (D1): Gatekeeper pedirá click-derecho → Abrir (ver README.md).
+-->
+<installer-gui-script minSpecVersion="2">
+	<title>wApp Edge</title>
+
+	<domains enable_anywhere="false" enable_currentUserHome="true" enable_localSystem="false"/>
+	<options customize="never" require-scripts="true" hostArchitectures="arm64"/>
+
+	<choices-outline>
+		<line choice="wapp.edge"/>
+	</choices-outline>
+
+	<choice id="wapp.edge" title="wApp Edge">
+		<pkg-ref id="com.wapp.edge"/>
+	</choice>
+
+	<pkg-ref id="com.wapp.edge">wapp-edge-component.pkg</pkg-ref>
+</installer-gui-script>

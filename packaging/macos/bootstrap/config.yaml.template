@@ -1,0 +1,28 @@
+# Bootstrap del Edge de wApp (Plan 023 · T4). El instalador (postinstall) lo copia a
+# <data_dir>/config.yaml SOLO si no existe: NUNCA pisa un Edge ya enrolado.
+#
+# ⛔ ZERO-KNOWLEDGE (ADR-0007 / R6): aquí SOLO viaja material PÚBLICO — el TLSCA de
+# bootstrap y el endpoint de enrolamiento. El enroll (T1) genera y custodia el par
+# mTLS en local; la DEK vive en el Keychain del usuario (T2). NUNCA pongas aquí
+# activation_code, tls_key, ni un tls_cert con material real.
+#
+# Los marcadores entre dobles arrobas los sustituye el postinstall con rutas ABSOLUTAS.
+
+log_level: "info"
+data_dir: "@@DATA_DIR@@"
+
+cloudlink:
+  # Bootstrap de confianza pre-provisto en el paquete: valida el TLS-de-servidor del
+  # Gateway durante el enroll. Reemplaza por el endpoint real de tu nube antes de
+  # construir el .pkg de distribución (o pásalo por WAPP_ENROLLMENT_ENDPOINT).
+  enrollment_endpoint: "@@ENROLLMENT_ENDPOINT@@"
+  tls_ca: "@@DATA_DIR@@/ca.pem"
+
+  # DESTINOS donde el enroll ESCRIBIRÁ la credencial mTLS y la pubkey de la nube.
+  # NO viajan en el paquete: los genera/persiste el enroll en ESTE equipo.
+  tls_cert: "@@DATA_DIR@@/edge.crt"
+  tls_key: "@@DATA_DIR@@/edge.key"
+  cloud_enc_pubkey_path: "@@DATA_DIR@@/cloud_enc.pub"
+
+  # endpoint (runtime CloudLink) se rellena TRAS enrolar, al conectar a la nube:
+  # endpoint: "gateway.wapp.example:443"

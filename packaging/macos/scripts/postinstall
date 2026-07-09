@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# postinstall del .pkg del Edge de wApp (Plan 023 · T4). Corre como el USUARIO (instalación POR-USUARIO bajo
+# el HOME, sin root). Deja el bootstrap público en <data_dir> SIN sobrescribir un Edge ya enrolado, instala
+# el LaunchAgent reusando install-launchagent.sh (T3) y abre la web de onboarding en la PRIMERA ejecución.
+#
+# ⛔ ZERO-KNOWLEDGE: el paquete solo trae binarios + TLSCA público + config de bootstrap. Aquí NO se genera
+# ni copia ninguna clave privada ni la DEK: eso lo hace el enroll (T1) y el Keychain (T2) en el equipo.
+set -euo pipefail
+
+# Directorio donde el instalador extrajo los scripts + plantillas (postinstall, install-launchagent.sh,
+# com.wapp.edge.plist.template, config.yaml.template, ca.pem).
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# Instalación por-usuario: NUNCA root. La DEK vive en el Keychain del usuario (T2); un daemon de sistema no
+# la vería (por eso el LaunchAgent es por-usuario, no LaunchDaemon).
+if [ "$(id -u)" = "0" ]; then
+	echo "postinstall: instalación POR-USUARIO; no ejecutes el instalador como root/sudo." >&2
+	exit 1
+fi
+
+WAPP_ROOT="$HOME/Library/Application Support/wApp"
+BIN_DIR="$WAPP_ROOT/bin"
+DATA_DIR="$WAPP_ROOT/edge"
+CONFIG="$DATA_DIR/config.yaml"
+CA_DST="$DATA_DIR/ca.pem"
+
+mkdir -p "$DATA_DIR/logs"
+chmod 700 "$DATA_DIR" 2>/dev/null || true
+
+# Bootstrap SIN sobrescribir: protege un Edge ya enrolado (config + credencial mTLS + DEK ya presentes).
+first_run=0
+if [ ! -f "$CONFIG" ]; then
+	sed \
+		-e "s|@@DATA_DIR@@|$DATA_DIR|g" \
+		-e "s|@@ENROLLMENT_ENDPOINT@@|${WAPP_ENROLLMENT_ENDPOINT:-gateway.wapp.example:9443}|g" \
+		"$HERE/config.yaml.template" > "$CONFIG"
+	chmod 600 "$CONFIG"
+	first_run=1
+fi
+if [ ! -f "$CA_DST" ]; then
+	cp "$HERE/ca.pem" "$CA_DST"
+	chmod 644 "$CA_DST"
+fi
+
+# Instala el LaunchAgent reusando el script de T3 (mismo mecanismo launchctl bootstrap gui/<uid>). Le
+# pasamos las rutas de instalación por las env que ya dejó overridables.
+WAPP_BIN_DIR="$BIN_DIR" WAPP_AGENT_DATA_DIR="$DATA_DIR" bash "$HERE/install-launchagent.sh"
+
+# Onboarding: abre la web SOLO en primera ejecución (no molestar en reinstalaciones sobre un Edge enrolado).
+if [ "$first_run" = "1" ]; then
+	# Margen para que el supervisor levante el loopback antes de abrir el navegador.
+	sleep 2
+	open "http://127.0.0.1:8765" 2>/dev/null || true
+fi
+
+exit 0

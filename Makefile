@@ -98,10 +98,61 @@ vet:
 test:
 	$(GO) test -race ./...
 
-## clean: elimina el directorio de salida.
+# --- Instalador macOS (T4) — .pkg/.dmg SIN firmar (D1) ---------------------
+# Empaqueta los 2 binarios (layout hermano) BAJO EL HOME (por-usuario, sin root) + bootstrap PÚBLICO
+# (TLSCA/endpoint) + el LaunchAgent (reusa packaging/macos de T3). Zero-knowledge (R6): pkg-verify-zk
+# aborta si se cuela material secreto. Solo corre en macOS (pkgbuild/productbuild/hdiutil); el CI no lo llama.
+PKG_ID        := com.wapp.edge
+PKG_OUT       := $(DISTDIR)/wApp-Edge-$(VERSION).pkg
+DMG_OUT       := $(DISTDIR)/wApp-Edge-$(VERSION).dmg
+PKG_BUILD     := build/pkg
+PKG_MACOS     := packaging/macos
+BOOTSTRAP_DIR ?= $(PKG_MACOS)/bootstrap
+
+## pkg: instalador .pkg por-usuario SIN firmar (macOS; consume dist/darwin-arm64/). Decisión D1.
+.PHONY: pkg
+pkg: build-darwin-arm64
+	@command -v pkgbuild >/dev/null 2>&1 && command -v productbuild >/dev/null 2>&1 || \
+		{ echo "make pkg requiere macOS (pkgbuild/productbuild)"; exit 1; }
+	rm -rf $(PKG_BUILD)
+	mkdir -p $(PKG_BUILD)/root/bin $(PKG_BUILD)/scripts $(PKG_BUILD)/flat
+	cp $(DISTDIR)/darwin-arm64/agent $(DISTDIR)/darwin-arm64/wapp-ctl $(PKG_BUILD)/root/bin/
+	chmod 755 $(PKG_BUILD)/root/bin/agent $(PKG_BUILD)/root/bin/wapp-ctl
+	cp $(PKG_MACOS)/scripts/postinstall $(PKG_BUILD)/scripts/postinstall
+	cp $(PKG_MACOS)/install-launchagent.sh $(PKG_BUILD)/scripts/install-launchagent.sh
+	cp $(PKG_MACOS)/com.wapp.edge.plist.template $(PKG_BUILD)/scripts/com.wapp.edge.plist.template
+	cp $(BOOTSTRAP_DIR)/config.yaml.template $(PKG_BUILD)/scripts/config.yaml.template
+	cp $(BOOTSTRAP_DIR)/ca.pem $(PKG_BUILD)/scripts/ca.pem
+	chmod 755 $(PKG_BUILD)/scripts/postinstall $(PKG_BUILD)/scripts/install-launchagent.sh
+	bash $(PKG_MACOS)/verify-zero-knowledge.sh $(PKG_BUILD)
+	pkgbuild --root $(PKG_BUILD)/root \
+		--install-location "Library/Application Support/wApp" \
+		--scripts $(PKG_BUILD)/scripts \
+		--identifier $(PKG_ID) --version $(VERSION) \
+		$(PKG_BUILD)/flat/wapp-edge-component.pkg
+	productbuild --distribution $(PKG_MACOS)/Distribution.xml \
+		--package-path $(PKG_BUILD)/flat \
+		$(PKG_OUT)
+	@echo "OK: $(PKG_OUT)"
+	@echo "SIN firmar (D1) — Gatekeeper: click-derecho -> Abrir. Ver $(PKG_MACOS)/README.md"
+
+## pkg-verify-zk: guarda zero-knowledge del staging del .pkg (falla si hay material secreto).
+.PHONY: pkg-verify-zk
+pkg-verify-zk:
+	bash $(PKG_MACOS)/verify-zero-knowledge.sh $(PKG_BUILD)
+
+## dmg: envuelve el .pkg en un .dmg (opcional; macOS, hdiutil).
+.PHONY: dmg
+dmg: pkg
+	@command -v hdiutil >/dev/null 2>&1 || { echo "make dmg requiere macOS (hdiutil)"; exit 1; }
+	rm -f $(DMG_OUT)
+	hdiutil create -volname "wApp Edge" -srcfolder $(PKG_OUT) -ov -format UDZO $(DMG_OUT)
+	@echo "OK: $(DMG_OUT)"
+
+## clean: elimina los directorios de salida (dist/ y el staging del .pkg).
 .PHONY: clean
 clean:
-	rm -rf $(DISTDIR)
+	rm -rf $(DISTDIR) build
 
 ## help: lista los targets documentados.
 .PHONY: help
