@@ -2,15 +2,20 @@
 
 package keycustody
 
-// file.go es la custodia PROVISIONAL para las plataformas SIN Keychain (Windows/Linux): persiste la DEK
-// en un archivo local en texto plano con permisos 0600 bajo un directorio 0700. En darwin la sustituye
-// el Keychain (keychain_darwin.go, Plan 023 · T2); este archivo queda bajo //go:build !darwin.
+// file.go define FileCustody: la custodia en un archivo local en texto plano con permisos 0600 bajo un
+// directorio 0700. Queda bajo //go:build !darwin (en darwin la sustituye el Keychain, keychain_darwin.go).
 //
-// ⚠️ DEUDA EXPLÍCITA (ADR-0007 / ADR-0013): NO es la decisión v1 para Windows/Linux — el Plan 024 la
-// sustituirá por DPAPI (Windows) y Secret Service (Linux). Como el cambio es solo de adaptador (todo
-// depende del puerto app.KeyCustody), la deuda queda acotada a este archivo. El archivo se guarda SIN
-// cifrar a propósito: cifrar la DEK requeriría custodiar la llave que la cifra — justo lo que el keystore
-// del SO resuelve en v1. Documentado como provisional para no dar falsa sensación de seguridad.
+// Rol tras el Plan 024 · T2: FileCustody + su constructor NO exportado newFileCustody son el FALLBACK
+// pure-Go que reusan los keystores del SO cuando NO están disponibles:
+//   - windows → dpapi_windows.go define el NewFileCustody exportado (DPAPI); degrada a newFileCustody.
+//   - linux   → secretservice_linux.go define el NewFileCustody exportado (Secret Service); degrada a
+//     newFileCustody si no hay D-Bus/escritorio (headless).
+//   - resto   → file_fallback.go expone NewFileCustody = newFileCustody directamente.
+//
+// ⚠️ DEUDA EXPLÍCITA (ADR-0007 / ADR-0013): el archivo plano NO es la custodia v1 — es el suelo de
+// seguridad. Se guarda SIN cifrar a propósito: cifrar la DEK requeriría custodiar la llave que la cifra —
+// justo lo que el keystore del SO (DPAPI/Secret Service) resuelve. Como todo depende del puerto
+// app.KeyCustody, el cambio de backend es solo de adaptador.
 
 import (
 	"errors"
@@ -32,9 +37,11 @@ type FileCustody struct {
 	path string
 }
 
-// NewFileCustody construye un FileCustody que custodia la DEK en path (p. ej. ".../keys/<id>.key"); su
-// directorio contenedor se crea con permisos 0700 en el primer Store si no existe.
-func NewFileCustody(path string) *FileCustody {
+// newFileCustody construye un FileCustody que custodia la DEK en path (p. ej. ".../keys/<id>.key"); su
+// directorio contenedor se crea con permisos 0700 en el primer Store si no existe. NO exportado: el
+// NewFileCustody exportado lo define cada plataforma (DPAPI/Secret Service/fallback) y delega aquí para el
+// suelo pure-Go. Firma idéntica a la de darwin para no cambiar el wiring.
+func newFileCustody(path string) *FileCustody {
 	return &FileCustody{path: path}
 }
 

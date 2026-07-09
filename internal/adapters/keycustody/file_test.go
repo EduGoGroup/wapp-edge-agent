@@ -1,37 +1,32 @@
 //go:build !darwin
 
-package keycustody_test
+package keycustody
 
 import (
 	"bytes"
-	"crypto/rand"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 
-	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-shared/envelope"
 )
 
-// FileCustody debe satisfacer el puerto app.KeyCustody (verificación en compilación).
-var _ app.KeyCustody = (*keycustody.FileCustody)(nil)
+// file_test.go prueba FileCustody (el archivo plano 0600) DIRECTAMENTE vía newFileCustody, con INDEPENDENCIA
+// del backend que devuelva el NewFileCustody exportado por plataforma (DPAPI en Windows, Secret Service en
+// Linux, archivo en el resto): FileCustody es el suelo/fallback pure-Go y debe cumplir el puerto en todas
+// las plataformas !darwin. Paquete interno (keycustody) para poder construir newFileCustody, no exportado.
+// Corre en CI-linux/windows; NO en darwin (build tag !darwin) — ahí la custodia es el Keychain. newTestDEK
+// viene de migrate_test.go (mismo paquete).
 
-// newDEK genera una DEK aleatoria de 32 bytes para los tests.
-func newDEK(t *testing.T) []byte {
-	t.Helper()
-	dek := make([]byte, keycustody.KeySize)
-	if _, err := rand.Read(dek); err != nil {
-		t.Fatalf("no se pudo generar DEK de prueba: %v", err)
-	}
-	return dek
-}
+// FileCustody debe satisfacer el puerto app.KeyCustody (verificación en compilación).
+var _ app.KeyCustody = (*FileCustody)(nil)
 
 func TestFileCustody_StoreLoadRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "sub", "dek.key")
-	c := keycustody.NewFileCustody(path)
-	dek := newDEK(t)
+	c := newFileCustody(path)
+	dek := newTestDEK(t)
 
 	if err := c.Store(dek); err != nil {
 		t.Fatalf("Store: %v", err)
@@ -47,12 +42,12 @@ func TestFileCustody_StoreLoadRoundTrip(t *testing.T) {
 
 func TestFileCustody_ExistsBeforeAndAfter(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dek.key")
-	c := keycustody.NewFileCustody(path)
+	c := newFileCustody(path)
 
 	if c.Exists() {
 		t.Fatal("Exists debe ser false antes de Store")
 	}
-	if err := c.Store(newDEK(t)); err != nil {
+	if err := c.Store(newTestDEK(t)); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 	if !c.Exists() {
@@ -63,7 +58,7 @@ func TestFileCustody_ExistsBeforeAndAfter(t *testing.T) {
 func TestFileCustody_ExistsFalseOnDirectory(t *testing.T) {
 	// Una ruta que apunta a un directorio no es una DEK regular.
 	dir := t.TempDir()
-	c := keycustody.NewFileCustody(dir)
+	c := newFileCustody(dir)
 	if c.Exists() {
 		t.Fatal("Exists debe ser false cuando la ruta es un directorio")
 	}
@@ -72,8 +67,8 @@ func TestFileCustody_ExistsFalseOnDirectory(t *testing.T) {
 func TestFileCustody_FilePermsAre0600(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "dek.key")
-	c := keycustody.NewFileCustody(path)
-	if err := c.Store(newDEK(t)); err != nil {
+	c := newFileCustody(path)
+	if err := c.Store(newTestDEK(t)); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
 
@@ -102,8 +97,8 @@ func TestFileCustody_StoreForces0600OnPreexistingFile(t *testing.T) {
 		t.Fatalf("preparar archivo previo: %v", err)
 	}
 
-	c := keycustody.NewFileCustody(path)
-	dek := newDEK(t)
+	c := newFileCustody(path)
+	dek := newTestDEK(t)
 	if err := c.Store(dek); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
@@ -126,13 +121,13 @@ func TestFileCustody_StoreForces0600OnPreexistingFile(t *testing.T) {
 
 func TestFileCustody_LoadMissingFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ausente.key")
-	c := keycustody.NewFileCustody(path)
+	c := newFileCustody(path)
 
 	_, err := c.Load()
 	if err == nil {
 		t.Fatal("Load sobre archivo ausente debe devolver error")
 	}
-	if !errors.Is(err, keycustody.ErrNoKey) {
+	if !errors.Is(err, ErrNoKey) {
 		t.Fatalf("error esperado ErrNoKey, got %v", err)
 	}
 }
@@ -144,7 +139,7 @@ func TestFileCustody_LoadCorruptSize(t *testing.T) {
 	if err := os.WriteFile(path, []byte("corto"), 0o600); err != nil {
 		t.Fatalf("preparar archivo corrupto: %v", err)
 	}
-	c := keycustody.NewFileCustody(path)
+	c := newFileCustody(path)
 
 	if _, err := c.Load(); err == nil {
 		t.Fatal("Load sobre DEK de tamaño incorrecto debe devolver error")
@@ -153,17 +148,17 @@ func TestFileCustody_LoadCorruptSize(t *testing.T) {
 
 func TestFileCustody_StoreRejectsWrongSize(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dek.key")
-	c := keycustody.NewFileCustody(path)
+	c := newFileCustody(path)
 
 	cases := map[string][]byte{
 		"vacía": {},
-		"corta": make([]byte, keycustody.KeySize-1),
-		"larga": make([]byte, keycustody.KeySize+1),
+		"corta": make([]byte, KeySize-1),
+		"larga": make([]byte, KeySize+1),
 		"nil":   nil,
 	}
 	for name, dek := range cases {
 		t.Run(name, func(t *testing.T) {
-			if err := c.Store(dek); !errors.Is(err, keycustody.ErrKeySize) {
+			if err := c.Store(dek); !errors.Is(err, ErrKeySize) {
 				t.Fatalf("Store(%s) error = %v, want ErrKeySize", name, err)
 			}
 			if c.Exists() {
@@ -181,9 +176,9 @@ func TestFileCustody_StoreErrorWhenDirNotCreatable(t *testing.T) {
 		t.Fatalf("preparar blocker: %v", err)
 	}
 	path := filepath.Join(blocker, "dek.key")
-	c := keycustody.NewFileCustody(path)
+	c := newFileCustody(path)
 
-	if err := c.Store(newDEK(t)); err == nil {
+	if err := c.Store(newTestDEK(t)); err == nil {
 		t.Fatal("Store debe fallar si no puede crear el directorio contenedor")
 	}
 }
@@ -192,9 +187,9 @@ func TestFileCustody_StoreErrorWhenPathIsDirectory(t *testing.T) {
 	// La ruta destino es un directorio existente: MkdirAll(dir-padre) tiene éxito
 	// pero WriteFile sobre un directorio falla.
 	path := t.TempDir()
-	c := keycustody.NewFileCustody(path)
+	c := newFileCustody(path)
 
-	if err := c.Store(newDEK(t)); err == nil {
+	if err := c.Store(newTestDEK(t)); err == nil {
 		t.Fatal("Store debe fallar cuando la ruta destino es un directorio")
 	}
 }
@@ -202,25 +197,25 @@ func TestFileCustody_StoreErrorWhenPathIsDirectory(t *testing.T) {
 func TestFileCustody_LoadErrorWhenPathIsDirectory(t *testing.T) {
 	// Leer un directorio devuelve un error distinto a os.ErrNotExist: no es ErrNoKey.
 	path := t.TempDir()
-	c := keycustody.NewFileCustody(path)
+	c := newFileCustody(path)
 
 	_, err := c.Load()
 	if err == nil {
 		t.Fatal("Load debe fallar cuando la ruta es un directorio")
 	}
-	if errors.Is(err, keycustody.ErrNoKey) {
+	if errors.Is(err, ErrNoKey) {
 		t.Fatalf("error de directorio no debe ser ErrNoKey, got %v", err)
 	}
 }
 
-// TestFileCustody_IntegratesWithEnvelope prueba que la DEK custodiada encaja con
-// el contrato de envelope: se sella algo con la DEK cargada y se vuelve a abrir.
-// El adaptador NO depende de envelope; el acoplamiento ocurre solo aquí, en el test.
+// TestFileCustody_IntegratesWithEnvelope prueba que la DEK custodiada encaja con el contrato de envelope:
+// se sella algo con la DEK cargada y se vuelve a abrir. El adaptador NO depende de envelope; el
+// acoplamiento ocurre solo aquí, en el test.
 func TestFileCustody_IntegratesWithEnvelope(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dek.key")
-	c := keycustody.NewFileCustody(path)
+	c := newFileCustody(path)
 
-	dek := newDEK(t)
+	dek := newTestDEK(t)
 	if err := c.Store(dek); err != nil {
 		t.Fatalf("Store: %v", err)
 	}
