@@ -24,6 +24,7 @@ import (
 	"github.com/EduGoGroup/wapp-cloudlink/lease"
 	"github.com/EduGoGroup/wapp-cloudlink/mtls"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cloudlink"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/outbox"
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
@@ -56,6 +57,10 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	if !ok {
 		return logSink
 	}
+
+	// Outbox durable (Plan 027 T2, H2) sobre la BD del path legacy: los entrantes/acuses con el stream
+	// caído se encolan y drenan al reconectar en vez de descartarse. nil (fallo de init) => best-effort.
+	ob := BuildOutbox(ctx, cfg, database, log)
 
 	// SendFunc: conecta los comandos SendText de la nube al despachador del Edge. Prioriza el CLIENTE
 	// VIVO de la escucha (una sola conexión por sesión): con la misma identidad multi-dispositivo, un
@@ -90,7 +95,10 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	// El Adapter es un multiplexor (un stream por Edge). El camino legacy single-sesión registra LA
 	// única sesión (cfg.CloudLink.SessionID) y usa SU sink etiquetado; la mecánica de mux es idéntica a
 	// la del daemon multi-sesión (runServe), solo que aquí hay una sola sesión.
-	adapter := cloudlink.NewAdapter(cc, log, newValidator, cloudlink.WithCloudEncPubKey(cloudEncPub))
+	adapter := cloudlink.NewAdapter(cc, log, newValidator,
+		cloudlink.WithCloudEncPubKey(cloudEncPub),
+		cloudlink.WithOutbox(ob),
+	)
 	// Camino single-sesión (listen/restore): el JID propio no está a mano aquí (la config solo trae el
 	// session_id); se registra con selfJID "" (el Cloud tolera vacío, Plan 020 T2). El número propio se
 	// reporta de raíz por el daemon multi-sesión (runServe/BuildMux), donde s.meta.JID sí está poblado.
@@ -125,7 +133,7 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 //     real cuyo loop de stream corre en goroutine ligada a ctx. El Manager registra cada sesión.
 //
 // ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK (ADR-0007).
-func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger) sessionmgr.CloudLinkMux {
+func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox) sessionmgr.CloudLinkMux {
 	if cfg.CloudLink.Endpoint == "" {
 		log.Info("CloudLink deshabilitado (sin endpoint): usando LogMux por sesión para diagnóstico")
 		return cloudlink.NewLogMux(log)
@@ -141,6 +149,9 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger) s
 		// Deadline por operación del demux (Plan 027 T1, H7): un envío/descarga colgado no vive lo que vive
 		// el stream ni frena a otras sesiones. Configurable por WAPP_AGENT_CLOUDLINK_COMMAND_TIMEOUT_SECONDS.
 		cloudlink.WithCommandTimeout(time.Duration(cfg.CloudLink.CommandTimeoutSeconds)*time.Second),
+		// Outbox durable (Plan 027 T2, H2): entrantes/acuses con el stream caído se encolan y drenan en
+		// orden al reconectar en vez de descartarse. nil (fallo de init) => best-effort.
+		cloudlink.WithOutbox(ob),
 	)
 	go func() {
 		_ = adapter.Run(ctx)
@@ -150,6 +161,21 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger) s
 	log.Info("CloudLink habilitado (multi-sesión): un stream multiplexado por session_id",
 		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil)
 	return adapter
+}
+
+// BuildOutbox construye el outbox durable (Plan 027 Ola 3 · T2, cierra H2 / ADR-0003) sobre la BD ÚNICA ya
+// migrada (la tabla `outbox` la crea db.Migrate). Aplica los límites de config (tamaño + TTL). NO es fatal:
+// si la construcción falla (p.ej. no se pudo sembrar la secuencia), devuelve nil y el Adapter cae al
+// best-effort previo — la durabilidad es una mejora, no un requisito de arranque.
+func BuildOutbox(ctx context.Context, cfg config.Config, database *sql.DB, log sharedlogger.Logger) app.Outbox {
+	ob, err := outbox.New(ctx, database, cfg.OutboxMaxEvents, cfg.OutboxTTLHours, log)
+	if err != nil {
+		log.Error("outbox durable: no se pudo inicializar; se sigue en best-effort (sin durabilidad)", "error", err)
+		return nil
+	}
+	log.Info("outbox durable habilitado (ADR-0003): entrantes/acuses con stream caído se encolan y drenan al reconectar",
+		"max_eventos", cfg.OutboxMaxEvents, "ttl_horas", cfg.OutboxTTLHours)
+	return ob
 }
 
 // dialCloudLink concentra el bloque COMÚN de BuildSink/BuildMux (H3: antes duplicado ~90 líneas): valida

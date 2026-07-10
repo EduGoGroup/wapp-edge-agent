@@ -365,7 +365,10 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	// session_id (ADR-0008) con lease POR sesión (ADR-0016 §5). Su loop de stream corre en goroutine
 	// ligada a ctx. Sin endpoint configurado cae a LogMux (diagnóstico por sesión, sin red). El Manager
 	// registra cada sesión (live-sender + presencia de DEK) al arrancar su listener y la quita en Unlink.
-	mux := wiring.BuildMux(ctx, cfg, log)
+	// Outbox durable (Plan 027 Ola 3 · T2, H2) sobre la BD ÚNICA: los entrantes/acuses con el stream
+	// CloudLink caído se encolan y drenan en orden al reconectar en vez de descartarse (ADR-0003).
+	outbox := wiring.BuildOutbox(ctx, cfg, database, log)
+	mux := wiring.BuildMux(ctx, cfg, log, outbox)
 
 	// Manager con la BD ÚNICA compartida (WithSharedDB): escucha real per-device (un listener por device
 	// que carga por SU JID sobre la BD compartida) y pairing real (Container per-device sobre la MISMA BD;
