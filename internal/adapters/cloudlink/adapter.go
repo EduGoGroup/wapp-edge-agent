@@ -205,8 +205,8 @@ func (a *Adapter) Register(sessionID, selfJID string, send SendFunc, sendMedia S
 		sendFunc:      send,
 		sendMediaFunc: sendMedia,
 		hasDEK:        hasDEK,
-		selfJID:       selfJID,                // JID crudo del device propio (Plan 020 T2); "" si aún sin emparejar.
-		selfPN:        selfPNFromJID(selfJID), // número propio E.164 sin '+'; "" si el JID no es un número.
+		selfJID:       selfJID,                      // JID crudo del device propio (Plan 020 T2); "" si aún sin emparejar.
+		selfPN:        domain.SelfPNFromJID(selfJID), // número propio E.164 sin '+'; "" si el JID no es un número.
 	}
 	if a.newValidator != nil {
 		entry.validator = a.newValidator()
@@ -425,17 +425,6 @@ func jidServer(jid string) string {
 		return jid[i+1:]
 	}
 	return ""
-}
-
-// selfPNFromJID deriva el número PROPIO (E.164 sin '+') del JID del device propio (Plan 020 T2). El JID
-// propio es un número real (server s.whatsapp.net): devuelve su user-part normalizada (sin server ni
-// device/agente). Si el JID viene vacío (sesión aún sin emparejar) o su server NO es de número (un LID u
-// otro), devuelve "" — el Cloud tolera vacío y NUNCA se reporta un LID como número.
-func selfPNFromJID(jid string) string {
-	if jid == "" || jidServer(jid) != serverPN {
-		return ""
-	}
-	return jidUser(jid)
 }
 
 // Run mantiene el único stream Connect vivo: conecta, recibe comandos (demux por session_id), late, y

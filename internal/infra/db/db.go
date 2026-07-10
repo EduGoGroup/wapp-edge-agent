@@ -1,21 +1,25 @@
-// Package db abre los SQLite del Edge y aplica sus migraciones embebidas, separadas en DOS sets
-// (ADR-0016 §2/§4, Plan 008 §4):
+// Package db abre la BD del Edge y aplica sus migraciones embebidas, separadas en DOS sets:
 //
-//   - set "store"  (migrations/store, hoy 0001_init.sql → tablas msg_enc_*): es el esquema del
-//     cryptostore y se aplica a CADA store.db POR SESIÓN (sessions/<id>/store.db). Solo material
-//     whatsmeow cifrado campo a campo con la DEK de esa sesión.
-//   - set "meta"   (migrations/meta, hoy 0002_sessions.sql + 0003_sessions_multi.sql → tablas
-//     sessions/sessions_v2): metadatos de NEGOCIO en claro de las sesiones; se aplican a la db
-//     CENTRAL (<data_dir>/sessions.db).
+//   - set "store" (migrations/store, hoy 0001_init.sql → tablas msg_enc_*): es el esquema del
+//     cryptostore. Solo material whatsmeow cifrado campo a campo con la DEK del dispositivo.
+//   - set "meta"  (migrations/meta, hoy 0002_sessions.sql + 0003_sessions_multi.sql +
+//     0004_accounts_devices.sql → tablas accounts/devices; sessions/sessions_v2 son legacy):
+//     metadatos de NEGOCIO en claro de las sesiones (número/JID/estado/rol/timestamps).
 //
-// El driver es modernc.org/sqlite (CGO_ENABLED=0, sin SQLCipher): el fichero .db NO se cifra a nivel
-// de página; el cryptostore (internal/adapters/cryptostore) cifra CADA campo sensible con la DEK
-// antes de escribirlo. Por eso aquí solo nos ocupamos de: abrir el .db con permisos 0600, fijar los
-// pragmas (WAL, foreign_keys, busy_timeout) y aplicar el set de migración que corresponda.
+// MODELO BD ÚNICA (ADR-0018, Plan 022): el Edge usa UNA sola *sql.DB (<data_dir>/edge.db en SQLite,
+// o la cadena Postgres) que aloja AMBOS sets — metadatos (accounts/devices), el Container whatsmeow
+// compartido y el store cifrado per-device (msg_enc_*) — retirando el modelo previo de un store.db
+// POR SESIÓN + una db CENTRAL de metadatos. El daemon `serve` la abre con Open (por dialecto) y aplica
+// los dos sets con Migrate. La DEK sigue custodiada FUERA de la BD, por dispositivo (Plan 022 §3).
 //
-// Compatibilidad: Migrate/OpenAndMigrate aplican AMBOS sets a una sola db (camino single-sesión
-// legacy de cmd/agent, que T3/T4 recablearán al layout por sesión). Los helpers per-sesión
-// (MigrateStore/OpenSessionStore) y central (MigrateMeta/OpenAndMigrateMeta) aplican un set cada uno.
+// El driver por defecto es modernc.org/sqlite (CGO_ENABLED=0, sin SQLCipher): el fichero .db NO se
+// cifra a nivel de página; el cryptostore (internal/adapters/cryptostore) cifra CADA campo sensible con
+// la DEK antes de escribirlo. Por eso aquí solo nos ocupamos de: abrir la BD con permisos 0600 (SQLite),
+// fijar los pragmas (WAL, foreign_keys, busy_timeout) y aplicar el set de migración que corresponda.
+//
+// Helpers legacy single-sesión (OpenAndMigrate = ambos sets a una db; OpenSessionStore = solo el set
+// store; OpenAndMigrateMeta/MigrateMeta/MigrateStore = un set) se CONSERVAN para los subcomandos
+// heredados de cmd/agent (pair/send/listen) y para el cryptostore; el daemon `serve` usa Open+Migrate.
 package db
 
 import (
@@ -43,9 +47,10 @@ var migrationsFS fs.FS = embeddedMigrations
 
 // Subdirectorios de cada set de migración dentro de migrationsFS.
 const (
-	// storeMigrationsDir aloja el esquema del store cifrado por sesión (tablas msg_enc_*).
+	// storeMigrationsDir aloja el esquema del store cifrado del cryptostore (tablas msg_enc_*).
 	storeMigrationsDir = "migrations/store"
-	// metaMigrationsDir aloja el esquema de metadatos de negocio (tablas sessions/sessions_v2).
+	// metaMigrationsDir aloja el esquema de metadatos de negocio (tablas accounts/devices; sessions/
+	// sessions_v2 son legacy).
 	metaMigrationsDir = "migrations/meta"
 )
 

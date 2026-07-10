@@ -279,7 +279,7 @@ func restoreOneSession(ctx context.Context, dataDir string, database *sql.DB, st
 	if err := store.Upsert(ctx, domain.Session{
 		SessionID: id,
 		JID:       jidStr,
-		SelfPN:    selfPNFromJID(jid),
+		SelfPN:    domain.SelfPNFromJID(jid.String()),
 		State:     domain.SessionStateActive,
 		Role:      domain.DeviceRolePrimary,
 		PairedAt:  now,
@@ -425,7 +425,7 @@ func registerLoggedOut(ctx context.Context, store *sessionstore.Store, id, jidSt
 	if err := store.Upsert(ctx, domain.Session{
 		SessionID: id,
 		JID:       jidStr,
-		SelfPN:    selfPNFromJID(jid),
+		SelfPN:    domain.SelfPNFromJID(jid.String()),
 		State:     domain.SessionStateLoggedOut,
 		Role:      domain.DeviceRolePrimary,
 		UpdatedAt: now,
@@ -444,8 +444,3 @@ func dekPathFor(dataDir, id string) (string, error) {
 	return filepath.Join(dataDir, keysDirName, id+dekFileExt), nil
 }
 
-// selfPNFromJID deriva el número propio (self_pn, E.164 sin '+') del JID pareado: la parte User del JID de
-// un teléfono ES el número (misma lógica que sessionmgr.selfPNFromJID). No es secreto (metadato de negocio).
-func selfPNFromJID(jid types.JID) string {
-	return jid.User
-}

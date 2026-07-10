@@ -207,6 +207,12 @@ func runPair(ctx context.Context, cfg config.Config, log sharedlogger.Logger) er
 	sess := domain.Session{
 		SessionID: sessionID,
 		JID:       res.WaJID,
+		// SelfPN + Role alineados con el camino multi-sesión (Plan 027 T5, cierra H8): el número propio se
+		// deriva del JID recién pareado (implementación única domain.SelfPNFromJID) y el device arranca como
+		// primary. Antes runPair legacy dejaba ambos vacíos, dejando la fila inconsistente con las que crea
+		// el Manager (assignRoleLocked/self_pn).
+		SelfPN:    domain.SelfPNFromJID(res.WaJID),
+		Role:      domain.DeviceRolePrimary,
 		State:     domain.SessionStateActive,
 		StoreDir:  "sessions/" + sessionID,
 		PairedAt:  now,

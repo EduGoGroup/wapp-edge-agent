@@ -114,7 +114,7 @@ func (m *Manager) Pair(ctx context.Context, qr app.QRSink) (app.PairResult, erro
 	//    MISMA cuenta (sessionstore.resolveAccount por self_pn) en vez de quedarse en el silo provisional;
 	//    la cuenta provisional que queda vacía la purga el propio Upsert (cero huérfanos).
 	paired := time.Now().UTC()
-	selfPN := selfPNFromJID(res.WaJID)
+	selfPN := domain.SelfPNFromJID(res.WaJID)
 
 	// Rol + cupo + registro vivo ATÓMICOS bajo m.mu (failover T5, design §6/§10.F): se decide el rol
 	// (primary/standby) del device y se verifica el cupo de devices VIVOS del número, y se registra la
@@ -189,14 +189,3 @@ func (m *Manager) cleanupPairing(ctx context.Context, id, jid string, custody ap
 	}
 }
 
-// selfPNFromJID deriva el número propio (self_pn, E.164 sin '+') a partir del JID de WhatsApp recién
-// pareado: el JID de un teléfono es "<numero>[:<device>]@s.whatsapp.net" y su parte User ES el número.
-// Devuelve "" si el JID no parsea (entonces la cuenta queda provisional hasta conocer el número). No es
-// secreto (es metadato de negocio); no se loguea aquí.
-func selfPNFromJID(jidStr string) string {
-	jid, err := types.ParseJID(jidStr)
-	if err != nil {
-		return ""
-	}
-	return jid.User
-}
