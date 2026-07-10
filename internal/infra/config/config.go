@@ -24,6 +24,11 @@ const EnvPrefix = "WAPP_AGENT_"
 // deriva del host del endpoint de enrolamiento con este puerto (configurable por RuntimePort).
 const DefaultCloudLinkRuntimePort = "8101"
 
+// DefaultCommandTimeoutSeconds es el deadline por operación por defecto del demux CloudLink (Plan 027 T1,
+// H7): 30s, alineado con la descarga de media del gateway whatsmeow para no cortar por debajo de una
+// operación legítima. Configurable por WAPP_AGENT_CLOUDLINK_COMMAND_TIMEOUT_SECONDS.
+const DefaultCommandTimeoutSeconds = 30
+
 // runtimeEndpointStateFile es el nombre del archivo de estado bajo data_dir donde el enroll persiste el
 // Endpoint de runtime derivado (Plan 026 T3, cierra follow-up 023) para que `serve` lo relea sin edición
 // manual del config.yaml. Material PÚBLICO (host:puerto), nunca secretos.
@@ -145,6 +150,12 @@ type CloudLinkConfig struct {
 	// EdgeID es la identidad del Edge que va al CommonName del CSR durante el enrolamiento. Si está
 	// vacío se resuelve en tiempo de ejecución: SessionID si existe, si no el hostname del equipo.
 	EdgeID string `yaml:"edge_id"`
+	// CommandTimeoutSeconds es el DEADLINE POR OPERACIÓN del demux CloudLink (Plan 027 T1, cierra H7): cada
+	// comando cloud->edge (SendText/SendMedia/…) se procesa bajo un context.WithTimeout de este tanto, de
+	// forma que un envío o descarga de media colgado no vive lo que vive el stream ni frena a otras
+	// sesiones. Default 30s (igual que la descarga de media del gateway, para no cortar por debajo de una
+	// operación legítima). Se lee de WAPP_AGENT_CLOUDLINK_COMMAND_TIMEOUT_SECONDS; <=0 cae al default.
+	CommandTimeoutSeconds int `yaml:"command_timeout_seconds"`
 }
 
 // defaultDataDir calcula la RUTA SAGRADA por defecto del store del Edge (MP-02, D1): SIEMPRE en el
@@ -178,7 +189,10 @@ func defaults() Config {
 		MultiDevicePerAccount: 1,
 		PushName:              "wApp",
 		ControlSocketPath:     "wapp-edge.sock",
-		CloudLink:             CloudLinkConfig{RuntimePort: DefaultCloudLinkRuntimePort},
+		CloudLink: CloudLinkConfig{
+			RuntimePort:           DefaultCloudLinkRuntimePort,
+			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
+		},
 	}
 }
 
@@ -224,11 +238,18 @@ func Load(path string) (Config, error) {
 	cfg.CloudLink.ActivationCode = loader.GetString("CLOUDLINK_ACTIVATION_CODE", cfg.CloudLink.ActivationCode)
 	cfg.CloudLink.EdgeID = loader.GetString("CLOUDLINK_EDGE_ID", cfg.CloudLink.EdgeID)
 	cfg.CloudLink.RuntimePort = loader.GetString("CLOUDLINK_RUNTIME_PORT", cfg.CloudLink.RuntimePort)
+	cfg.CloudLink.CommandTimeoutSeconds = loader.GetInt("CLOUDLINK_COMMAND_TIMEOUT_SECONDS", cfg.CloudLink.CommandTimeoutSeconds)
 
 	// Puerto de runtime CloudLink por defecto (Plan 026 T3): si nadie lo fijó (YAML/env), "8101"
 	// (topología de prod, design §1). Con él el enroll deriva y persiste el Endpoint de runtime.
 	if cfg.CloudLink.RuntimePort == "" {
 		cfg.CloudLink.RuntimePort = DefaultCloudLinkRuntimePort
+	}
+
+	// Deadline por operación del demux (Plan 027 T1): un valor no positivo (sin fijar, o tecleado mal en
+	// YAML/env) cae al default en vez de dejar el demux sin deadline efectivo.
+	if cfg.CloudLink.CommandTimeoutSeconds <= 0 {
+		cfg.CloudLink.CommandTimeoutSeconds = DefaultCommandTimeoutSeconds
 	}
 
 	// Dialecto de BD (Plan 022 T0): solo "sqlite" (default) o "postgres". Se valida aquí para fallar

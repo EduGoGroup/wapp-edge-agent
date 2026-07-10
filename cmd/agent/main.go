@@ -666,7 +666,12 @@ func buildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger) s
 		return cloudlink.NewLogMux(log)
 	}
 
-	adapter := cloudlink.NewAdapter(cc, log, newValidator, cloudlink.WithCloudEncPubKey(cloudEncPub))
+	adapter := cloudlink.NewAdapter(cc, log, newValidator,
+		cloudlink.WithCloudEncPubKey(cloudEncPub),
+		// Deadline por operación del demux (Plan 027 T1, H7): un envío/descarga colgado no vive lo que vive
+		// el stream ni frena a otras sesiones. Configurable por WAPP_AGENT_CLOUDLINK_COMMAND_TIMEOUT_SECONDS.
+		cloudlink.WithCommandTimeout(time.Duration(cfg.CloudLink.CommandTimeoutSeconds)*time.Second),
+	)
 	go func() {
 		_ = adapter.Run(ctx)
 		_ = cc.Close()

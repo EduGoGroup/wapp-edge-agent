@@ -104,10 +104,26 @@ type Adapter struct {
 	baseDelay  time.Duration
 	maxDelay   time.Duration
 
+	// cmdTimeout es el deadline POR OPERACIÓN del demux (Plan 027 T1, cierra H7): cada handleCommand se
+	// ejecuta bajo un context.WithTimeout de esta duración, de modo que un envío/descarga colgado no vive
+	// lo que vive el stream. cmdQueueSize es el buffer por sesión del despacho concurrente (backpressure
+	// acotado por session_id). Se fijan en NewAdapter y se ajustan con WithCommandTimeout/WithCommandQueueSize.
+	cmdTimeout   time.Duration
+	cmdQueueSize int
+
 	mu       sync.Mutex
 	cl       *client.Client           // stream activo; nil mientras está desconectado
 	sessions map[string]*sessionEntry // registro multi-sesión por session_id
 }
+
+// Valores por defecto del despacho del demux (Plan 027 T1). defaultCommandTimeout es el deadline por
+// operación (H7): 30s, igual que la descarga de media del gateway whatsmeow (sender.go), para que el
+// deadline del demux nunca corte por debajo de una operación legítima. defaultCommandQueueSize es el
+// buffer por sesión: holgura para absorber ráfagas por sesión sin frenar el loop del stream.
+const (
+	defaultCommandTimeout   = 30 * time.Second
+	defaultCommandQueueSize = 64
+)
 
 // Option configura aspectos opcionales del Adapter (cadencias de test, etc.).
 type Option func(*Adapter)
@@ -128,6 +144,26 @@ func WithCloudEncPubKey(pub []byte) Option {
 	return func(a *Adapter) { a.cloudEncPub = pub }
 }
 
+// WithCommandTimeout fija el deadline POR OPERACIÓN del demux (Plan 027 T1, H7). Por defecto 30s. Un
+// valor <=0 se ignora (conserva el default) para no dejar el demux sin deadline.
+func WithCommandTimeout(d time.Duration) Option {
+	return func(a *Adapter) {
+		if d > 0 {
+			a.cmdTimeout = d
+		}
+	}
+}
+
+// WithCommandQueueSize fija el buffer por sesión del despacho concurrente (Plan 027 T1). Sobre todo para
+// tests deterministas; en producción el default es sensato. Un valor <=0 se ignora.
+func WithCommandQueueSize(n int) Option {
+	return func(a *Adapter) {
+		if n > 0 {
+			a.cmdQueueSize = n
+		}
+	}
+}
+
 // NewAdapter construye el multiplexor CloudLink sobre una conexión gRPC ya establecida (cc).
 //   - newValidator: factory del Validator de lease POR SESIÓN (nil => gate de lease desactivado).
 //   - log: logger estructurado (nunca imprime DEK ni secretos).
@@ -144,6 +180,8 @@ func NewAdapter(cc grpc.ClientConnInterface, log logger.Logger, newValidator Val
 		hbInterval:   30 * time.Second,
 		baseDelay:    1 * time.Second,
 		maxDelay:     60 * time.Second,
+		cmdTimeout:   defaultCommandTimeout,
+		cmdQueueSize: defaultCommandQueueSize,
 		sessions:     make(map[string]*sessionEntry),
 	}
 	for _, opt := range opts {
@@ -445,6 +483,13 @@ func (a *Adapter) runOnce(ctx context.Context) (bool, error) {
 	defer hbCancel()
 	go a.heartbeatLoop(hbCtx, cl)
 
+	// Despacho CONCURRENTE por session_id (Plan 027 T1, cierra H1/H7): en vez de ejecutar handleCommand
+	// síncrono en este loop —lo que dejaba que una operación lenta de una sesión congelara la recepción de
+	// TODAS— se encola en la cola de su sesión y un worker por session_id la procesa en paralelo con
+	// deadline por operación. shutdown drena/cancela al caer el stream o apagarse el agente (sin fugas).
+	disp := newCommandDispatcher(ctx, a, cl, a.cmdTimeout, a.cmdQueueSize)
+	defer disp.shutdown()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -453,7 +498,7 @@ func (a *Adapter) runOnce(ctx context.Context) (bool, error) {
 			if !ok {
 				return true, errors.New("cloudlink: stream cerrado por el servidor")
 			}
-			a.handleCommand(ctx, cl, c2e)
+			disp.dispatch(c2e)
 		}
 	}
 }
