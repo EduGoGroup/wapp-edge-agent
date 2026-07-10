@@ -29,6 +29,17 @@ const DefaultCloudLinkRuntimePort = "8101"
 // operación legítima. Configurable por WAPP_AGENT_CLOUDLINK_COMMAND_TIMEOUT_SECONDS.
 const DefaultCommandTimeoutSeconds = 30
 
+// DefaultOutboxMaxEvents es el tope por defecto de eventos retenidos en el outbox durable del Edge (Plan
+// 027 Ola 3 · T2, ADR-0003): al llenarse se aplica DROP-OLDEST (se descarta el más viejo, con log) en vez
+// de crecer sin límite. 10 000 eventos es holgado para un nano-negocio y acota el tamaño del .db ante una
+// caída larga de la nube. Configurable por WAPP_AGENT_OUTBOX_MAX_EVENTS.
+const DefaultOutboxMaxEvents = 10000
+
+// DefaultOutboxTTLHours es el TTL por defecto (en horas) de un evento en el outbox: 0 = DESACTIVADO
+// (durabilidad primero; el único recorte es el drop-oldest por tamaño). Un valor >0 poda los eventos más
+// viejos que ese tiempo al encolar/drenar. Configurable por WAPP_AGENT_OUTBOX_TTL_HOURS.
+const DefaultOutboxTTLHours = 0
+
 // runtimeEndpointStateFile es el nombre del archivo de estado bajo data_dir donde el enroll persiste el
 // Endpoint de runtime derivado (Plan 026 T3, cierra follow-up 023) para que `serve` lo relea sin edición
 // manual del config.yaml. Material PÚBLICO (host:puerto), nunca secretos.
@@ -106,6 +117,13 @@ type Config struct {
 	// plano de control (ADR-0015): co-ubicado, SIN puerto de red. Default relativo al cwd, junto al
 	// db_path (ver defaults). Override por WAPP_AGENT_CONTROL_SOCKET_PATH (mismo overlay que el resto).
 	ControlSocketPath string `yaml:"control_socket_path"`
+	// OutboxMaxEvents es el tope de eventos del outbox durable (Plan 027 Ola 3 · T2, ADR-0003): al llenarse
+	// se descarta el más viejo (drop-oldest) con log, en vez de crecer sin límite. Default 10 000. Se lee de
+	// WAPP_AGENT_OUTBOX_MAX_EVENTS; un valor <=0 cae al default (guardarraíl, no invariante).
+	OutboxMaxEvents int `yaml:"outbox_max_events"`
+	// OutboxTTLHours es el TTL (horas) de un evento del outbox: 0 = desactivado (solo recorta el drop-oldest
+	// por tamaño). Con >0 se podan los eventos más viejos que ese tiempo. Se lee de WAPP_AGENT_OUTBOX_TTL_HOURS.
+	OutboxTTLHours int `yaml:"outbox_ttl_hours"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -189,6 +207,8 @@ func defaults() Config {
 		MultiDevicePerAccount: 1,
 		PushName:              "wApp",
 		ControlSocketPath:     "wapp-edge.sock",
+		OutboxMaxEvents:       DefaultOutboxMaxEvents,
+		OutboxTTLHours:        DefaultOutboxTTLHours,
 		CloudLink: CloudLinkConfig{
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
@@ -226,6 +246,8 @@ func Load(path string) (Config, error) {
 	cfg.MultiDevicePerAccount = loader.GetInt("MULTIDEVICE_PER_ACCOUNT", cfg.MultiDevicePerAccount)
 	cfg.PushName = loader.GetString("PUSH_NAME", cfg.PushName)
 	cfg.ControlSocketPath = loader.GetString("CONTROL_SOCKET_PATH", cfg.ControlSocketPath)
+	cfg.OutboxMaxEvents = loader.GetInt("OUTBOX_MAX_EVENTS", cfg.OutboxMaxEvents)
+	cfg.OutboxTTLHours = loader.GetInt("OUTBOX_TTL_HOURS", cfg.OutboxTTLHours)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)
@@ -250,6 +272,15 @@ func Load(path string) (Config, error) {
 	// YAML/env) cae al default en vez de dejar el demux sin deadline efectivo.
 	if cfg.CloudLink.CommandTimeoutSeconds <= 0 {
 		cfg.CloudLink.CommandTimeoutSeconds = DefaultCommandTimeoutSeconds
+	}
+
+	// Outbox durable (Plan 027 Ola 3 · T2): tope no positivo cae al default (guardarraíl); TTL negativo se
+	// satura en 0 (desactivado). No fatal: son límites operativos, no invariantes de seguridad.
+	if cfg.OutboxMaxEvents <= 0 {
+		cfg.OutboxMaxEvents = DefaultOutboxMaxEvents
+	}
+	if cfg.OutboxTTLHours < 0 {
+		cfg.OutboxTTLHours = 0
 	}
 
 	// Dialecto de BD (Plan 022 T0): solo "sqlite" (default) o "postgres". Se valida aquí para fallar
