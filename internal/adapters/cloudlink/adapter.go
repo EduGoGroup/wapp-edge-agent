@@ -111,6 +111,20 @@ type Adapter struct {
 	cmdTimeout   time.Duration
 	cmdQueueSize int
 
+	// outbox es la cola DURABLE de eventos edge->cloud (Plan 027 Ola 3 · T2, cierra H2 / ADR-0003). Si está
+	// presente (WithOutbox), un entrante/acuse que no se pudo enviar (stream caído o Send con error) se
+	// ENCOLA en vez de descartarse, y se drena en orden al reconectar. nil => comportamiento previo
+	// (best-effort, se descarta): lo que usan los tests de transporte y el modo dev sin BD.
+	outbox              app.Outbox
+	outboxDrainInterval time.Duration // cadencia del re-drenaje mientras hay stream (además del drenaje al conectar)
+
+	// pending guarda, EN MEMORIA, las sesiones con backlog en el outbox (Plan 027 T2): mientras una sesión
+	// tiene eventos encolados, los nuevos también se encolan (no se envían en vivo) para PRESERVAR el orden
+	// relativo por sesión al drenar. Se siembra de PendingSessions al arrancar y se recalcula tras cada
+	// drenaje. Cross-sesión es independiente; por sesión, Deliver es serial (un listener por sesión).
+	pendingMu sync.Mutex
+	pending   map[string]bool
+
 	mu       sync.Mutex
 	cl       *client.Client           // stream activo; nil mientras está desconectado
 	sessions map[string]*sessionEntry // registro multi-sesión por session_id
@@ -123,6 +137,15 @@ type Adapter struct {
 const (
 	defaultCommandTimeout   = 30 * time.Second
 	defaultCommandQueueSize = 64
+)
+
+// Parámetros del drenaje del outbox durable (Plan 027 T2). defaultOutboxDrainInterval es la cadencia del
+// re-drenaje MIENTRAS hay stream (además del drenaje inmediato al conectar): cubre cualquier evento que
+// caiga al outbox estando conectado (p.ej. un Send que falla justo antes de que el stream muera).
+// outboxDrainBatch es el tamaño de lote por pasada de drenaje.
+const (
+	defaultOutboxDrainInterval = 5 * time.Second
+	outboxDrainBatch           = 128
 )
 
 // Option configura aspectos opcionales del Adapter (cadencias de test, etc.).
@@ -164,6 +187,29 @@ func WithCommandQueueSize(n int) Option {
 	}
 }
 
+// WithOutbox activa el outbox DURABLE (Plan 027 Ola 3 · T2, cierra H2 / ADR-0003): con él, los entrantes y
+// acuses que no se pueden enviar (stream caído o Send con error) se ENCOLAN y se drenan en orden al
+// reconectar, en vez de descartarse. Sin esta opción el Adapter conserva el comportamiento previo
+// (best-effort). nil se ignora (queda desactivado).
+func WithOutbox(o app.Outbox) Option {
+	return func(a *Adapter) {
+		if o != nil {
+			a.outbox = o
+		}
+	}
+}
+
+// WithOutboxDrainInterval ajusta la cadencia del re-drenaje del outbox mientras hay stream (Plan 027 T2).
+// Sobre todo para tests deterministas (intervalos minúsculos); en producción el default (5s) es sensato.
+// Un valor <=0 se ignora.
+func WithOutboxDrainInterval(d time.Duration) Option {
+	return func(a *Adapter) {
+		if d > 0 {
+			a.outboxDrainInterval = d
+		}
+	}
+}
+
 // NewAdapter construye el multiplexor CloudLink sobre una conexión gRPC ya establecida (cc).
 //   - newValidator: factory del Validator de lease POR SESIÓN (nil => gate de lease desactivado).
 //   - log: logger estructurado (nunca imprime DEK ni secretos).
@@ -180,9 +226,11 @@ func NewAdapter(cc grpc.ClientConnInterface, log logger.Logger, newValidator Val
 		hbInterval:   30 * time.Second,
 		baseDelay:    1 * time.Second,
 		maxDelay:     60 * time.Second,
-		cmdTimeout:   defaultCommandTimeout,
-		cmdQueueSize: defaultCommandQueueSize,
-		sessions:     make(map[string]*sessionEntry),
+		cmdTimeout:          defaultCommandTimeout,
+		cmdQueueSize:        defaultCommandQueueSize,
+		outboxDrainInterval: defaultOutboxDrainInterval,
+		pending:             make(map[string]bool),
+		sessions:            make(map[string]*sessionEntry),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -261,22 +309,19 @@ type sessionSink struct {
 var _ app.InboundSink = (*sessionSink)(nil)
 
 // Deliver mapea el InboundEvent a IncomingMessage etiquetado con session_id y lo reenvía por el stream.
-// ZERO-KNOWLEDGE: solo viaja contenido de negocio; no hay campo alguno para la DEK ni el store. Si no
-// hay stream vivo, lo registra y devuelve nil (no tumba el socket; outbox durable = follow-up).
+// ZERO-KNOWLEDGE: solo viaja contenido de negocio; no hay campo alguno para la DEK ni el store. Si no hay
+// stream vivo o el envío falla, con outbox durable configurado (Plan 027 T2) el evento se ENCOLA y se
+// reenvía en orden al reconectar; sin outbox conserva el best-effort previo (se registra y descarta).
+// Devuelve nil siempre (nunca tumba el socket de WhatsApp).
 //
 // CIFRADO EN TRÁNSITO (Plan 011 §6.3/§10.E): si hay pública de cifrado de la nube (s.cloudEncPub),
 // los campos SENSIBLES (text/push_name/from_pn/from_lid) se serializan como un SensitivePayload proto,
 // se sellan con SealFor (X25519 anónimo) y viajan en EncPayload; los planos se vacían. Si no hay
 // pública o el sellado falla, se cae al FALLBACK CLARO (§10.H): los sensibles viajan planos y el mTLS
 // sigue protegiendo el canal (nunca se falla el reenvío por esto). Los NO sensibles (from/ts_unix/
-// wa_message_id/is_group/addressing_mode) van en claro SIEMPRE.
+// wa_message_id/is_group/addressing_mode) van en claro SIEMPRE. El sellado ocurre ANTES de encolar, así
+// que el outbox guarda ya los sensibles cifrados (durabilidad zero-knowledge).
 func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error {
-	cl := s.a.currentClient()
-	if cl == nil {
-		s.a.log.Warn("CloudLink desconectado: InboundEvent no reenviado (follow-up: outbox durable)",
-			"wa_message_id", evt.MessageID, "session_id", s.sessionID)
-		return nil
-	}
 	fromPN, fromLID := deriveContactRefs(evt.Sender, evt.SenderAlt)
 	in := &cloudlinkv1.IncomingMessage{
 		From:           evt.Sender, // se mantiene (compat, ADR-0005)
@@ -295,11 +340,7 @@ func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error 
 		SessionId: s.sessionID,
 		Payload:   &cloudlinkv1.EdgeToCloud_Incoming{Incoming: in},
 	}
-	if err := cl.Send(msg); err != nil {
-		s.a.log.Warn("CloudLink: fallo al reenviar InboundEvent (se descarta; follow-up: outbox)",
-			"error", err, "wa_message_id", evt.MessageID, "session_id", s.sessionID)
-		return nil
-	}
+	s.a.forward(msg, s.sessionID, app.OutboxKindIncoming, evt.MessageID)
 	return nil
 }
 
@@ -338,14 +379,9 @@ func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
 // el session_id ya etiquetado (por-sesión, patrón mux.SinkFor) y el command_id llega correlacionado
 // (vacío si no se correlacionó: sube como estado crudo por message_ids, no rompe). ZERO-KNOWLEDGE /
 // §10.G: solo viajan message_ids/status/timestamp/session_id/command_id — nada de contenido/PII. Si no
-// hay stream vivo, lo registra y descarta (outbox durable = follow-up), sin tumbar la escucha.
+// hay stream vivo o el envío falla, con outbox durable (Plan 027 T2) el acuse se ENCOLA y se drena en
+// orden al reconectar; sin outbox conserva el best-effort previo (se descarta), sin tumbar la escucha.
 func (a *Adapter) SendReceipt(commandID string, evt domain.ReceiptEvent) {
-	cl := a.currentClient()
-	if cl == nil {
-		a.log.Warn("CloudLink desconectado: MessageReceipt no reenviado (follow-up: outbox durable)",
-			"session_id", evt.SessionID, "status", string(evt.Status), "acked", len(evt.MessageIDs))
-		return
-	}
 	r := &cloudlinkv1.MessageReceipt{
 		SessionId:  evt.SessionID,
 		MessageIds: evt.MessageIDs,
@@ -353,11 +389,12 @@ func (a *Adapter) SendReceipt(commandID string, evt domain.ReceiptEvent) {
 		Timestamp:  evt.Timestamp.Unix(),
 		CommandId:  commandID,
 	}
-	a.send(cl, &cloudlinkv1.EdgeToCloud{
+	msg := &cloudlinkv1.EdgeToCloud{
 		CommandId: uuid.NewString(),
 		SessionId: evt.SessionID,
 		Payload:   &cloudlinkv1.EdgeToCloud_Receipt{Receipt: r},
-	})
+	}
+	a.forward(msg, evt.SessionID, app.OutboxKindReceipt, "")
 }
 
 // receiptStatusToProto mapea el estado de dominio del acuse al enum del contrato (Plan 013 §10.A):
@@ -431,6 +468,10 @@ func jidServer(jid string) string {
 // reconecta con backoff + jitter ante cualquier caída. BLOQUEA hasta que ctx se cancele (devuelve nil
 // al cancelar limpio).
 func (a *Adapter) Run(ctx context.Context) error {
+	// Siembra el guard de orden del outbox desde la BD (Plan 027 T2): si un reinicio dejó backlog, las
+	// sesiones afectadas arrancan como "pendientes" para que un evento nuevo no adelante al backlog al
+	// reconectar. No-op sin outbox.
+	a.recomputePending(ctx)
 	delay := a.baseDelay
 	for {
 		if ctx.Err() != nil {
@@ -471,6 +512,11 @@ func (a *Adapter) runOnce(ctx context.Context) (bool, error) {
 	hbCtx, hbCancel := context.WithCancel(ctx)
 	defer hbCancel()
 	go a.heartbeatLoop(hbCtx, cl)
+
+	// Drenaje del outbox durable (Plan 027 T2, H2): al conectar reenvía el backlog acumulado durante la
+	// caída y sigue drenando periódicamente mientras el stream viva (hbCtx se cancela al caer). No-op sin
+	// outbox configurado.
+	go a.drainLoop(hbCtx, cl)
 
 	// Despacho CONCURRENTE por session_id (Plan 027 T1, cierra H1/H7): en vez de ejecutar handleCommand
 	// síncrono en este loop —lo que dejaba que una operación lenta de una sesión congelara la recepción de
