@@ -48,6 +48,15 @@ type Store struct {
 
 var _ app.SessionStore = (*Store)(nil)
 
+// Guards de las CAPACIDADES OPCIONALES que el runtime resuelve por interface-upgrade (Plan 027 T4, H4):
+// el Store REAL las satisface (borrado en cascada por dispositivo + operaciones por cuenta), así que el
+// Manager las usa; los fakes en memoria de los tests no, y el runtime cae a su fallback. Anclarlas aquí
+// hace que una deriva del concreto falle en compilación, no en runtime.
+var (
+	_ app.DeviceCascadeStore = (*Store)(nil)
+	_ app.AccountStore       = (*Store)(nil)
+)
+
 // New construye el Store sobre la BD del Edge.
 func New(db *sql.DB) *Store {
 	return &Store{db: db}

@@ -34,9 +34,17 @@ type Manager struct {
 	// sigue DESACOPLADA en disco (Plan 022 §3/§10.C), y es lo único que el Layout resuelve en runtime.
 	layout Layout
 	// sessions persiste los metadatos de negocio (tablas accounts/devices de la BD única); fuente para
-	// Persisted(). El runtime T3 aprovecha además sus métodos por-dispositivo/cuenta vía type-assert
-	// (cascadeStore/accountStore) para el borrado quirúrgico sin huérfanos.
+	// Persisted().
 	sessions app.SessionStore
+
+	// cascade y account son las CAPACIDADES OPCIONALES del store para el borrado quirúrgico sin huérfanos
+	// (Plan 027 T4, cierra H4): borrado por-dispositivo en cascada y operaciones por-cuenta (número). Se
+	// resuelven UNA vez en NewManager por interface-upgrade sobre `sessions` (puertos EXPLÍCITOS de app,
+	// no interfaces ad-hoc acopladas al store concreto), en vez de re-asertar en cada borrado. nil si el
+	// store no las implementa (fakes en memoria de los tests): entonces deleteDeviceMeta cae a
+	// sessions.Delete y UnlinkAccount devuelve error claro de "no soportado".
+	cascade app.DeviceCascadeStore
+	account app.AccountStore
 
 	// db es la BD ÚNICA COMPARTIDA del Edge (Plan 022 T3, decisión §10.A): una sola *sql.DB de la que
 	// cuelgan los metadatos (accounts/devices), el Container whatsmeow compartido (whatsmeow_*) y el store
@@ -116,6 +124,10 @@ func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlog
 		// concreto y el campo es del puerto app.KeyCustody. Los tests lo sustituyen por un doble en memoria.
 		newCustody: func(path string) app.KeyCustody { return keycustody.NewFileCustody(path) },
 	}
+	// Resuelve UNA vez las capacidades opcionales del store (Plan 027 T4, H4): interface-upgrade en el
+	// wiring, no type-assert repetido en cada borrado del runtime. nil si el store no las implementa.
+	m.cascade, _ = sessions.(app.DeviceCascadeStore)
+	m.account, _ = sessions.(app.AccountStore)
 	for _, o := range opts {
 		o(m)
 	}
@@ -166,28 +178,13 @@ func WithSharedDB(db *sql.DB, dialect string) Option {
 	}
 }
 
-// cascadeStore es el subconjunto del sessionstore concreto para el borrado transaccional POR DISPOSITIVO
-// (device + cuenta vacía en una tx, sin huérfanos). El puerto app.SessionStore solo expone Delete; el
-// runtime T3 prefiere DeleteDeviceCascade cuando el store lo implementa (type-assert), y cae a Delete con
-// los fakes en memoria de los tests (que no purgan la cuenta).
-type cascadeStore interface {
-	DeleteDeviceCascade(ctx context.Context, sessionID string) error
-}
-
-// accountStore es el subconjunto del sessionstore concreto para el borrado POR CUENTA (número): listar los
-// dispositivos de la cuenta y borrarlos junto a la cuenta en una tx. Lo usa Manager.UnlinkAccount vía
-// type-assert; los fakes en memoria no lo implementan (UnlinkAccount devuelve error claro con ellos).
-type accountStore interface {
-	GetByAccount(ctx context.Context, accountID string) ([]domain.Session, error)
-	DeleteByAccount(ctx context.Context, accountID string) error
-}
-
 // deleteDeviceMeta borra la fila de metadatos del dispositivo id purgando la cuenta si queda vacía
-// (DeleteDeviceCascade) cuando el store lo soporta; si no (fakes en memoria), cae al Delete simple del
-// puerto app.SessionStore. Compartido por Unlink y cleanupPairing (cero huérfanos de metadatos).
+// (DeleteDeviceCascade) cuando el store soporta esa capacidad (app.DeviceCascadeStore, resuelta en
+// NewManager); si no (fakes en memoria), cae al Delete simple del puerto app.SessionStore. Compartido por
+// Unlink y cleanupPairing (cero huérfanos de metadatos).
 func (m *Manager) deleteDeviceMeta(ctx context.Context, id string) error {
-	if cs, ok := m.sessions.(cascadeStore); ok {
-		return cs.DeleteDeviceCascade(ctx, id)
+	if m.cascade != nil {
+		return m.cascade.DeleteDeviceCascade(ctx, id)
 	}
 	return m.sessions.Delete(ctx, id)
 }

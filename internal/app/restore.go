@@ -52,6 +52,24 @@ type SessionStore interface {
 	Delete(ctx context.Context, sessionID string) error
 }
 
+// DeviceCascadeStore es una CAPACIDAD OPCIONAL sobre SessionStore (Plan 027 T4, cierra H4): borrado
+// transaccional POR DISPOSITIVO (fila del device + su cuenta si queda vacía, en una sola tx — cero
+// huérfanos). Puerto EXPLÍCITO de app en vez de una interfaz ad-hoc acoplada al store concreto: el
+// consumidor (sessionmgr.Manager) lo resuelve por interface-upgrade UNA vez y cae a SessionStore.Delete
+// si el store no la implementa (los fakes en memoria de los tests no purgan la cuenta).
+type DeviceCascadeStore interface {
+	DeleteDeviceCascade(ctx context.Context, sessionID string) error
+}
+
+// AccountStore es una CAPACIDAD OPCIONAL sobre SessionStore (Plan 027 T4, cierra H4): operaciones POR
+// CUENTA (número) —listar los dispositivos de una cuenta y borrarlos junto a la cuenta en una tx. Puerto
+// EXPLÍCITO de app; el Manager lo resuelve por interface-upgrade UNA vez y, si el store no la implementa
+// (fakes en memoria), el borrado por cuenta responde con un error claro de "no soportado".
+type AccountStore interface {
+	GetByAccount(ctx context.Context, accountID string) ([]domain.Session, error)
+	DeleteByAccount(ctx context.Context, accountID string) error
+}
+
 // PairedDeviceLocator resuelve el JID del device pareado que vive en el store CIFRADO
 // (msg_enc_device) SIN descifrar material. Permite a RestoreSessions backfillear el registro de
 // negocio cuando el device fue pareado antes de existir la tabla `sessions`. La implementación real

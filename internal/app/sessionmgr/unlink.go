@@ -113,11 +113,10 @@ func (m *Manager) Unlink(ctx context.Context, id string) error {
 // o revocación por número en un solo mensaje), el corte es del repo cloud/proto y se ANOTA como plan aparte:
 // NO se amplía este tramo al cloud (regla dura T6). El Edge ya deja el otro lado listo (Unregister por device).
 func (m *Manager) UnlinkAccount(ctx context.Context, accountID string) error {
-	as, ok := m.sessions.(accountStore)
-	if !ok {
+	if m.account == nil {
 		return fmt.Errorf("sessionmgr: el store no soporta borrado por cuenta (GetByAccount/DeleteByAccount)")
 	}
-	devices, err := as.GetByAccount(ctx, accountID)
+	devices, err := m.account.GetByAccount(ctx, accountID)
 	if err != nil {
 		return fmt.Errorf("sessionmgr: listar dispositivos de la cuenta: %w", err)
 	}
@@ -143,7 +142,7 @@ func (m *Manager) UnlinkAccount(ctx context.Context, accountID string) error {
 	}
 
 	// Metadatos: borra TODOS los devices + la cuenta en una transacción (cero huérfanos).
-	if err := as.DeleteByAccount(ctx, accountID); err != nil {
+	if err := m.account.DeleteByAccount(ctx, accountID); err != nil {
 		errs = append(errs, fmt.Errorf("borrar cuenta y dispositivos: %w", err))
 	}
 
