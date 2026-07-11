@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sync"
+	"time"
 
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
@@ -12,9 +13,15 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-shared/logger"
 )
+
+// presenceTimeout acota el anuncio de presencia (SendPresence) tras cada Connected (Plan 031 T6): es un
+// round-trip a WhatsApp por el socket vivo; sin plazo, sobre un socket a medio morir podría bloquear la
+// goroutine del onConnect. Es best-effort (un fallo no tumba la escucha), así que un plazo corto basta.
+const presenceTimeout = 10 * time.Second
 
 // ListenGateway implementa app.ListenGateway sobre whatsmeow ALWAYS-ON (RF-5/RF-6, design §5).
 //
@@ -60,7 +67,15 @@ type ListenGateway struct {
 	// store no conoce ya el nombre REAL de la cuenta (app-state), que siempre prevalece. Vacío = no se
 	// fuerza (si el store tampoco lo trae, SendPresence falla best-effort y la escucha sigue). Sin PII.
 	pushName string
+
+	// reporter registra la prueba de vida del socket de ESTA sesión en el registro de salud (Plan 031 T6).
+	// serve() lo pasa al Listener; nil ⇒ no se reporta. Lo cablea el factory del sessionmgr (SetHealthReporter).
+	reporter health.SessionReporter
 }
+
+// SetHealthReporter liga el gateway (y su Listener) al registro de salud de SU sesión (Plan 031 T6). Se
+// llama ANTES de Listen (al construir el gateway). nil ⇒ no se reporta. No es secreto ni PII.
+func (g *ListenGateway) SetHealthReporter(r health.SessionReporter) { g.reporter = r }
 
 var _ app.ListenGateway = (*ListenGateway)(nil)
 var _ app.LiveLogout = (*ListenGateway)(nil)
@@ -134,6 +149,9 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	defer g.setLiveClient(nil)
 
 	listener := NewListener(sink, g.log)
+	// Salud por sesión (Plan 031 T6): el Listener reporta connected/connecting/dead + edad del último
+	// entrante al registro. nil ⇒ no reporta.
+	listener.SetHealthReporter(g.reporter)
 	// Acuses (delivered/read) → destino de la sesión (nil en T0; T2 lo cablea con SetReceiptHandler).
 	listener.onReceipt = g.onReceipt
 	// Cierre de sesión (LoggedOut) → destino de la sesión (Plan 020 T3): propaga el estado ZOMBIE a la nube.
@@ -153,7 +171,11 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 				client.Store.PushName = name
 			}
 		}
-		if err := client.SendPresence(ctx, types.PresenceAvailable); err != nil {
+		// Acota el round-trip de presencia (Plan 031 T6): sobre un socket a medio morir, sin plazo, esto
+		// colgaría la goroutine del onConnect. Best-effort: un fallo/timeout no tumba la escucha.
+		presCtx, cancel := context.WithTimeout(ctx, presenceTimeout)
+		defer cancel()
+		if err := client.SendPresence(presCtx, types.PresenceAvailable); err != nil {
 			g.log.Warn("listener: no se pudo anunciar presencia (available)", "error", err)
 		}
 	}
