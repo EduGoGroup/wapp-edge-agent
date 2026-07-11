@@ -3,8 +3,8 @@ module github.com/EduGoGroup/wapp-edge-agent
 go 1.26.0
 
 require (
-	github.com/EduGoGroup/wapp-cloudlink v0.7.0
-	github.com/EduGoGroup/wapp-edge-intent v0.0.0
+	github.com/EduGoGroup/wapp-cloudlink v0.8.0
+	github.com/EduGoGroup/wapp-edge-intent v0.1.0
 	github.com/EduGoGroup/wapp-shared/config v0.2.0
 	github.com/EduGoGroup/wapp-shared/envelope v0.1.1
 	github.com/EduGoGroup/wapp-shared/intents v0.1.0
@@ -51,13 +51,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
-
-// Plan 029 fase pre-release: el clasificador de intenciones (edge-intent), el contrato de config
-// (wapp-shared/intents) y el proto CloudLink v0.8.0 (ClassifiedIntent + ConfigUpdate) viven en ramas
-// feat/029-ola0 sin tag. Se consumen por replace local hasta cortar los tags/releases de la Ola 4.
-// TODO(029): retirar al cortar edge-intent/v0.1.0 · intents/v0.1.0 · cloudlink v0.8.0.
-replace github.com/EduGoGroup/wapp-edge-intent => ../wapp-edge-intent
-
-replace github.com/EduGoGroup/wapp-shared/intents => ../../shared/wapp-shared/intents
-
-replace github.com/EduGoGroup/wapp-cloudlink => ../../cloud/wapp-cloudlink
