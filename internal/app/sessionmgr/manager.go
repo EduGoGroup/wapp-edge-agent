@@ -8,6 +8,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -105,6 +106,12 @@ type Manager struct {
 	// minúsculos (WithListenerBackoff) para no depender de esperas reales.
 	backoffBase time.Duration
 	backoffMax  time.Duration
+
+	// health es el registro de salud de runtime por sesión (Plan 031 T6): el factory liga cada sesión a su
+	// SessionReporter (socket state + duración de carga de DEK + edad del último entrante) y runListener lo
+	// actualiza al arrancar/caer. T7 lo consume para el heartbeat y GET /v1/health. nil ⇒ no se reporta (el
+	// reporter ligado es no-op, ver health.Registry.For). Lo inyecta WithHealthRegistry.
+	health *health.Registry
 }
 
 // Option configura un Manager en su construcción (inyección de dependencias opcionales como el
@@ -181,6 +188,18 @@ func WithMultiDevicePerAccount(n int) Option {
 			n = 4
 		}
 		m.multiDevicePerAccount = n
+	}
+}
+
+// WithHealthRegistry inyecta el registro de salud de runtime por sesión (Plan 031 T6): el Manager liga
+// cada listener a su SessionReporter (prueba de vida del socket, duración de carga de DEK, edad del último
+// entrante) para que T7 lo consuma en el heartbeat y el plano de control lo exponga en GET /v1/health. Sin
+// esta opción (tests) el registro es nil y el reporte es no-op (health.Registry.For es nil-safe). nil se ignora.
+func WithHealthRegistry(reg *health.Registry) Option {
+	return func(m *Manager) {
+		if reg != nil {
+			m.health = reg
+		}
 	}
 }
 
