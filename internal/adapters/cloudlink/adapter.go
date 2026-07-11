@@ -71,6 +71,15 @@ type SendMediaFunc = func(ctx context.Context, commandID, to, presignedURL, file
 // ADR-0016 §5): por eso es un factory y no un Validator compartido.
 type ValidatorFactory func() *lease.Validator
 
+// ConfigApplier aplica una config empujada por la nube (frame ConfigUpdate, ADR-0021). Lo satisface
+// edgeconfig.Service (interfaz estructural: el adapter de transporte NO importa edgeconfig). Devuelve error
+// SOLO ante un fallo de persistencia (reintentable: el Cloud reempuja al reconectar); los demás desenlaces
+// (kind desconocido, versión ya aplicada, blob inválido con last-known-good) los resuelve el applier con log
+// y devuelven nil ⇒ el Edge siempre responde Ack. nil (no cableado) ⇒ el adapter Ack-ea tolerante sin persistir.
+type ConfigApplier interface {
+	Apply(ctx context.Context, kind, version string, payload []byte) error
+}
+
 // sessionEntry es el estado por sesión dentro del multiplex: su emisor por cliente vivo, su Validator de
 // lease (propio) y su contador de heartbeat. El Adapter lo crea en Register y lo descarta en Unregister.
 type sessionEntry struct {
@@ -110,6 +119,12 @@ type Adapter struct {
 	// acotado por session_id). Se fijan en NewAdapter y se ajustan con WithCommandTimeout/WithCommandQueueSize.
 	cmdTimeout   time.Duration
 	cmdQueueSize int
+
+	// configApplier aplica los ConfigUpdate empujados por la nube (Plan 029 · T10 / ADR-0021): persiste el
+	// blob (last-known-good), valida por kind y notifica al clasificador en caliente. nil (feature Intent off,
+	// o camino de diagnóstico) ⇒ un ConfigUpdate se Ack-ea tolerante sin persistir (kinds futuros). Es un
+	// enriquecimiento del demux, nunca gatea envíos/leases.
+	configApplier ConfigApplier
 
 	// outbox es la cola DURABLE de eventos edge->cloud (Plan 027 Ola 3 · T2, cierra H2 / ADR-0003). Si está
 	// presente (WithOutbox), un entrante/acuse que no se pudo enviar (stream caído o Send con error) se
@@ -199,6 +214,17 @@ func WithOutbox(o app.Outbox) Option {
 	}
 }
 
+// WithConfigApplier cablea el applier de config empujada por la nube (Plan 029 · T10, ConfigUpdate/ADR-0021):
+// con él, un ConfigUpdate se persiste/valida/notifica; sin él, se Ack-ea tolerante sin persistir. nil se
+// ignora (queda desactivado).
+func WithConfigApplier(a ConfigApplier) Option {
+	return func(ad *Adapter) {
+		if a != nil {
+			ad.configApplier = a
+		}
+	}
+}
+
 // WithOutboxDrainInterval ajusta la cadencia del re-drenaje del outbox mientras hay stream (Plan 027 T2).
 // Sobre todo para tests deterministas (intervalos minúsculos); en producción el default (5s) es sensato.
 // Un valor <=0 se ignora.
@@ -220,12 +246,12 @@ func NewAdapter(cc grpc.ClientConnInterface, log logger.Logger, newValidator Val
 		log = logger.Default()
 	}
 	a := &Adapter{
-		cc:           cc,
-		newValidator: newValidator,
-		log:          log,
-		hbInterval:   30 * time.Second,
-		baseDelay:    1 * time.Second,
-		maxDelay:     60 * time.Second,
+		cc:                  cc,
+		newValidator:        newValidator,
+		log:                 log,
+		hbInterval:          30 * time.Second,
+		baseDelay:           1 * time.Second,
+		maxDelay:            60 * time.Second,
 		cmdTimeout:          defaultCommandTimeout,
 		cmdQueueSize:        defaultCommandQueueSize,
 		outboxDrainInterval: defaultOutboxDrainInterval,
@@ -253,7 +279,7 @@ func (a *Adapter) Register(sessionID, selfJID string, send SendFunc, sendMedia S
 		sendFunc:      send,
 		sendMediaFunc: sendMedia,
 		hasDEK:        hasDEK,
-		selfJID:       selfJID,                      // JID crudo del device propio (Plan 020 T2); "" si aún sin emparejar.
+		selfJID:       selfJID,                       // JID crudo del device propio (Plan 020 T2); "" si aún sin emparejar.
 		selfPN:        domain.SelfPNFromJID(selfJID), // número propio E.164 sin '+'; "" si el JID no es un número.
 	}
 	if a.newValidator != nil {
@@ -333,6 +359,7 @@ func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error 
 		FromPn:         fromPN,
 		FromLid:        fromLID,
 		AddressingMode: evt.AddressingMode,
+		Intent:         classifiedIntentToProto(evt.Intent),
 	}
 	s.sealSensitive(in)
 	msg := &cloudlinkv1.EdgeToCloud{
@@ -358,6 +385,9 @@ func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
 		PushName: in.GetPushName(),
 		FromPn:   in.GetFromPn(),
 		FromLid:  in.GetFromLid(),
+		// La intención LLM (Plan 029) es SENSIBLE: sus params pueden llevar texto literal del cliente. Con
+		// sellado activo viaja DENTRO del sobre; el espejo claro (in.Intent) se vacía abajo.
+		Intent: in.GetIntent(),
 	}
 	raw, err := proto.Marshal(sp)
 	if err != nil {
@@ -371,6 +401,22 @@ func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
 	}
 	in.EncPayload = sealed
 	in.Text, in.PushName, in.FromPn, in.FromLid = "", "", "", "" // no viajan en claro
+	in.Intent = nil                                              // la intención va sellada, no en el espejo claro
+}
+
+// classifiedIntentToProto mapea la intención de dominio (Plan 029) al tipo del contrato CloudLink. Devuelve
+// nil si no hay intención (el caso normal: la mayoría de mensajes no clasifican), de modo que el campo del
+// proto queda vacío. Confidence pasa de float64 (dominio) a float32 (proto).
+func classifiedIntentToProto(ci *domain.ClassifiedIntent) *cloudlinkv1.ClassifiedIntent {
+	if ci == nil {
+		return nil
+	}
+	return &cloudlinkv1.ClassifiedIntent{
+		Intent:        ci.Name,
+		Params:        ci.Params,
+		Confidence:    float32(ci.Confidence),
+		ConfigVersion: ci.ConfigVersion,
+	}
 }
 
 // SendReceipt sube al cloud un ACUSE (delivered/read) de un mensaje SALIENTE por el ÚNICO stream del
@@ -542,6 +588,13 @@ func (a *Adapter) runOnce(ctx context.Context) (bool, error) {
 // despacha según su payload (oneof). Un comando para un session_id desconocido se loguea y se ignora.
 func (a *Adapter) handleCommand(ctx context.Context, cl *client.Client, c2e *cloudlinkv1.CloudToEdge) {
 	sid := c2e.GetSessionId()
+	// ConfigUpdate (Plan 029 · T10 / ADR-0021) es config del EDGE por kind, NO de una sesión: se atiende
+	// ANTES de resolver la sesión (aplica global) y SIEMPRE se Ack-ea, aunque el session_id que la etiqueta
+	// no esté registrado. No pasa por el gate de lease (no es una operación de WhatsApp).
+	if cu := c2e.GetConfigUpdate(); cu != nil {
+		a.handleConfigUpdate(ctx, cl, c2e.GetCommandId(), cu)
+		return
+	}
 	e := a.entry(sid)
 	if e == nil {
 		a.log.Warn("CloudLink: comando para session_id desconocido (ignorado)",
@@ -622,6 +675,28 @@ func mediaKindToString(k cloudlinkv1.MediaKind) string {
 	default:
 		return "document"
 	}
+}
+
+// handleConfigUpdate atiende un ConfigUpdate empujado por la nube (Plan 029 · T10 / ADR-0021): delega en el
+// applier (persistencia last-known-good + validación por kind + notificación en caliente al clasificador) y
+// responde Ack. Sin applier cableado (Intent off / diagnóstico), Ack-ea TOLERANTE sin persistir (kinds
+// futuros). El applier resuelve kind-desconocido/versión-duplicada/blob-inválido con log devolviendo nil ⇒
+// Ack{ok=true}; solo un fallo de PERSISTENCIA devuelve error ⇒ Ack{ok=false} (el Cloud reempuja al reconectar).
+func (a *Adapter) handleConfigUpdate(ctx context.Context, cl *client.Client, cmdID string, cu *cloudlinkv1.ConfigUpdate) {
+	sid := cu.GetSessionId()
+	if a.configApplier == nil {
+		a.log.Info("CloudLink: ConfigUpdate recibido sin applier (Intent off); Ack tolerante sin persistir",
+			"kind", cu.GetKind(), "version", cu.GetVersion(), "session_id", sid, "command_id", cmdID)
+		a.ack(cl, sid, cmdID, true, "")
+		return
+	}
+	if err := a.configApplier.Apply(ctx, cu.GetKind(), cu.GetVersion(), cu.GetPayload()); err != nil {
+		a.log.Error("CloudLink: ConfigUpdate no persistido (se reintentará al reconectar)",
+			"kind", cu.GetKind(), "version", cu.GetVersion(), "session_id", sid, "command_id", cmdID, "error", err)
+		a.ack(cl, sid, cmdID, false, err.Error())
+		return
+	}
+	a.ack(cl, sid, cmdID, true, "")
 }
 
 // handleLeaseUpdate aplica un LeaseUpdate firmado al Validator de ESA sesión (verifica firma, expiración,

@@ -39,4 +39,27 @@ type InboundEvent struct {
 	IsFromMe bool
 	// IsGroup indica que el chat es un grupo/lista de difusión.
 	IsGroup bool
+	// Intent es la clasificación LLM del texto (Plan 029, ADR-0020), poblada por el decorador
+	// internal/adapters/intent SOLO cuando el clasificador local resuelve una intención accionable. nil en
+	// todo lo demás (feature off, no elegible, fastlane, timeout/error/circuito abierto, o "desconocido"):
+	// el decorador JAMÁS bloquea el mensaje por culpa del clasificador. Al reenviar a la nube viaja DENTRO
+	// del sobre sellado cuando el sellado en tránsito está activo (params llevan texto literal del cliente).
+	Intent *ClassifiedIntent
+}
+
+// ClassifiedIntent es la intención accionable extraída del texto por el clasificador local (Plan 029): el
+// "el LLM extrae, el código (Cloud) resuelve". NO lleva texto de respuesta — la respuesta al cliente la
+// produce el Motor de Flujos del Cloud, nunca el LLM del Edge. Los Params pueden contener texto literal del
+// mensaje del cliente (p.ej. el nombre del producto), por eso son SENSIBLES y viajan sellados a la nube.
+type ClassifiedIntent struct {
+	// Name es el nombre de la intención (enum del contrato de intenciones del tenant; p.ej. "crear_pedido").
+	Name string
+	// Params son los parámetros extraídos y SANEADOS por el clasificador (claves libres → valores presentes
+	// en el mensaje). Sensibles (texto literal del cliente).
+	Params map[string]string
+	// Confidence es la confianza del modelo [0,1] tras aplicar el umbral del contrato.
+	Confidence float64
+	// ConfigVersion es la versión de la config de intenciones con la que se clasificó (viaja en la señal
+	// para que el Cloud sepa contra qué contrato se resolvió).
+	ConfigVersion string
 }
