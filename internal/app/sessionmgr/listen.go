@@ -146,7 +146,8 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			if m.inboundDecorator != nil {
 				outSink = m.inboundDecorator(outSink)
 			}
-			runner := app.NewListen(s.custody, gateway, outSink)
+			// s.log arrastra session_id/jid: la traza de la carga de la DEK sale etiquetada por sesión.
+			runner := app.NewListen(s.custody, gateway, outSink, s.log)
 			return runner, nil, nil
 		}
 	}

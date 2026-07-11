@@ -68,7 +68,7 @@ func TestListen_DeliversAndStopsOnCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- NewListen(cust, gw, sink).Run(ctx) }()
+	go func() { done <- NewListen(cust, gw, sink, nil).Run(ctx) }()
 
 	// Espera a que lleguen los 3 eventos antes de cancelar.
 	waitFor(t, func() bool { return sink.count() == 3 })
@@ -95,7 +95,7 @@ func TestListen_DeliversAndStopsOnCancel(t *testing.T) {
 func TestListen_NoDEK(t *testing.T) {
 	sink := &spySink{}
 	gw := &fakeListenGateway{emit: 1}
-	err := NewListen(&fakeCustody{}, gw, sink).Run(context.Background())
+	err := NewListen(&fakeCustody{}, gw, sink, nil).Run(context.Background())
 	if err == nil {
 		t.Fatal("se esperaba error al no haber DEK custodiada")
 	}
@@ -109,7 +109,7 @@ func TestListen_GatewayError(t *testing.T) {
 	sentinel := errors.New("socket caído")
 	cust := custodyWith(bytes.Repeat([]byte{1}, DEKSize))
 	gw := &fakeListenGateway{connectErr: sentinel}
-	err := NewListen(cust, gw, &spySink{}).Run(context.Background())
+	err := NewListen(cust, gw, &spySink{}, nil).Run(context.Background())
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error = %v, quería envolver %v", err, sentinel)
 	}

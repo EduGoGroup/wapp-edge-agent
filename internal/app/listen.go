@@ -18,9 +18,18 @@ package app
 import (
 	"context"
 	"fmt"
+	"io"
+	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
+	"github.com/EduGoGroup/wapp-shared/logger"
 )
+
+// dekLoadWarnAfter es el umbral del watchdog de la carga de la DEK (observabilidad, follow-up Plan 029
+// Ola 3): en macOS, si la ACL del ítem del Keychain quedó invalidada (típico tras RECOMPILAR el binario),
+// SecItemCopyMatching se BLOQUEA esperando el diálogo de permiso en pantalla y, sin este aviso, nada lo
+// delata en el log (caso real: 31 minutos colgado en silencio).
+const dekLoadWarnAfter = 10 * time.Second
 
 // InboundSink es el puerto de SALIDA de los mensajes entrantes ya descifrados (domain.InboundEvent).
 // En la Fase 1 lo implementa el cliente CloudLink (reenvío a la nube por gRPC bidi-stream); en el
@@ -72,22 +81,38 @@ type Listen struct {
 	custody KeyCustody
 	gateway ListenGateway
 	sink    InboundSink
+	log     logger.Logger
 }
 
-// NewListen construye el caso de uso con los puertos dados.
-func NewListen(custody KeyCustody, gateway ListenGateway, sink InboundSink) *Listen {
-	return &Listen{custody: custody, gateway: gateway, sink: sink}
+// NewListen construye el caso de uso con los puertos dados. log traza la carga de la DEK (el llamador
+// multi-sesión pasa su logger con session_id; ver sessionmgr); nil ⇒ se descarta (tests).
+func NewListen(custody KeyCustody, gateway ListenGateway, sink InboundSink, log logger.Logger) *Listen {
+	if log == nil {
+		log = logger.New(logger.WithWriter(io.Discard))
+	}
+	return &Listen{custody: custody, gateway: gateway, sink: sink, log: log}
 }
 
 // Run recupera la DEK de custodia y arranca la escucha always-on, bloqueando hasta que el ctx se
 // cancele (o falle la conexión). Garantiza que la DEK en claro se borra de RAM al salir (defer zero):
 // como Listen bloquea toda la sesión, la DEK permanece viva mientras el socket viva (ADR-0007).
+// La DEK en sí NUNCA se loguea; solo el hecho y la duración de su carga (observabilidad).
 func (l *Listen) Run(ctx context.Context) error {
+	l.log.Info("custodia: cargando DEK…")
+	start := time.Now()
+	// Watchdog barato: si la carga se cuelga (>10s), avisa UNA vez con la causa probable. time.AfterFunc
+	// no fuga goroutines: si no dispara, Stop lo cancela; si dispara, su goroutine termina al loguear.
+	watchdog := time.AfterFunc(dekLoadWarnAfter, func() {
+		l.log.Warn("custodia: la carga de la DEK sigue pendiente — posible diálogo de permiso del Keychain pendiente; requiere atención en pantalla (típico tras recompilar el binario)",
+			"umbral", dekLoadWarnAfter.String())
+	})
 	dek, err := l.custody.Load()
+	watchdog.Stop()
 	if err != nil {
 		return fmt.Errorf("listen: cargar DEK de custodia: %w", err)
 	}
 	defer zeroBytes(dek)
+	l.log.Info("custodia: DEK cargada", "duracion", time.Since(start).String())
 
 	if err := l.gateway.Listen(ctx, dek, l.sink); err != nil {
 		return fmt.Errorf("listen: %w", err)

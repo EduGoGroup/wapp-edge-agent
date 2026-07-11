@@ -180,7 +180,7 @@ func runPair(ctx context.Context, cfg config.Config, log sharedlogger.Logger) er
 	}
 	defer func() { _ = database.Close() }()
 
-	connector := waconn.NewConnector(database, db.DialectSQLite)
+	connector := waconn.NewConnector(database, db.DialectSQLite, log)
 	qrSink := control.NewTerminalQRSink(os.Stdout)
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
 
@@ -240,7 +240,7 @@ func runSend(ctx context.Context, cfg config.Config, log sharedlogger.Logger, to
 	defer func() { _ = database.Close() }()
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
-	sender := waconn.NewSender(database, db.DialectSQLite)
+	sender := waconn.NewSender(database, db.DialectSQLite, log)
 
 	log.Info("envio: despachando texto a WhatsApp",
 		"to", to, "db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
@@ -316,7 +316,7 @@ func newEscucha(ctx context.Context, cfg config.Config, log sharedlogger.Logger,
 
 	// app.Listen hace el restore CRIPTOGRAFICO + socket always-on; RestoreSessions le antepone el
 	// registro de negocio (resolver/backfillear/marcar activa la sesion). Sin duplicar la conexion.
-	listener := app.NewListen(custody, gateway, sink)
+	listener := app.NewListen(custody, gateway, sink, log)
 	return app.NewRestoreSessions(sessions, locator, listener)
 }
 

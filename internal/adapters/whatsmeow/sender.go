@@ -4,7 +4,7 @@
 //  1. cryptostore.NewEncryptedContainer(ctx, db, dialect, dek) -> store cifrado con la DEK custodiada (RAM).
 //  2. cryptostore.FirstDeviceJID(ctx, db)              -> JID de la única sesión pareada del Edge.
 //  3. cryptostore.LoadDevice(ctx, container, jid)       -> carga el device EXISTENTE de esa sesión.
-//  4. whatsmeow.NewClient(device, Noop)                 -> cliente efímero (logger silencioso).
+//  4. whatsmeow.NewClient(device, waLog→slog)           -> cliente efímero (puente de log, walog.go).
 //  5. client.Connect() + client.WaitForConnection(t)    -> espera DETERMINISTA de la conexión.
 //  6. client.SendMessage(texto).
 //  7. Sleep(flush) -> Disconnect()                       -> flush del frame y cierre del socket.
@@ -40,6 +40,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-shared/logger"
 )
 
 const (
@@ -111,10 +112,14 @@ type mediaUploader interface {
 // NewSender construye el adaptador real sobre la BD ÚNICA del Edge (store cifrado por envío, Plan 022
 // T3). La BD debe estar YA migrada (tablas whatsmeow_* y msg_enc_*) y con una sesión pareada; dialect es
 // el motor con el que se abrió (DialectSQLite|DialectPostgres, fin del "sqlite" hardcodeado).
-func NewSender(db *sql.DB, dialect string) *Sender {
+// log da voz al cliente whatsmeow efímero vía el puente waLog→slog (walog.go); nil ⇒ silencioso.
+func NewSender(db *sql.DB, dialect string, log logger.Logger) *Sender {
+	waLogger := newWALog(log)
 	return &Sender{
-		loadDevice:     realLoadDevice(db, dialect),
-		dispatch:       realDispatch,
+		loadDevice: realLoadDevice(db, dialect),
+		dispatch: func(ctx context.Context, device *store.Device, msg outgoing, connectTimeout, flushDelay time.Duration) error {
+			return realDispatch(ctx, device, msg, connectTimeout, flushDelay, waLogger)
+		},
 		connectTimeout: defaultConnectTimeout,
 		flushDelay:     defaultFlushDelay,
 	}
@@ -339,9 +344,10 @@ func buildMediaMessage(ctx context.Context, up mediaUploader, msg outgoing) (*wa
 // por este cliente efímero. El Disconnect inmediato pierde los events.Receipt asíncronos (que llegan
 // DESPUÉS) y este ciclo además descarta el SendResponse, con lo que se pierde el MessageID necesario
 // para la correlación (§10.E). Se conserva como costura de tests/legacy; no se borra en este plan.
-func realDispatch(ctx context.Context, device *store.Device, msg outgoing, connectTimeout, flushDelay time.Duration) error {
-	// Logger silencioso: whatsmeow NO debe volcar material sensible (claves/store) a los logs.
-	client := wm.NewClient(device, waLog.Noop)
+func realDispatch(ctx context.Context, device *store.Device, msg outgoing, connectTimeout, flushDelay time.Duration, wlog waLog.Logger) error {
+	// whatsmeow loguea por el puente waLog→slog (walog.go) que le pasa NewSender; los fallos del ciclo
+	// efímero (conexión/socket) YA quedan trazados en el log del agente (antes waLog.Noop los callaba).
+	client := wm.NewClient(device, wlog)
 
 	if err := client.Connect(); err != nil {
 		return fmt.Errorf("whatsapp: conectar: %w", err)

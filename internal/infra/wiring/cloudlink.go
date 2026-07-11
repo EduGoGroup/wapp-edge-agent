@@ -85,7 +85,7 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	} else {
 		// Camino efímero (defensivo, sin cliente vivo): no hay Correlator que alimentar; el command_id se
 		// ignora y el acuse subiría como estado crudo.
-		sendUC := app.NewSend(custody, waconn.NewSender(database, db.DialectSQLite))
+		sendUC := app.NewSend(custody, waconn.NewSender(database, db.DialectSQLite, log))
 		sendFunc = func(ctx context.Context, _ /*commandID*/, to, text string) error { return sendUC.Run(ctx, to, text) }
 		sendMediaFunc = func(ctx context.Context, _ /*commandID*/, to, presignedURL, filename, mime, kind, caption string) error {
 			return sendUC.RunMedia(ctx, to, presignedURL, filename, mime, kind, caption)
