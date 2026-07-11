@@ -3,7 +3,7 @@ module github.com/EduGoGroup/wapp-edge-agent
 go 1.26.0
 
 require (
-	github.com/EduGoGroup/wapp-cloudlink v0.8.0
+	github.com/EduGoGroup/wapp-cloudlink v0.9.0
 	github.com/EduGoGroup/wapp-edge-intent v0.1.0
 	github.com/EduGoGroup/wapp-shared/config v0.2.0
 	github.com/EduGoGroup/wapp-shared/envelope v0.1.1
@@ -51,8 +51,3 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
-
-// TODO(031): retirar al cortar cloudlink v0.9.0. Mientras la Ola 0 (frames SessionHealth/Diagnostics)
-// vive sin release en la rama feat/031-ola0, el Edge compila contra el cloudlink LOCAL para poder
-// enriquecer el heartbeat y responder DiagnosticsRequest (T7/T8).
-replace github.com/EduGoGroup/wapp-cloudlink => ../../cloud/wapp-cloudlink
