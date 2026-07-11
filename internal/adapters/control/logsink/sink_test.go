@@ -15,6 +15,25 @@ func writeLine(t *testing.T, s *Sink, line string) {
 	}
 }
 
+// TestTailReturnsLastLines: Tail(n) del ring buffer devuelve las últimas n líneas en orden (Plan 031 T8,
+// alimenta el log_tail del bundle de diagnóstico). Cubre n<disponible, n>disponible y buffer con vuelta.
+func TestTailReturnsLastLines(t *testing.T) {
+	s := New(3) // capacidad 3: fuerza descartar los más viejos
+	for _, l := range []string{"a", "b", "c", "d", "e"} {
+		writeLine(t, s, l)
+	}
+	// El ring solo retiene las 3 últimas: c, d, e.
+	if got := s.Tail(2); len(got) != 2 || got[0] != "d" || got[1] != "e" {
+		t.Errorf("Tail(2) = %v, want [d e]", got)
+	}
+	if got := s.Tail(10); len(got) != 3 || got[0] != "c" || got[2] != "e" {
+		t.Errorf("Tail(10) = %v, want [c d e] (tope = lo disponible)", got)
+	}
+	if got := s.Tail(0); len(got) != 3 {
+		t.Errorf("Tail(0) = %v, want las 3 vigentes", got)
+	}
+}
+
 func TestWriteSplitsLinesAndKeepsPartial(t *testing.T) {
 	s := New(10)
 

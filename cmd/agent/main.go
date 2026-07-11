@@ -30,6 +30,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/diagnostics"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
@@ -50,6 +51,11 @@ import (
 // dev cuando se compila sin ldflags (go run/build directos, CI). La versión
 // resultante viaja a /v1/health (server.Config.Version) y a los logs de arranque.
 var Version = "0.1.0-bootstrap"
+
+// processStartedAt marca el arranque del PROCESO (uptime del daemon, Plan 031 T7). Se fija al cargar el
+// paquete (antes de cualquier subcomando), así el uptime que viaja en el heartbeat de salud y en GET
+// /v1/health mide la vida real del daemon, no el instante en que se cableó el colector.
+var processStartedAt = time.Now()
 
 // singleDBFileName es el nombre de la BD ÚNICA del Edge (Plan 022 T3) bajo data_dir cuando el dialecto es
 // SQLite y no se pasó un DSN explícito. Aloja metadatos (accounts/devices) + whatsmeow_* + msg_enc_* en un
@@ -387,15 +393,29 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	if intentStack.Service != nil {
 		intentStack.Service.Bootstrap(ctx)
 	}
-	mux := wiring.BuildMux(ctx, cfg, log, outbox, intentStack)
+
+	// Registro de salud de runtime por sesión (Plan 031 T6): el Manager lo puebla (prueba de vida del
+	// socket, duración de carga de DEK, edad del último entrante). Se crea ANTES del mux porque el colector
+	// de salud (T7) lo lee para enriquecer el heartbeat, y el builder de diagnóstico (T8) lo usa para el
+	// snapshot de subsistemas. Un solo registro por daemon, compartido por todas las sesiones.
+	healthReg := health.NewRegistry()
+
+	// Colector de salud (Plan 031 T7): combina el Registry (prueba de vida) con las señales de alcance
+	// daemon —profundidad del outbox, circuito del clasificador (029), versión del binario y uptime del
+	// proceso— para armar el SessionHealth por sesión. El outbox puede ser nil (best-effort ⇒ depth 0);
+	// intentStack.CircuitFunc es nil-safe (029 off ⇒ circuito ""). Alimenta el heartbeat, GET /v1/health y
+	// el bundle de diagnóstico. ZERO-KNOWLEDGE: solo metadatos operativos (ADR-0007).
+	healthCollector := health.NewCollector(healthReg, outbox, intentStack.CircuitFunc(), Version, processStartedAt)
+
+	// Builder del bundle de diagnóstico bajo demanda (Plan 031 T8): arma log_tail (ring buffer del logsink,
+	// sin tocar disco) + goroutine_dump + subsystems_json (salud del colector), saneado y truncado en origen.
+	diagBuilder := diagnostics.NewBuilder(sink, healthCollector, cfg.DiagLogLines)
+
+	mux := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder)
 
 	// Manager con la BD ÚNICA compartida (WithSharedDB): escucha real per-device (un listener por device
 	// que carga por SU JID sobre la BD compartida) y pairing real (Container per-device sobre la MISMA BD;
 	// el QRSink lo inyecta el plano de control POR emparejamiento para el polling async del QR).
-	// Registro de salud de runtime por sesión (Plan 031 T6): el Manager lo puebla (prueba de vida del
-	// socket, duración de carga de DEK, edad del último entrante); T7 lo consumirá para enriquecer el
-	// heartbeat y exponer GET /v1/health. Un solo registro por daemon, compartido por todas las sesiones.
-	healthReg := health.NewRegistry()
 
 	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
 		sessionmgr.WithSharedDB(database, cfg.DBDialect),
@@ -419,6 +439,9 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 		server.Config{SocketPath: cfg.ControlSocketPath, Version: Version},
 		log, managerInventory{mgr},
 	)
+	// Salud enriquecida en GET /v1/health (Plan 031 T7): uptime del daemon + snapshot por sesión del
+	// Registry T6. Mismo colector que alimenta el heartbeat, para que el plano local y el Cloud vean lo mismo.
+	srv.SetHealthProvider(healthCollector)
 	srv.Handle(http.MethodGet, "/v1/logs", logsink.Handler(sink))
 	// GET /v1/intent/status (Plan 029 · T13): estado del clasificador local (la web de onboarding lo
 	// consumirá en el Plan 030). Se registra SIEMPRE; con la feature off reporta enabled=false. El sondeo de
