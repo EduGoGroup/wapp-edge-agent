@@ -139,7 +139,14 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			gateway.SetLoggedOutHandler(func() {
 				m.onLoggedOut(s)
 			})
-			runner := app.NewListen(s.custody, gateway, mux.SinkFor(sid))
+			// Sink de SALIDA etiquetado por session_id; con el clasificador de intenciones ON (Plan 029 · T11)
+			// se envuelve con el decorador COMPARTIDO para anotar la intención LLM antes del reenvío. Feature
+			// off ⇒ inboundDecorator nil ⇒ sink tal cual (cableado idéntico al previo).
+			outSink := mux.SinkFor(sid)
+			if m.inboundDecorator != nil {
+				outSink = m.inboundDecorator(outSink)
+			}
+			runner := app.NewListen(s.custody, gateway, outSink)
 			return runner, nil, nil
 		}
 	}
