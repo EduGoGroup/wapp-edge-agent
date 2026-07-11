@@ -44,6 +44,8 @@ import (
 	cloudlinkv1 "github.com/EduGoGroup/wapp-cloudlink/gen/wapp/cloudlink/v1"
 	"github.com/EduGoGroup/wapp-cloudlink/lease"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/diagnostics"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-shared/envelope"
 	"github.com/EduGoGroup/wapp-shared/logger"
@@ -78,6 +80,21 @@ type ValidatorFactory func() *lease.Validator
 // y devuelven nil ⇒ el Edge siempre responde Ack. nil (no cableado) ⇒ el adapter Ack-ea tolerante sin persistir.
 type ConfigApplier interface {
 	Apply(ctx context.Context, kind, version string, payload []byte) error
+}
+
+// HealthCollector arma el snapshot de salud de UNA sesión para adjuntarlo al heartbeat (Plan 031 T7). Lo
+// satisface *health.Collector. Collect devuelve ok=false si la sesión no tiene prueba de vida (sin entrada
+// en el Registry T6): en ese caso el heartbeat viaja SIN salud (como hoy). nil (no cableado) ⇒ heartbeat
+// sin salud, retrocompatible byte a byte con el previo. ZERO-KNOWLEDGE: el Report son metadatos, nunca DEK.
+type HealthCollector interface {
+	Collect(ctx context.Context, sessionID string) (health.Report, bool)
+}
+
+// DiagnosticsBuilder arma el bundle de diagnóstico bajo demanda (Plan 031 T8) en respuesta a un
+// DiagnosticsRequest. Lo satisface *diagnostics.Builder. El bundle ya viene saneado (sin secretos) y
+// truncado en origen. nil (no cableado) ⇒ el adapter Ack-ea tolerante sin bundle (patrón ConfigUpdate).
+type DiagnosticsBuilder interface {
+	Build(ctx context.Context, scope string) diagnostics.Bundle
 }
 
 // sessionEntry es el estado por sesión dentro del multiplex: su emisor por cliente vivo, su Validator de
@@ -125,6 +142,18 @@ type Adapter struct {
 	// o camino de diagnóstico) ⇒ un ConfigUpdate se Ack-ea tolerante sin persistir (kinds futuros). Es un
 	// enriquecimiento del demux, nunca gatea envíos/leases.
 	configApplier ConfigApplier
+
+	// healthCollector arma el SessionHealth por sesión que se adjunta al heartbeat (Plan 031 T7). nil ⇒ el
+	// heartbeat viaja sin salud (retrocompatible). No gatea nada: es telemetría opcional.
+	healthCollector HealthCollector
+
+	// diagBuilder arma el bundle de diagnóstico bajo demanda (Plan 031 T8). nil ⇒ el DiagnosticsRequest se
+	// Ack-ea tolerante sin bundle. diagSeen da IDEMPOTENCIA por command_id (patrón ConfigUpdate): un
+	// DiagnosticsRequest repetido no rearma ni reenvía el bundle. Acotado (diagSeenCap) para no crecer.
+	diagBuilder DiagnosticsBuilder
+	diagMu      sync.Mutex
+	diagSeen    map[string]struct{}
+	diagOrder   []string
 
 	// outbox es la cola DURABLE de eventos edge->cloud (Plan 027 Ola 3 · T2, cierra H2 / ADR-0003). Si está
 	// presente (WithOutbox), un entrante/acuse que no se pudo enviar (stream caído o Send con error) se
@@ -225,6 +254,29 @@ func WithConfigApplier(a ConfigApplier) Option {
 	}
 }
 
+// WithHealthCollector cablea el colector de salud (Plan 031 T7): con él, cada Heartbeat lleva adjunto el
+// SessionHealth de su sesión (estado real del socket, motivo de degradación, edad del último entrante,
+// duración de la DEK, circuito del intent, profundidad del outbox, versión y uptime). nil se ignora
+// (heartbeat sin salud, retrocompatible).
+func WithHealthCollector(c HealthCollector) Option {
+	return func(a *Adapter) {
+		if c != nil {
+			a.healthCollector = c
+		}
+	}
+}
+
+// WithDiagnosticsBuilder cablea el armador del bundle de diagnóstico bajo demanda (Plan 031 T8): con él, un
+// DiagnosticsRequest se responde con un DiagnosticsBundle (log_tail + goroutine_dump + subsystems_json,
+// saneado y truncado en origen). nil se ignora (el Edge Ack-ea tolerante sin bundle).
+func WithDiagnosticsBuilder(b DiagnosticsBuilder) Option {
+	return func(a *Adapter) {
+		if b != nil {
+			a.diagBuilder = b
+		}
+	}
+}
+
 // WithOutboxDrainInterval ajusta la cadencia del re-drenaje del outbox mientras hay stream (Plan 027 T2).
 // Sobre todo para tests deterministas (intervalos minúsculos); en producción el default (5s) es sensato.
 // Un valor <=0 se ignora.
@@ -257,6 +309,7 @@ func NewAdapter(cc grpc.ClientConnInterface, log logger.Logger, newValidator Val
 		outboxDrainInterval: defaultOutboxDrainInterval,
 		pending:             make(map[string]bool),
 		sessions:            make(map[string]*sessionEntry),
+		diagSeen:            make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -595,6 +648,14 @@ func (a *Adapter) handleCommand(ctx context.Context, cl *client.Client, c2e *clo
 		a.handleConfigUpdate(ctx, cl, c2e.GetCommandId(), cu)
 		return
 	}
+	// DiagnosticsRequest (Plan 031 T8 / ADR-0023) es una petición de DIAGNÓSTICO del EDGE, no una operación
+	// de WhatsApp: se atiende ANTES de resolver la sesión (el bundle es de alcance daemon, aunque lleve un
+	// session_id de contexto) y NO pasa por el gate de lease. Patrón ConfigUpdate: Ack + idempotencia por
+	// command_id.
+	if dr := c2e.GetDiagnosticsRequest(); dr != nil {
+		a.handleDiagnosticsRequest(ctx, cl, dr)
+		return
+	}
 	e := a.entry(sid)
 	if e == nil {
 		a.log.Warn("CloudLink: comando para session_id desconocido (ignorado)",
@@ -699,6 +760,68 @@ func (a *Adapter) handleConfigUpdate(ctx context.Context, cl *client.Client, cmd
 	a.ack(cl, sid, cmdID, true, "")
 }
 
+// diagSeenCap acota el registro de command_id de diagnóstico ya atendidos (idempotencia): al pasarlo, se
+// descarta el más viejo (FIFO). El diagnóstico es de baja frecuencia (a petición humana/soporte), así que
+// un tope pequeño basta para descartar reintentos/duplicados del mismo request sin memoria ilimitada.
+const diagSeenCap = 256
+
+// markDiagSeen registra el command_id como atendido y devuelve true si es NUEVO (false si ya se atendió).
+// Idempotencia del handler de diagnóstico (patrón ConfigUpdate por command_id): un DiagnosticsRequest
+// repetido no rearma ni reenvía el bundle. FIFO acotado a diagSeenCap.
+func (a *Adapter) markDiagSeen(cmdID string) bool {
+	a.diagMu.Lock()
+	defer a.diagMu.Unlock()
+	if _, ok := a.diagSeen[cmdID]; ok {
+		return false
+	}
+	a.diagSeen[cmdID] = struct{}{}
+	a.diagOrder = append(a.diagOrder, cmdID)
+	if len(a.diagOrder) > diagSeenCap {
+		oldest := a.diagOrder[0]
+		a.diagOrder = a.diagOrder[1:]
+		delete(a.diagSeen, oldest)
+	}
+	return true
+}
+
+// handleDiagnosticsRequest atiende un DiagnosticsRequest empujado por la nube (Plan 031 T8 / ADR-0023):
+// arma el bundle (log_tail + goroutine_dump + subsystems_json, ya saneado y truncado en origen por el
+// builder) y lo sube como DiagnosticsBundle CORRELACIONADO por command_id, más un Ack. Idempotente por
+// command_id (un request repetido se ignora). Sin builder cableado, Ack-ea tolerante sin bundle (patrón
+// ConfigUpdate sin applier). ZERO-KNOWLEDGE (ADR-0007): el bundle NUNCA lleva DEK, credenciales ni
+// contenido de mensajes — el builder lo garantiza (Scrub + gate de test).
+func (a *Adapter) handleDiagnosticsRequest(ctx context.Context, cl *client.Client, dr *cloudlinkv1.DiagnosticsRequest) {
+	cmdID := dr.GetCommandId()
+	sid := dr.GetSessionId()
+	if !a.markDiagSeen(cmdID) {
+		a.log.Info("CloudLink: DiagnosticsRequest duplicado (idempotencia por command_id), ignorado",
+			"command_id", cmdID, "session_id", sid, "scope", dr.GetScope())
+		return
+	}
+	if a.diagBuilder == nil {
+		a.log.Info("CloudLink: DiagnosticsRequest recibido sin builder (diagnóstico off); Ack tolerante sin bundle",
+			"command_id", cmdID, "session_id", sid, "scope", dr.GetScope())
+		a.ack(cl, sid, cmdID, true, "")
+		return
+	}
+	bundle := a.diagBuilder.Build(ctx, dr.GetScope())
+	a.log.Info("CloudLink: DiagnosticsRequest atendido, subiendo bundle",
+		"command_id", cmdID, "session_id", sid, "scope", dr.GetScope(),
+		"log_tail_bytes", len(bundle.LogTail), "goroutine_bytes", len(bundle.GoroutineDump),
+		"subsystems_bytes", len(bundle.SubsystemsJSON))
+	a.send(cl, &cloudlinkv1.EdgeToCloud{
+		CommandId: uuid.NewString(),
+		SessionId: sid,
+		Payload: &cloudlinkv1.EdgeToCloud_DiagnosticsBundle{DiagnosticsBundle: &cloudlinkv1.DiagnosticsBundle{
+			CommandId:      cmdID,
+			LogTail:        bundle.LogTail,
+			GoroutineDump:  bundle.GoroutineDump,
+			SubsystemsJson: bundle.SubsystemsJSON,
+		}},
+	})
+	a.ack(cl, sid, cmdID, true, "")
+}
+
 // handleLeaseUpdate aplica un LeaseUpdate firmado al Validator de ESA sesión (verifica firma, expiración,
 // counter). El estado de lease es por sesión: un LeaseUpdate de una sesión no toca el de las otras.
 func (a *Adapter) handleLeaseUpdate(sid string, e *sessionEntry, lu *cloudlinkv1.LeaseUpdate) {
@@ -780,13 +903,60 @@ func (a *Adapter) sendHeartbeat(cl *client.Client, sessionID string, e *sessionE
 		// Plan 020 T2: cada latido lleva el número/JID propio para que el Cloud sepa a qué número pertenece
 		// la sesión al marcarla online (anti-self-loop). Un latido periódico corresponde a una sesión
 		// `active` en el Edge → estado de línea UNSPECIFIED (liveness normal) vía el mapeo unificado (T4).
+		// Plan 031 T7: si hay colector, adjunta el SessionHealth de la sesión (salud real del socket, no
+		// "el cliente existe"). Sin colector o sin prueba de vida, va nil ⇒ heartbeat como hoy.
 		Payload: &cloudlinkv1.EdgeToCloud_Heartbeat{Heartbeat: &cloudlinkv1.Heartbeat{
-			LeaseCounter: ctr,
-			SelfPn:       e.selfPN,
-			SelfJid:      e.selfJID,
-			State:        heartbeatStateFor(domain.SessionStateActive),
+			LeaseCounter:  ctr,
+			SelfPn:        e.selfPN,
+			SelfJid:       e.selfJID,
+			State:         heartbeatStateFor(domain.SessionStateActive),
+			SessionHealth: a.collectHealth(sessionID),
 		}},
 	})
+}
+
+// collectHealth arma el SessionHealth de la sesión desde el colector (Plan 031 T7). Devuelve nil si no hay
+// colector cableado o la sesión no tiene prueba de vida (sin entrada en el Registry T6): el heartbeat viaja
+// sin salud, retrocompatible. Acota la lectura con un contexto propio (la profundidad del outbox toca la
+// BD): un heartbeat no debe colgarse por la telemetría.
+func (a *Adapter) collectHealth(sessionID string) *cloudlinkv1.SessionHealth {
+	if a.healthCollector == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r, ok := a.healthCollector.Collect(ctx, sessionID)
+	if !ok {
+		return nil
+	}
+	return &cloudlinkv1.SessionHealth{
+		WhatsappSocketState:  socketStateToProto(r.SocketState),
+		DegradedReason:       r.DegradedReason,
+		LastInboundEventAgeS: r.LastInboundAgeS,
+		DekLoadDurationMs:    r.DEKLoadDurationMs,
+		IntentCircuit:        r.IntentCircuit,
+		OutboxDepth:          r.OutboxDepth,
+		BinaryVersion:        r.BinaryVersion,
+		DaemonUptimeS:        r.DaemonUptimeS,
+	}
+}
+
+// socketStateToProto mapea la etiqueta de prueba de vida del Registry T6 (health.SocketState como string)
+// al enum del contrato SessionHealth (Plan 031 T1). Una etiqueta desconocida o vacía cae a UNSPECIFIED
+// (Edge sin dato de salud), que el Cloud interpreta como "no medido".
+func socketStateToProto(s string) cloudlinkv1.WhatsappSocketState {
+	switch health.SocketState(s) {
+	case health.SocketConnected:
+		return cloudlinkv1.WhatsappSocketState_WHATSAPP_SOCKET_STATE_CONNECTED
+	case health.SocketConnecting:
+		return cloudlinkv1.WhatsappSocketState_WHATSAPP_SOCKET_STATE_CONNECTING
+	case health.SocketDegraded:
+		return cloudlinkv1.WhatsappSocketState_WHATSAPP_SOCKET_STATE_DEGRADED
+	case health.SocketDead:
+		return cloudlinkv1.WhatsappSocketState_WHATSAPP_SOCKET_STATE_DEAD
+	default:
+		return cloudlinkv1.WhatsappSocketState_WHATSAPP_SOCKET_STATE_UNSPECIFIED
+	}
 }
 
 // SendLoggedOut propaga al Cloud que WhatsApp CERRÓ la sesión (events.LoggedOut, Plan 020 T3): emite un

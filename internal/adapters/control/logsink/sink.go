@@ -143,6 +143,24 @@ func (s *Sink) Subscribe() (snapshot []string, lines <-chan string, cancel func(
 	return snap, ch, cancel
 }
 
+// Tail devuelve las ÚLTIMAS n líneas del ring buffer (de la más antigua a la más reciente de ese tramo).
+// Lo consume el bundle de diagnóstico (Plan 031 T8) para adjuntar el contexto reciente de log SIN tocar
+// disco: reusa el mismo ring buffer que ya alimenta GET /v1/logs. n<=0 o n mayor que lo disponible
+// devuelve todo lo vigente. No difunde ni altera el buffer (solo lectura).
+func (s *Sink) Tail(n int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n <= 0 || n > s.count {
+		n = s.count
+	}
+	out := make([]string, n)
+	first := s.count - n // salta las (count-n) más antiguas
+	for i := 0; i < n; i++ {
+		out[i] = s.buf[(s.start+first+i)%s.capByte]
+	}
+	return out
+}
+
 // subscriberCount devuelve el número de suscriptores activos. Uso interno/tests (verifica que la
 // desconexión de un cliente SSE limpia su suscripción).
 func (s *Sink) subscriberCount() int {

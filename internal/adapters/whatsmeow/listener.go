@@ -22,6 +22,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -71,7 +72,17 @@ type Listener struct {
 	// a la nube mientras el stream aún vive. nil = solo se loguea (comportamiento previo). Corre FUERA del
 	// lock. No lleva PII. (Sufijo Hook para no colisionar con el método onLoggedOut.)
 	onLoggedOutHook func()
+
+	// reporter registra la prueba de vida del socket y la edad del último entrante en el registro de salud
+	// por sesión (Plan 031 T6): connected en *events.Connected, connecting en *events.Disconnected (whatsmeow
+	// reintenta), dead en *events.LoggedOut, y el instante de cada *events.Message. nil ⇒ no se reporta (el
+	// registro es opcional; el factory del sessionmgr lo liga a la sesión). No lleva PII: solo estados/tiempos.
+	reporter health.SessionReporter
 }
+
+// SetHealthReporter liga el listener al registro de salud de SU sesión (Plan 031 T6). Se llama ANTES de
+// Register (al construir el ciclo de escucha). nil ⇒ no se reporta salud. No es secreto ni PII.
+func (l *Listener) SetHealthReporter(r health.SessionReporter) { l.reporter = r }
 
 // NewListener construye el listener con el sink y el logger dados y el backoff por defecto del spike.
 func NewListener(sink app.InboundSink, log logger.Logger) *Listener {
@@ -121,6 +132,11 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 // se registra pero NO tumba la escucha (el socket sigue vivo).
 func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 	inbound := toInboundEvent(e)
+	// Prueba de vida (Plan 031 T6): sella el instante del último entrante. T7 deriva la edad — una edad
+	// creciente con socket "connected" es la firma del arranque mudo (§1 del runbook).
+	if l.reporter != nil {
+		l.reporter.MarkInbound(time.Now())
+	}
 	if err := l.sink.Deliver(ctx, inbound); err != nil {
 		l.log.Error("listener: no se pudo entregar el evento entrante al sink",
 			"error", err, "message_id", inbound.MessageID)
@@ -136,6 +152,10 @@ func (l *Listener) onConnected() {
 	hook := l.onConnect
 	l.mu.Unlock()
 	l.log.Info("listener: socket conectado (escucha 24/7 activa)")
+	// Prueba de vida (Plan 031 T6): el socket de WhatsApp está VIVO (no solo "el cliente existe").
+	if l.reporter != nil {
+		l.reporter.SetSocketState(health.SocketConnected, "")
+	}
 	if hook != nil {
 		hook()
 	}
@@ -189,6 +209,11 @@ func (l *Listener) onDisconnected() {
 
 	l.log.Warn("listener: socket desconectado; whatsmeow reintentará (política de backoff)",
 		"intento", attempt, "siguiente_delay", delay.String())
+	// Prueba de vida (Plan 031 T6): corte transitorio — whatsmeow reintenta el dial (auto-reconnect); el
+	// socket no está vivo pero tampoco caído para siempre ⇒ connecting, no degraded.
+	if l.reporter != nil {
+		l.reporter.SetSocketState(health.SocketConnecting, health.ReasonReconnecting)
+	}
 	if hook != nil {
 		hook(attempt, delay)
 	}
@@ -203,6 +228,10 @@ func (l *Listener) onLoggedOut(e *events.LoggedOut) {
 	l.mu.Unlock()
 	l.log.Error("listener: sesión cerrada por WhatsApp (LoggedOut); requiere re-emparejar",
 		"on_connect", e.OnConnect, "reason", e.Reason.String())
+	// Prueba de vida (Plan 031 T6): WhatsApp cerró la sesión — dead, no se recupera solo (requiere re-QR).
+	if l.reporter != nil {
+		l.reporter.SetSocketState(health.SocketDead, health.ReasonLoggedOut)
+	}
 	// Plan 020 T3: propaga el cierre al cloud (estado ZOMBIE) mientras el stream aún vive, ANTES del
 	// teardown local. El comportamiento local previo (logging/no re-pairing) no cambia. Corre fuera del lock.
 	if hook != nil {

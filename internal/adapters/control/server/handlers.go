@@ -5,8 +5,18 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 )
+
+// HealthReporter provee la salud de runtime ENRIQUECIDA para GET /v1/health (Plan 031 T7): el snapshot por
+// sesión (del Registry T6, prueba de vida real) + los datos del daemon (uptime, versión). Lo satisface
+// *health.Collector. Puede ser nil (constructor/tests sin colector): /v1/health responde solo {status,
+// version} como antes (retrocompatible con el supervisor, que solo mira esos dos campos).
+type HealthReporter interface {
+	Reports(ctx context.Context) map[string]health.Report
+	DaemonUptimeS() int64
+}
 
 // SessionLister es el puerto de lectura que consume GET /v1/sessions, RE-LLAVEADO a session_id
 // (integración Plan 008): combina el inventario PERSISTIDO de N sesiones (Persisted, incluye 'pairing'
@@ -20,17 +30,56 @@ type SessionLister interface {
 	Health(id string) (string, bool)
 }
 
-// healthResponse es el cuerpo de GET /v1/health (decisión §10: {status, version}).
+// healthResponse es el cuerpo de GET /v1/health. Base histórica {status, version} (lo que el supervisor
+// consulta para el up/down), ENRIQUECIDA en el Plan 031 T7 con el uptime del daemon y la salud por sesión
+// (del Registry T6: prueba de vida real del socket). Los campos nuevos son omitempty: sin colector cableado
+// el cuerpo es idéntico al previo (retrocompatible). ZERO-KNOWLEDGE: solo metadatos, nunca DEK/credenciales.
 type healthResponse struct {
-	Status  string `json:"status"`
-	Version string `json:"version"`
+	Status   string                       `json:"status"`
+	Version  string                       `json:"version"`
+	UptimeS  int64                        `json:"uptime_s,omitempty"`
+	Sessions map[string]sessionHealthView `json:"sessions,omitempty"`
 }
 
-// handleHealth responde 200 con {status:"ok", version}. La versión es la build del núcleo
-// (cmd/agent/main.go const Version), inyectada por Config.Version. Es la base del "daemon up/down"
-// que el supervisor consultará por el socket.
-func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, healthResponse{Status: "ok", Version: s.cfg.Version})
+// sessionHealthView es la proyección JSON de la salud de runtime de UNA sesión en GET /v1/health (misma
+// lista cerrada de campos que el SessionHealth del heartbeat, ADR-0023). snake_case explícito.
+type sessionHealthView struct {
+	SocketState       string `json:"socket_state"`
+	DegradedReason    string `json:"degraded_reason,omitempty"`
+	LastInboundAgeS   int64  `json:"last_inbound_age_s"`
+	DEKLoadDurationMs int64  `json:"dek_load_duration_ms"`
+	IntentCircuit     string `json:"intent_circuit,omitempty"`
+	OutboxDepth       int64  `json:"outbox_depth"`
+	BinaryVersion     string `json:"binary_version"`
+	DaemonUptimeS     int64  `json:"daemon_uptime_s"`
+}
+
+// handleHealth responde 200 con {status:"ok", version} y, si hay colector de salud cableado (Plan 031 T7),
+// el uptime del daemon y la salud por sesión leída del Registry T6. La versión es la build del núcleo
+// (cmd/agent/main.go const Version), inyectada por Config.Version. Es la base del "daemon up/down" que el
+// supervisor consulta; los campos de salud son un enriquecimiento aditivo.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	resp := healthResponse{Status: "ok", Version: s.cfg.Version}
+	if s.health != nil {
+		resp.UptimeS = s.health.DaemonUptimeS()
+		reports := s.health.Reports(r.Context())
+		if len(reports) > 0 {
+			resp.Sessions = make(map[string]sessionHealthView, len(reports))
+			for id, hr := range reports {
+				resp.Sessions[id] = sessionHealthView{
+					SocketState:       hr.SocketState,
+					DegradedReason:    hr.DegradedReason,
+					LastInboundAgeS:   hr.LastInboundAgeS,
+					DEKLoadDurationMs: hr.DEKLoadDurationMs,
+					IntentCircuit:     hr.IntentCircuit,
+					OutboxDepth:       hr.OutboxDepth,
+					BinaryVersion:     hr.BinaryVersion,
+					DaemonUptimeS:     hr.DaemonUptimeS,
+				}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // sessionDTO es la proyección JSON de domain.Session para el contrato /v1 (nombres snake_case

@@ -38,6 +38,7 @@ type Server struct {
 	cfg      Config
 	log      sharedlogger.Logger
 	sessions SessionLister
+	health   HealthReporter
 
 	mux     *http.ServeMux
 	routes  []routeTemplate
@@ -73,6 +74,13 @@ func New(cfg Config, log sharedlogger.Logger, sessions SessionLister) *Server {
 	s.Handle(http.MethodGet, "/v1/health", s.handleHealth)
 	s.Handle(http.MethodGet, "/v1/sessions", s.handleSessions)
 	return s
+}
+
+// SetHealthProvider cablea el colector de salud que enriquece GET /v1/health (Plan 031 T7): con él, la
+// respuesta suma el uptime del daemon y la salud por sesión (del Registry T6). Se llama ANTES de Serve
+// (mismo patrón que Handle/RegisterPairing). nil deja /v1/health en su forma base {status, version}.
+func (s *Server) SetHealthProvider(h HealthReporter) {
+	s.health = h
 }
 
 // Handle registra una ruta /v1 adicional. PUNTO DE EXTENSIÓN para los tramos siguientes (T1 /v1/logs,

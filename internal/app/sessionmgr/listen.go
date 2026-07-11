@@ -26,6 +26,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 )
 
@@ -102,6 +103,9 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// (s.meta.JID) con SU DEK sobre la db compartida (N devices, 1 *sql.DB). El *sql.DB NO se cierra
 			// por-listener: lo posee el daemon (apagado ordenado §10.I), por eso el io.Closer es nil.
 			gateway := whatsmeow.NewListenGatewayForDevice(m.db, m.dbDialect, s.meta.JID, s.log)
+			// Salud por sesión (Plan 031 T6): liga el gateway/listener al registro (connected/connecting/dead
+			// + edad del último entrante). health.Registry.For es nil-safe (registro no cableado ⇒ reporter no-op).
+			gateway.SetHealthReporter(m.health.For(s.meta.SessionID))
 			// Nombre visible de FALLBACK para anunciar presencia (Plan 013 §10.D): whatsmeow rechaza
 			// SendPresence si el store restaurado no trae PushName. El gateway solo lo usa si el nombre
 			// real de la cuenta (app-state) aún no está; ese prevalece.
@@ -147,7 +151,12 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 				outSink = m.inboundDecorator(outSink)
 			}
 			// s.log arrastra session_id/jid: la traza de la carga de la DEK sale etiquetada por sesión.
-			runner := app.NewListen(s.custody, gateway, outSink, s.log)
+			// Watchdog+reporte de la carga de DEK (Plan 031 T6): al vencer el plazo, Run devuelve
+			// ErrDEKLoadTimeout ⇒ runListener degrada con motivo dek_load_timeout; la duración (éxito o
+			// retorno tardío) alimenta dek_load_duration_ms en el registro de salud.
+			rep := m.health.For(s.meta.SessionID)
+			runner := app.NewListen(s.custody, gateway, outSink, s.log,
+				app.WithDEKDurationReporter(rep.SetDEKLoadDuration))
 			return runner, nil, nil
 		}
 	}
@@ -223,6 +232,9 @@ func (m *Manager) startListener(s *liveSession) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.arm(cancel)
 	s.mark(HealthStarting, nil)
+	// Salud (Plan 031 T6): aún sin socket vivo (arrancando/cargando DEK) ⇒ connecting. El listener whatsmeow
+	// lo pasa a connected en *events.Connected; runListener a degraded si cae. Nil-safe (registro opcional).
+	m.health.SetSocketState(s.meta.SessionID, health.SocketConnecting, "")
 	m.wg.Add(1)
 	go m.runListener(ctx, s)
 }
@@ -254,9 +266,13 @@ func (m *Manager) runListener(ctx context.Context, s *liveSession) {
 
 		// Caída AISLADA: marca degradada, traza y reintenta tras el backoff (whatsmeow/manual).
 		s.mark(HealthDegraded, err)
+		// Salud (Plan 031 T6): degradación observable con MOTIVO clasificado (dek_load_timeout vs genérico),
+		// para que T7 lo suba en el heartbeat y el Cloud lo vea (regla: ningún "sano" sin prueba de vida).
+		reason := degradedReason(err)
+		m.health.SetSocketState(s.meta.SessionID, health.SocketDegraded, reason)
 		delay := backoff.Next()
 		s.log.Warn("listener caído; sesión degradada, reintentando con backoff",
-			"error", err, "intento", backoff.Attempt(), "siguiente_delay", delay.String())
+			"error", err, "reason", reason, "intento", backoff.Attempt(), "siguiente_delay", delay.String())
 
 		select {
 		case <-ctx.Done():
@@ -288,5 +304,20 @@ func (m *Manager) runListenOnce(ctx context.Context, s *liveSession) (err error)
 	}
 
 	s.mark(HealthListening, nil)
+	// Salud (Plan 031 T6): intento FRESCO — el runner se (re)construyó y va a cargar la DEK y conectar el
+	// socket ⇒ connecting (limpia un degraded previo). El listener whatsmeow lo pasará a connected en
+	// *events.Connected. Se hace tras el factory (no antes): así un reintento retenido no borra el degraded.
+	m.health.SetSocketState(s.meta.SessionID, health.SocketConnecting, "")
 	return runner.Run(ctx)
+}
+
+// degradedReason clasifica la causa de una caída del listener a una etiqueta corta y estable para el
+// registro de salud (Plan 031 T6): hoy distingue el timeout de carga de DEK (ErrDEKLoadTimeout, el caso del
+// incidente 2026-07-11) del resto (listener_down genérico). Un pánico recuperado o un error de conexión
+// caen al genérico. La etiqueta viaja al Cloud (T7→T3/T4): no lleva PII.
+func degradedReason(err error) string {
+	if errors.Is(err, app.ErrDEKLoadTimeout) {
+		return health.ReasonDEKLoadTimeout
+	}
+	return health.ReasonListenerDown
 }

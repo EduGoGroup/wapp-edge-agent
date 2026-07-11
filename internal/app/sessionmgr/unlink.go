@@ -166,6 +166,9 @@ func (m *Manager) stopLive(id string) (jid string, live bool) {
 		delete(m.live, id)
 	}
 	m.mu.Unlock()
+	// Salud (Plan 031 T6): la sesión se desvincula ⇒ deja de reportar salud (idempotente y nil-safe). Se
+	// hace aunque no estuviera viva (una 'pairing' pudo dejar una entrada connecting).
+	m.health.Remove(id)
 	if !ok {
 		return "", false
 	}
