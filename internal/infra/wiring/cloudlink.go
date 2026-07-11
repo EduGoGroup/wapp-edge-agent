@@ -46,7 +46,7 @@ import (
 //     el Adapter CloudLink real conectándolo a app.Send vía SendFunc, y se devuelve un TEE (Adapter
 //     primario + LogSink de diagnóstico). El loop de conexión del Adapter corre en goroutine ligada a ctx.
 //     ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK.
-func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, custody app.KeyCustody, database *sql.DB, gateway *waconn.ListenGateway) app.InboundSink {
+func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, custody app.KeyCustody, database *sql.DB, gateway *waconn.ListenGateway, intentStack *IntentStack) app.InboundSink {
 	logSink := cloudlink.NewLogSink(log)
 	if cfg.CloudLink.Endpoint == "" {
 		log.Info("CloudLink deshabilitado (sin endpoint): usando LogSink puro para diagnóstico")
@@ -85,7 +85,7 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	} else {
 		// Camino efímero (defensivo, sin cliente vivo): no hay Correlator que alimentar; el command_id se
 		// ignora y el acuse subiría como estado crudo.
-		sendUC := app.NewSend(custody, waconn.NewSender(database, db.DialectSQLite))
+		sendUC := app.NewSend(custody, waconn.NewSender(database, db.DialectSQLite, log))
 		sendFunc = func(ctx context.Context, _ /*commandID*/, to, text string) error { return sendUC.Run(ctx, to, text) }
 		sendMediaFunc = func(ctx context.Context, _ /*commandID*/, to, presignedURL, filename, mime, kind, caption string) error {
 			return sendUC.RunMedia(ctx, to, presignedURL, filename, mime, kind, caption)
@@ -98,6 +98,9 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	adapter := cloudlink.NewAdapter(cc, log, newValidator,
 		cloudlink.WithCloudEncPubKey(cloudEncPub),
 		cloudlink.WithOutbox(ob),
+		// Config empujada por la nube (Plan 029 · T10): persiste/valida/notifica los ConfigUpdate. nil-safe
+		// (feature off ⇒ applier nil ⇒ Ack tolerante).
+		cloudlink.WithConfigApplier(intentStack.applier()),
 	)
 	// Camino single-sesión (listen/restore): el JID propio no está a mano aquí (la config solo trae el
 	// session_id); se registra con selfJID "" (el Cloud tolera vacío, Plan 020 T2). El número propio se
@@ -121,7 +124,9 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 	log.Info("CloudLink habilitado: reenviando entrantes y atendiendo comandos cloud->edge",
 		"endpoint", cfg.CloudLink.Endpoint, "session_id", cfg.CloudLink.SessionID,
 		"lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil)
-	return cloudlink.NewTeeSink(adapter.SinkFor(cfg.CloudLink.SessionID), logSink)
+	// Clasificador de intenciones (Plan 029 · T11): con la feature ON se envuelve el sink (clasificar ANTES
+	// del tee, para que Adapter y LogSink vean la intención anotada); off ⇒ WrapSink devuelve el sink tal cual.
+	return intentStack.WrapSink(cloudlink.NewTeeSink(adapter.SinkFor(cfg.CloudLink.SessionID), logSink))
 }
 
 // BuildMux construye el multiplexor CloudLink del daemon MULTI-SESIÓN (un solo stream, N sesiones por
@@ -133,7 +138,7 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 //     real cuyo loop de stream corre en goroutine ligada a ctx. El Manager registra cada sesión.
 //
 // ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK (ADR-0007).
-func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox) sessionmgr.CloudLinkMux {
+func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox, intentStack *IntentStack) sessionmgr.CloudLinkMux {
 	if cfg.CloudLink.Endpoint == "" {
 		log.Info("CloudLink deshabilitado (sin endpoint): usando LogMux por sesión para diagnóstico")
 		return cloudlink.NewLogMux(log)
@@ -152,6 +157,9 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, o
 		// Outbox durable (Plan 027 T2, H2): entrantes/acuses con el stream caído se encolan y drenan en
 		// orden al reconectar en vez de descartarse. nil (fallo de init) => best-effort.
 		cloudlink.WithOutbox(ob),
+		// Config empujada por la nube (Plan 029 · T10): persiste/valida/notifica los ConfigUpdate. nil-safe
+		// (feature off ⇒ applier nil ⇒ Ack tolerante).
+		cloudlink.WithConfigApplier(intentStack.applier()),
 	)
 	go func() {
 		_ = adapter.Run(ctx)

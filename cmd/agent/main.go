@@ -25,6 +25,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/logsink"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/server"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/intent"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
@@ -179,7 +180,7 @@ func runPair(ctx context.Context, cfg config.Config, log sharedlogger.Logger) er
 	}
 	defer func() { _ = database.Close() }()
 
-	connector := waconn.NewConnector(database, db.DialectSQLite)
+	connector := waconn.NewConnector(database, db.DialectSQLite, log)
 	qrSink := control.NewTerminalQRSink(os.Stdout)
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
 
@@ -239,7 +240,7 @@ func runSend(ctx context.Context, cfg config.Config, log sharedlogger.Logger, to
 	defer func() { _ = database.Close() }()
 
 	custody := keycustody.NewFileCustody(cfg.DEKPath)
-	sender := waconn.NewSender(database, db.DialectSQLite)
+	sender := waconn.NewSender(database, db.DialectSQLite, log)
 
 	log.Info("envio: despachando texto a WhatsApp",
 		"to", to, "db_path", cfg.DBPath, "dek_path", cfg.DEKPath)
@@ -300,14 +301,22 @@ func newEscucha(ctx context.Context, cfg config.Config, log sharedlogger.Logger,
 	sessions := sessionstore.New(database)
 	locator := sessionstore.NewLocator(database)
 
+	// Clasificador de intenciones (Plan 029): stack compartido (decorador + applier de config empujada).
+	// Feature off ⇒ stack vacío (sink sin decorar, cableado idéntico). Bootstrap recarga la config
+	// persistida (last-known-good) para arrancar clasificando sin esperar un push del Cloud.
+	intentStack := wiring.BuildIntent(cfg, database, log)
+	if intentStack.Service != nil {
+		intentStack.Service.Bootstrap(ctx)
+	}
+
 	// Sink: conducto CloudLink REAL si hay endpoint configurado (con LogSink en tee para diagnóstico);
 	// si no, LogSink puro (no rompe el flujo del spike). El adaptador corre su loop de conexión en
 	// segundo plano, ligado al mismo ctx (se cierra con SIGINT junto al socket).
-	sink := wiring.BuildSink(ctx, cfg, log, custody, database, gateway)
+	sink := wiring.BuildSink(ctx, cfg, log, custody, database, gateway, intentStack)
 
 	// app.Listen hace el restore CRIPTOGRAFICO + socket always-on; RestoreSessions le antepone el
 	// registro de negocio (resolver/backfillear/marcar activa la sesion). Sin duplicar la conexion.
-	listener := app.NewListen(custody, gateway, sink)
+	listener := app.NewListen(custody, gateway, sink, log)
 	return app.NewRestoreSessions(sessions, locator, listener)
 }
 
@@ -368,7 +377,16 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	// Outbox durable (Plan 027 Ola 3 · T2, H2) sobre la BD ÚNICA: los entrantes/acuses con el stream
 	// CloudLink caído se encolan y drenan en orden al reconectar en vez de descartarse (ADR-0003).
 	outbox := wiring.BuildOutbox(ctx, cfg, database, log)
-	mux := wiring.BuildMux(ctx, cfg, log, outbox)
+
+	// Clasificador de intenciones (Plan 029): stack COMPARTIDO por todas las sesiones (un solo Ollama, un
+	// solo circuito). Feature off ⇒ stack vacío (applier/decorador nil ⇒ cableado idéntico al previo).
+	// Bootstrap recarga la config persistida (last-known-good) antes de arrancar los listeners, para que la
+	// clasificación arranque activa sin esperar un nuevo push del Cloud.
+	intentStack := wiring.BuildIntent(cfg, database, log)
+	if intentStack.Service != nil {
+		intentStack.Service.Bootstrap(ctx)
+	}
+	mux := wiring.BuildMux(ctx, cfg, log, outbox, intentStack)
 
 	// Manager con la BD ÚNICA compartida (WithSharedDB): escucha real per-device (un listener por device
 	// que carga por SU JID sobre la BD compartida) y pairing real (Container per-device sobre la MISMA BD;
@@ -379,6 +397,9 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
 		// Failover multi-dispositivo por número (Plan 022 T5, §10.F): off por defecto (1). RESILIENCIA, no sigilo.
 		sessionmgr.WithMultiDevicePerAccount(cfg.MultiDevicePerAccount),
+		// Clasificador de intenciones (Plan 029 · T11): con la feature ON cada listener envuelve su sink con el
+		// decorador compartido; off ⇒ DecoratorWrap devuelve nil ⇒ WithInboundDecorator no altera el cableado.
+		sessionmgr.WithInboundDecorator(intentStack.DecoratorWrap()),
 	)
 
 	if err := mgr.Restore(ctx); err != nil {
@@ -392,6 +413,16 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 		log, managerInventory{mgr},
 	)
 	srv.Handle(http.MethodGet, "/v1/logs", logsink.Handler(sink))
+	// GET /v1/intent/status (Plan 029 · T13): estado del clasificador local (la web de onboarding lo
+	// consumirá en el Plan 030). Se registra SIEMPRE; con la feature off reporta enabled=false. El sondeo de
+	// Ollama tiene timeout corto (no bloquea el endpoint).
+	srv.Handle(http.MethodGet, "/v1/intent/status", intent.StatusHandler(intent.StatusDeps{
+		Enabled:       intentStack.Enabled,
+		Model:         intentStack.Model,
+		Prober:        intentStack.Prober,
+		ConfigVersion: intentStack.ConfigVersion,
+		Circuit:       intentStack.CircuitFunc(),
+	}))
 	srv.RegisterPairing(mgr) // POST /v1/sessions/pair → Manager.Pair (async; QR por polling)
 	srv.RegisterUnlink(mgr)  // DELETE /v1/sessions/{id} → Manager.Unlink(session_id)
 	// GET /v1/enroll/status + POST /v1/enroll (onboarding sin terminal, Plan 023 · T1).

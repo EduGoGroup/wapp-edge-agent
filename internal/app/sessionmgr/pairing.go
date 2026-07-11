@@ -52,7 +52,7 @@ type pairFactory func(custody app.KeyCustody, storeDB *sql.DB, qr app.QRSink) pa
 func WithWhatsmeowPairing(timeout time.Duration) Option {
 	return func(m *Manager) {
 		m.newPairer = func(custody app.KeyCustody, storeDB *sql.DB, qr app.QRSink) pairRunner {
-			connector := whatsmeow.NewConnector(storeDB, m.dbDialect)
+			connector := whatsmeow.NewConnector(storeDB, m.dbDialect, m.log)
 			return app.NewPair(connector, qr, custody, app.WithTimeout(timeout))
 		}
 	}
@@ -188,4 +188,3 @@ func (m *Manager) cleanupPairing(ctx context.Context, id, jid string, custody ap
 		m.log.Warn("sessionmgr: borrar fila del pairing fallido", "session_id", id, "error", err)
 	}
 }
-

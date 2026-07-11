@@ -443,4 +443,3 @@ func dekPathFor(dataDir, id string) (string, error) {
 	}
 	return filepath.Join(dataDir, keysDirName, id+dekFileExt), nil
 }
-

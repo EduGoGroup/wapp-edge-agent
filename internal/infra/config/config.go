@@ -127,6 +127,36 @@ type Config struct {
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
+	// Intent configura el CLASIFICADOR LLM local de intenciones (Plan 029, ADR-0020). OFF por defecto: con
+	// Enabled=false el cableado del sink es idéntico byte a byte al previo (sin decorador). Con Enabled=true
+	// el Edge envuelve el sink de entrada con el clasificador (Ollama local) y persiste/aplica la config de
+	// intenciones que empuja el Cloud.
+	Intent IntentConfig `yaml:"intent"`
+}
+
+// DefaultIntentOllamaURL es la URL por defecto del Ollama local (loopback): el LLM corre en el MISMO equipo
+// del Edge (zero-knowledge / sin dependencia de red externa para clasificar). Configurable por
+// WAPP_AGENT_INTENT_OLLAMA_URL.
+const DefaultIntentOllamaURL = "http://127.0.0.1:11434"
+
+// DefaultIntentModel es el modelo por defecto del clasificador (pequeño, apto para CPU de escritorio).
+// Configurable por WAPP_AGENT_INTENT_MODEL.
+const DefaultIntentModel = "qwen3:1.7b"
+
+// DefaultIntentTimeoutMS es el timeout por defecto (ms) de una clasificación: pasado ese tanto el decorador
+// degrada (entrega el mensaje SIN intención) sin bloquear. Configurable por WAPP_AGENT_INTENT_TIMEOUT_MS.
+const DefaultIntentTimeoutMS = 3000
+
+// IntentConfig agrupa los parámetros del clasificador de intenciones (Plan 029). Todo OFF por defecto.
+type IntentConfig struct {
+	// Enabled activa el clasificador. false (default) ⇒ el sink no se decora (cableado idéntico al actual).
+	Enabled bool `yaml:"enabled"`
+	// OllamaURL es la URL del servidor Ollama local (default loopback :11434).
+	OllamaURL string `yaml:"ollama_url"`
+	// Model es el modelo de clasificación (default qwen3:1.7b).
+	Model string `yaml:"model"`
+	// TimeoutMS es el timeout por clasificación en milisegundos (default 3000). <=0 cae al default.
+	TimeoutMS int `yaml:"timeout_ms"`
 }
 
 // CloudLinkConfig agrupa los parámetros del conducto CloudLink. Todos OPCIONALES: con Endpoint vacío
@@ -213,6 +243,12 @@ func defaults() Config {
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
 		},
+		Intent: IntentConfig{
+			Enabled:   false,
+			OllamaURL: DefaultIntentOllamaURL,
+			Model:     DefaultIntentModel,
+			TimeoutMS: DefaultIntentTimeoutMS,
+		},
 	}
 }
 
@@ -261,6 +297,10 @@ func Load(path string) (Config, error) {
 	cfg.CloudLink.EdgeID = loader.GetString("CLOUDLINK_EDGE_ID", cfg.CloudLink.EdgeID)
 	cfg.CloudLink.RuntimePort = loader.GetString("CLOUDLINK_RUNTIME_PORT", cfg.CloudLink.RuntimePort)
 	cfg.CloudLink.CommandTimeoutSeconds = loader.GetInt("CLOUDLINK_COMMAND_TIMEOUT_SECONDS", cfg.CloudLink.CommandTimeoutSeconds)
+	cfg.Intent.Enabled = loader.GetBool("INTENT_ENABLED", cfg.Intent.Enabled)
+	cfg.Intent.OllamaURL = loader.GetString("INTENT_OLLAMA_URL", cfg.Intent.OllamaURL)
+	cfg.Intent.Model = loader.GetString("INTENT_MODEL", cfg.Intent.Model)
+	cfg.Intent.TimeoutMS = loader.GetInt("INTENT_TIMEOUT_MS", cfg.Intent.TimeoutMS)
 
 	// Puerto de runtime CloudLink por defecto (Plan 026 T3): si nadie lo fijó (YAML/env), "8101"
 	// (topología de prod, design §1). Con él el enroll deriva y persiste el Endpoint de runtime.
@@ -281,6 +321,19 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.OutboxTTLHours < 0 {
 		cfg.OutboxTTLHours = 0
+	}
+
+	// Clasificador de intenciones (Plan 029): normaliza defaults cuando la feature está ON. Un valor
+	// vacío/tecleado mal (YAML/env) cae al default en vez de dejar el clasificador sin URL/modelo/timeout.
+	// Con Enabled=false no se toca nada relevante (el decorador no se cablea).
+	if cfg.Intent.OllamaURL == "" {
+		cfg.Intent.OllamaURL = DefaultIntentOllamaURL
+	}
+	if cfg.Intent.Model == "" {
+		cfg.Intent.Model = DefaultIntentModel
+	}
+	if cfg.Intent.TimeoutMS <= 0 {
+		cfg.Intent.TimeoutMS = DefaultIntentTimeoutMS
 	}
 
 	// Dialecto de BD (Plan 022 T0): solo "sqlite" (default) o "postgres". Se valida aquí para fallar

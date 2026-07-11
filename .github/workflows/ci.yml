@@ -2,7 +2,8 @@ name: CI
 
 # CI de PR/push para wapp-edge-agent (módulo Go único, público).
 # Adaptado del patrón de API de EduGo y de wapp-shared/ci.yml (Go 1.26,
-# golangci-lint v2.4.0). SIN deploy a GCP ni GitHub Packages (no aplica a wApp).
+# golangci-lint v2.12.2 — el pin previo v2.4.0 estaba compilado con go1.25 y
+# no soporta go 1.26). SIN deploy a GCP ni GitHub Packages (no aplica a wApp).
 # Como los módulos wApp son PÚBLICOS, NO se necesita GOPRIVATE ni token: el
 # proxy público resuelve las dependencias (wapp-shared/*, wapp-cloudlink).
 # (El cross-build de los 5 targets del Edge es un concern de release, no de CI; se añadirá aparte.)
@@ -64,5 +65,5 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          version: v2.4.0
+          version: v2.12.2
           args: --timeout=5m

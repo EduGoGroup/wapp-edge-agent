@@ -9,7 +9,6 @@ import (
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
-	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
@@ -124,9 +123,10 @@ func (g *ListenGateway) Listen(ctx context.Context, dek []byte, sink app.Inbound
 }
 
 // serve cablea el Listener al cliente real y mantiene el socket vivo hasta la cancelación del ctx.
-// Logger silencioso de whatsmeow: no debe volcar material sensible (claves/store) a los logs.
+// whatsmeow loguea por el puente waLog→slog (walog.go): un fallo/caída del websocket YA queda trazado
+// en el log del agente (antes waLog.Noop lo silenciaba); el nivel lo gobierna el logger del agente.
 func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink app.InboundSink) error {
-	client := wm.NewClient(device, waLog.Noop)
+	client := wm.NewClient(device, newWALog(g.log))
 	client.EnableAutoReconnect = true // whatsmeow reintenta el socket; el Listener traza el backoff.
 
 	// Publica el cliente VIVO para que el envío reutilice esta misma conexión, y lo limpia al salir.
