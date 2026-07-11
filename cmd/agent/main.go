@@ -30,6 +30,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
@@ -391,8 +392,14 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	// Manager con la BD ÚNICA compartida (WithSharedDB): escucha real per-device (un listener por device
 	// que carga por SU JID sobre la BD compartida) y pairing real (Container per-device sobre la MISMA BD;
 	// el QRSink lo inyecta el plano de control POR emparejamiento para el polling async del QR).
+	// Registro de salud de runtime por sesión (Plan 031 T6): el Manager lo puebla (prueba de vida del
+	// socket, duración de carga de DEK, edad del último entrante); T7 lo consumirá para enriquecer el
+	// heartbeat y exponer GET /v1/health. Un solo registro por daemon, compartido por todas las sesiones.
+	healthReg := health.NewRegistry()
+
 	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
 		sessionmgr.WithSharedDB(database, cfg.DBDialect),
+		sessionmgr.WithHealthRegistry(healthReg),
 		sessionmgr.WithWhatsmeowListen(mux, cfg.PushName),
 		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
 		// Failover multi-dispositivo por número (Plan 022 T5, §10.F): off por defecto (1). RESILIENCIA, no sigilo.
