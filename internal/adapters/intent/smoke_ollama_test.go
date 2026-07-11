@@ -137,7 +137,7 @@ func TestSmokeOllama_CaidoAbreCircuito(t *testing.T) {
 	cap := &captureSink{}
 
 	start := time.Now()
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		if err := d.Wrap(cap).Deliver(context.Background(), textEvent("quiero una pizza grande")); err != nil {
 			t.Fatalf("Deliver nunca debe devolver error por culpa del clasificador: %v", err)
 		}

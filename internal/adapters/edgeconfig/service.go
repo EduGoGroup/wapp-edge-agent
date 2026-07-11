@@ -3,6 +3,7 @@ package edgeconfig
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sync"
 	"time"
 
@@ -102,9 +103,7 @@ func (s *Service) Apply(ctx context.Context, kind, version string, payload []byt
 func (s *Service) Bootstrap(ctx context.Context) {
 	s.mu.Lock()
 	kinds := make(map[string]registration, len(s.kinds))
-	for k, r := range s.kinds {
-		kinds[k] = r
-	}
+	maps.Copy(kinds, s.kinds)
 	s.mu.Unlock()
 
 	for kind, reg := range kinds {

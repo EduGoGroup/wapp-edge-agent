@@ -116,7 +116,7 @@ func TestDeliver_Desconocido_SinIntencion_NoAbreCircuito(t *testing.T) {
 	fc := &fakeClassifier{res: classifier.Classification{Intent: intents.ReservedUnknown}}
 	d := readyDecorator(t, fc)
 	cap := &captureSink{}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		_ = d.Wrap(cap).Deliver(context.Background(), textEvent("mensaje ambiguo larguito"))
 	}
 	if cap.lastEvent().Intent != nil {
@@ -156,7 +156,7 @@ func TestCircuitBreaker_AbreTras5Fallos_YMedioAbierto(t *testing.T) {
 	cap := &captureSink{}
 
 	// 5 fallos consecutivos ⇒ circuito abierto.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		_ = d.Wrap(cap).Deliver(context.Background(), textEvent("quiero algo de comer"))
 	}
 	if d.Circuit() != "open" {
