@@ -94,6 +94,12 @@ type Manager struct {
 	// directamente (sin mux): startListener/Unlink omiten el registro de forma segura.
 	cloudMux CloudLinkMux
 
+	// inboundDecorator envuelve el sink de SALIDA de cada listener (mux.SinkFor(sid)) antes de entregárselo
+	// a app.Listen (Plan 029 · T11): con el clasificador de intenciones ON, decora la entrega para anotar la
+	// intención LLM antes del reenvío a la nube. nil (feature off) ⇒ el sink va tal cual (cableado idéntico
+	// al previo). Lo inyecta WithInboundDecorator. Es COMPARTIDO por todas las sesiones (un solo clasificador).
+	inboundDecorator func(app.InboundSink) app.InboundSink
+
 	// backoffBase/backoffMax acotan la política de reintento de un listener caído (aislamiento §10.H):
 	// retroceso exponencial Base·2^n saturado en Max. Defaults 1s/60s; los tests inyectan valores
 	// minúsculos (WithListenerBackoff) para no depender de esperas reales.
@@ -144,6 +150,19 @@ func WithListenerBackoff(base, max time.Duration) Option {
 		}
 		if max > 0 {
 			m.backoffMax = max
+		}
+	}
+}
+
+// WithInboundDecorator inyecta el decorador del sink de entrada (Plan 029 · T11): con el clasificador de
+// intenciones ON, cada listener envuelve su mux.SinkFor(sid) con este wrap para anotar la intención LLM
+// antes del reenvío a la nube. En producción lo cablea cmd/agent desde el stack de intent (compartido por
+// todas las sesiones); con la feature off no se pasa la opción y el sink va tal cual (cableado idéntico).
+// nil se ignora.
+func WithInboundDecorator(wrap func(app.InboundSink) app.InboundSink) Option {
+	return func(m *Manager) {
+		if wrap != nil {
+			m.inboundDecorator = wrap
 		}
 	}
 }

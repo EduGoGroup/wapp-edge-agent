@@ -3,9 +3,11 @@ module github.com/EduGoGroup/wapp-edge-agent
 go 1.26.0
 
 require (
-	github.com/EduGoGroup/wapp-cloudlink v0.7.0
+	github.com/EduGoGroup/wapp-cloudlink v0.8.0
+	github.com/EduGoGroup/wapp-edge-intent v0.1.0
 	github.com/EduGoGroup/wapp-shared/config v0.2.0
 	github.com/EduGoGroup/wapp-shared/envelope v0.1.1
+	github.com/EduGoGroup/wapp-shared/intents v0.1.0
 	github.com/EduGoGroup/wapp-shared/logger v0.1.0
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.12.3

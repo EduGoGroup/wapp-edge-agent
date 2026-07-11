@@ -19,10 +19,10 @@ import (
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types/events"
-	waLog "go.mau.fi/whatsmeow/util/log"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-shared/logger"
 )
 
 // containerFactory construye el store.DeviceContainer CIFRADO con una DEK dada. Se inyecta para
@@ -49,6 +49,8 @@ type Connector struct {
 	signalBuffer int
 	// activationTimeout acota la espera del *events.Connected de la reconexión post-pairing.
 	activationTimeout time.Duration
+	// log alimenta el puente waLog→slog del cliente whatsmeow del pairing (walog.go); nil ⇒ Noop.
+	log logger.Logger
 }
 
 var _ app.Connector = (*Connector)(nil)
@@ -57,7 +59,8 @@ var _ app.Connector = (*Connector)(nil)
 // debe estar YA migrada (tablas whatsmeow_* y msg_enc_*; ver internal/infra/db); dialect es el motor con
 // el que se abrió (DialectSQLite|DialectPostgres). Cada pairing crea SU container cifrado per-device
 // (OpenDeviceContainer) sobre esta MISMA conexión compartida (N devices, 1 *sql.DB).
-func NewConnector(db *sql.DB, dialect string) *Connector {
+// log da voz al cliente whatsmeow del pairing vía el puente waLog→slog (walog.go); nil ⇒ silencioso.
+func NewConnector(db *sql.DB, dialect string, log logger.Logger) *Connector {
 	return &Connector{
 		newContainer: func(ctx context.Context, dek []byte) (store.DeviceContainer, error) {
 			// BD única compartida (Plan 022 §10.A): container per-device con la DEK del pairing, sobre la
@@ -66,6 +69,7 @@ func NewConnector(db *sql.DB, dialect string) *Connector {
 		},
 		signalBuffer:      8,
 		activationTimeout: defaultActivationTimeout,
+		log:               log,
 	}
 }
 
@@ -86,9 +90,9 @@ func (c *Connector) StartConnection(ctx context.Context, dek []byte) (<-chan app
 	}
 
 	// Device fresco cuyo Container es el decorator cifrado: al completar el pairing, whatsmeow llama
-	// Device.Save -> PutDevice (cifrado). Logger silencioso (sin volcar material sensible).
+	// Device.Save -> PutDevice (cifrado). whatsmeow loguea por el puente waLog→slog (walog.go).
 	device := cryptostore.NewDeviceForPairing(container)
-	client := wm.NewClient(device, waLog.Noop)
+	client := wm.NewClient(device, newWALog(c.log))
 
 	qrChan, err := client.GetQRChannel(ctx)
 	if err != nil {
