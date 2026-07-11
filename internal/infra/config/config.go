@@ -35,6 +35,10 @@ const DefaultCommandTimeoutSeconds = 30
 // caída larga de la nube. Configurable por WAPP_AGENT_OUTBOX_MAX_EVENTS.
 const DefaultOutboxMaxEvents = 10000
 
+// DefaultDiagLogLines es el número de líneas de log por defecto en el bundle de diagnóstico (Plan 031 T8).
+// Configurable por WAPP_AGENT_DIAG_LOG_LINES. 500 da contexto reciente amplio sin acercarse al tope de tamaño.
+const DefaultDiagLogLines = 500
+
 // DefaultOutboxTTLHours es el TTL por defecto (en horas) de un evento en el outbox: 0 = DESACTIVADO
 // (durabilidad primero; el único recorte es el drop-oldest por tamaño). Un valor >0 poda los eventos más
 // viejos que ese tiempo al encolar/drenar. Configurable por WAPP_AGENT_OUTBOX_TTL_HOURS.
@@ -124,6 +128,10 @@ type Config struct {
 	// OutboxTTLHours es el TTL (horas) de un evento del outbox: 0 = desactivado (solo recorta el drop-oldest
 	// por tamaño). Con >0 se podan los eventos más viejos que ese tiempo. Se lee de WAPP_AGENT_OUTBOX_TTL_HOURS.
 	OutboxTTLHours int `yaml:"outbox_ttl_hours"`
+	// DiagLogLines es cuántas líneas del ring buffer de logs incluye el bundle de diagnóstico bajo demanda
+	// (Plan 031 T8, ADR-0023). Default 500 (contexto reciente amplio sin acercarse al tope de 4 MiB del
+	// frame). Se lee de WAPP_AGENT_DIAG_LOG_LINES; <=0 cae al default.
+	DiagLogLines int `yaml:"diag_log_lines"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -239,6 +247,7 @@ func defaults() Config {
 		ControlSocketPath:     "wapp-edge.sock",
 		OutboxMaxEvents:       DefaultOutboxMaxEvents,
 		OutboxTTLHours:        DefaultOutboxTTLHours,
+		DiagLogLines:          DefaultDiagLogLines,
 		CloudLink: CloudLinkConfig{
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
@@ -284,6 +293,7 @@ func Load(path string) (Config, error) {
 	cfg.ControlSocketPath = loader.GetString("CONTROL_SOCKET_PATH", cfg.ControlSocketPath)
 	cfg.OutboxMaxEvents = loader.GetInt("OUTBOX_MAX_EVENTS", cfg.OutboxMaxEvents)
 	cfg.OutboxTTLHours = loader.GetInt("OUTBOX_TTL_HOURS", cfg.OutboxTTLHours)
+	cfg.DiagLogLines = loader.GetInt("DIAG_LOG_LINES", cfg.DiagLogLines)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)
@@ -321,6 +331,10 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.OutboxTTLHours < 0 {
 		cfg.OutboxTTLHours = 0
+	}
+	// Bundle de diagnóstico (Plan 031 T8): nº de líneas de log no positivo cae al default.
+	if cfg.DiagLogLines <= 0 {
+		cfg.DiagLogLines = DefaultDiagLogLines
 	}
 
 	// Clasificador de intenciones (Plan 029): normaliza defaults cuando la feature está ON. Un valor

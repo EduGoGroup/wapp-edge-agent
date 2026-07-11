@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 )
 
@@ -125,6 +126,72 @@ func TestHealth(t *testing.T) {
 	}
 	if got.Version != testVersion {
 		t.Errorf("version: got %q, want %q", got.Version, testVersion)
+	}
+}
+
+// fakeHealth satisface HealthReporter para GET /v1/health enriquecido (Plan 031 T7).
+type fakeHealth struct {
+	uptime  int64
+	reports map[string]health.Report
+}
+
+func (f fakeHealth) DaemonUptimeS() int64                             { return f.uptime }
+func (f fakeHealth) Reports(context.Context) map[string]health.Report { return f.reports }
+
+// startServerWithHealth arranca el servidor con un colector de salud cableado (SetHealthProvider).
+func startServerWithHealth(t *testing.T, lister SessionLister, h HealthReporter) *http.Client {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "wapp-ctl-h-")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "edge.sock")
+
+	srv := New(Config{SocketPath: socket, Version: testVersion}, nil, lister)
+	srv.SetHealthProvider(h)
+	ln, err := srv.Listen()
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var d net.Dialer
+		return d.DialContext(ctx, "unix", socket)
+	}}}
+}
+
+// TestHealth_Enriched: con colector cableado, GET /v1/health suma uptime del daemon + salud por sesión
+// (Plan 031 T7), conservando status/version (retrocompatible con el supervisor).
+func TestHealth_Enriched(t *testing.T) {
+	h := fakeHealth{uptime: 77, reports: map[string]health.Report{
+		"sess-1": {SocketState: "degraded", DegradedReason: "dek_load_timeout", OutboxDepth: 3, BinaryVersion: testVersion, DaemonUptimeS: 77},
+	}}
+	c := startServerWithHealth(t, fakeLister{}, h)
+
+	resp := do(t, c, http.MethodGet, "/v1/health")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+	var got healthResponse
+	decode(t, resp, &got)
+	if got.Status != "ok" || got.Version != testVersion {
+		t.Errorf("base: status=%q version=%q", got.Status, got.Version)
+	}
+	if got.UptimeS != 77 {
+		t.Errorf("uptime_s = %d, want 77", got.UptimeS)
+	}
+	sh, ok := got.Sessions["sess-1"]
+	if !ok {
+		t.Fatalf("falta la sesión sess-1 en /v1/health: %+v", got.Sessions)
+	}
+	if sh.SocketState != "degraded" || sh.DegradedReason != "dek_load_timeout" || sh.OutboxDepth != 3 {
+		t.Errorf("salud sess-1 = %+v", sh)
 	}
 }
 

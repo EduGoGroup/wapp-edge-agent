@@ -138,7 +138,7 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 //     real cuyo loop de stream corre en goroutine ligada a ctx. El Manager registra cada sesión.
 //
 // ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK (ADR-0007).
-func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox, intentStack *IntentStack) sessionmgr.CloudLinkMux {
+func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox, intentStack *IntentStack, collector cloudlink.HealthCollector, diagBuilder cloudlink.DiagnosticsBuilder) sessionmgr.CloudLinkMux {
 	if cfg.CloudLink.Endpoint == "" {
 		log.Info("CloudLink deshabilitado (sin endpoint): usando LogMux por sesión para diagnóstico")
 		return cloudlink.NewLogMux(log)
@@ -160,6 +160,10 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, o
 		// Config empujada por la nube (Plan 029 · T10): persiste/valida/notifica los ConfigUpdate. nil-safe
 		// (feature off ⇒ applier nil ⇒ Ack tolerante).
 		cloudlink.WithConfigApplier(intentStack.applier()),
+		// Salud en el heartbeat (Plan 031 T7): cada latido lleva el SessionHealth de su sesión. nil-safe.
+		cloudlink.WithHealthCollector(collector),
+		// Diagnóstico bajo demanda (Plan 031 T8): responde DiagnosticsRequest con el bundle saneado. nil-safe.
+		cloudlink.WithDiagnosticsBuilder(diagBuilder),
 	)
 	go func() {
 		_ = adapter.Run(ctx)

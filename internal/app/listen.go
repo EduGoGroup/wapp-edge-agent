@@ -17,19 +17,29 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/watchdog"
 	"github.com/EduGoGroup/wapp-shared/logger"
 )
 
-// dekLoadWarnAfter es el umbral del watchdog de la carga de la DEK (observabilidad, follow-up Plan 029
-// Ola 3): en macOS, si la ACL del ítem del Keychain quedó invalidada (típico tras RECOMPILAR el binario),
-// SecItemCopyMatching se BLOQUEA esperando el diálogo de permiso en pantalla y, sin este aviso, nada lo
-// delata en el log (caso real: 31 minutos colgado en silencio).
-const dekLoadWarnAfter = 10 * time.Second
+// defaultDEKLoadTimeout es el plazo del watchdog de la carga de la DEK (Plan 031 T6, generaliza el WARN
+// >10s del follow-up 029): en macOS, si la ACL del ítem del Keychain quedó invalidada (típico tras
+// RECOMPILAR el binario), SecItemCopyMatching se BLOQUEA en una llamada cgo esperando el diálogo de permiso
+// en pantalla y, sin plazo, nada lo delata (caso real 2026-07-11: 31 minutos colgado en silencio con el
+// Cloud diciendo "online"). Al vencer, Run ABANDONA la espera (la cgo no es cancelable) y devuelve
+// ErrDEKLoadTimeout ⇒ el runner marca la sesión DEGRADED{dek_load_timeout} y reintenta con backoff, en vez
+// de colgarse para siempre. 10s da holgura al Keychain normal y hace visible el cuelgue en <15s.
+const defaultDEKLoadTimeout = 10 * time.Second
+
+// ErrDEKLoadTimeout: la carga de la DEK excedió su plazo (defaultDEKLoadTimeout) y Run abandonó la espera
+// (Plan 031 T6). El runner del sessionmgr lo reconoce (errors.Is) para etiquetar la degradación con el
+// motivo health.ReasonDEKLoadTimeout; NO es un fallo fatal: se reintenta con el backoff existente.
+var ErrDEKLoadTimeout = errors.New("listen: la carga de la DEK excedió el plazo (posible diálogo de permiso del Keychain pendiente)")
 
 // InboundSink es el puerto de SALIDA de los mensajes entrantes ya descifrados (domain.InboundEvent).
 // En la Fase 1 lo implementa el cliente CloudLink (reenvío a la nube por gRPC bidi-stream); en el
@@ -82,15 +92,57 @@ type Listen struct {
 	gateway ListenGateway
 	sink    InboundSink
 	log     logger.Logger
+
+	// dekLoadTimeout es el plazo del watchdog de la carga de la DEK (Plan 031 T6); 0 ⇒ defaultDEKLoadTimeout.
+	dekLoadTimeout time.Duration
+	// onDEKDuration reporta la duración de la carga de la DEK (éxito o retorno tardío de una carga
+	// abandonada) para poblar dek_load_duration_ms en el registro de salud (T6→T7). nil ⇒ no se reporta.
+	onDEKDuration func(time.Duration)
+}
+
+// ListenOption configura opciones del caso de uso Listen sin romper la firma de NewListen (variádica). En
+// producción el sessionmgr inyecta el watchdog+reporte por sesión; los tests las omiten (defaults seguros).
+type ListenOption func(*Listen)
+
+// WithDEKLoadTimeout ajusta el plazo del watchdog de la carga de la DEK (Plan 031 T6). <=0 ⇒ el default.
+// Los tests lo bajan para ejercitar el timeout de forma determinista y rápida.
+func WithDEKLoadTimeout(d time.Duration) ListenOption {
+	return func(l *Listen) {
+		if d > 0 {
+			l.dekLoadTimeout = d
+		}
+	}
+}
+
+// WithDEKDurationReporter inyecta el callback que registra la duración de la carga de la DEK (T6→T7:
+// dek_load_duration_ms). nil se ignora.
+func WithDEKDurationReporter(fn func(time.Duration)) ListenOption {
+	return func(l *Listen) {
+		if fn != nil {
+			l.onDEKDuration = fn
+		}
+	}
 }
 
 // NewListen construye el caso de uso con los puertos dados. log traza la carga de la DEK (el llamador
-// multi-sesión pasa su logger con session_id; ver sessionmgr); nil ⇒ se descarta (tests).
-func NewListen(custody KeyCustody, gateway ListenGateway, sink InboundSink, log logger.Logger) *Listen {
+// multi-sesión pasa su logger con session_id; ver sessionmgr); nil ⇒ se descarta (tests). opts inyectan el
+// watchdog/reporte de salud (Plan 031 T6); sin opts, defaults seguros (plazo default, sin reporte).
+func NewListen(custody KeyCustody, gateway ListenGateway, sink InboundSink, log logger.Logger, opts ...ListenOption) *Listen {
 	if log == nil {
 		log = logger.New(logger.WithWriter(io.Discard))
 	}
-	return &Listen{custody: custody, gateway: gateway, sink: sink, log: log}
+	l := &Listen{custody: custody, gateway: gateway, sink: sink, log: log, dekLoadTimeout: defaultDEKLoadTimeout}
+	for _, o := range opts {
+		o(l)
+	}
+	return l
+}
+
+// reportDEKDuration publica la duración de la carga de la DEK si hay reporter cableado (nil-safe).
+func (l *Listen) reportDEKDuration(d time.Duration) {
+	if l.onDEKDuration != nil {
+		l.onDEKDuration(d)
+	}
 }
 
 // Run recupera la DEK de custodia y arranca la escucha always-on, bloqueando hasta que el ctx se
@@ -99,20 +151,34 @@ func NewListen(custody KeyCustody, gateway ListenGateway, sink InboundSink, log 
 // La DEK en sí NUNCA se loguea; solo el hecho y la duración de su carga (observabilidad).
 func (l *Listen) Run(ctx context.Context) error {
 	l.log.Info("custodia: cargando DEK…")
-	start := time.Now()
-	// Watchdog barato: si la carga se cuelga (>10s), avisa UNA vez con la causa probable. time.AfterFunc
-	// no fuga goroutines: si no dispara, Stop lo cancela; si dispara, su goroutine termina al loguear.
-	watchdog := time.AfterFunc(dekLoadWarnAfter, func() {
-		l.log.Warn("custodia: la carga de la DEK sigue pendiente — posible diálogo de permiso del Keychain pendiente; requiere atención en pantalla (típico tras recompilar el binario)",
-			"umbral", dekLoadWarnAfter.String())
-	})
-	dek, err := l.custody.Load()
-	watchdog.Stop()
-	if err != nil {
-		return fmt.Errorf("listen: cargar DEK de custodia: %w", err)
+	// Watchdog "abandona y reporta" (Plan 031 T6): custody.Load() puede colgarse en una llamada cgo al
+	// Keychain (macOS) que NO se puede cancelar. Al vencer el plazo abandonamos la espera (la goroutine
+	// muere cuando la cgo retorne) y devolvemos ErrDEKLoadTimeout ⇒ DEGRADED + reintento con backoff, en
+	// vez de quedar colgados para siempre. onLate registra la duración REAL si la carga abandonada retorna
+	// tarde (p. ej. el usuario atendió el diálogo) y borra la DEK que ya no usaremos.
+	res := watchdog.Guard(l.dekLoadTimeout,
+		func() ([]byte, error) { return l.custody.Load() },
+		func(late watchdog.Result[[]byte]) {
+			if late.Err == nil {
+				l.reportDEKDuration(late.Elapsed)
+				zeroBytes(late.Value) // la carga abandonada retornó una DEK que ya no se usará: bórrala.
+			}
+			l.log.Warn("custodia: la carga de la DEK abandonada retornó tarde",
+				"duracion", late.Elapsed.String(), "error", late.Err)
+		})
+
+	if res.TimedOut {
+		l.log.Warn("custodia: la carga de la DEK excedió el plazo — sesión DEGRADED; posible diálogo de permiso del Keychain pendiente (típico tras recompilar el binario), requiere atención en pantalla",
+			"umbral", l.dekLoadTimeout.String(), "reason", "dek_load_timeout")
+		return ErrDEKLoadTimeout
 	}
+	if res.Err != nil {
+		return fmt.Errorf("listen: cargar DEK de custodia: %w", res.Err)
+	}
+	dek := res.Value
 	defer zeroBytes(dek)
-	l.log.Info("custodia: DEK cargada", "duracion", time.Since(start).String())
+	l.reportDEKDuration(res.Elapsed)
+	l.log.Info("custodia: DEK cargada", "duracion", res.Elapsed.String())
 
 	if err := l.gateway.Listen(ctx, dek, l.sink); err != nil {
 		return fmt.Errorf("listen: %w", err)
