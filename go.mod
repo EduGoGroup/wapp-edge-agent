@@ -51,3 +51,8 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
+
+// TODO(031): retirar al cortar cloudlink v0.9.0. Mientras la Ola 0 (frames SessionHealth/Diagnostics)
+// vive sin release en la rama feat/031-ola0, el Edge compila contra el cloudlink LOCAL para poder
+// enriquecer el heartbeat y responder DiagnosticsRequest (T7/T8).
+replace github.com/EduGoGroup/wapp-cloudlink => ../../cloud/wapp-cloudlink

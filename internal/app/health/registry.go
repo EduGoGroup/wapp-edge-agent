@@ -12,6 +12,7 @@
 package health
 
 import (
+	"sort"
 	"sync"
 	"time"
 )
@@ -156,6 +157,23 @@ func (r *Registry) Snapshot(id string) (Snapshot, bool) {
 	}
 	r.mu.RUnlock()
 	return snap, true
+}
+
+// SessionIDs devuelve, ordenados, los session_id con entrada de salud (los que han reportado algo del ciclo
+// de escucha). Lo consume el colector (T7) para enumerar las sesiones vivas al armar GET /v1/health y el
+// snapshot de subsistemas del bundle de diagnóstico (T8). Nil-safe (devuelve nil sin registro).
+func (r *Registry) SessionIDs() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	ids := make([]string, 0, len(r.sessions))
+	for id := range r.sessions {
+		ids = append(ids, id)
+	}
+	r.mu.RUnlock()
+	sort.Strings(ids)
+	return ids
 }
 
 // Remove borra la entrada de la sesión id (al desvincularla): su salud deja de reportarse. Idempotente y

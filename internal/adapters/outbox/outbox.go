@@ -182,6 +182,18 @@ func (s *Store) PendingSessions(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
+// Depth cuenta los eventos pendientes de la sesión sessionID (profundidad del outbox por sesión, Plan 031
+// T7). Es una lectura de solo-conteo (no toca payloads): alimenta SessionHealth.outbox_depth del heartbeat
+// de salud. No poda TTL (es una foto instantánea; el drenaje/encolado ya podan).
+func (s *Store) Depth(ctx context.Context, sessionID string) (int64, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM outbox WHERE session_id = ?`, sessionID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("outbox: contar profundidad (session_id=%s): %w", sessionID, err)
+	}
+	return n, nil
+}
+
 // pruneTTLLocked borra los eventos más viejos que el TTL (no-op si ttl==0). Debe llamarse bajo s.mu.
 func (s *Store) pruneTTLLocked(ctx context.Context, nowUnix int64) error {
 	if s.ttl <= 0 {

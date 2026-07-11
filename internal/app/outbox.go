@@ -48,4 +48,9 @@ type Outbox interface {
 	// PendingSessions devuelve los session_id que tienen al menos un evento pendiente. Sirve para SEMBRAR
 	// el guard de orden del transporte al arrancar (un evento nuevo no debe adelantar a un backlog previo).
 	PendingSessions(ctx context.Context) ([]string, error)
+	// Depth devuelve cuántos eventos pendientes tiene la sesión sessionID (profundidad del outbox por
+	// sesión). Es la señal de saturación/desconexión que viaja en el heartbeat de salud (Plan 031 T7,
+	// SessionHealth.outbox_depth): un backlog creciente delata que el stream lleva rato caído. Metadato
+	// operativo, nunca contenido (ADR-0007).
+	Depth(ctx context.Context, sessionID string) (int64, error)
 }
