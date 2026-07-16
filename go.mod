@@ -5,10 +5,12 @@ go 1.26.0
 require (
 	github.com/EduGoGroup/wapp-cloudlink v0.9.0
 	github.com/EduGoGroup/wapp-edge-intent v0.1.0
+	github.com/EduGoGroup/wapp-shared/auth v0.2.0
 	github.com/EduGoGroup/wapp-shared/config v0.2.0
 	github.com/EduGoGroup/wapp-shared/envelope v0.1.1
 	github.com/EduGoGroup/wapp-shared/intents v0.1.0
 	github.com/EduGoGroup/wapp-shared/logger v0.1.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.12.3
 	github.com/mdp/qrterminal/v3 v3.2.1
@@ -51,3 +53,10 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	rsc.io/qr v0.2.0 // indirect
 )
+
+// TEMPORAL (Plan 033 Ola 3, ADR-0025): los frames de auth de usuario
+// (UserLogin/UserRefresh/UserLogout → UserAuthResponse) viven en el árbol de
+// trabajo de wapp-cloudlink pero AÚN NO están publicados como tag v0.10.0.
+// Mientras tanto se consume el repo local (igual que hizo cloud-platform en la
+// Ola 2). RETIRAR cuando se publique cloudlink v0.10.0 y se suba el require.
+replace github.com/EduGoGroup/wapp-cloudlink => ../../cloud/wapp-cloudlink

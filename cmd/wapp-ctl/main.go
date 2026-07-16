@@ -1,6 +1,6 @@
 // Command wapp-ctl es el SUPERVISOR liviano del Edge (Plan 007, T4). Proceso SIEMPRE VIVO que:
 //
-//  1. Sirve la web UI embebida (internal/webui) en loopback 127.0.0.1:8765 (configurable; §10.G).
+//  1. Sirve la web UI embebida (internal/webui) en loopback 127.0.0.1:8105 (configurable; §10.G).
 //  2. Reverse-proxy de /v1/* (rutas que NO son /v1/daemon/*) al Unix socket co-ubicado del núcleo
 //     (ADR-0015) → single-origin, sin CORS, el socket nunca se expone a red (decisión §10.A).
 //  3. Arranca/detiene el núcleo (`agent serve`) como proceso HIJO vía internal/adapters/supervisor
@@ -15,9 +15,7 @@ package main
 import (
 	"context"
 	"flag"
-	"net"
 	"net/http"
-	"net/http/httputil"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -41,7 +39,7 @@ import (
 var Version = "0.1.0-ctl"
 
 func main() {
-	addr := flag.String("addr", envOr("WAPP_CTL_ADDR", "127.0.0.1:8765"), "dirección loopback donde sirve el supervisor (host:puerto)")
+	addr := flag.String("addr", envOr("WAPP_CTL_ADDR", "127.0.0.1:8105"), "dirección loopback donde sirve el supervisor (host:puerto)")
 	agentBin := flag.String("agent-bin", envOr("WAPP_CTL_AGENT_BIN", defaultAgentBin()), "ruta del binario núcleo `agent` a lanzar (default: hermano de wapp-ctl, si no PATH)")
 	socketFlag := flag.String("socket", "", "ruta del Unix socket /v1 del núcleo (default: cfg.ControlSocketPath del config)")
 	pidFile := flag.String("pid-file", "", "ruta del PID/lock file anti-duplicado (default: <socket>.pid)")
@@ -130,9 +128,16 @@ func main() {
 func newRouter(sup *supervisor.Supervisor, socketPath string, log sharedlogger.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 
+	// Borde de sesión del operador (Plan 033 · Ola 3 · Paso B): sesión en cookie HttpOnly + CSRF, con el
+	// access token custodiado server-side y el refresh SIEMPRE en el núcleo.
+	store := newSessionStore()
+	socketClient := newSocketClient(socketPath)
+	auth := newAuthBorder(store, socketClient, log)
+
 	// Control de proceso: lo atiende el supervisor (no se proxya). Sin método en el patrón para devolver
 	// un 405 con envelope ante el verbo equivocado (en vez de proxyar la ruta /v1/daemon/* al núcleo).
-	mux.HandleFunc("/v1/daemon/start", func(w http.ResponseWriter, r *http.Request) {
+	// Las mutadoras (start/stop) exigen CSRF SI hay sesión (bootstrap pre-login sigue funcionando).
+	mux.HandleFunc("/v1/daemon/start", requireCSRFIfSession(store, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
 			return
@@ -142,9 +147,9 @@ func newRouter(sup *supervisor.Supervisor, socketPath string, log sharedlogger.L
 			return
 		}
 		writeJSON(w, http.StatusOK, toDaemonStatus(sup.Status(r.Context())))
-	})
+	}))
 
-	mux.HandleFunc("/v1/daemon/stop", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/v1/daemon/stop", requireCSRFIfSession(store, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			methodNotAllowed(w, http.MethodPost)
 			return
@@ -154,7 +159,7 @@ func newRouter(sup *supervisor.Supervisor, socketPath string, log sharedlogger.L
 			return
 		}
 		writeJSON(w, http.StatusOK, toDaemonStatus(sup.Status(r.Context())))
-	})
+	}))
 
 	mux.HandleFunc("/v1/daemon/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -164,39 +169,47 @@ func newRouter(sup *supervisor.Supervisor, socketPath string, log sharedlogger.L
 		writeJSON(w, http.StatusOK, toDaemonStatus(sup.Status(r.Context())))
 	})
 
-	// Reverse-proxy del resto de /v1/* al Unix socket del núcleo. /v1/daemon/* gana por especificidad
-	// del ServeMux (patrón más largo), así que aquí solo cae health/sessions/logs/pair.
-	mux.Handle("/v1/", newCoreProxy(socketPath, log))
+	// Reverse-proxy endurecido del resto de /v1/* al Unix socket del núcleo (Bearer de la cookie + CSRF +
+	// retry-on-401 con refresh single-flight). /v1/daemon/* gana por especificidad del ServeMux.
+	mux.Handle("/v1/", newCoreProxy(socketPath, auth, store, log))
 
-	// Web UI embebida (placeholder T4; UI real T5), mismo origen loopback.
-	mux.Handle("/", webui.Handler())
+	// Borde de autenticación (rutas propias de wapp-ctl, NO proxy).
+	mux.HandleFunc("POST /login", auth.handleLoginPost)
+	mux.HandleFunc("GET /login", auth.handleLoginGet)
+	mux.HandleFunc("POST /logout", auth.handleLogout)
+	mux.HandleFunc("GET /session", auth.handleSession)
+
+	// Web UI embebida, mismo origen loopback. El documento raíz (/) está PROTEGIDO: sin sesión válida
+	// redirige a /login. Los assets estáticos (app.js, styles.css, …) se sirven sin sesión (no llevan
+	// secretos y los necesita también la pantalla de login).
+	mux.Handle("/", rootGate(store))
 	return mux
 }
 
-// newCoreProxy construye el reverse-proxy a /v1/* del núcleo por el Unix socket. El Transport marca
-// SIEMPRE el socket (DialContext a "unix"); el host de la URL es un placeholder. Si el socket no
-// responde (núcleo caído), el ErrorHandler TRADUCE el fallo a "daemon down" (503 + envelope), nunca un
-// 502 crudo ni una página rota → contrato estable para la UI (T5): status 503 + code "daemon_down".
-func newCoreProxy(socketPath string, log sharedlogger.Logger) *httputil.ReverseProxy {
-	return &httputil.ReverseProxy{
-		Director: func(r *http.Request) {
-			r.URL.Scheme = "http"
-			r.URL.Host = "unix" // placeholder; el DialContext ignora el host y marca el socket
-		},
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				var d net.Dialer
-				return d.DialContext(ctx, "unix", socketPath)
-			},
-			ResponseHeaderTimeout: 30 * time.Second,
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			if log != nil {
-				log.Warn("wapp-ctl: núcleo no responde por el socket (daemon down)", "path", r.URL.Path, "error", err)
+// rootGate protege el documento raíz de la webui: "/" (index.html) exige sesión válida — sin ella redirige
+// a /login. El resto de rutas (assets estáticos) se delega al FileServer embebido sin restricción.
+func rootGate(store *sessionStore) http.Handler {
+	fs := webui.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+			if store.fromRequest(r) == nil {
+				http.Redirect(w, r, "/login", http.StatusSeeOther)
+				return
 			}
-			writeError(w, http.StatusServiceUnavailable, codeDaemonDown,
-				"el núcleo no responde por el socket: arranca el daemon (POST /v1/daemon/start)")
-		},
+		}
+		fs.ServeHTTP(w, r)
+	})
+}
+
+// requireCSRFIfSession envuelve un handler mutador propio de wapp-ctl (daemon start/stop): si hay sesión de
+// operador, exige X-CSRF-Token válido; sin sesión (bootstrap de primera ejecución) lo deja pasar.
+func requireCSRFIfSession(store *sessionStore, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if sess := store.fromRequest(r); sess != nil && !csrfValid(r, sess) {
+			writeError(w, http.StatusForbidden, "csrf_invalid", "Token CSRF ausente o inválido.")
+			return
+		}
+		next(w, r)
 	}
 }
 
