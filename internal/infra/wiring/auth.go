@@ -10,6 +10,8 @@ package wiring
 
 import (
 	"context"
+	"crypto/x509"
+	"encoding/pem"
 	"os"
 	"path/filepath"
 
@@ -59,7 +61,58 @@ func BuildAuthManager(cfg config.Config, log sharedlogger.Logger, keyStore *edge
 	}
 	custodyPath := filepath.Join(cfg.DataDir, "auth", "operator.refresh")
 	custody := edgeauth.NewFileSecretCustody(custodyPath)
-	return edgeauth.NewManager(relay, keyStore, custody, log)
+
+	// Tenant coherente (ADR-0025): solo se aceptan tokens del tenant al que el Edge está enrolado. La
+	// fuente de verdad es el propio cert mTLS del Edge (Subject.Organization[0]), que el Gateway firmó con
+	// el tenant y lee de vuelta como identidad del canal — la MISMA que gobierna el stream CloudLink. Si el
+	// Edge aún NO está enrolado (sin cert), el tenant es "" y el guard queda INERTE: no se fuerza un rechazo
+	// que rompería el bootstrap enroll→login (ver enrolledTenant).
+	var opts []edgeauth.Option
+	if tenant := enrolledTenant(cfg, log); tenant != "" {
+		opts = append(opts, edgeauth.WithExpectedTenant(tenant))
+		log.Info("auth: guard de tenant coherente ACTIVO (ADR-0025 dec.1)", "tenant_id", tenant)
+	} else {
+		log.Info("auth: sin tenant de enrolamiento conocido; guard de tenant coherente INERTE (pre-enrolamiento)")
+	}
+	return edgeauth.NewManager(relay, keyStore, custody, log, opts...)
+}
+
+// enrolledTenant extrae el tenant al que el Edge está enrolado del cert mTLS emitido por el Gateway
+// (cfg.CloudLink.TLSCert), leyendo Subject.Organization[0]. Es la MISMA fuente de verdad que identifica el
+// canal mTLS ante la nube (ADR-0025 dec.1): el tenant NO viaja en los frames, es implícito del enrolamiento.
+//
+// Devuelve "" (guard inerte, sin rechazo) en los casos benignos de pre-enrolamiento —ruta de cert sin
+// configurar o cert aún inexistente— para NO romper el bootstrap enroll→login. Un cert presente pero
+// ilegible o sin Organization es una ANOMALÍA: se AVISA y también se devuelve "" (fail-open del guard, no
+// del arranque; el resto de la validación —firma ES256 + RBAC— sigue vigente).
+func enrolledTenant(cfg config.Config, log sharedlogger.Logger) string {
+	certPath := cfg.CloudLink.TLSCert
+	if certPath == "" {
+		return "" // mTLS no configurado (dev/pre-enrolamiento): guard inerte.
+	}
+	pemBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "" // aún no enrolado (el cert se crea en `enroll`): guard inerte, esperado.
+		}
+		log.Warn("auth: no se pudo leer el cert mTLS para derivar el tenant; guard de tenant INERTE", "tls_cert", certPath, "error", err)
+		return ""
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		log.Warn("auth: cert mTLS sin bloque PEM legible; guard de tenant INERTE", "tls_cert", certPath)
+		return ""
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		log.Warn("auth: cert mTLS ilegible al parsear; guard de tenant INERTE", "tls_cert", certPath, "error", err)
+		return ""
+	}
+	if len(cert.Subject.Organization) == 0 || cert.Subject.Organization[0] == "" {
+		log.Warn("auth: cert mTLS sin Subject.Organization (tenant); guard de tenant INERTE", "tls_cert", certPath)
+		return ""
+	}
+	return cert.Subject.Organization[0]
 }
 
 // SharedEdgeConfigService devuelve el edgeconfig.Service COMPARTIDO sobre el que se registran los kinds
