@@ -10,14 +10,25 @@ package webui
 
 import (
 	"embed"
+	"io/fs"
 	"net/http"
 )
 
-//go:embed index.html app.js styles.css
+// login.html se embebe junto a los assets del dashboard: es la pantalla de inicio de sesión del operador
+// (Plan 033 · Ola 3 · Paso B, ADR-0025). Es un documento AUTOCONTENIDO (script inline) que reutiliza
+// styles.css; wapp-ctl la sirve en GET /login (público) y protege index.html tras la cookie de sesión.
+//
+//go:embed index.html app.js styles.css login.html
 var assets embed.FS
 
 // Handler devuelve el http.Handler que sirve los assets embebidos. http.FileServer sirve index.html en
 // "/" automáticamente y aplica el Content-Type correcto por extensión a app.js y styles.css.
 func Handler() http.Handler {
 	return http.FileServer(http.FS(assets))
+}
+
+// FS expone el sistema de archivos embebido para que wapp-ctl sirva documentos concretos con control de
+// acceso propio (p.ej. login.html en GET /login, público, vs. index.html protegido tras la sesión).
+func FS() fs.FS {
+	return assets
 }

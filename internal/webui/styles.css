@@ -34,6 +34,40 @@ header {
 header h1 { margin: 0; font-size: 1.4rem; }
 header .subtitle { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; }
 
+/* ---------- Barra de sesión del operador (Plan 033 · Ola 3) ---------- */
+.header-main {
+  max-width: 860px;
+  margin: 0 auto;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.session-bar { display: flex; align-items: center; gap: 10px; }
+
+/* ---------- Banner (modo degradado / sin nube) ---------- */
+.banner {
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 0.9rem;
+  font-weight: 500;
+}
+.banner-warn { background: #fef3c7; color: var(--warn); border: 1px solid #fcd34d; }
+
+/* ---------- Formulario de login (Plan 033 · Ola 3) ---------- */
+.login-form { display: grid; gap: 12px; max-width: 22rem; }
+.login-form .field { display: grid; gap: 4px; font-size: 0.9rem; }
+.login-form .field span { color: var(--muted); }
+.login-form input {
+  font: inherit;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #fff;
+  color: var(--ink);
+}
+.login-form input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+
 main {
   max-width: 860px;
   margin: 0 auto;

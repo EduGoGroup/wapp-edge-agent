@@ -75,8 +75,10 @@ func (s *Server) RegisterPairing(p sessionPairer) {
 	if s.log != nil {
 		m.log = s.log
 	}
-	s.Handle(http.MethodPost, "/v1/sessions/pair", m.handlePair)
-	s.Handle(http.MethodGet, "/v1/sessions/{id}/pair", m.handlePoll)
+	// POST inicia un emparejamiento (añade un teléfono): escritura (edge.sessions.pair). El poll GET es
+	// lectura del progreso (edge.status.read; permitido en modo degradado ≤2h).
+	s.Handle(http.MethodPost, "/v1/sessions/pair", s.guard(resourceSessionsPair, true, m.handlePair))
+	s.Handle(http.MethodGet, "/v1/sessions/{id}/pair", s.guard(resourceStatusRead, false, m.handlePoll))
 }
 
 // pairResponse es el cuerpo de POST /v1/sessions/pair: id del EMPAREJAMIENTO (para hacer poll) + QR

@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<!--
+  Pantalla de inicio de sesión del operador (Plan 033 · Ola 3 · Paso B, ADR-0025 dec.5). Documento
+  AUTOCONTENIDO (script inline) servido por wapp-ctl en GET /login (público). Reutiliza styles.css.
+
+  Orden de bootstrap enroll → login:
+    - Al cargar, sondea GET /v1/enroll/status. Si el Edge AÚN NO está enrolado (enrolled:false), muestra
+      el formulario de ENROLAR (POST /v1/enroll, exento de sesión). Tras enrolar → login.
+    - Si el núcleo está caído (503 daemon_down), pide arrancar el daemon (POST /v1/daemon/start).
+    - Con el Edge enrolado, muestra el LOGIN: POST /login a wapp-ctl, que llama al socket /v1/auth/login,
+      crea la cookie de sesión y responde. Los errores se mapean por `code` a mensajes amigables.
+-->
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>wApp Edge · iniciar sesión</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>wApp Edge</h1>
+      <p class="subtitle">Plano de control local</p>
+    </header>
+
+    <main>
+      <!-- Aviso de daemon caído / bootstrap. -->
+      <section id="section-daemon-down" class="card hidden">
+        <div class="card-head">
+          <h2>Núcleo detenido</h2>
+          <span class="badge badge-down">Daemon down</span>
+        </div>
+        <p class="detail">El núcleo del Edge no está corriendo. Arráncalo para continuar.</p>
+        <div class="actions">
+          <button id="btn-start-daemon" type="button">Arrancar daemon</button>
+        </div>
+        <p id="daemon-down-status" class="detail muted"></p>
+      </section>
+
+      <!-- Enrolar (primera ejecución, antes del login). -->
+      <section id="section-enroll" class="card hidden">
+        <div class="card-head">
+          <h2>Enrolar este equipo</h2>
+          <span class="badge badge-warn">Sin credencial</span>
+        </div>
+        <p class="detail">
+          Este Edge todavía no está enrolado en la nube de wApp. Introduce el
+          <strong>activation code</strong> del panel. La llave privada se genera y se queda
+          <strong>solo en este equipo</strong> (nunca viaja a la nube). El inicio de sesión llega
+          <em>después</em> de enrolar.
+        </p>
+        <form id="enroll-form" class="enroll-form" autocomplete="off">
+          <input id="enroll-code" type="text" spellcheck="false" placeholder="Activation code" aria-label="Activation code" />
+          <button id="enroll-submit" type="submit">Enrolar</button>
+        </form>
+        <p id="enroll-status" class="detail muted"></p>
+      </section>
+
+      <!-- Login del operador. -->
+      <section id="section-login" class="card hidden">
+        <div class="card-head">
+          <h2>Iniciar sesión</h2>
+        </div>
+        <form id="login-form" class="login-form" autocomplete="on">
+          <label class="field">
+            <span>Email</span>
+            <input id="login-email" type="email" autocomplete="username" placeholder="tu@correo.com" required />
+          </label>
+          <label class="field">
+            <span>Contraseña</span>
+            <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••" required />
+          </label>
+          <div class="actions">
+            <button id="login-submit" type="submit">Entrar</button>
+          </div>
+        </form>
+        <p id="login-error" class="detail notice-error hidden" role="alert"></p>
+      </section>
+    </main>
+
+    <script>
+      "use strict";
+      const $ = (id) => document.getElementById(id);
+      const show = (elm, on) => elm.classList.toggle("hidden", !on);
+
+      const secDown = $("section-daemon-down");
+      const secEnroll = $("section-enroll");
+      const secLogin = $("section-login");
+
+      // Averigua el estado de bootstrap y decide qué tarjeta mostrar.
+      async function refreshState() {
+        show(secDown, false);
+        show(secEnroll, false);
+        show(secLogin, false);
+        try {
+          const res = await fetch("/v1/enroll/status", { headers: { Accept: "application/json" } });
+          if (res.status === 503) {
+            show(secDown, true); // daemon down: hay que arrancarlo primero
+            return;
+          }
+          const body = await res.json();
+          if (body && body.enrolled === false) {
+            show(secEnroll, true); // aún no enrolado: enrolar antes de login
+            return;
+          }
+          show(secLogin, true); // enrolado: mostrar login
+        } catch (_) {
+          show(secDown, true);
+        }
+      }
+
+      // Arrancar el daemon (bootstrap, sin sesión → sin CSRF requerido).
+      $("btn-start-daemon").addEventListener("click", async () => {
+        const st = $("daemon-down-status");
+        st.textContent = "Arrancando el núcleo…";
+        try {
+          const res = await fetch("/v1/daemon/start", { method: "POST" });
+          if (!res.ok) throw new Error("start failed");
+          st.textContent = "Núcleo arrancado.";
+          setTimeout(refreshState, 800);
+        } catch (_) {
+          st.textContent = "No se pudo arrancar el núcleo. Revisa los logs.";
+        }
+      });
+
+      // Enrolar (exento de sesión/CSRF).
+      $("enroll-form").addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const code = $("enroll-code").value.trim();
+        const st = $("enroll-status");
+        if (!code) { st.textContent = "Introduce el activation code."; return; }
+        $("enroll-submit").disabled = true;
+        st.textContent = "Enrolando…";
+        try {
+          const res = await fetch("/v1/enroll", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ activation_code: code }),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            st.textContent = (body.error && body.error.message) || "No se pudo enrolar. Revisa el código.";
+            $("enroll-submit").disabled = false;
+            return;
+          }
+          st.textContent = "✅ Equipo enrolado. Ahora inicia sesión.";
+          setTimeout(refreshState, 700);
+        } catch (_) {
+          st.textContent = "Error de red al enrolar.";
+          $("enroll-submit").disabled = false;
+        }
+      });
+
+      // Login del operador.
+      $("login-form").addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        const email = $("login-email").value.trim();
+        const password = $("login-password").value;
+        const errEl = $("login-error");
+        show(errEl, false);
+        $("login-submit").disabled = true;
+        try {
+          const res = await fetch("/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email, password }),
+          });
+          if (res.ok) {
+            window.location = "/";
+            return;
+          }
+          const body = await res.json().catch(() => ({}));
+          errEl.textContent = (body.error && body.error.message) || "No se pudo iniciar sesión.";
+          show(errEl, true);
+        } catch (_) {
+          errEl.textContent = "Error de red al iniciar sesión.";
+          show(errEl, true);
+        } finally {
+          $("login-submit").disabled = false;
+        }
+      });
+
+      refreshState();
+    </script>
+  </body>
+</html>

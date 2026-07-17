@@ -1,7 +1,7 @@
 // app.js — lógica de la web UI del plano de control del Edge (Plan 007, T5).
 //
 // Todo es JS vanilla (fetch + EventSource), sin dependencias ni CDN. La página vive en el MISMO origen
-// loopback que el supervisor (http://127.0.0.1:8765), así que las rutas /v1/* se piden relativas y el
+// loopback que el supervisor (http://127.0.0.1:8105), así que las rutas /v1/* se piden relativas y el
 // supervisor decide qué atiende él (/v1/daemon/*) y qué proxya al núcleo (/v1/health, /v1/sessions, …).
 //
 // Contrato real de los endpoints (verificado en el código Go):
@@ -46,7 +46,87 @@ const el = {
   sectionSessions: $("section-sessions"),
   sectionPair: $("section-pair"),
   sectionLogs: $("section-logs"),
+  // Sesión del operador + modo degradado (Plan 033 · Ola 3, ADR-0025).
+  sessionRoles: $("session-roles"),
+  btnLogout: $("btn-logout"),
+  degradedBanner: $("degraded-banner"),
 };
+
+// ----------------------------- Sesión / CSRF / modo degradado (Plan 033 · Ola 3) -----------------------------
+
+// readCookie lee una cookie por nombre (para el token CSRF legible, patrón double-submit).
+function readCookie(name) {
+  const m = document.cookie.match("(?:^|; )" + name.replace(/([.$?*|{}()\[\]\\\/\+^])/g, "\\$1") + "=([^;]*)");
+  return m ? decodeURIComponent(m[1]) : "";
+}
+
+// csrfHeaders añade el header X-CSRF-Token (de la cookie wapp_edge_csrf) a las peticiones MUTADORAS que la
+// SPA envía a través de wapp-ctl (double-submit). Las GET no lo necesitan.
+function csrfHeaders(extra) {
+  return Object.assign({ "X-CSRF-Token": readCookie("wapp_edge_csrf") }, extra || {});
+}
+
+// mutate envuelve fetch para peticiones mutadoras: inyecta el header CSRF y trata 401 (sesión caducada →
+// a /login) y el modo degradado (403 degraded_read_only / 503 relay_offline → banner "solo lectura").
+async function mutate(url, opts) {
+  const o = Object.assign({}, opts);
+  o.headers = csrfHeaders(o.headers);
+  const res = await fetch(url, o);
+  if (res.status === 401) {
+    window.location = "/login";
+    return res;
+  }
+  return res;
+}
+
+// noteDegradedFromError inspecciona el cuerpo de error de una acción y enciende el banner de modo degradado
+// cuando el cloud no está disponible para escrituras (ADR-0025).
+function noteDegradedFromError(status, body) {
+  const code = body && body.error ? body.error.code : "";
+  if ((status === 403 && code === "degraded_read_only") || (status === 503 && code === "relay_offline")) {
+    showDegraded("Sin conexión al cloud: el Edge está en modo solo lectura.");
+    return true;
+  }
+  return false;
+}
+
+function showDegraded(msg) {
+  if (!el.degradedBanner) return;
+  el.degradedBanner.textContent = "⚠️ " + msg;
+  el.degradedBanner.classList.remove("hidden");
+}
+
+function clearDegraded() {
+  if (el.degradedBanner) el.degradedBanner.classList.add("hidden");
+}
+
+// loadSession pinta el rol del operador desde GET /session (nunca el access token). Sin sesión → /login.
+async function loadSession() {
+  try {
+    const res = await fetch("/session", { cache: "no-store" });
+    const s = await res.json();
+    if (!s || !s.authenticated) {
+      window.location = "/login";
+      return;
+    }
+    if (el.sessionRoles && Array.isArray(s.roles) && s.roles.length) {
+      el.sessionRoles.textContent = s.roles.join(" · ");
+      el.sessionRoles.classList.remove("hidden");
+    }
+  } catch (_) {
+    /* red caída: el sondeo de estado ya avisa; no forzamos logout por un fallo transitorio */
+  }
+}
+
+// logout cierra la sesión en wapp-ctl (limpia cookie + revoca el refresh custodiado) y va a /login.
+async function logout() {
+  try {
+    await mutate("/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  } catch (_) {
+    /* ignoramos: caducamos la sesión local igualmente navegando a /login */
+  }
+  window.location = "/login";
+}
 
 // Estado de la UI (no del daemon): nos sirve para no relanzar sondeos/streams en cada tick.
 const ui = {
@@ -199,7 +279,7 @@ async function submitEnroll(ev) {
   el.enrollSubmit.disabled = true;
   setEnrollStatus("Enrolando este equipo contra la nube…", false);
   try {
-    const res = await fetch("/v1/enroll", {
+    const res = await mutate("/v1/enroll", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ activation_code: code }),
@@ -238,7 +318,7 @@ async function startDaemon() {
   setBadge(el.daemonBadge, "warn", "Arrancando…");
   el.daemonDetail.textContent = "Lanzando el núcleo, espera unos segundos…";
   try {
-    const res = await fetch("/v1/daemon/start", { method: "POST" });
+    const res = await mutate("/v1/daemon/start", { method: "POST" });
     const s = await res.json();
     if (!res.ok) {
       // El supervisor responde {"error":{code,message}} (p. ej. start_failed).
@@ -257,7 +337,7 @@ async function stopDaemon() {
   setDaemonControls(false, false);
   setBadge(el.daemonBadge, "warn", "Deteniendo…");
   try {
-    const res = await fetch("/v1/daemon/stop", { method: "POST" });
+    const res = await mutate("/v1/daemon/stop", { method: "POST" });
     const s = await res.json();
     if (!res.ok) {
       const code = s && s.error ? s.error.code : "error";
@@ -382,13 +462,18 @@ function showUnlinkConfirm(btn, jid) {
 async function deleteSession(jid) {
   showSessionsNotice("Desvinculando " + jid + "…", false);
   try {
-    const res = await fetch("/v1/sessions/" + encodeURIComponent(jid), { method: "DELETE" });
+    const res = await mutate("/v1/sessions/" + encodeURIComponent(jid), { method: "DELETE" });
     if (res.status === 404) {
       showSessionsNotice("La sesión ya no existe (nada que limpiar).", false);
       refreshSessions();
       return;
     }
-    if (res.status === 503) {
+    if (res.status === 503 || res.status === 403) {
+      const body = await res.json().catch(() => ({}));
+      if (noteDegradedFromError(res.status, body)) {
+        showSessionsNotice("Sin conexión al cloud: el Edge está en modo solo lectura.", true);
+        return;
+      }
       showSessionsNotice("Daemon no disponible. Arráncalo e inténtalo de nuevo.", true);
       return;
     }
@@ -431,14 +516,19 @@ async function startPairing() {
   ui.lastQr = "";
 
   try {
-    const res = await fetch("/v1/sessions/pair", { method: "POST" });
+    const res = await mutate("/v1/sessions/pair", { method: "POST" });
     if (res.status === 409) {
       el.pairStatus.textContent = "Ya hay un emparejamiento en curso.";
       el.btnPair.disabled = false;
       return;
     }
-    if (res.status === 503) {
-      el.pairStatus.textContent = "Daemon no disponible. Arráncalo primero.";
+    if (res.status === 503 || res.status === 403) {
+      const body = await res.json().catch(() => ({}));
+      if (noteDegradedFromError(res.status, body)) {
+        el.pairStatus.textContent = "Sin conexión al cloud: el Edge está en modo solo lectura.";
+      } else {
+        el.pairStatus.textContent = "Daemon no disponible. Arráncalo primero.";
+      }
       el.pairStatus.className = "detail muted";
       el.btnPair.disabled = false;
       return;
@@ -574,6 +664,10 @@ el.btnPair.addEventListener("click", startPairing);
 el.btnRefreshSessions.addEventListener("click", refreshSessions);
 el.sessionsBody.addEventListener("click", onSessionsClick);
 el.enrollForm.addEventListener("submit", submitEnroll); // onboarding sin terminal (T1)
+if (el.btnLogout) el.btnLogout.addEventListener("click", logout); // cerrar sesión (Plan 033 · Ola 3)
+
+// Sesión del operador: pinta el rol (o redirige a /login si la sesión ya no vale).
+loadSession();
 
 // Primer sondeo inmediato + bucle de estado cada 3s (el supervisor siempre responde aunque el núcleo
 // esté caído, así que este loop nunca deja la UI en blanco).

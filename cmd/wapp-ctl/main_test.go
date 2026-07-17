@@ -119,8 +119,9 @@ func TestDaemonStartWrongMethod(t *testing.T) {
 	}
 }
 
-// TestWebUIServed: la web UI embebida responde 200 en "/".
-func TestWebUIServed(t *testing.T) {
+// TestRootRedirectsToLoginWithoutSession: tras el Plan 033 · Ola 3, "/" está protegido: sin cookie de
+// sesión válida el borde redirige a /login (303), no sirve el dashboard.
+func TestRootRedirectsToLoginWithoutSession(t *testing.T) {
 	dir := t.TempDir()
 	sup := supervisor.New(supervisor.Config{SocketPath: filepath.Join(dir, "edge.sock")}, nil)
 	router := newRouter(sup, filepath.Join(dir, "edge.sock"), nil)
@@ -129,7 +130,26 @@ func TestWebUIServed(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	router.ServeHTTP(rec, req)
 
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("/ sin sesión status = %d; quería 303 (redirect a /login)", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/login" {
+		t.Fatalf("/ sin sesión Location = %q; quería /login", loc)
+	}
+}
+
+// TestStaticAssetsServedWithoutSession: los assets estáticos (styles.css) se sirven SIN sesión (los
+// necesita también la pantalla de login).
+func TestStaticAssetsServedWithoutSession(t *testing.T) {
+	dir := t.TempDir()
+	sup := supervisor.New(supervisor.Config{SocketPath: filepath.Join(dir, "edge.sock")}, nil)
+	router := newRouter(sup, filepath.Join(dir, "edge.sock"), nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/styles.css", nil)
+	router.ServeHTTP(rec, req)
+
 	if rec.Code != http.StatusOK {
-		t.Fatalf("webui / status = %d; quería 200", rec.Code)
+		t.Fatalf("/styles.css status = %d; quería 200", rec.Code)
 	}
 }

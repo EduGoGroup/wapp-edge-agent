@@ -34,7 +34,8 @@ func (s *Server) RegisterUnlink(u sessionUnlinker) {
 	if s.log != nil {
 		h.log = s.log
 	}
-	s.Handle(http.MethodDelete, "/v1/sessions/{id}", h.handle)
+	// Escritura destructiva (edge.sessions.logout): exige refresh vivo incluso en modo degradado (ADR-0025).
+	s.Handle(http.MethodDelete, "/v1/sessions/{id}", s.guard(resourceSessionsLogout, true, h.handle))
 }
 
 // unlinkResponse es el cuerpo de un DELETE /v1/sessions/{id} exitoso: confirma el borrado quirúrgico de
