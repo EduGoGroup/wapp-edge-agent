@@ -16,7 +16,7 @@ func setup(t *testing.T, relay Relay) (*Manager, *KeyStore, *ecdsa.PrivateKey) {
 	t.Helper()
 	key := newES256Key(t)
 	ks := NewKeyStore(testIssuer)
-	if err := ks.InstallJWKS(jwksJSON("es256-1", &key.PublicKey)); err != nil {
+	if err := ks.InstallJWKS(jwksJSON(t, "es256-1", &key.PublicKey)); err != nil {
 		t.Fatalf("install jwks: %v", err)
 	}
 	m := NewManager(relay, ks, &MemorySecretCustody{}, nil,
@@ -128,7 +128,7 @@ func TestAuthorize_TenantMismatch(t *testing.T) {
 	relay := &fakeRelay{}
 	key := newES256Key(t)
 	ks := NewKeyStore(testIssuer)
-	_ = ks.InstallJWKS(jwksJSON("es256-1", &key.PublicKey))
+	_ = ks.InstallJWKS(jwksJSON(t, "es256-1", &key.PublicKey))
 	m := NewManager(relay, ks, &MemorySecretCustody{}, nil, WithExpectedTenant("tenant-esperado"))
 
 	tok := mintES256(t, key, "es256-1", "otro-tenant", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())

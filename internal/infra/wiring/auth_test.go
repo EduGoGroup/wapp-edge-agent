@@ -68,26 +68,24 @@ func keyStoreWith(t *testing.T, kid string) (*edgeauth.KeyStore, *ecdsa.PrivateK
 		t.Fatalf("generar clave ES256: %v", err)
 	}
 	ks := edgeauth.NewKeyStore(wiringTestIssuer)
-	if err := ks.InstallJWKS(jwksJSONForTest(kid, &key.PublicKey)); err != nil {
+	if err := ks.InstallJWKS(jwksJSONForTest(t, kid, &key.PublicKey)); err != nil {
 		t.Fatalf("instalar JWKS: %v", err)
 	}
 	return ks, key
 }
 
-func leftPad32ForTest(b []byte) []byte {
-	if len(b) >= 32 {
-		return b[len(b)-32:]
+func jwksJSONForTest(t *testing.T, kid string, pub *ecdsa.PublicKey) []byte {
+	t.Helper()
+	// Bytes() devuelve la codificación sin comprimir SEC1: 0x04 || X(32) || Y(32) para P-256.
+	// Se evita pub.X/pub.Y (deprecados desde Go 1.26) siguiendo la guía de crypto/ecdsa.
+	raw, err := pub.Bytes()
+	if err != nil {
+		t.Fatalf("codificar clave pública: %v", err)
 	}
-	out := make([]byte, 32)
-	copy(out[32-len(b):], b)
-	return out
-}
-
-func jwksJSONForTest(kid string, pub *ecdsa.PublicKey) []byte {
 	set := map[string]any{"keys": []map[string]any{{
 		"kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256", "kid": kid,
-		"x": base64.RawURLEncoding.EncodeToString(leftPad32ForTest(pub.X.Bytes())),
-		"y": base64.RawURLEncoding.EncodeToString(leftPad32ForTest(pub.Y.Bytes())),
+		"x": base64.RawURLEncoding.EncodeToString(raw[1:33]),
+		"y": base64.RawURLEncoding.EncodeToString(raw[33:65]),
 	}}}
 	b, _ := json.Marshal(set)
 	return b

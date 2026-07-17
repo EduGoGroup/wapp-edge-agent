@@ -38,26 +38,23 @@ func newES256Key(t *testing.T) *ecdsa.PrivateKey {
 	return k
 }
 
-// leftPad32 alinea un big-endian a 32 bytes (coords JWK).
-func leftPad32(b []byte) []byte {
-	if len(b) >= 32 {
-		return b[len(b)-32:]
-	}
-	out := make([]byte, 32)
-	copy(out[32-len(b):], b)
-	return out
-}
-
 // jwksJSON arma un JWK Set ES256 estándar con una llave (kid → pub), tal como lo empuja la nube.
-func jwksJSON(kid string, pub *ecdsa.PublicKey) []byte {
+func jwksJSON(t *testing.T, kid string, pub *ecdsa.PublicKey) []byte {
+	t.Helper()
+	// Bytes() devuelve la codificación sin comprimir SEC1: 0x04 || X(32) || Y(32) para P-256.
+	// Se evita pub.X/pub.Y (deprecados desde Go 1.26) siguiendo la guía de crypto/ecdsa.
+	raw, err := pub.Bytes()
+	if err != nil {
+		t.Fatalf("codificar clave pública: %v", err)
+	}
 	set := map[string]any{"keys": []map[string]any{{
 		"kty": "EC",
 		"crv": "P-256",
 		"use": "sig",
 		"alg": "ES256",
 		"kid": kid,
-		"x":   base64.RawURLEncoding.EncodeToString(leftPad32(pub.X.Bytes())),
-		"y":   base64.RawURLEncoding.EncodeToString(leftPad32(pub.Y.Bytes())),
+		"x":   base64.RawURLEncoding.EncodeToString(raw[1:33]),
+		"y":   base64.RawURLEncoding.EncodeToString(raw[33:65]),
 	}}}
 	b, _ := json.Marshal(set)
 	return b

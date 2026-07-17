@@ -10,7 +10,7 @@ import (
 
 func TestParseJWKS_Valid(t *testing.T) {
 	key := newES256Key(t)
-	keys, err := ParseJWKS(jwksJSON("es256-1", &key.PublicKey))
+	keys, err := ParseJWKS(jwksJSON(t, "es256-1", &key.PublicKey))
 	if err != nil {
 		t.Fatalf("ParseJWKS válido: %v", err)
 	}
@@ -43,8 +43,8 @@ func TestParseJWKS_DuplicateKid(t *testing.T) {
 	k2 := newES256Key(t)
 	// Dos entradas con el mismo kid.
 	payload := `{"keys":[` +
-		strings.TrimPrefix(strings.TrimSuffix(string(jwksJSON("dup", &k1.PublicKey)), "}"), `{"keys":[`) + `,` +
-		strings.TrimPrefix(strings.TrimSuffix(string(jwksJSON("dup", &k2.PublicKey)), "]}"), `{"keys":[`) + `}`
+		strings.TrimPrefix(strings.TrimSuffix(string(jwksJSON(t, "dup", &k1.PublicKey)), "}"), `{"keys":[`) + `,` +
+		strings.TrimPrefix(strings.TrimSuffix(string(jwksJSON(t, "dup", &k2.PublicKey)), "]}"), `{"keys":[`) + `}`
 	if _, err := ParseJWKS([]byte(payload)); err == nil {
 		t.Fatalf("se esperaba error por kid duplicado")
 	}
@@ -58,7 +58,7 @@ func TestKeyStore_InstallAndVerify(t *testing.T) {
 		t.Fatalf("Verifier debe ser nil antes de instalar ningún JWKS")
 	}
 
-	if err := ks.InstallJWKS(jwksJSON("es256-1", &key.PublicKey)); err != nil {
+	if err := ks.InstallJWKS(jwksJSON(t, "es256-1", &key.PublicKey)); err != nil {
 		t.Fatalf("InstallJWKS: %v", err)
 	}
 	mv := ks.Verifier()
@@ -83,7 +83,7 @@ func TestKeyStore_InstallAndVerify(t *testing.T) {
 func TestKeyStore_InstallInvalidKeepsPrevious(t *testing.T) {
 	key := newES256Key(t)
 	ks := NewKeyStore(testIssuer)
-	if err := ks.InstallJWKS(jwksJSON("es256-1", &key.PublicKey)); err != nil {
+	if err := ks.InstallJWKS(jwksJSON(t, "es256-1", &key.PublicKey)); err != nil {
 		t.Fatalf("install inicial: %v", err)
 	}
 	before := ks.Verifier()
@@ -99,7 +99,7 @@ func TestKeyStore_InstallInvalidKeepsPrevious(t *testing.T) {
 func TestKeyStore_UnknownKidRejected(t *testing.T) {
 	key := newES256Key(t)
 	ks := NewKeyStore(testIssuer)
-	_ = ks.InstallJWKS(jwksJSON("es256-1", &key.PublicKey))
+	_ = ks.InstallJWKS(jwksJSON(t, "es256-1", &key.PublicKey))
 	// Token con kid desconocido.
 	tok := mintES256(t, key, "otro-kid", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())
 	_, err := ks.Verifier().ValidateToken(tok)
