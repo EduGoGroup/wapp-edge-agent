@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <!--
   Web UI del plano de control del Edge (Plan 007, T5). HTML/CSS/JS vanilla, SIN build step:
-  se embebe con //go:embed (ver webui.go) y se sirve en el MISMO origen loopback (127.0.0.1:8765)
+  se embebe con //go:embed (ver webui.go) y se sirve en el MISMO origen loopback (127.0.0.1:8105)
   que el proxy /v1/* del supervisor → sin CORS. La lógica vive en app.js; el estilo en styles.css.
 -->
 <html lang="es">
@@ -13,11 +13,25 @@
   </head>
   <body>
     <header>
-      <h1>wApp Edge</h1>
-      <p class="subtitle">Plano de control local</p>
+      <div class="header-main">
+        <div>
+          <h1>wApp Edge</h1>
+          <p class="subtitle">Plano de control local</p>
+        </div>
+        <!-- Sesión del operador (Plan 033 · Ola 3, ADR-0025): rol(es) + cerrar sesión. app.js lo puebla
+             desde GET /session (nunca expone el access token). -->
+        <div id="session-bar" class="session-bar">
+          <span id="session-roles" class="badge badge-ok hidden"></span>
+          <button id="btn-logout" type="button" class="secondary small">Cerrar sesión</button>
+        </div>
+      </div>
     </header>
 
     <main>
+      <!-- Aviso de modo degradado / sin nube (ADR-0025): una escritura que devuelve degraded_read_only
+           (403) o relay_offline (503) enciende este banner. app.js lo muestra/oculta. -->
+      <div id="degraded-banner" class="banner banner-warn hidden" role="status"></div>
+
       <!-- ===================== Enrolar (onboarding sin terminal, Plan 023 · T1) =====================
         Primera ejecución: si el núcleo aún no tiene credencial mTLS (GET /v1/enroll/status → enrolled:false),
         app.js muestra ESTA tarjeta y oculta el dashboard (sesiones/emparejar/logs). Al enrolar con el

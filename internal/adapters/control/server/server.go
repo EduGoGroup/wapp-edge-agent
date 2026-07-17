@@ -40,10 +40,33 @@ type Server struct {
 	sessions SessionLister
 	health   HealthReporter
 
+	// authorizer aplica la validación ES256 offline + RBAC edge.* (Plan 033 Ola 3 / ADR-0025) sobre las
+	// rutas /v1 protegidas. nil (constructor/tests sin auth, y el comportamiento previo al Plan 033) ⇒ guard
+	// es un no-op: las rutas quedan abiertas como antes. Se cablea con SetAuthorizer ANTES de Serve.
+	authorizer Authorizer
+
 	mux     *http.ServeMux
 	routes  []routeTemplate
 	httpSrv *http.Server
 }
+
+// Authorizer valida el access token del operador (ES256 offline) y evalúa un grant edge.* con default
+// DENY. Lo satisface *auth.Manager. Devuelve primitivas (no un tipo compartido) para NO acoplar el
+// paquete server al paquete auth: allowed + el status HTTP, code y mensaje a emitir cuando se deniega.
+// write=true marca una operación destructiva/de escritura (en modo degradado ≤2h solo se permiten lecturas).
+type Authorizer interface {
+	Authorize(ctx context.Context, bearer, resource string, write bool) (allowed bool, status int, code, message string)
+}
+
+// Recursos edge.* del catálogo RBAC (ADR-0025 dec.4). El middleware los pasa al Authorizer por ruta.
+const (
+	// resourceStatusRead cubre las LECTURAS del plano de control (permitidas en modo degradado ≤2h).
+	resourceStatusRead = "edge.status.read"
+	// resourceSessionsPair autoriza AÑADIR un teléfono (POST /v1/sessions/pair): escritura.
+	resourceSessionsPair = "edge.sessions.pair"
+	// resourceSessionsLogout autoriza DESVINCULAR una sesión de WhatsApp (DELETE /v1/sessions/{id}): escritura.
+	resourceSessionsLogout = "edge.sessions.logout"
+)
 
 // routeTemplate registra una ruta declarada (método + segmentos de la plantilla) para poder
 // distinguir 404 (ninguna plantilla casa la ruta) de 405 (la ruta casa pero el método no) y calcular
@@ -71,9 +94,58 @@ func New(cfg Config, log sharedlogger.Logger, sessions SessionLister) *Server {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	// GET /v1/health queda EXENTO de auth: es la sonda de liveness que el supervisor (wapp-ctl) consulta
+	// para el up/down del daemon, sin identidad de operador (equivale al heartbeat, exento por ADR-0025).
 	s.Handle(http.MethodGet, "/v1/health", s.handleHealth)
-	s.Handle(http.MethodGet, "/v1/sessions", s.handleSessions)
+	// GET /v1/sessions es lectura protegida (edge.status.read): permitida en modo degradado ≤2h.
+	s.Handle(http.MethodGet, "/v1/sessions", s.guard(resourceStatusRead, false, s.handleSessions))
 	return s
+}
+
+// SetAuthorizer cablea el gate de auth de operador (Plan 033 Ola 3 / ADR-0025). Se llama ANTES de Serve
+// (mismo patrón que SetHealthProvider/Register*). nil deja las rutas abiertas (comportamiento previo).
+func (s *Server) SetAuthorizer(a Authorizer) {
+	s.authorizer = a
+}
+
+// HandleAuthorized registra una ruta /v1 PROTEGIDA por el gate edge.* (envuelve h con guard). resource es
+// el grant a evaluar; write marca si la operación es destructiva/de escritura (modo degradado ≤2h: solo
+// lectura). Punto de extensión para las rutas colgadas desde cmd/agent (logs, intent/status).
+func (s *Server) HandleAuthorized(method, pattern, resource string, write bool, h http.HandlerFunc) {
+	s.Handle(method, pattern, s.guard(resource, write, h))
+}
+
+// guard envuelve un handler con el gate de auth: extrae el Bearer del request (que wapp-ctl reenvía desde
+// la cookie de sesión), lo valida contra el Authorizer y aplica el grant `resource` con default DENY. Si
+// no hay Authorizer cableado (tests / pre-Plan 033) devuelve el handler tal cual (no-op, retrocompatible).
+func (s *Server) guard(resource string, write bool, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.authorizer == nil {
+			h(w, r)
+			return
+		}
+		bearer := bearerToken(r)
+		allowed, status, code, msg := s.authorizer.Authorize(r.Context(), bearer, resource, write)
+		if !allowed {
+			if s.log != nil {
+				s.log.Warn("plano de control: acceso denegado", "resource", resource, "write", write, "code", code)
+			}
+			writeError(w, status, code, msg)
+			return
+		}
+		h(w, r)
+	}
+}
+
+// bearerToken extrae el token del header "Authorization: Bearer <token>". Devuelve "" si falta o no es
+// del esquema Bearer.
+func bearerToken(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(h) > len(prefix) && strings.EqualFold(h[:len(prefix)], prefix) {
+		return strings.TrimSpace(h[len(prefix):])
+	}
+	return ""
 }
 
 // SetHealthProvider cablea el colector de salud que enriquece GET /v1/health (Plan 031 T7): con él, la

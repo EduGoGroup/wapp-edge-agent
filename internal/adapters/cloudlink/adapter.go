@@ -155,6 +155,13 @@ type Adapter struct {
 	diagSeen    map[string]struct{}
 	diagOrder   []string
 
+	// authPending correlaciona las peticiones de auth de usuario (Plan 033 / ADR-0025) con su
+	// UserAuthResponse por command_id (mismo patrón request/response que Ping→Pong y Diagnostics). El
+	// relay (Login/Refresh/Logout) registra un canal por command_id antes de enviar y lo espera; el demux
+	// (handleUserAuthResponse, pre-switch) lo entrega. Ver auth.go.
+	authMu      sync.Mutex
+	authPending map[string]chan *cloudlinkv1.UserAuthResponse
+
 	// outbox es la cola DURABLE de eventos edge->cloud (Plan 027 Ola 3 · T2, cierra H2 / ADR-0003). Si está
 	// presente (WithOutbox), un entrante/acuse que no se pudo enviar (stream caído o Send con error) se
 	// ENCOLA en vez de descartarse, y se drena en orden al reconectar. nil => comportamiento previo
@@ -310,6 +317,7 @@ func NewAdapter(cc grpc.ClientConnInterface, log logger.Logger, newValidator Val
 		pending:             make(map[string]bool),
 		sessions:            make(map[string]*sessionEntry),
 		diagSeen:            make(map[string]struct{}),
+		authPending:         make(map[string]chan *cloudlinkv1.UserAuthResponse),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -654,6 +662,14 @@ func (a *Adapter) handleCommand(ctx context.Context, cl *client.Client, c2e *clo
 	// command_id.
 	if dr := c2e.GetDiagnosticsRequest(); dr != nil {
 		a.handleDiagnosticsRequest(ctx, cl, dr)
+		return
+	}
+	// UserAuthResponse (Plan 033 / ADR-0025) es la respuesta a un login/refresh/logout del OPERADOR: NO es
+	// por-sesión de WhatsApp (el login puede ocurrir antes de emparejar ningún teléfono). Se correlaciona
+	// por command_id con la petición pendiente del relay (auth.go), ANTES de resolver la sesión, y NO pasa
+	// por el gate de lease.
+	if ar := c2e.GetUserAuthResponse(); ar != nil {
+		a.handleUserAuthResponse(ar)
 		return
 	}
 	e := a.entry(sid)

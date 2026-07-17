@@ -390,9 +390,16 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	// Bootstrap recarga la config persistida (last-known-good) antes de arrancar los listeners, para que la
 	// clasificación arranque activa sin esperar un nuevo push del Cloud.
 	intentStack := wiring.BuildIntent(cfg, database, log)
-	if intentStack.Service != nil {
-		intentStack.Service.Bootstrap(ctx)
-	}
+
+	// Auth de operador (Plan 033 Ola 3 / ADR-0025): sobre el edgeconfig.Service COMPARTIDO se registra el
+	// kind "jwks" (llave pública ES256 del emisor) además de "intents". El store de llaves resultante lo
+	// consulta el session manager para validar access tokens OFFLINE. El applier con AMBOS kinds es el que
+	// consume el Adapter CloudLink (por eso se fija intentStack.Applier al Service compartido, aun con el
+	// clasificador OFF). Bootstrap recarga intents + jwks persistidos (last-known-good) antes de arrancar.
+	edgeCfgSvc := wiring.SharedEdgeConfigService(intentStack, log)
+	authKeyStore := wiring.RegisterJWKS(edgeCfgSvc, log)
+	intentStack.Applier = edgeCfgSvc
+	edgeCfgSvc.Bootstrap(ctx)
 
 	// Registro de salud de runtime por sesión (Plan 031 T6): el Manager lo puebla (prueba de vida del
 	// socket, duración de carga de DEK, edad del último entrante). Se crea ANTES del mux porque el colector
@@ -411,7 +418,13 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	// sin tocar disco) + goroutine_dump + subsystems_json (salud del colector), saneado y truncado en origen.
 	diagBuilder := diagnostics.NewBuilder(sink, healthCollector, cfg.DiagLogLines)
 
-	mux := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder)
+	mux, authRelay := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder)
+
+	// Session manager del operador (Plan 033 Ola 3 / ADR-0025): relaya login/refresh/logout por el mismo
+	// stream CloudLink (authRelay = el Adapter; nil ⇒ relay offline), custodia el refresh token y valida
+	// access tokens offline con las llaves del store jwks. Arranca el refresh proactivo ligado a ctx.
+	authMgr := wiring.BuildAuthManager(cfg, log, authKeyStore, authRelay)
+	authMgr.StartProactiveRefresh(ctx)
 
 	// Manager con la BD ÚNICA compartida (WithSharedDB): escucha real per-device (un listener por device
 	// que carga por SU JID sobre la BD compartida) y pairing real (Container per-device sobre la MISMA BD;
@@ -442,20 +455,27 @@ func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, s
 	// Salud enriquecida en GET /v1/health (Plan 031 T7): uptime del daemon + snapshot por sesión del
 	// Registry T6. Mismo colector que alimenta el heartbeat, para que el plano local y el Cloud vean lo mismo.
 	srv.SetHealthProvider(healthCollector)
-	srv.Handle(http.MethodGet, "/v1/logs", logsink.Handler(sink))
+	// Gate de auth de operador (Plan 033 Ola 3 / ADR-0025): valida el access token (ES256 offline) y aplica
+	// RBAC edge.* (default DENY) en las rutas protegidas. GET /v1/health y POST /v1/enroll quedan EXENTOS
+	// (liveness del supervisor / bootstrap de primera ejecución antes de que exista identidad de operador).
+	srv.SetAuthorizer(authMgr)
+	srv.RegisterAuth(authMgr) // POST /v1/auth/{login,refresh,logout} (relay al IAM; exentos del gate)
+	// Lecturas protegidas (edge.status.read; permitidas en modo degradado ≤2h).
+	srv.HandleAuthorized(http.MethodGet, "/v1/logs", "edge.status.read", false, logsink.Handler(sink))
 	// GET /v1/intent/status (Plan 029 · T13): estado del clasificador local (la web de onboarding lo
 	// consumirá en el Plan 030). Se registra SIEMPRE; con la feature off reporta enabled=false. El sondeo de
 	// Ollama tiene timeout corto (no bloquea el endpoint).
-	srv.Handle(http.MethodGet, "/v1/intent/status", intent.StatusHandler(intent.StatusDeps{
+	srv.HandleAuthorized(http.MethodGet, "/v1/intent/status", "edge.status.read", false, intent.StatusHandler(intent.StatusDeps{
 		Enabled:       intentStack.Enabled,
 		Model:         intentStack.Model,
 		Prober:        intentStack.Prober,
 		ConfigVersion: intentStack.ConfigVersion,
 		Circuit:       intentStack.CircuitFunc(),
 	}))
-	srv.RegisterPairing(mgr) // POST /v1/sessions/pair → Manager.Pair (async; QR por polling)
-	srv.RegisterUnlink(mgr)  // DELETE /v1/sessions/{id} → Manager.Unlink(session_id)
-	// GET /v1/enroll/status + POST /v1/enroll (onboarding sin terminal, Plan 023 · T1).
+	srv.RegisterPairing(mgr) // POST /v1/sessions/pair → Manager.Pair (async; QR por polling) — gated edge.sessions.pair
+	srv.RegisterUnlink(mgr)  // DELETE /v1/sessions/{id} → Manager.Unlink(session_id) — gated edge.sessions.logout
+	// GET /v1/enroll/status + POST /v1/enroll (onboarding sin terminal, Plan 023 · T1). EXENTO del gate:
+	// es el bootstrap de primera ejecución, previo a que exista identidad de operador (no hay token todavía).
 	srv.RegisterEnroll(enrollPort{cfg: cfg, log: log})
 
 	ln, err := srv.Listen()

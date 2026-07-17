@@ -28,6 +28,7 @@ import (
 	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
+	edgeauth "github.com/EduGoGroup/wapp-edge-agent/internal/auth"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
@@ -138,15 +139,19 @@ func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, 
 //     real cuyo loop de stream corre en goroutine ligada a ctx. El Manager registra cada sesión.
 //
 // ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK (ADR-0007).
-func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox, intentStack *IntentStack, collector cloudlink.HealthCollector, diagBuilder cloudlink.DiagnosticsBuilder) sessionmgr.CloudLinkMux {
+//
+// Devuelve además el RELAY de auth de operador (Plan 033 Ola 3 / ADR-0025): el mismo Adapter satisface
+// edgeauth.Relay (login/refresh/logout por el stream). Cuando no hay endpoint (LogMux) el relay es nil: el
+// caller cae a un relay offline (login siempre falla; no hay login offline de primera vez).
+func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox, intentStack *IntentStack, collector cloudlink.HealthCollector, diagBuilder cloudlink.DiagnosticsBuilder) (sessionmgr.CloudLinkMux, edgeauth.Relay) {
 	if cfg.CloudLink.Endpoint == "" {
 		log.Info("CloudLink deshabilitado (sin endpoint): usando LogMux por sesión para diagnóstico")
-		return cloudlink.NewLogMux(log)
+		return cloudlink.NewLogMux(log), nil
 	}
 
 	cc, newValidator, cloudEncPub, ok := dialCloudLink(cfg.CloudLink, log, "LogMux")
 	if !ok {
-		return cloudlink.NewLogMux(log)
+		return cloudlink.NewLogMux(log), nil
 	}
 
 	adapter := cloudlink.NewAdapter(cc, log, newValidator,
@@ -172,7 +177,7 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, o
 
 	log.Info("CloudLink habilitado (multi-sesión): un stream multiplexado por session_id",
 		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil)
-	return adapter
+	return adapter, adapter
 }
 
 // BuildOutbox construye el outbox durable (Plan 027 Ola 3 · T2, cierra H2 / ADR-0003) sobre la BD ÚNICA ya

@@ -37,6 +37,8 @@ const (
 	codeStopFailed = "stop_failed"
 	// codeMethodNotAllowed: verbo HTTP no permitido para una ruta /v1/daemon/*.
 	codeMethodNotAllowed = "method_not_allowed"
+	// codeNotFound: ruta no disponible desde el navegador (p.ej. /v1/auth/* se bloquea en el proxy).
+	codeNotFound = "not_found"
 )
 
 func writeError(w http.ResponseWriter, status int, code, message string) {
