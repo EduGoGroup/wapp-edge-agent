@@ -1,204 +1,290 @@
-/*
-  Estilo sobrio del plano de control (Plan 007, T5). Sin frameworks ni CDN: CSS plano embebido.
-  Prioriza legibilidad y función sobre estética. Paleta neutra con un acento sobrio.
-*/
+/* ==========================================================================
+   wApp Edge Agent UI — Design Tokens & Componentes Estandarizados
+   ========================================================================== */
 
 :root {
-  --bg: #f4f5f7;
-  --card: #ffffff;
-  --ink: #1c2128;
-  --muted: #6b7280;
-  --border: #e2e5ea;
-  --accent: #2563eb;
-  --accent-ink: #ffffff;
-  --ok: #16a34a;
-  --warn: #d97706;
-  --err: #dc2626;
+  /* --- Tokens Globales wApp (Acento Edge: Slate / Blue) --- */
+  --wapp-color-brand-primary: #2563EB;
+  --wapp-color-brand-on-primary: #FFFFFF;
+  --wapp-color-brand-container: #DBEAFE;
+  --wapp-color-brand-on-container: #1E3A8A;
+
+  --wapp-color-secondary: #4A635E;
+  --wapp-color-on-secondary: #FFFFFF;
+  --wapp-color-secondary-container: #CCE8E1;
+  --wapp-color-on-secondary-container: #06201B;
+
+  --wapp-color-tertiary: #446179;
+  --wapp-color-on-tertiary: #FFFFFF;
+  --wapp-color-tertiary-container: #CBE6FF;
+  --wapp-color-on-tertiary-container: #001E31;
+
+  --wapp-color-success: #16A34A;
+  --wapp-color-on-success: #FFFFFF;
+  --wapp-color-success-container: #DCFCE7;
+
+  --wapp-color-warning: #D97706;
+  --wapp-color-on-warning: #FFFFFF;
+  --wapp-color-warning-container: #FEF3C7;
+
+  --wapp-color-error: #BA1A1A;
+  --wapp-color-on-error: #FFFFFF;
+  --wapp-color-error-container: #FFDAD6;
+  --wapp-color-on-error-container: #410002;
+
+  --wapp-color-bg: #F4FBF8;
+  --wapp-color-on-bg: #161D1B;
+  --wapp-color-surface: #F4FBF8;
+  --wapp-color-on-surface: #161D1B;
+  --wapp-color-surface-variant: #DAE5E1;
+  --wapp-color-on-surface-variant: #3F4946;
+  --wapp-color-border: #6F7975;
+  --wapp-color-border-variant: #BEC9C4;
+  --wapp-color-surface-card: #FFFFFF;
+
+  --wapp-font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --wapp-font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+
+  --wapp-radius-xs: 4px;
+  --wapp-radius-sm: 8px;
+  --wapp-radius-md: 12px;
+  --wapp-radius-lg: 16px;
+  --wapp-radius-xl: 28px;
+  --wapp-radius-full: 999px;
+
+  --wapp-shadow-1: 0 1px 2px rgba(0,0,0,0.20), 0 1px 3px 1px rgba(0,0,0,0.10);
+  --wapp-shadow-2: 0 1px 2px rgba(0,0,0,0.20), 0 2px 6px 2px rgba(0,0,0,0.10);
+
+  --wapp-space-1: 4px;
+  --wapp-space-2: 8px;
+  --wapp-space-3: 12px;
+  --wapp-space-4: 16px;
+  --wapp-space-6: 24px;
+
+  /* Aliases de compatibilidad para el Dashboard SPA */
+  --bg: var(--wapp-color-bg);
+  --card: var(--wapp-color-surface-card);
+  --ink: var(--wapp-color-on-bg);
+  --muted: var(--wapp-color-on-surface-variant);
+  --border: var(--wapp-color-border-variant);
+  --accent: var(--wapp-color-brand-primary);
+  --accent-ink: var(--wapp-color-brand-on-primary);
+  --ok: var(--wapp-color-success);
+  --warn: var(--wapp-color-warning);
+  --err: var(--wapp-color-error);
   --logs-bg: #0d1117;
   --logs-ink: #d1d5db;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --wapp-color-bg: #0E1513;
+    --wapp-color-on-bg: #DDE4E1;
+    --wapp-color-surface: #0E1513;
+    --wapp-color-on-surface: #DDE4E1;
+    --wapp-color-surface-variant: #3F4946;
+    --wapp-color-on-surface-variant: #BEC9C4;
+    --wapp-color-border: #899390;
+    --wapp-color-border-variant: #3F4946;
+    --wapp-color-surface-card: #161D1B;
+  }
 }
 
 * { box-sizing: border-box; }
 
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  background: var(--bg);
-  color: var(--ink);
+  font-family: var(--wapp-font-family);
+  background: var(--wapp-color-bg);
+  color: var(--wapp-color-on-bg);
   line-height: 1.45;
 }
 
-header {
-  padding: 20px 24px 8px;
-}
-header h1 { margin: 0; font-size: 1.4rem; }
-header .subtitle { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; }
-
-/* ---------- Barra de sesión del operador (Plan 033 · Ola 3) ---------- */
-.header-main {
-  max-width: 860px;
-  margin: 0 auto;
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-.session-bar { display: flex; align-items: center; gap: 10px; }
-
-/* ---------- Banner (modo degradado / sin nube) ---------- */
-.banner {
-  border-radius: 8px;
-  padding: 10px 14px;
-  font-size: 0.9rem;
-  font-weight: 500;
-}
-.banner-warn { background: #fef3c7; color: var(--warn); border: 1px solid #fcd34d; }
-
-/* ---------- Formulario de login (Plan 033 · Ola 3) ---------- */
-.login-form { display: grid; gap: 12px; max-width: 22rem; }
-.login-form .field { display: grid; gap: 4px; font-size: 0.9rem; }
-.login-form .field span { color: var(--muted); }
-.login-form input {
-  font: inherit;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: #fff;
-  color: var(--ink);
-}
-.login-form input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
-
-main {
-  max-width: 860px;
-  margin: 0 auto;
-  padding: 12px 24px 48px;
-  display: grid;
-  gap: 16px;
-}
-
-.card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px 18px;
-}
-
-.card-head {
+/* --- Layout de Autenticación Unificado --- */
+.wapp-auth-container {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 10px;
+  justify-content: center;
+  min-height: 100vh;
+  padding: var(--wapp-space-4);
+  background-color: var(--wapp-color-bg);
 }
-.card-head h2 { margin: 0; font-size: 1.05rem; }
 
+.wapp-card {
+  background-color: var(--wapp-color-surface-card);
+  border: 1px solid var(--wapp-color-border-variant);
+  border-radius: var(--wapp-radius-lg);
+  box-shadow: var(--wapp-shadow-2);
+  padding: var(--wapp-space-6);
+}
+
+.wapp-login-card {
+  width: 100%;
+  max-width: 420px;
+  box-sizing: border-box;
+}
+
+.wapp-login-header {
+  text-align: center;
+  margin-bottom: var(--wapp-space-6);
+}
+
+.wapp-brand-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  background-color: var(--wapp-color-brand-container);
+  color: var(--wapp-color-brand-primary);
+  border-radius: var(--wapp-radius-md);
+  margin-bottom: var(--wapp-space-3);
+}
+
+.wapp-title {
+  margin: 0;
+  font-size: 1.75rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--wapp-color-on-surface);
+}
+
+.wapp-subtitle {
+  margin: var(--wapp-space-1) 0 0 0;
+  font-size: 0.9rem;
+  color: var(--wapp-color-on-surface-variant);
+}
+
+.wapp-form-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wapp-space-4);
+}
+
+.wapp-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--wapp-space-1);
+}
+
+.wapp-field--alpha {
+  background-color: var(--wapp-color-secondary-container);
+  border: 1px solid var(--wapp-color-secondary);
+  border-radius: var(--wapp-radius-md);
+  padding: var(--wapp-space-3);
+  margin-bottom: var(--wapp-space-4);
+}
+
+.wapp-field__label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--wapp-color-on-surface-variant);
+}
+
+.wapp-field--alpha .wapp-field__label {
+  color: var(--wapp-color-on-secondary-container);
+}
+
+.wapp-field__control {
+  width: 100%;
+  padding: var(--wapp-space-3);
+  box-sizing: border-box;
+  background-color: var(--wapp-color-surface);
+  color: var(--wapp-color-on-surface);
+  border: 1px solid var(--wapp-color-border-variant);
+  border-radius: var(--wapp-radius-sm);
+  font-family: var(--wapp-font-family);
+  font-size: 0.95rem;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.wapp-field__control:focus {
+  outline: none;
+  border-color: var(--wapp-color-brand-primary);
+  box-shadow: 0 0 0 3px var(--wapp-color-brand-container);
+}
+
+.wapp-actions {
+  margin-top: var(--wapp-space-2);
+}
+
+.wapp-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: var(--wapp-space-3) var(--wapp-space-6);
+  border: none;
+  border-radius: var(--wapp-radius-full);
+  font-family: var(--wapp-font-family);
+  font-size: 0.95rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s, filter 0.2s;
+}
+
+.wapp-btn--filled {
+  background-color: var(--wapp-color-brand-primary);
+  color: var(--wapp-color-brand-on-primary);
+}
+
+.wapp-btn--filled:hover {
+  filter: brightness(1.1);
+}
+
+.wapp-snackbar {
+  padding: var(--wapp-space-3) var(--wapp-space-4);
+  border-radius: var(--wapp-radius-sm);
+  font-size: 0.875rem;
+  margin-bottom: var(--wapp-space-4);
+}
+
+.wapp-snackbar--error {
+  background-color: var(--wapp-color-error-container);
+  color: var(--wapp-color-on-error-container);
+  border: 1px solid var(--wapp-color-error);
+}
+
+/* --- Dashboard SPA Styles --- */
+header { padding: 20px 24px 8px; }
+header h1 { margin: 0; font-size: 1.4rem; }
+header .subtitle { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; }
+.header-main { max-width: 860px; margin: 0 auto; display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.session-bar { display: flex; align-items: center; gap: 10px; }
+
+main { max-width: 860px; margin: 0 auto; padding: 12px 24px 48px; display: grid; gap: 16px; }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+.card-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.card-head h2 { margin: 0; font-size: 1.05rem; }
 .detail { margin: 4px 0 12px; font-size: 0.92rem; }
 .muted { color: var(--muted); }
 .hidden { display: none !important; }
-
-/* ---------- Botones ---------- */
 .actions { display: flex; gap: 10px; flex-wrap: wrap; }
 
-button {
-  font: inherit;
-  cursor: pointer;
-  border: 1px solid var(--accent);
-  background: var(--accent);
-  color: var(--accent-ink);
-  padding: 8px 16px;
-  border-radius: 7px;
-  transition: opacity 0.15s ease;
-}
+button { font: inherit; cursor: pointer; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink); padding: 8px 16px; border-radius: 7px; transition: opacity 0.15s ease; }
 button:hover:not(:disabled) { opacity: 0.88; }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
-button.secondary {
-  background: transparent;
-  color: var(--accent);
-}
+button.secondary { background: transparent; color: var(--accent); }
 button.small { padding: 5px 10px; font-size: 0.85rem; }
-
-/* Acción destructiva (desvincular/limpiar): borde/acento rojo, sobrio. */
-button.danger {
-  border-color: var(--err);
-  color: var(--err);
-  background: transparent;
-}
+button.danger { border-color: var(--err); color: var(--err); background: transparent; }
 button.danger:hover:not(:disabled) { background: #fee2e2; opacity: 1; }
 
-/* Confirmación inline (sin diálogo bloqueante) en la celda de acciones. */
-.session-actions { white-space: nowrap; }
-.confirm-text { font-size: 0.85rem; color: var(--warn); margin-right: 4px; }
-
-/* Aviso de resultado bajo la tabla de sesiones. */
-.notice-error { color: var(--err); }
-
-/* ---------- Badges de estado ---------- */
-.badge {
-  font-size: 0.8rem;
-  font-weight: 600;
-  padding: 3px 10px;
-  border-radius: 999px;
-  white-space: nowrap;
-}
+.badge { font-size: 0.8rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; white-space: nowrap; }
 .badge-unknown { background: #e5e7eb; color: var(--muted); }
 .badge-ok      { background: #dcfce7; color: var(--ok); }
 .badge-down    { background: #fee2e2; color: var(--err); }
 .badge-warn    { background: #fef3c7; color: var(--warn); }
 
-/* ---------- Tabla de sesiones ---------- */
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.9rem;
-}
-th, td {
-  text-align: left;
-  padding: 7px 8px;
-  border-bottom: 1px solid var(--border);
-}
+table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; }
 td { word-break: break-all; }
 
-/* ---------- QR ---------- */
-.qr-wrap {
-  margin-top: 8px;
-  display: flex;
-  justify-content: center;
-}
-.qr-wrap img {
-  width: 256px;
-  height: 256px;
-  image-rendering: pixelated;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: #fff;
-  padding: 8px;
-}
+.qr-wrap { margin-top: 8px; display: flex; justify-content: center; }
+.qr-wrap img { width: 256px; height: 256px; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 8px; background: #fff; padding: 8px; }
 
-/* ---------- Onboarding / enrolar (Plan 023, T1) ---------- */
 .enroll-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-.enroll-form input {
-  flex: 1 1 16rem;
-  font: inherit;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  background: #fff;
-  color: var(--ink);
-}
+.enroll-form input { flex: 1 1 16rem; font: inherit; padding: 8px 12px; border: 1px solid var(--border); border-radius: 7px; background: #fff; color: var(--ink); }
 .enroll-form input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* ---------- Logs ---------- */
-.logs {
-  margin: 0;
-  background: var(--logs-bg);
-  color: var(--logs-ink);
-  padding: 12px;
-  border-radius: 8px;
-  height: 280px;
-  overflow-y: auto;
-  font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
-  font-size: 0.8rem;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
+.logs { margin: 0; background: var(--logs-bg); color: var(--logs-ink); padding: 12px; border-radius: 8px; height: 280px; overflow-y: auto; font-family: var(--wapp-font-mono); font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; }

@@ -1,82 +1,102 @@
 <!DOCTYPE html>
-<!--
-  Pantalla de inicio de sesión del operador (Plan 033 · Ola 3 · Paso B, ADR-0025 dec.5). Documento
-  AUTOCONTENIDO (script inline) servido por wapp-ctl en GET /login (público). Reutiliza styles.css.
-
-  Orden de bootstrap enroll → login:
-    - Al cargar, sondea GET /v1/enroll/status. Si el Edge AÚN NO está enrolado (enrolled:false), muestra
-      el formulario de ENROLAR (POST /v1/enroll, exento de sesión). Tras enrolar → login.
-    - Si el núcleo está caído (503 daemon_down), pide arrancar el daemon (POST /v1/daemon/start).
-    - Con el Edge enrolado, muestra el LOGIN: POST /login a wapp-ctl, que llama al socket /v1/auth/login,
-      crea la cookie de sesión y responde. Los errores se mapean por `code` a mensajes amigables.
--->
 <html lang="es">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>wApp Edge · iniciar sesión</title>
+    <title>wApp Edge · Iniciar sesión</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
-    <header>
-      <h1>wApp Edge</h1>
-      <p class="subtitle">Plano de control local</p>
-    </header>
-
-    <main>
-      <!-- Aviso de daemon caído / bootstrap. -->
-      <section id="section-daemon-down" class="card hidden">
-        <div class="card-head">
-          <h2>Núcleo detenido</h2>
-          <span class="badge badge-down">Daemon down</span>
+    <div class="wapp-auth-container">
+      <!-- Aviso de daemon caído / bootstrap -->
+      <section id="section-daemon-down" class="wapp-card wapp-login-card hidden">
+        <div class="wapp-login-header">
+            <div class="wapp-brand-badge">
+                <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor">
+                    <path d="M12 2a10 10 0 0 0-8.5 15.3L2 22l4.8-1.5A10 10 0 1 0 12 2Zm0 2a8 8 0 1 1-4.2 14.8l-.3-.2-2.7.8.8-2.6-.2-.3A8 8 0 0 1 12 4Z"/>
+                </svg>
+            </div>
+            <h1 class="wapp-title">wApp Edge</h1>
+            <p class="wapp-subtitle">Núcleo Detenido</p>
         </div>
-        <p class="detail">El núcleo del Edge no está corriendo. Arráncalo para continuar.</p>
-        <div class="actions">
-          <button id="btn-start-daemon" type="button">Arrancar daemon</button>
+        <p class="detail" style="text-align: center;">El núcleo del Edge no está corriendo. Arráncalo para continuar.</p>
+        <div class="wapp-actions">
+          <button id="btn-start-daemon" type="button" class="wapp-btn wapp-btn--filled">Arrancar daemon</button>
         </div>
-        <p id="daemon-down-status" class="detail muted"></p>
+        <p id="daemon-down-status" class="detail muted" style="text-align: center; margin-top: 8px;"></p>
       </section>
 
-      <!-- Enrolar (primera ejecución, antes del login). -->
-      <section id="section-enroll" class="card hidden">
-        <div class="card-head">
-          <h2>Enrolar este equipo</h2>
-          <span class="badge badge-warn">Sin credencial</span>
+      <!-- Enrolar (primera ejecución, antes del login) -->
+      <section id="section-enroll" class="wapp-card wapp-login-card hidden">
+        <div class="wapp-login-header">
+            <div class="wapp-brand-badge">
+                <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor">
+                    <path d="M12 2a10 10 0 0 0-8.5 15.3L2 22l4.8-1.5A10 10 0 1 0 12 2Zm0 2a8 8 0 1 1-4.2 14.8l-.3-.2-2.7.8.8-2.6-.2-.3A8 8 0 0 1 12 4Z"/>
+                </svg>
+            </div>
+            <h1 class="wapp-title">Enrolar Equipo</h1>
+            <p class="wapp-subtitle">Introduce tu activation code de wApp Cloud</p>
         </div>
-        <p class="detail">
-          Este Edge todavía no está enrolado en la nube de wApp. Introduce el
-          <strong>activation code</strong> del panel. La llave privada se genera y se queda
-          <strong>solo en este equipo</strong> (nunca viaja a la nube). El inicio de sesión llega
-          <em>después</em> de enrolar.
-        </p>
-        <form id="enroll-form" class="enroll-form" autocomplete="off">
-          <input id="enroll-code" type="text" spellcheck="false" placeholder="Activation code" aria-label="Activation code" />
-          <button id="enroll-submit" type="submit">Enrolar</button>
-        </form>
-        <p id="enroll-status" class="detail muted"></p>
-      </section>
-
-      <!-- Login del operador. -->
-      <section id="section-login" class="card hidden">
-        <div class="card-head">
-          <h2>Iniciar sesión</h2>
-        </div>
-        <form id="login-form" class="login-form" autocomplete="on">
-          <label class="field">
-            <span>Email</span>
-            <input id="login-email" type="email" autocomplete="username" placeholder="tu@correo.com" required />
-          </label>
-          <label class="field">
-            <span>Contraseña</span>
-            <input id="login-password" type="password" autocomplete="current-password" placeholder="••••••••" required />
-          </label>
-          <div class="actions">
-            <button id="login-submit" type="submit">Entrar</button>
+        <form id="enroll-form" class="wapp-form-stack" autocomplete="off">
+          <div class="wapp-field">
+            <label class="wapp-field__label" for="enroll-code">Código de activación</label>
+            <input id="enroll-code" class="wapp-field__control" type="text" spellcheck="false" placeholder="Activation code" required />
+          </div>
+          <div class="wapp-actions">
+            <button id="enroll-submit" type="submit" class="wapp-btn wapp-btn--filled">Enrolar</button>
           </div>
         </form>
-        <p id="login-error" class="detail notice-error hidden" role="alert"></p>
+        <p id="enroll-status" class="detail muted" style="text-align: center; margin-top: 8px;"></p>
       </section>
-    </main>
+
+      <!-- Login del operador -->
+      <section id="section-login" class="wapp-card wapp-login-card hidden">
+        <!-- Encabezado de la Tarjeta -->
+        <div class="wapp-login-header">
+            <div class="wapp-brand-badge">
+                <svg viewBox="0 0 24 24" width="28" height="28" fill="currentColor">
+                    <path d="M12 2a10 10 0 0 0-8.5 15.3L2 22l4.8-1.5A10 10 0 1 0 12 2Zm0 2a8 8 0 1 1-4.2 14.8l-.3-.2-2.7.8.8-2.6-.2-.3A8 8 0 0 1 12 4Z"/>
+                </svg>
+            </div>
+            <h1 class="wapp-title">wApp</h1>
+            <p class="wapp-subtitle">Plano de Control Local</p>
+        </div>
+
+        <!-- Componente Alpha: Selector de Usuarios de Prueba -->
+        {{ if .EnableAlphaTestAccounts }}
+        <div class="wapp-field wapp-field--alpha" id="alpha-user-container">
+            <label class="wapp-field__label" for="alpha-user-select">
+                <span>Usuario de prueba (Alpha)</span>
+            </label>
+            <select class="wapp-field__control" id="alpha-user-select" aria-label="Selecciona un usuario de prueba">
+                <option value="" selected disabled>Selecciona para autocompletar el email...</option>
+                <option value="admin@e2e.local" data-email="admin@e2e.local" data-password="E2eAuth!033">Administrador e2e (admin@e2e.local)</option>
+                <option value="admin-b@e2e.local" data-email="admin-b@e2e.local" data-password="E2eAuth!033">Admin Tenant B (admin-b@e2e.local)</option>
+            </select>
+        </div>
+        {{ end }}
+
+        <!-- Mensaje de Error / Alerta -->
+        <div id="login-error" class="wapp-snackbar wapp-snackbar--error hidden" role="alert"></div>
+
+        <!-- Formulario de Login -->
+        <form id="login-form" class="wapp-form-stack" autocomplete="on">
+          <div class="wapp-field">
+            <label class="wapp-field__label" for="login-email">Correo electrónico</label>
+            <input id="login-email" class="wapp-field__control" type="email" autocomplete="username" placeholder="tu@empresa.com" required autofocus />
+          </div>
+
+          <div class="wapp-field">
+            <label class="wapp-field__label" for="login-password">Contraseña</label>
+            <input id="login-password" class="wapp-field__control" type="password" autocomplete="current-password" placeholder="••••••••" required />
+          </div>
+
+          <div class="wapp-actions">
+            <button id="login-submit" type="submit" class="wapp-btn wapp-btn--filled">Iniciar sesión</button>
+          </div>
+        </form>
+      </section>
+    </div>
 
     <script>
       "use strict";
@@ -87,7 +107,6 @@
       const secEnroll = $("section-enroll");
       const secLogin = $("section-login");
 
-      // Averigua el estado de bootstrap y decide qué tarjeta mostrar.
       async function refreshState() {
         show(secDown, false);
         show(secEnroll, false);
@@ -95,21 +114,20 @@
         try {
           const res = await fetch("/v1/enroll/status", { headers: { Accept: "application/json" } });
           if (res.status === 503) {
-            show(secDown, true); // daemon down: hay que arrancarlo primero
+            show(secDown, true);
             return;
           }
           const body = await res.json();
           if (body && body.enrolled === false) {
-            show(secEnroll, true); // aún no enrolado: enrolar antes de login
+            show(secEnroll, true);
             return;
           }
-          show(secLogin, true); // enrolado: mostrar login
+          show(secLogin, true);
         } catch (_) {
           show(secDown, true);
         }
       }
 
-      // Arrancar el daemon (bootstrap, sin sesión → sin CSRF requerido).
       $("btn-start-daemon").addEventListener("click", async () => {
         const st = $("daemon-down-status");
         st.textContent = "Arrancando el núcleo…";
@@ -123,7 +141,6 @@
         }
       });
 
-      // Enrolar (exento de sesión/CSRF).
       $("enroll-form").addEventListener("submit", async (ev) => {
         ev.preventDefault();
         const code = $("enroll-code").value.trim();
@@ -151,7 +168,6 @@
         }
       });
 
-      // Login del operador.
       $("login-form").addEventListener("submit", async (ev) => {
         ev.preventDefault();
         const email = $("login-email").value.trim();
@@ -179,6 +195,21 @@
           $("login-submit").disabled = false;
         }
       });
+
+      const alphaSel = $("alpha-user-select");
+      if (alphaSel) {
+        alphaSel.addEventListener("change", (e) => {
+          const opt = e.target.options[e.target.selectedIndex];
+          const em = opt.getAttribute("data-email");
+          const pw = opt.getAttribute("data-password");
+          if (em && pw) {
+            const emailInp = $("login-email");
+            const passInp = $("login-password");
+            if (emailInp) emailInp.value = em;
+            if (passInp) passInp.value = pw;
+          }
+        });
+      }
 
       refreshState();
     </script>

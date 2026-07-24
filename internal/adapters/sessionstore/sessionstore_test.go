@@ -292,45 +292,6 @@ func TestStoreErrorsOnClosedDB(t *testing.T) {
 	}
 }
 
-// --- Locator ---
-
-// TestLocatorNoDevice: sin device pareado en el store cifrado, PairedJID devuelve ok=false.
-func TestLocatorNoDevice(t *testing.T) {
-	ctx := context.Background()
-	_, database := newStore(t)
-	loc := NewLocator(database)
-	jid, ok, err := loc.PairedJID(ctx)
-	if err != nil {
-		t.Fatalf("PairedJID: %v", err)
-	}
-	if ok || jid != "" {
-		t.Fatalf("esperaba ok=false/jid vacío sin device, got ok=%v jid=%q", ok, jid)
-	}
-}
-
-// TestLocatorWithDevice: con una fila en msg_enc_device, PairedJID resuelve su JID.
-func TestLocatorWithDevice(t *testing.T) {
-	ctx := context.Background()
-	_, database := newStore(t)
-	if _, err := database.ExecContext(ctx,
-		`INSERT INTO msg_enc_device (jid, registration_id, signed_pre_key_id, noise_priv,
-		   identity_priv, signed_pre_key_priv, signed_pre_key_sig, adv_secret_key, adv_details,
-		   adv_account_sig, adv_account_sig_key, adv_device_sig)
-		 VALUES ('56984467443:47@s.whatsapp.net', 1, 1, x'00', x'00', x'00', x'00', x'00', x'00', x'00', x'00', x'00')`); err != nil {
-		t.Fatalf("insert device: %v", err)
-	}
-	loc := NewLocator(database)
-	jid, ok, err := loc.PairedJID(ctx)
-	if err != nil {
-		t.Fatalf("PairedJID: %v", err)
-	}
-	if !ok {
-		t.Fatal("esperaba ok=true con un device pareado")
-	}
-	if jid != "56984467443:47@s.whatsapp.net" {
-		t.Fatalf("jid = %q", jid)
-	}
-}
 
 // TestSessionStoreOnCentralMetaDB: el sessionstore opera sobre la db CENTRAL de metadatos abierta con
 // el set "meta" SOLO (db.OpenAndMigrateMeta), sin el esquema del store cifrado. Es la garantía T2(d):

@@ -25,110 +25,16 @@ import (
 	"github.com/EduGoGroup/wapp-cloudlink/mtls"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cloudlink"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/outbox"
-	waconn "github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
 	edgeauth "github.com/EduGoGroup/wapp-edge-agent/internal/auth"
-	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
-	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 )
-
-// BuildSink construye el InboundSink de la escucha 24/7 (camino single-sesión: listen/restore).
-//
-//   - Sin cfg.CloudLink.Endpoint: LogSink PURO (diagnóstico, sin red). Mantiene el comportamiento del
-//     spike intacto (pair/send/listen siguen funcionando sin nube).
-//   - Con endpoint: dial gRPC (mTLS si hay cert/clave/CA; insecure en dev con advertencia), se construye
-//     el Adapter CloudLink real conectándolo a app.Send vía SendFunc, y se devuelve un TEE (Adapter
-//     primario + LogSink de diagnóstico). El loop de conexión del Adapter corre en goroutine ligada a ctx.
-//     ZERO-KNOWLEDGE: por el cable solo viaja contenido de negocio; nunca la DEK.
-func BuildSink(ctx context.Context, cfg config.Config, log sharedlogger.Logger, custody app.KeyCustody, database *sql.DB, gateway *waconn.ListenGateway, intentStack *IntentStack) app.InboundSink {
-	logSink := cloudlink.NewLogSink(log)
-	if cfg.CloudLink.Endpoint == "" {
-		log.Info("CloudLink deshabilitado (sin endpoint): usando LogSink puro para diagnóstico")
-		return logSink
-	}
-
-	cc, newValidator, cloudEncPub, ok := dialCloudLink(cfg.CloudLink, log, "LogSink puro")
-	if !ok {
-		return logSink
-	}
-
-	// Outbox durable (Plan 027 T2, H2) sobre la BD del path legacy: los entrantes/acuses con el stream
-	// caído se encolan y drenan al reconectar en vez de descartarse. nil (fallo de init) => best-effort.
-	ob := BuildOutbox(ctx, cfg, database, log)
-
-	// SendFunc: conecta los comandos SendText de la nube al despachador del Edge. Prioriza el CLIENTE
-	// VIVO de la escucha (una sola conexión por sesión): con la misma identidad multi-dispositivo, un
-	// cliente efímero aparte reemplazaría la conexión y dejaría la escucha sorda. Si el gateway no
-	// expone un emisor vivo (defensivo), cae al sender efímero (NewClient+Connect+Disconnect por envío).
-	var sendFunc func(ctx context.Context, commandID, to, text string) error
-	var sendMediaFunc func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error
-	if liveSender, ok := any(gateway).(app.LiveSender); ok && gateway != nil {
-		// Variante TRACKED (Plan 013 §10.E): el envío puebla el Correlator del gateway con el command_id
-		// para que el acuse posterior suba correlacionado.
-		sendFunc = func(ctx context.Context, commandID, to, text string) error {
-			_, err := liveSender.SendViaLiveClientTracked(ctx, commandID, to, text)
-			return err
-		}
-		// Emisor de ARCHIVOS por cliente vivo (Plan 017 §7): descarga la presigned URL (GET sin
-		// credenciales) y sube el binario por la misma conexión, correlacionando por command_id.
-		sendMediaFunc = func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error {
-			_, err := liveSender.SendMediaViaLiveClientTracked(ctx, commandID, to, presignedURL, filename, mime, kind, caption)
-			return err
-		}
-		log.Info("CloudLink: el envío reutilizará el CLIENTE VIVO de la escucha (conexión única por sesión)")
-	} else {
-		// Camino efímero (defensivo, sin cliente vivo): no hay Correlator que alimentar; el command_id se
-		// ignora y el acuse subiría como estado crudo.
-		sendUC := app.NewSend(custody, waconn.NewSender(database, db.DialectSQLite, log))
-		sendFunc = func(ctx context.Context, _ /*commandID*/, to, text string) error { return sendUC.Run(ctx, to, text) }
-		sendMediaFunc = func(ctx context.Context, _ /*commandID*/, to, presignedURL, filename, mime, kind, caption string) error {
-			return sendUC.RunMedia(ctx, to, presignedURL, filename, mime, kind, caption)
-		}
-	}
-
-	// El Adapter es un multiplexor (un stream por Edge). El camino legacy single-sesión registra LA
-	// única sesión (cfg.CloudLink.SessionID) y usa SU sink etiquetado; la mecánica de mux es idéntica a
-	// la del daemon multi-sesión (runServe), solo que aquí hay una sola sesión.
-	adapter := cloudlink.NewAdapter(cc, log, newValidator,
-		cloudlink.WithCloudEncPubKey(cloudEncPub),
-		cloudlink.WithOutbox(ob),
-		// Config empujada por la nube (Plan 029 · T10): persiste/valida/notifica los ConfigUpdate. nil-safe
-		// (feature off ⇒ applier nil ⇒ Ack tolerante).
-		cloudlink.WithConfigApplier(intentStack.applier()),
-	)
-	// Camino single-sesión (listen/restore): el JID propio no está a mano aquí (la config solo trae el
-	// session_id); se registra con selfJID "" (el Cloud tolera vacío, Plan 020 T2). El número propio se
-	// reporta de raíz por el daemon multi-sesión (runServe/BuildMux), donde s.meta.JID sí está poblado.
-	adapter.Register(cfg.CloudLink.SessionID, "", sendFunc, sendMediaFunc, custody.Exists)
-	// Acuses (Plan 013 T2a): al llegar un events.Receipt, etiqueta con el session_id, correlaciona con el
-	// command_id del envío (Correlator del gateway vivo) y sube el MessageReceipt por el mismo stream.
-	sid := cfg.CloudLink.SessionID
-	gateway.SetReceiptHandler(func(evt domain.ReceiptEvent) {
-		evt.SessionID = sid
-		cmd, _ := gateway.Correlator().Lookup(evt.MessageIDs)
-		adapter.SendReceipt(cmd, evt)
-	})
-	// LoggedOut (Plan 020 T3): propaga el estado ZOMBIE al cloud cuando WhatsApp cierra la sesión.
-	gateway.SetLoggedOutHandler(func() { adapter.SendLoggedOut(sid) })
-	go func() {
-		_ = adapter.Run(ctx)
-		_ = cc.Close()
-	}()
-
-	log.Info("CloudLink habilitado: reenviando entrantes y atendiendo comandos cloud->edge",
-		"endpoint", cfg.CloudLink.Endpoint, "session_id", cfg.CloudLink.SessionID,
-		"lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil)
-	// Clasificador de intenciones (Plan 029 · T11): con la feature ON se envuelve el sink (clasificar ANTES
-	// del tee, para que Adapter y LogSink vean la intención anotada); off ⇒ WrapSink devuelve el sink tal cual.
-	return intentStack.WrapSink(cloudlink.NewTeeSink(adapter.SinkFor(cfg.CloudLink.SessionID), logSink))
-}
 
 // BuildMux construye el multiplexor CloudLink del daemon MULTI-SESIÓN (un solo stream, N sesiones por
 // session_id, ADR-0008). Reusa el mismo dial mTLS y la misma factory de Validator que el camino legacy:

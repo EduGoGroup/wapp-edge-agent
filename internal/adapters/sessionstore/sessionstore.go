@@ -29,7 +29,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 )
@@ -456,27 +455,3 @@ func fromNullableUnix(sec sql.NullInt64) time.Time {
 	return time.Unix(sec.Int64, 0).UTC()
 }
 
-// Locator implementa app.PairedDeviceLocator: resuelve el JID del device pareado en el store CIFRADO
-// (msg_enc_device) SIN descifrar material, envolviendo cryptostore.FirstDeviceJID. Lo usa RestoreSessions
-// para backfillear el registro cuando la BD fue pareada antes de existir el registro de negocio.
-type Locator struct {
-	db *sql.DB
-}
-
-var _ app.PairedDeviceLocator = (*Locator)(nil)
-
-// NewLocator construye el locator sobre la BD del store cifrado del Edge.
-func NewLocator(db *sql.DB) *Locator {
-	return &Locator{db: db}
-}
-
-// PairedJID devuelve el JID de la sesión pareada (ok=true) o ok=false si el store no tiene device.
-func (l *Locator) PairedJID(ctx context.Context) (string, bool, error) {
-	jid, err := cryptostore.FirstDeviceJID(ctx, l.db)
-	if err != nil {
-		// FirstDeviceJID devuelve error si no hay device pareado: lo traducimos a ok=false (no es un
-		// fallo del store, es "nada que restaurar").
-		return "", false, nil
-	}
-	return jid.String(), true, nil
-}
