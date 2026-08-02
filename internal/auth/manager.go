@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
+	identityrbac "github.com/EduGoGroup/identity-shared/auth/rbac"
 	sharedjwt "github.com/EduGoGroup/wapp-shared/auth/jwt"
-	sharedrbac "github.com/EduGoGroup/wapp-shared/auth/rbac"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -301,7 +301,7 @@ func (m *Manager) evaluate(claims *sharedjwt.Claims, resource string) (bool, int
 	if m.expectedTenant != "" && claims.TenantID != m.expectedTenant {
 		return false, http.StatusForbidden, "tenant_mismatch", "el token pertenece a otro tenant"
 	}
-	if !sharedrbac.EvaluateGrants(claims.Grants, resource) {
+	if !identityrbac.EvaluateGrants(claims.Grants, resource) {
 		return false, http.StatusForbidden, "forbidden", "permiso denegado para " + resource
 	}
 	return true, http.StatusOK, "", ""

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
+	identityrbac "github.com/EduGoGroup/identity-shared/auth/rbac"
 	sharedjwt "github.com/EduGoGroup/wapp-shared/auth/jwt"
-	sharedrbac "github.com/EduGoGroup/wapp-shared/auth/rbac"
 	"github.com/golang-jwt/jwt/v5"
 )
 
@@ -63,7 +63,7 @@ func jwksJSON(t *testing.T, kid string, pub *ecdsa.PublicKey) []byte {
 
 // mintES256 firma un access token ES256 con el kid, grants y expiración dados. Permite exp en el PASADO
 // (para probar el modo degradado), algo que GenerateToken del IAM no deja hacer.
-func mintES256(t *testing.T, priv *ecdsa.PrivateKey, kid, tenant string, grants sharedrbac.Grants, exp time.Time) string {
+func mintES256(t *testing.T, priv *ecdsa.PrivateKey, kid, tenant string, grants identityrbac.Grants, exp time.Time) string {
 	t.Helper()
 	claims := sharedjwt.Claims{
 		UserID:   "u1",
