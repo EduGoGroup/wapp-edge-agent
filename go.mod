@@ -1,6 +1,6 @@
 module github.com/EduGoGroup/wapp-edge-agent
 
-go 1.26.0
+go 1.26.5
 
 require (
 	github.com/EduGoGroup/wapp-cloudlink v0.10.0
