@@ -26,7 +26,8 @@ import (
 	edgeauth "github.com/EduGoGroup/wapp-edge-agent/internal/auth"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/wiring"
-	sharedauth "github.com/EduGoGroup/wapp-shared/auth"
+	sharedjwt "github.com/EduGoGroup/wapp-shared/auth/jwt"
+	sharedrbac "github.com/EduGoGroup/wapp-shared/auth/rbac"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -93,12 +94,12 @@ func jwksJSONForTest(t *testing.T, kid string, pub *ecdsa.PublicKey) []byte {
 
 func mintTokenForTenant(t *testing.T, priv *ecdsa.PrivateKey, kid, tenant string) string {
 	t.Helper()
-	claims := sharedauth.Claims{
+	claims := sharedjwt.Claims{
 		UserID:   "u1",
 		TenantID: tenant,
 		Roles:    []string{"operator"},
-		Grants:   sharedauth.Grants{Allow: []string{"edge.*"}},
-		TokenUse: sharedauth.TokenUseAccess,
+		Grants:   sharedrbac.Grants{Allow: []string{"edge.*"}},
+		TokenUse: sharedjwt.TokenUseAccess,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        "jti-1",
 			Issuer:    wiringTestIssuer,

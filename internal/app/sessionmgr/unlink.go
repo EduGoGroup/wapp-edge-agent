@@ -166,14 +166,15 @@ func (m *Manager) stopLive(id string) (jid string, live bool) {
 		delete(m.live, id)
 	}
 	m.mu.Unlock()
-	// Salud (Plan 031 T6): la sesión se desvincula ⇒ deja de reportar salud (idempotente y nil-safe). Se
-	// hace aunque no estuviera viva (una 'pairing' pudo dejar una entrada connecting).
-	m.health.Remove(id)
 	if !ok {
+		m.health.Remove(id)
 		return "", false
 	}
 	s.stop()
 	s.waitDone()
+	// Salud (Plan 031 T6): saca la entrada del registro de salud DESPUÉS de que la goroutine haya parado
+	// por completo, evitando carreras donde el teardown recien-conectado intente un SetSocketState.
+	m.health.Remove(id)
 	return s.meta.JID, true
 }
 

@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	sharedauth "github.com/EduGoGroup/wapp-shared/auth"
+	sharedrbac "github.com/EduGoGroup/wapp-shared/auth/rbac"
 )
 
 // setup arma un Manager con una llave ES256 instalada en el store, el relay dado y custodia en memoria.
@@ -27,7 +27,7 @@ func setup(t *testing.T, relay Relay) (*Manager, *KeyStore, *ecdsa.PrivateKey) {
 func TestAuthorize_ValidTokenAllows(t *testing.T) {
 	relay := &fakeRelay{}
 	m, _, key := setup(t, relay)
-	tok := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())
+	tok := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timeFuture())
 	relay.loginTokens = Tokens{AccessToken: tok, RefreshToken: "rt-1", TokenType: "Bearer", ExpiresAt: timeFuture()}
 
 	if _, err := m.Login(context.Background(), "op@x", "pw"); err != nil {
@@ -51,7 +51,7 @@ func TestAuthorize_DefaultDeny(t *testing.T) {
 	relay := &fakeRelay{}
 	m, _, key := setup(t, relay)
 	// Grants que NO cubren edge.sessions.logout.
-	tok := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.status.read"}}, timeFuture())
+	tok := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.status.read"}}, timeFuture())
 	relay.loginTokens = Tokens{AccessToken: tok, RefreshToken: "rt", ExpiresAt: timeFuture()}
 	_, _ = m.Login(context.Background(), "op", "pw")
 
@@ -73,7 +73,7 @@ func TestAuthorize_DegradedReadAllowedWriteDenied(t *testing.T) {
 	relay := &fakeRelay{}
 	m, _, key := setup(t, relay)
 	// Token EXPIRADO (exp en el pasado) pero dentro de la gracia (past + 2h > now).
-	expired := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timePast())
+	expired := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timePast())
 	relay.loginTokens = Tokens{AccessToken: expired, RefreshToken: "rt", ExpiresAt: timePast()}
 	if _, err := m.Login(context.Background(), "op", "pw"); err != nil {
 		t.Fatalf("login: %v", err)
@@ -94,7 +94,7 @@ func TestAuthorize_DegradedReadAllowedWriteDenied(t *testing.T) {
 func TestAuthorize_DegradedOutsideGraceDenied(t *testing.T) {
 	relay := &fakeRelay{}
 	m, _, key := setup(t, relay)
-	expired := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timePast())
+	expired := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timePast())
 	relay.loginTokens = Tokens{AccessToken: expired, RefreshToken: "rt", ExpiresAt: timePast()}
 	_, _ = m.Login(context.Background(), "op", "pw")
 
@@ -109,12 +109,12 @@ func TestAuthorize_DegradedOutsideGraceDenied(t *testing.T) {
 func TestAuthorize_DegradedOnlyHeldToken(t *testing.T) {
 	relay := &fakeRelay{}
 	m, _, key := setup(t, relay)
-	held := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timePast())
+	held := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timePast())
 	relay.loginTokens = Tokens{AccessToken: held, RefreshToken: "rt", ExpiresAt: timePast()}
 	_, _ = m.Login(context.Background(), "op", "pw")
 
 	// Otro token expirado válidamente firmado pero que NO es el custodiado: no obtiene gracia.
-	otherExpired := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timePast())
+	otherExpired := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timePast())
 	if otherExpired == held {
 		t.Skip("tokens idénticos por colisión improbable")
 	}
@@ -131,7 +131,7 @@ func TestAuthorize_TenantMismatch(t *testing.T) {
 	_ = ks.InstallJWKS(jwksJSON(t, "es256-1", &key.PublicKey))
 	m := NewManager(relay, ks, &MemorySecretCustody{}, nil, WithExpectedTenant("tenant-esperado"))
 
-	tok := mintES256(t, key, "es256-1", "otro-tenant", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())
+	tok := mintES256(t, key, "es256-1", "otro-tenant", sharedrbac.Grants{Allow: []string{"edge.*"}}, timeFuture())
 	relay.loginTokens = Tokens{AccessToken: tok, RefreshToken: "rt", ExpiresAt: timeFuture()}
 	_, _ = m.Login(context.Background(), "op", "pw")
 
@@ -145,12 +145,12 @@ func TestProactiveRefresh_RefreshesNearExpiry(t *testing.T) {
 	relay := &fakeRelay{}
 	m, _, key := setup(t, relay)
 	// Access que expira en 1 min; margen de refresh 2 min ⇒ vencido para el refresh proactivo.
-	near := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, time.Now().Add(time.Minute))
+	near := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, time.Now().Add(time.Minute))
 	relay.loginTokens = Tokens{AccessToken: near, RefreshToken: "rt-old", ExpiresAt: time.Now().Add(time.Minute)}
 	_, _ = m.Login(context.Background(), "op", "pw")
 
 	// Configura el token que devolverá el refresh.
-	fresh := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())
+	fresh := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timeFuture())
 	relay.refreshTokens = Tokens{AccessToken: fresh, RefreshToken: "rt-new", ExpiresAt: timeFuture()}
 
 	if !m.proactiveTick(context.Background()) {
@@ -191,7 +191,7 @@ func TestRefresh_NoCustodyIsRefreshInvalid(t *testing.T) {
 func TestLogout_ClearsSessionAndRevokes(t *testing.T) {
 	relay := &fakeRelay{}
 	m, _, key := setup(t, relay)
-	tok := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())
+	tok := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timeFuture())
 	relay.loginTokens = Tokens{AccessToken: tok, RefreshToken: "rt", ExpiresAt: timeFuture()}
 	_, _ = m.Login(context.Background(), "op", "pw")
 

@@ -3,7 +3,7 @@
 Instalador **por-usuario, bajo el HOME, SIN root** y **SIN firmar** (decisión **D1**). Empaqueta los dos
 binarios del Edge (`agent` + `wapp-ctl`, layout hermano), el **LaunchAgent** por-usuario (T3) y un
 **bootstrap público** (TLSCA + endpoint de enrolamiento). El usuario enrola y empareja por la web
-(`http://127.0.0.1:8765`); el par mTLS lo genera el enroll (T1) y la DEK vive en el Keychain (T2).
+(`http://127.0.0.1:8105`); el par mTLS lo genera el enroll (T1) y la DEK vive en el Keychain (T2).
 
 ## Qué instala
 
