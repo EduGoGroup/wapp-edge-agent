@@ -5,7 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	sharedauth "github.com/EduGoGroup/wapp-shared/auth"
+	sharedjwt "github.com/EduGoGroup/wapp-shared/auth/jwt"
+	sharedrbac "github.com/EduGoGroup/wapp-shared/auth/rbac"
 )
 
 func TestParseJWKS_Valid(t *testing.T) {
@@ -67,14 +68,14 @@ func TestKeyStore_InstallAndVerify(t *testing.T) {
 	}
 
 	// Un token firmado con la clave instalada valida; su kid selecciona la entrada.
-	tok := mintES256(t, key, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())
+	tok := mintES256(t, key, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timeFuture())
 	if _, err := mv.ValidateToken(tok); err != nil {
 		t.Fatalf("validar token con la llave instalada: %v", err)
 	}
 
 	// Un token de OTRA clave con el mismo kid se rechaza (firma no coincide).
 	other := newES256Key(t)
-	bad := mintES256(t, other, "es256-1", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())
+	bad := mintES256(t, other, "es256-1", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timeFuture())
 	if _, err := mv.ValidateToken(bad); err == nil {
 		t.Fatalf("un token firmado con otra clave debe rechazarse")
 	}
@@ -101,9 +102,9 @@ func TestKeyStore_UnknownKidRejected(t *testing.T) {
 	ks := NewKeyStore(testIssuer)
 	_ = ks.InstallJWKS(jwksJSON(t, "es256-1", &key.PublicKey))
 	// Token con kid desconocido.
-	tok := mintES256(t, key, "otro-kid", "t1", sharedauth.Grants{Allow: []string{"edge.*"}}, timeFuture())
+	tok := mintES256(t, key, "otro-kid", "t1", sharedrbac.Grants{Allow: []string{"edge.*"}}, timeFuture())
 	_, err := ks.Verifier().ValidateToken(tok)
-	if err == nil || !errors.Is(err, sharedauth.ErrInvalidToken) {
+	if err == nil || !errors.Is(err, sharedjwt.ErrInvalidToken) {
 		t.Fatalf("un kid desconocido debe rechazarse con ErrInvalidToken, got: %v", err)
 	}
 }

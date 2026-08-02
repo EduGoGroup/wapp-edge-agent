@@ -8,7 +8,8 @@ import (
 	"sync"
 	"time"
 
-	sharedauth "github.com/EduGoGroup/wapp-shared/auth"
+	sharedjwt "github.com/EduGoGroup/wapp-shared/auth/jwt"
+	sharedrbac "github.com/EduGoGroup/wapp-shared/auth/rbac"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -54,7 +55,7 @@ type Manager struct {
 
 	mu             sync.Mutex
 	access         string
-	claims         *sharedauth.Claims
+	claims         *sharedjwt.Claims
 	expires        time.Time
 	degradedLogged bool // evita spamear el log al entrar en modo degradado
 }
@@ -219,13 +220,13 @@ func (m *Manager) loginResult() LoginResult {
 // si ya hay JWKS instalado; si no, parseo SIN verificar (el token viene recién
 // emitido por la nube sobre mTLS y solo se usa para bookkeeping local — el
 // middleware sí verifica en cada request). Devuelve nil si no se pueden leer.
-func (m *Manager) parseClaims(token string) *sharedauth.Claims {
+func (m *Manager) parseClaims(token string) *sharedjwt.Claims {
 	if mv := m.keys.Verifier(); mv != nil {
 		if c, err := mv.ValidateToken(token); err == nil {
 			return c
 		}
 	}
-	var c sharedauth.Claims
+	var c sharedjwt.Claims
 	if _, _, err := jwt.NewParser().ParseUnverified(token, &c); err != nil {
 		m.log.Warn("auth: no se pudieron parsear los claims del access token (bookkeeping local)", "error", err)
 		return nil
@@ -256,7 +257,7 @@ func (m *Manager) Authorize(_ context.Context, bearer, resource string, write bo
 		case err == nil:
 			m.exitDegraded()
 			return m.evaluate(claims, resource)
-		case errors.Is(err, sharedauth.ErrTokenExpired):
+		case errors.Is(err, sharedjwt.ErrTokenExpired):
 			// cae a la ruta degradada
 		default:
 			return false, http.StatusUnauthorized, "unauthorized", "token de acceso inválido"
@@ -296,11 +297,11 @@ func (m *Manager) authorizeDegraded(bearer, resource string, write bool) (bool, 
 
 // evaluate aplica el tenant (si se exige) y el RBAC glob (default DENY) sobre los
 // claims para el recurso pedido.
-func (m *Manager) evaluate(claims *sharedauth.Claims, resource string) (bool, int, string, string) {
+func (m *Manager) evaluate(claims *sharedjwt.Claims, resource string) (bool, int, string, string) {
 	if m.expectedTenant != "" && claims.TenantID != m.expectedTenant {
 		return false, http.StatusForbidden, "tenant_mismatch", "el token pertenece a otro tenant"
 	}
-	if !sharedauth.EvaluateGrants(claims.Grants, resource) {
+	if !sharedrbac.EvaluateGrants(claims.Grants, resource) {
 		return false, http.StatusForbidden, "forbidden", "permiso denegado para " + resource
 	}
 	return true, http.StatusOK, "", ""
