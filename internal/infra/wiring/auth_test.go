@@ -23,11 +23,11 @@ import (
 	"testing"
 	"time"
 
+	identityrbac "github.com/EduGoGroup/identity-shared/auth/rbac"
 	edgeauth "github.com/EduGoGroup/wapp-edge-agent/internal/auth"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/wiring"
 	sharedjwt "github.com/EduGoGroup/wapp-shared/auth/jwt"
-	sharedrbac "github.com/EduGoGroup/wapp-shared/auth/rbac"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -98,7 +98,7 @@ func mintTokenForTenant(t *testing.T, priv *ecdsa.PrivateKey, kid, tenant string
 		UserID:   "u1",
 		TenantID: tenant,
 		Roles:    []string{"operator"},
-		Grants:   sharedrbac.Grants{Allow: []string{"edge.*"}},
+		Grants:   identityrbac.Grants{Allow: []string{"edge.*"}},
 		TokenUse: sharedjwt.TokenUseAccess,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ID:        "jti-1",
