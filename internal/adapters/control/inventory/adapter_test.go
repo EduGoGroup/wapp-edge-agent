@@ -18,7 +18,7 @@ func (f fakeStore) List(context.Context) ([]domain.Session, error) {
 }
 func (f fakeStore) ListActive(context.Context) ([]domain.Session, error) { return nil, nil }
 func (f fakeStore) Get(context.Context, string) (domain.Session, error)  { return domain.Session{}, nil }
-func (f fakeStore) Delete(context.Context, string) error                { return nil }
+func (f fakeStore) Delete(context.Context, string) error                 { return nil }
 
 func TestManagerAdapter(t *testing.T) {
 	layout := sessionmgr.NewLayout(t.TempDir())

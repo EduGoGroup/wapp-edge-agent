@@ -292,7 +292,6 @@ func TestStoreErrorsOnClosedDB(t *testing.T) {
 	}
 }
 
-
 // TestSessionStoreOnCentralMetaDB: el sessionstore opera sobre la db CENTRAL de metadatos abierta con
 // el set "meta" SOLO (db.OpenAndMigrateMeta), sin el esquema del store cifrado. Es la garantía T2(d):
 // separar las migraciones (store por sesión vs metadatos central) deja el sessionstore verde sobre la

@@ -117,8 +117,6 @@ func main() {
 	)
 }
 
-
-
 // runServe es el daemon MULTI-SESIÓN UNIFICADO (integración Plan 008 + plano de control Plan 007): en UN
 // SOLO proceso (decisión §10.E Plan 007 + ADR-0014/0015) levanta el Session Manager —restaura TODAS las
 // sesiones activas y mantiene un listener por sesión 24/7 (concurrencia Go sin broker, ADR-0003)— Y el
@@ -136,8 +134,6 @@ func main() {
 func runServe(ctx context.Context, cfg config.Config, log sharedlogger.Logger, sink *logsink.Sink) error {
 	return daemon.New(cfg, log, sink, Version, processStartedAt).Run(ctx)
 }
-
-
 
 // runEnroll cablea el subcomando `enroll`: lee el código de activación de cfg o de os.Args
 // (`agent enroll <codigo>`), valida precondiciones (endpoint de enrolamiento, TLSCA pre-provista y

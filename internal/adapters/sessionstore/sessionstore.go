@@ -454,4 +454,3 @@ func fromNullableUnix(sec sql.NullInt64) time.Time {
 	}
 	return time.Unix(sec.Int64, 0).UTC()
 }
-
