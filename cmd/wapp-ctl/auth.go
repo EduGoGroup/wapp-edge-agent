@@ -14,8 +14,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"html/template"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -159,7 +161,16 @@ func (a *authBorder) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/", http.StatusSeeOther)
 		return
 	}
-	http.ServeFileFS(w, r, webui.FS(), "login.html")
+	tmpl, err := template.ParseFS(webui.FS(), "login.html")
+	if err != nil {
+		http.ServeFileFS(w, r, webui.FS(), "login.html")
+		return
+	}
+	enableAlpha := os.Getenv("WAPP_ALPHA_TEST_ACCOUNTS") == "true" || os.Getenv("WAPP_ENABLE_ALPHA_LOGIN") == "true"
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = tmpl.Execute(w, map[string]any{
+		"EnableAlphaTestAccounts": enableAlpha,
+	})
 }
 
 // handleLogout cierra la sesión: llama al socket /v1/auth/logout (best-effort), borra la sesión server-side

@@ -55,7 +55,7 @@ echo "  wapp-ctl : $INSTALL_DIR/wapp-ctl (--no-open --autostart)"
 echo "  agent    : $INSTALL_DIR/agent"
 echo "  data_dir : $DATA_DIR"
 echo "  logs     : $LOGS_DIR/edge.log"
-echo "Plano de control: http://127.0.0.1:8765"
+echo "Plano de control: http://127.0.0.1:8105"
 echo
 echo "Para que siga corriendo SIN sesion abierta:  loginctl enable-linger $USER"
 echo "Estado:   systemctl --user status wapp-edge.service"

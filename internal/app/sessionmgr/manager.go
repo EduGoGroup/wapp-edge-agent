@@ -3,10 +3,10 @@ package sessionmgr
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sync"
 	"time"
 
-	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
@@ -132,10 +132,6 @@ func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlog
 		log:                   log,
 		backoffBase:           1 * time.Second,
 		backoffMax:            60 * time.Second,
-		// Default de producción: el backend real de custodia (Keychain en darwin, archivo en el resto),
-		// seleccionado por build-tag en keycustody. Un wrapper porque NewFileCustody devuelve un tipo
-		// concreto y el campo es del puerto app.KeyCustody. Los tests lo sustituyen por un doble en memoria.
-		newCustody: func(path string) app.KeyCustody { return keycustody.NewFileCustody(path) },
 	}
 	// Resuelve UNA vez las capacidades opcionales del store (Plan 027 T4, H4): interface-upgrade en el
 	// wiring, no type-assert repetido en cada borrado del runtime. nil si el store no las implementa.
@@ -145,6 +141,15 @@ func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlog
 		o(m)
 	}
 	return m
+}
+
+// WithKeyCustodyFactory inyecta el constructor de custodia de DEK por sesión (DIP, Plan 035).
+func WithKeyCustodyFactory(fn func(path string) app.KeyCustody) Option {
+	return func(m *Manager) {
+		if fn != nil {
+			m.newCustody = fn
+		}
+	}
 }
 
 // WithListenerBackoff ajusta la política de reintento de los listeners caídos (aislamiento §10.H). En
@@ -234,6 +239,9 @@ func (m *Manager) custodyFor(id string) (app.KeyCustody, error) {
 	path, err := m.layout.DEKPath(id)
 	if err != nil {
 		return nil, err
+	}
+	if m.newCustody == nil {
+		return nil, fmt.Errorf("sessionmgr: falta inyectar KeyCustodyFactory (WithKeyCustodyFactory)")
 	}
 	return m.newCustody(path), nil
 }

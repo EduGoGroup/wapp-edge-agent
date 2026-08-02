@@ -140,6 +140,8 @@ type Config struct {
 	// el Edge envuelve el sink de entrada con el clasificador (Ollama local) y persiste/aplica la config de
 	// intenciones que empuja el Cloud.
 	Intent IntentConfig `yaml:"intent"`
+	// EnableAlphaTestAccounts activa el selector de usuarios de prueba (Alpha) en la UI de login. Default: false.
+	EnableAlphaTestAccounts bool `yaml:"enable_alpha_test_accounts"`
 }
 
 // DefaultIntentOllamaURL es la URL por defecto del Ollama local (loopback): el LLM corre en el MISMO equipo
@@ -258,6 +260,7 @@ func defaults() Config {
 			Model:     DefaultIntentModel,
 			TimeoutMS: DefaultIntentTimeoutMS,
 		},
+		EnableAlphaTestAccounts: false,
 	}
 }
 
@@ -311,6 +314,7 @@ func Load(path string) (Config, error) {
 	cfg.Intent.OllamaURL = loader.GetString("INTENT_OLLAMA_URL", cfg.Intent.OllamaURL)
 	cfg.Intent.Model = loader.GetString("INTENT_MODEL", cfg.Intent.Model)
 	cfg.Intent.TimeoutMS = loader.GetInt("INTENT_TIMEOUT_MS", cfg.Intent.TimeoutMS)
+	cfg.EnableAlphaTestAccounts = loader.GetBool("ALPHA_TEST_ACCOUNTS", loader.GetBool("ENABLE_ALPHA_LOGIN", cfg.EnableAlphaTestAccounts))
 
 	// Puerto de runtime CloudLink por defecto (Plan 026 T3): si nadie lo fijó (YAML/env), "8101"
 	// (topología de prod, design §1). Con él el enroll deriva y persiste el Endpoint de runtime.

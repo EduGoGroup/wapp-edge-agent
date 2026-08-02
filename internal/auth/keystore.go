@@ -10,13 +10,13 @@ import (
 	"math/big"
 	"sync"
 
-	sharedauth "github.com/EduGoGroup/wapp-shared/auth"
+	sharedjwt "github.com/EduGoGroup/wapp-shared/auth/jwt"
 )
 
 // jwkSet es un JWK Set estándar (RFC 7517) tal como lo empuja la nube por
 // ConfigUpdate kind:"jwks" (ADR-0025 dec.2). La llave pública ES256 es GLOBAL del
 // emisor (no por-tenant): el Edge la instala por kid y valida el access token
-// offline con el MultiVerifier de wapp-shared/auth.
+// offline con el MultiVerifier de wapp-shared/auth/jwt.
 type jwkSet struct {
 	Keys []jwk `json:"keys"`
 }
@@ -120,7 +120,7 @@ type KeyStore struct {
 	issuer string
 
 	mu sync.RWMutex
-	mv *sharedauth.MultiVerifier // nil hasta que llega el primer JWKS válido
+	mv *sharedjwt.MultiVerifier // nil hasta que llega el primer JWKS válido
 }
 
 // NewKeyStore construye un KeyStore para el issuer esperado del IAM (el `iss` que
@@ -140,12 +140,12 @@ func (k *KeyStore) InstallJWKS(payload []byte) error {
 	if err != nil {
 		return err
 	}
-	byKid := make(map[string]sharedauth.VerifierKey, len(keys))
+	byKid := make(map[string]sharedjwt.VerifierKey, len(keys))
 	for _, kk := range keys {
-		byKid[kk.Kid] = sharedauth.ES256VerifierKey(kk.Pub)
+		byKid[kk.Kid] = sharedjwt.ES256VerifierKey(kk.Pub)
 	}
 	// def en cero: un access token SIN kid se rechaza (el IAM SIEMPRE estampa kid, ADR-0019).
-	mv, err := sharedauth.NewMultiVerifier(k.issuer, byKid, sharedauth.VerifierKey{})
+	mv, err := sharedjwt.NewMultiVerifier(k.issuer, byKid, sharedjwt.VerifierKey{})
 	if err != nil {
 		return fmt.Errorf("jwks: no se pudo construir el MultiVerifier: %w", err)
 	}
@@ -157,7 +157,7 @@ func (k *KeyStore) InstallJWKS(payload []byte) error {
 
 // Verifier devuelve el MultiVerifier vigente, o nil si aún no se instaló ninguna
 // llave (el Edge arrancó y el Cloud no ha empujado el JWKS todavía).
-func (k *KeyStore) Verifier() *sharedauth.MultiVerifier {
+func (k *KeyStore) Verifier() *sharedjwt.MultiVerifier {
 	k.mu.RLock()
 	defer k.mu.RUnlock()
 	return k.mv

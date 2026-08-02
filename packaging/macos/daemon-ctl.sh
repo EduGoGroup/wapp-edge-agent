@@ -6,7 +6,7 @@
 # Alternativa "dura" (parar TODO, incluido el supervisor): launchctl bootout/bootstrap (ver *-launchagent.sh).
 set -euo pipefail
 
-ADDR="${WAPP_CTL_ADDR:-127.0.0.1:8765}"
+ADDR="${WAPP_CTL_ADDR:-127.0.0.1:8105}"
 BASE="http://$ADDR/v1/daemon"
 
 case "${1:-}" in

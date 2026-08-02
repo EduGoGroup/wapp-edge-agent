@@ -53,3 +53,8 @@ go.work.sum
 .vscode/
 *.swp
 *.swo
+agent.log
+ctl.log
+full_diff.txt
+staged_diff.patch
+
