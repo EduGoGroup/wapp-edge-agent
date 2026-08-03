@@ -3,12 +3,12 @@ module github.com/EduGoGroup/wapp-edge-agent
 go 1.26.5
 
 require (
-	github.com/EduGoGroup/identity-shared/auth v0.3.0
-	github.com/EduGoGroup/wapp-cloudlink v0.10.0
+	github.com/EduGoGroup/identity-shared/auth v0.3.1
+	github.com/EduGoGroup/wapp-cloudlink v0.10.1
 	github.com/EduGoGroup/wapp-edge-intent v0.1.0
 	github.com/EduGoGroup/wapp-shared/auth v0.4.0
 	github.com/EduGoGroup/wapp-shared/config v0.3.0
-	github.com/EduGoGroup/wapp-shared/envelope v0.2.0
+	github.com/EduGoGroup/wapp-shared/envelope v0.2.1
 	github.com/EduGoGroup/wapp-shared/intents v0.1.0
 	github.com/EduGoGroup/wapp-shared/logger v0.2.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -18,8 +18,8 @@ require (
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/zalando/go-keyring v0.2.8
 	go.mau.fi/whatsmeow v0.0.0-20260616120636-eaa388b4e537
-	golang.org/x/sys v0.46.0
-	google.golang.org/grpc v1.81.1
+	golang.org/x/sys v0.47.0
+	google.golang.org/grpc v1.82.1
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.53.0
 )
@@ -41,13 +41,13 @@ require (
 	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
 	go.mau.fi/libsignal v0.2.2 // indirect
 	go.mau.fi/util v0.9.10 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260611194520-c48552f49976 // indirect
 	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/term v0.44.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/term v0.45.0 // indirect
+	golang.org/x/text v0.40.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.73.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
