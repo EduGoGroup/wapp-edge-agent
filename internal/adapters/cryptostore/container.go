@@ -9,6 +9,11 @@ package cryptostore
 // whatsmeow_device tiene CHECK length=32/64 que NO admite el ciphertext GCM). El esquema
 // (msg_enc_*) lo crea el runner de migración (internal/infra/db); este decorator asume las
 // tablas ya creadas y solo crea las whatsmeow_* (no sensibles) vía sqlstore.Upgrade.
+//
+// En whatsmeow_device SÍ se escribe una fila ANCLA por device (sin material de clave: ceros), porque
+// 12 tablas whatsmeow_* declaran FK contra ella y los stores HEREDADOS escriben ahí. Ver
+// device_anchor.go: es el arreglo del `FOREIGN KEY constraint failed (787)` que ahogaba el log y
+// mantenía el app-state sin sincronizar.
 
 import (
 	"context"
@@ -60,13 +65,25 @@ func newCryptoContainer(ctx context.Context, db *sql.DB, dialect string, env *en
 // El mapeo LID↔PN NO es material criptográfico sensible (solo asocia identificadores), así que se
 // respalda con el LIDMap nativo de whatsmeow (tabla whatsmeow_lid_map, ya migrada) en vez de
 // cifrarlo: mismo patrón mixto (stores sensibles en msg_enc_*, no sensibles en whatsmeow_*).
-func (c *cryptoContainer) wrapStores(d *store.Device) {
+//
+// ANTES de cablear nada, asegura el ANCLA de integridad referencial del device en whatsmeow_device
+// (ver device_anchor.go): los stores HEREDADOS del sqlstore nativo escriben en 12 tablas whatsmeow_*
+// que declaran `FOREIGN KEY ... REFERENCES whatsmeow_device(jid)`, y sin fila padre TODAS fallan con
+// `FOREIGN KEY constraint failed (787)`. Es el ÚNICO punto por el que pasan los dos caminos que
+// producen un Device usable (PutDevice del pairing nuevo y GetDevice de cada arranque), así que aquí
+// el ancla queda garantizada tanto en una BD nueva como en una que lleva meses con la tabla vacía.
+// El ancla NO lleva material de clave (ADR-0007): ceros del largo que exigen los CHECK.
+func (c *cryptoContainer) wrapStores(ctx context.Context, d *store.Device) error {
+	if err := ensureDeviceAnchor(ctx, c.db, *d.ID); err != nil {
+		return err
+	}
 	inner := sqlstore.NewSQLStore(c.inner, *d.ID)
 	cs := newCryptoStore(inner, c.db, c.env, *d.ID)
 	d.SetAllStores(cs)
 	d.LIDs = c.inner.LIDMap // store GLOBAL (no sensible): LIDMap nativo sobre whatsmeow_lid_map.
 	d.Container = c
 	d.Initialized = true
+	return nil
 }
 
 // newDevice fabrica un Device NUEVO (claves frescas, sin JID) cuyo Container es ESTE decorator.
@@ -130,7 +147,7 @@ func (c *cryptoContainer) PutDevice(ctx context.Context, d *store.Device) error 
 		return err
 	}
 	if !d.Initialized {
-		c.wrapStores(d)
+		return c.wrapStores(ctx, d)
 	}
 	return nil
 }
@@ -266,7 +283,9 @@ func (c *cryptoContainer) GetDevice(ctx context.Context, jid types.JID) (*store.
 		}
 		d.LID = lid
 	}
-	c.wrapStores(d)
+	if err := c.wrapStores(ctx, d); err != nil {
+		return nil, err
+	}
 	return d, nil
 }
 
@@ -274,6 +293,12 @@ func (c *cryptoContainer) DeleteDevice(ctx context.Context, d *store.Device) err
 	if d.ID == nil {
 		return errors.New("device JID debe estar definido")
 	}
-	_, err := c.db.ExecContext(ctx, `DELETE FROM msg_enc_device WHERE jid=?`, d.ID.String())
-	return err
+	if _, err := c.db.ExecContext(ctx, `DELETE FROM msg_enc_device WHERE jid=?`, d.ID.String()); err != nil {
+		return err
+	}
+	// El ancla de integridad va DESPUÉS del material cifrado y arrastra en cascada las filas
+	// whatsmeow_* de este device (contactos, chat settings, app-state, message secrets, privacy
+	// tokens, nct salt, buffers): sin esto, un re-emparejamiento del MISMO JID heredaría el
+	// app-state y los contactos del emparejamiento anterior, ya inservibles.
+	return deleteDeviceAnchor(ctx, c.db, *d.ID)
 }
