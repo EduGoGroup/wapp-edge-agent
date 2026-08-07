@@ -145,7 +145,7 @@ type bracketSummary struct {
 
 // Motivos de cierre de un corchete.
 const (
-	closeCompleted = "completed"  // lo cerró *events.OfflineSyncCompleted (rutina).
+	closeCompleted = "completed" // lo cerró *events.OfflineSyncCompleted (rutina).
 	closeSuperOK   = "nuevo_preview"
 	closeReconnect = "reconexion" // el socket cayó con el corchete abierto.
 )

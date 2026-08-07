@@ -43,7 +43,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 )
 
-// anchorPlatform marca la fila ancla en la columna libre `platform` (TEXT NOT NULL DEFAULT '').
+// anchorPlatform marca la fila ancla en la columna libre `platform` (TEXT NOT NULL, default cadena vacía).
 // Es un marcador FORENSE, no funcional: el Edge nunca lee `whatsmeow_device` (el device sale de
 // `msg_enc_device`), así que este valor jamás llega a un *store.Device vivo.
 const anchorPlatform = "wapp-fk-anchor"
