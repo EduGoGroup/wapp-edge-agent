@@ -103,9 +103,17 @@ type InboundStats struct {
 // probar el criterio sin reloj ni cliente.
 //
 // RESPALDO Y SANEAMIENTO del sello, en un solo sitio:
-//   - sello CERO (arranque en frío, aún no hubo un `success`) ⇒ se usa `now`. Es más estricto (descarta
-//     más) y NUNCA deja escapar la ráfaga; y en el instante de una conexión recién levantada el pipeline
-//     todavía no está atascado, que es justo cuando `now` mentiría.
+//   - sello CERO (arranque en frío, aún no hubo un `success`) ⇒ se usa `now`. Es más estricto QUE EL
+//     SELLO —y solo eso—: como `now >= sello`, el umbral sube y lo descartado es un superconjunto. En
+//     el instante de una conexión recién levantada el pipeline todavía no está atascado, que es cuando
+//     `now` mentiría, así que el respaldo es razonable.
+//     ⚠️ Pero NO garantiza que la ráfaga no escape, y esa frase estaría mal escrita aquí: los DOS
+//     umbrales son reloj LOCAL y `Info.Timestamp` es reloj del SERVIDOR. Con el reloj local ATRASADO el
+//     umbral se hunde y la ráfaga pasa, en proporción al desfase (un reloj 6 h atrasado deja pasar entera
+//     una ráfaga de 5 h). Y el agravante es de manual: el respaldo se usa justo en ARRANQUE EN FRÍO —
+//     máquina recién encendida o despierta de suspensión—, que es exactamente cuando el reloj puede ir
+//     desfasado hasta que NTP re-sincronice, y cuando la ráfaga es mayor. El reloj local es el punto
+//     ciego de este criterio; el margen lo absorbe hasta donde llega y no más.
 //   - sello FUTURO ⇒ imposible: una conexión no puede haber empezado después de ahora. Es la firma de una
 //     lectura rota (F2/F3) o de un salto de reloj, y es el modo CARO —un umbral futuro descartaría
 //     tráfico vivo—, así que se trata igual que la ausencia: se cae a `now`. Esto NO sincroniza nada; es

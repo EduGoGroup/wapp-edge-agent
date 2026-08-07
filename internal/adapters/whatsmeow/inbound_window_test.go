@@ -143,8 +143,10 @@ func TestResolveThreshold(t *testing.T) {
 	})
 }
 
-// TestVentana_SinSelloUsaNow: sin sello (arranque en frío) el respaldo es `now` — más estricto, nunca deja
-// escapar la ráfaga.
+// TestVentana_SinSelloUsaNow: sin sello (arranque en frío) el respaldo es `now`, que es más estricto QUE EL
+// SELLO. Ojo con leer de más: no garantiza que la ráfaga no escape — ambos umbrales son reloj local y la
+// hora del mensaje es del servidor, así que un reloj local atrasado la deja pasar igual (ver
+// resolveThreshold). Este test fija el respaldo, no una garantía absoluta.
 func TestVentana_SinSelloUsaNow(t *testing.T) {
 	sink := &spySink{}
 	l := NewListener(sink, quietLogger()) // connectSeal nil
