@@ -102,6 +102,7 @@ Prefijo **`WAPP_AGENT_`**. Precedencia: defaults < YAML < entorno.
 | `WAPP_AGENT_DB_DSN` | (vacío) | Cadena de conexión cuando el dialecto la exige (Postgres). |
 | `WAPP_AGENT_OUTBOX_MAX_EVENTS` | `10000` | Tope del outbox durable; al llenarse aplica drop-oldest. |
 | `WAPP_AGENT_OUTBOX_TTL_HOURS` | `0` | TTL de evento del outbox; 0 = desactivado (durabilidad primero). |
+| `WAPP_AGENT_INBOUND_MARGIN_SECONDS` | `300` | Margen de la **ventana de ingesta** (ADR-0037, ver ³). Se descarta todo entrante anterior a `inicio de conexión − margen`, y lo descartado **no sube a la nube**. `<=0` cae al default. Clave YAML: `inbound_margin_seconds`. |
 | `WAPP_AGENT_DIAG_LOG_LINES` | `500` | Líneas del ring buffer en el bundle de diagnóstico. |
 | `WAPP_AGENT_CONTROL_SOCKET_PATH` | `wapp-edge.sock` | Ruta del Unix socket del plano de control `/v1`. |
 | `WAPP_AGENT_CLOUDLINK_ENDPOINT` | (vacío²) | Endpoint gRPC del stream Connect (mTLS). Vacío = sin nube (LogSink). |
@@ -119,6 +120,22 @@ Prefijo **`WAPP_AGENT_`**. Precedencia: defaults < YAML < entorno.
 (o `$XDG_CONFIG_HOME`) · Windows `%AppData%\wApp\edge`.
 ² Si el Endpoint no viene por YAML/env, se lee del archivo `<data_dir>/cloudlink-endpoint`
 que el `enroll` persiste (material público host:puerto).
+
+³ **Ventana de ingesta — el Edge atiende tiempo real (ADR-0037).** Al reconectar, WhatsApp
+entrega de golpe la ráfaga de lo ocurrido mientras el socket estuvo caído. Esa ráfaga **no se
+ingiere**: el Edge compara el `Info.Timestamp` de cada entrante (reloj del **servidor**) contra
+el **inicio de su conexión**, y descarta lo anterior a ese instante menos el margen. Quien
+decide es el sello temporal, **no** los corchetes de sincronización offline.
+
+El margen existe por el **desfase de reloj**: `whatsmeow` lo mide pero lo guarda privado, así
+que al no poder corregirlo hay que absorberlo, y eso lo pone en minutos. De paso es la **ventana
+de rescate de la microcaída**: lo enviado en los 5 min previos a reconectar se trata como vivo.
+Un margen `0` no se acepta (guardarraíl): descartaría tráfico vivo en cuanto el reloj local
+fuera un segundo por delante del servidor.
+
+⚠️ Junto con esto, los **ecos propios** (`IsFromMe`) dejaron de subir a la nube. Si echas en
+falta mensajes en el Cloud tras una caída larga, **es el comportamiento esperado**, no una
+pérdida: revisa este margen antes de buscar el fallo en otro sitio.
 
 ## Store y custodia (zero-knowledge)
 

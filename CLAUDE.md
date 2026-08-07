@@ -95,6 +95,7 @@ internal/
 | ADR-0018 | BD única del Edge (dialecto-conmutable) | `accounts`↔`devices`, DEK por dispositivo, failover, migración sin re-escanear |
 | ADR-0020 | Clasificador de intenciones LLM local (**ya construido**) | Repo hermano `edge/wapp-edge-intent` (Ollama/`qwen3:1.7b`); opcional, OFF por defecto |
 | ADR-0023 | Telemetría de flota + diagnóstico remoto | `SessionHealth` en heartbeat + bundle de diagnóstico bajo demanda |
+| ADR-0037 | El Edge atiende **tiempo real**: la ráfaga de la caída no se ingiere | Manda `Info.Timestamp` (reloj del servidor) contra el inicio de conexión, **no** los corchetes de sync offline; margen `WAPP_AGENT_INBOUND_MARGIN_SECONDS` (300 s) para el desfase de reloj. Los ecos propios (`IsFromMe`) ya no suben |
 
 ---
 
