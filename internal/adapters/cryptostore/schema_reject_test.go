@@ -12,6 +12,12 @@ import (
 // del esquema REAL de whatsmeow (también en SQLite: CHECK length(noise_key)=32) rechaza un ciphertext
 // GCM de 60B (32 + overhead 28). Es lo que JUSTIFICA el esquema propio msg_enc_* con BLOB libre en
 // vez de envolver el SQLStore real para esas columnas (ADR-0002).
+//
+// Sigue vigente TRAS el arreglo del FK 787 (device_anchor.go), y es justo lo que lo condiciona: como el
+// ciphertext NO cabe en whatsmeow_device, la fila ancla que ahí se escribe solo puede llevar relleno
+// INERTE (ceros del largo exigido). El material real sigue viviendo cifrado en msg_enc_device.
+// El control con 32B exactos de abajo enseña la única alternativa —guardar la clave EN CLARO—, que es
+// exactamente lo que ADR-0007 prohíbe y lo que el ancla evita.
 func TestUpstreamSchemaRejectsCiphertext(t *testing.T) {
 	ctx := context.Background()
 	db, _ := openTestDB(t)

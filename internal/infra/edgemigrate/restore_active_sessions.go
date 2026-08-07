@@ -18,12 +18,13 @@ package edgemigrate
 //     del cryptostore, SIN foreign keys, llaveadas por jid/our_jid: copiarlas verbatim a la BD única (que
 //     ya tiene ese esquema migrado) es seguro y BASTA para que la sesión de WhatsApp siga viva (el device
 //     reconecta con su material Noise/Identity/Adv de msg_enc_device; Signal re-negocia lo demás).
-//   - NO: las tablas `whatsmeow_*`. En el modelo híbrido (T2) el device propio vive en `msg_enc_device`, NO
-//     en `whatsmeow_device`, que queda VACÍA (cryptoContainer.PutDevice solo escribe msg_enc_device). Casi
-//     todas las whatsmeow_* declaran `FOREIGN KEY (our_jid) REFERENCES whatsmeow_device(jid)` (upstream
-//     00-latest-schema.sql), así que copiarlas con foreign_keys=ON referenciaría una fila inexistente
-//     (huérfanos) y es innecesario: app-state/contactos/lid-map los RE-SINCRONIZA WhatsApp tras reconectar.
-//     Ver el resumen en el retorno del ejecutor (contradicción anotada frente al texto del plan).
+//   - NO: las tablas `whatsmeow_*`. En el modelo híbrido (T2) el device propio vive CIFRADO en
+//     `msg_enc_device`; de `whatsmeow_device` solo existe una fila ANCLA sin material de clave, que crea el
+//     cryptoContainer al cablear el device (ver adapters/cryptostore/device_anchor.go). En los stores
+//     ARCHIVADOS por la fase 1 esa ancla NO existía —es justo el bug del `FOREIGN KEY constraint failed
+//     (787)`— así que sus tablas whatsmeow_* están VACÍAS: no hay nada que copiar. Y aunque hubiera,
+//     tampoco haría falta: app-state/contactos/lid-map los RE-SINCRONIZA WhatsApp tras reconectar, y el
+//     ancla del JID restaurado la crea sola la primera carga del device (GetDevice → wrapStores).
 //
 // Con red (nunca romper una sesión buena, decisión §10.K):
 //   - Fallback por device: si falta/está corrupta la DEK, el store no abre, no hay device pareado, el JID
