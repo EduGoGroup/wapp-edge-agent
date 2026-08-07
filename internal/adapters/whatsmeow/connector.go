@@ -93,6 +93,9 @@ func (c *Connector) StartConnection(ctx context.Context, dek []byte) (<-chan app
 	// Device.Save -> PutDevice (cifrado). whatsmeow loguea por el puente waLog→slog (walog.go).
 	device := cryptostore.NewDeviceForPairing(container)
 	client := wm.NewClient(device, newWALog(c.log))
+	// Corte C (ADR-0037): el EMPAREJAMIENTO es justo donde nace el history sync, así que este cliente es el
+	// que más lo necesita. Poner la bandera solo en el de la escucha dejaría este camino sin cubrir.
+	disableHistorySync(client)
 
 	qrChan, err := client.GetQRChannel(ctx)
 	if err != nil {

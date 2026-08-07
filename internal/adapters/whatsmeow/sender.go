@@ -348,6 +348,7 @@ func realDispatch(ctx context.Context, device *store.Device, msg outgoing, conne
 	// whatsmeow loguea por el puente waLog→slog (walog.go) que le pasa NewSender; los fallos del ciclo
 	// efímero (conexión/socket) YA quedan trazados en el log del agente (antes waLog.Noop los callaba).
 	client := wm.NewClient(device, wlog)
+	disableHistorySync(client)
 
 	if err := client.Connect(); err != nil {
 		return fmt.Errorf("whatsapp: conectar: %w", err)
