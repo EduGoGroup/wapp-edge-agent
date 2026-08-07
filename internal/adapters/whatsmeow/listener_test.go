@@ -38,6 +38,12 @@ func newJID(user, server string) types.JID {
 	return types.JID{User: user, Server: server}
 }
 
+// liveTS es el sello de un mensaje EN VIVO. Desde el ADR-0037 el listener descarta los entrantes cuya edad
+// supera el cinturón (defaultInboundMaxAge), así que los tests de MAPEO/ENRUTADO —que no van de
+// antigüedad— tienen que sellar sus mensajes con una marca reciente. Un types.MessageInfo con Timestamp
+// cero (año 1) o con una fecha fija del pasado ya NO llega al sink, y es correcto que no llegue.
+func liveTS() time.Time { return time.Now() }
+
 // --- tests ---
 
 // TestHandleEvent_Message_Conversation: un *events.Message de texto simple se mapea a InboundEvent y
@@ -46,7 +52,7 @@ func TestHandleEvent_Message_Conversation(t *testing.T) {
 	sink := &spySink{}
 	l := NewListener(sink, quietLogger())
 
-	ts := time.Date(2026, 6, 25, 10, 0, 0, 0, time.UTC)
+	ts := liveTS()
 	evt := &events.Message{
 		Info: types.MessageInfo{
 			MessageSource: types.MessageSource{
@@ -132,7 +138,7 @@ func TestHandleEvent_Message_ExtendedText(t *testing.T) {
 	l := NewListener(sink, quietLogger())
 
 	evt := &events.Message{
-		Info: types.MessageInfo{ID: "X2"},
+		Info: types.MessageInfo{ID: "X2", Timestamp: liveTS()},
 		Message: &waE2E.Message{
 			ExtendedTextMessage: &waE2E.ExtendedTextMessage{Text: proto.String("con contexto")},
 		},
@@ -150,7 +156,7 @@ func TestHandleEvent_Message_DeliverError(t *testing.T) {
 	sink := &spySink{err: errors.New("sink caído")}
 	l := NewListener(sink, quietLogger())
 	l.handleEvent(context.Background(), &events.Message{
-		Info:    types.MessageInfo{ID: "E1"},
+		Info:    types.MessageInfo{ID: "E1", Timestamp: liveTS()},
 		Message: &waE2E.Message{Conversation: proto.String("x")},
 	})
 	if len(sink.got) != 1 {

@@ -112,6 +112,11 @@ type Manager struct {
 	// actualiza al arrancar/caer. T7 lo consume para el heartbeat y GET /v1/health. nil ⇒ no se reporta (el
 	// reporter ligado es no-op, ver health.Registry.For). Lo inyecta WithHealthRegistry.
 	health *health.Registry
+
+	// inboundMaxAge es el umbral del cinturón por antigüedad de la ingesta (ADR-0037 corte B) que el
+	// factory pasa al gateway de cada sesión. 0 (opción no inyectada) ⇒ NO se toca el gateway y manda el
+	// default del propio Listener; así los tests del Manager que no cablean el corte siguen intactos.
+	inboundMaxAge time.Duration
 }
 
 // Option configura un Manager en su construcción (inyección de dependencias opcionales como el
@@ -175,6 +180,18 @@ func WithInboundDecorator(wrap func(app.InboundSink) app.InboundSink) Option {
 	return func(m *Manager) {
 		if wrap != nil {
 			m.inboundDecorator = wrap
+		}
+	}
+}
+
+// WithInboundMaxAge fija el umbral del CINTURÓN POR ANTIGÜEDAD de la ingesta (ADR-0037 corte B) para todas
+// las sesiones: un entrante más viejo que esto al procesarlo se descarta en la puerta y no sube a la nube.
+// En producción lo cablea el daemon desde WAPP_AGENT_INBOUND_MAX_AGE_SECONDS. Un valor <=0 se IGNORA (no
+// desactiva nada): manda el default del Listener, porque el cinturón es una defensa, no un knob opcional.
+func WithInboundMaxAge(d time.Duration) Option {
+	return func(m *Manager) {
+		if d > 0 {
+			m.inboundMaxAge = d
 		}
 	}
 }

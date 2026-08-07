@@ -110,6 +110,11 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// SendPresence si el store restaurado no trae PushName. El gateway solo lo usa si el nombre
 			// real de la cuenta (app-state) aún no está; ese prevalece.
 			gateway.SetPushName(pushName)
+			// Cinturón por antigüedad de la ingesta (ADR-0037 corte B). 0 ⇒ no se toca: manda el default
+			// del Listener (los tests que no cablean la opción quedan idénticos).
+			if m.inboundMaxAge > 0 {
+				gateway.SetInboundMaxAge(m.inboundMaxAge)
+			}
 			sid := s.meta.SessionID
 			// Rota el live-sender de ESTE ciclo: el mux ya tiene registrado s.sendVia; aquí solo apunta la
 			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo). Usa la variante

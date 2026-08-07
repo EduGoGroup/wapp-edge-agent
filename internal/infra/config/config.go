@@ -39,6 +39,15 @@ const DefaultOutboxMaxEvents = 10000
 // Configurable por WAPP_AGENT_DIAG_LOG_LINES. 500 da contexto reciente amplio sin acercarse al tope de tamaño.
 const DefaultDiagLogLines = 500
 
+// DefaultInboundMaxAgeSeconds es el umbral por defecto del CINTURÓN POR ANTIGÜEDAD de la ingesta
+// (ADR-0037 corte B): 900 s = 15 min. Un entrante cuya edad al procesarlo lo supere se descarta en la
+// puerta — es la red bajo el trapecio del corte A, que por sí solo no basta (upstream documenta dos fugas
+// de orden: cola llena y nodo lento). Holgado A PROPÓSITO: descartar un mensaje vivo es una pérdida de
+// negocio invisible, mientras que dejar pasar uno algo viejo llega deduplicado aguas abajo. Configurable
+// por WAPP_AGENT_INBOUND_MAX_AGE_SECONDS; <=0 cae al default (guardarraíl: el cinturón es una defensa y no
+// debe quedar desactivado por una config mal puesta).
+const DefaultInboundMaxAgeSeconds = 900
+
 // DefaultOutboxTTLHours es el TTL por defecto (en horas) de un evento en el outbox: 0 = DESACTIVADO
 // (durabilidad primero; el único recorte es el drop-oldest por tamaño). Un valor >0 poda los eventos más
 // viejos que ese tiempo al encolar/drenar. Configurable por WAPP_AGENT_OUTBOX_TTL_HOURS.
@@ -132,6 +141,10 @@ type Config struct {
 	// (Plan 031 T8, ADR-0023). Default 500 (contexto reciente amplio sin acercarse al tope de 4 MiB del
 	// frame). Se lee de WAPP_AGENT_DIAG_LOG_LINES; <=0 cae al default.
 	DiagLogLines int `yaml:"diag_log_lines"`
+	// InboundMaxAgeSeconds es el umbral del cinturón por antigüedad de la ingesta (ADR-0037 corte B): un
+	// entrante más viejo que esto al procesarlo se descarta en la puerta y NO sube a la nube. Default 900
+	// (15 min). Se lee de WAPP_AGENT_INBOUND_MAX_AGE_SECONDS; <=0 cae al default (guardarraíl, no invariante).
+	InboundMaxAgeSeconds int `yaml:"inbound_max_age_seconds"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -250,6 +263,7 @@ func defaults() Config {
 		OutboxMaxEvents:       DefaultOutboxMaxEvents,
 		OutboxTTLHours:        DefaultOutboxTTLHours,
 		DiagLogLines:          DefaultDiagLogLines,
+		InboundMaxAgeSeconds:  DefaultInboundMaxAgeSeconds,
 		CloudLink: CloudLinkConfig{
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
@@ -297,6 +311,7 @@ func Load(path string) (Config, error) {
 	cfg.OutboxMaxEvents = loader.GetInt("OUTBOX_MAX_EVENTS", cfg.OutboxMaxEvents)
 	cfg.OutboxTTLHours = loader.GetInt("OUTBOX_TTL_HOURS", cfg.OutboxTTLHours)
 	cfg.DiagLogLines = loader.GetInt("DIAG_LOG_LINES", cfg.DiagLogLines)
+	cfg.InboundMaxAgeSeconds = loader.GetInt("INBOUND_MAX_AGE_SECONDS", cfg.InboundMaxAgeSeconds)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)
@@ -339,6 +354,11 @@ func Load(path string) (Config, error) {
 	// Bundle de diagnóstico (Plan 031 T8): nº de líneas de log no positivo cae al default.
 	if cfg.DiagLogLines <= 0 {
 		cfg.DiagLogLines = DefaultDiagLogLines
+	}
+	// Cinturón por antigüedad de la ingesta (ADR-0037 corte B): un umbral no positivo cae al default. El
+	// cinturón es una DEFENSA (la red bajo el trapecio del corte A); no se deja desactivar por config.
+	if cfg.InboundMaxAgeSeconds <= 0 {
+		cfg.InboundMaxAgeSeconds = DefaultInboundMaxAgeSeconds
 	}
 
 	// Clasificador de intenciones (Plan 029): normaliza defaults cuando la feature está ON. Un valor

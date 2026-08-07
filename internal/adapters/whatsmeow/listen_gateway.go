@@ -71,7 +71,16 @@ type ListenGateway struct {
 	// reporter registra la prueba de vida del socket de ESTA sesión en el registro de salud (Plan 031 T6).
 	// serve() lo pasa al Listener; nil ⇒ no se reporta. Lo cablea el factory del sessionmgr (SetHealthReporter).
 	reporter health.SessionReporter
+
+	// inboundMaxAge es el umbral del cinturón por antigüedad de la ingesta (ADR-0037 corte B) que serve()
+	// pasa al Listener. 0 ⇒ no se toca el Listener y manda su default (defaultInboundMaxAge).
+	inboundMaxAge time.Duration
 }
+
+// SetInboundMaxAge fija el umbral del cinturón por antigüedad de la ingesta de ESTA sesión (ADR-0037 corte
+// B). Se llama ANTES de Listen (al construir el gateway), como el resto de setters. <=0 ⇒ manda el default
+// del Listener.
+func (g *ListenGateway) SetInboundMaxAge(d time.Duration) { g.inboundMaxAge = d }
 
 // SetHealthReporter liga el gateway (y su Listener) al registro de salud de SU sesión (Plan 031 T6). Se
 // llama ANTES de Listen (al construir el gateway). nil ⇒ no se reporta. No es secreto ni PII.
@@ -143,6 +152,7 @@ func (g *ListenGateway) Listen(ctx context.Context, dek []byte, sink app.Inbound
 func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink app.InboundSink) error {
 	client := wm.NewClient(device, newWALog(g.log))
 	client.EnableAutoReconnect = true // whatsmeow reintenta el socket; el Listener traza el backoff.
+	disableHistorySync(client)
 
 	// Publica el cliente VIVO para que el envío reutilice esta misma conexión, y lo limpia al salir.
 	g.setLiveClient(client)
@@ -152,6 +162,10 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	// Salud por sesión (Plan 031 T6): el Listener reporta connected/connecting/dead + edad del último
 	// entrante al registro. nil ⇒ no reporta.
 	listener.SetHealthReporter(g.reporter)
+	// Cinturón por antigüedad de la ingesta (ADR-0037 corte B); 0 ⇒ se respeta el default del Listener.
+	if g.inboundMaxAge > 0 {
+		listener.SetInboundMaxAge(g.inboundMaxAge)
+	}
 	// Acuses (delivered/read) → destino de la sesión (nil en T0; T2 lo cablea con SetReceiptHandler).
 	listener.onReceipt = g.onReceipt
 	// Cierre de sesión (LoggedOut) → destino de la sesión (Plan 020 T3): propaga el estado ZOMBIE a la nube.

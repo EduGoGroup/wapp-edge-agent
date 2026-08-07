@@ -103,6 +103,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		sessionmgr.WithWhatsmeowListen(mux, cfg.PushName),
 		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
 		sessionmgr.WithMultiDevicePerAccount(cfg.MultiDevicePerAccount),
+		// Cinturón por antigüedad de la ingesta (ADR-0037 corte B): lo que llegó del buzón que WhatsApp
+		// reencola tras una caída no se ingiere. config.Load ya garantiza un valor > 0.
+		sessionmgr.WithInboundMaxAge(time.Duration(cfg.InboundMaxAgeSeconds)*time.Second),
 		sessionmgr.WithInboundDecorator(intentStack.DecoratorWrap()),
 		sessionmgr.WithKeyCustodyFactory(func(p string) app.KeyCustody {
 			return keycustody.NewFileCustody(p)
