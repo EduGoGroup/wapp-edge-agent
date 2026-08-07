@@ -38,10 +38,10 @@ func newJID(user, server string) types.JID {
 	return types.JID{User: user, Server: server}
 }
 
-// liveTS es el sello de un mensaje EN VIVO. Desde el ADR-0037 el listener descarta los entrantes cuya edad
-// supera el cinturón (defaultInboundMaxAge), así que los tests de MAPEO/ENRUTADO —que no van de
-// antigüedad— tienen que sellar sus mensajes con una marca reciente. Un types.MessageInfo con Timestamp
-// cero (año 1) o con una fecha fija del pasado ya NO llega al sink, y es correcto que no llegue.
+// liveTS es el sello de un mensaje EN VIVO. Desde el ADR-0037 el listener descarta los entrantes que caen
+// fuera de la ventana temporal, así que los tests de MAPEO/ENRUTADO —que no van de eso— tienen que sellar
+// sus mensajes con una marca reciente. Una fecha fija del pasado ya NO llega al sink, y es correcto que no
+// llegue. (Un Timestamp CERO sí llega, pero por el camino de admisión explícita, que es otro test.)
 func liveTS() time.Time { return time.Now() }
 
 // --- tests ---

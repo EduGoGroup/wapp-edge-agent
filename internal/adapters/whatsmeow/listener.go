@@ -6,8 +6,9 @@
 //   - *events.Connected    -> marca estado conectado y RESETEA el backoff.
 //   - *events.Disconnected -> marca estado desconectado y AVANZA el backoff (whatsmeow auto-reconecta).
 //   - *events.LoggedOut    -> marca la sesión CAÍDA (no se re-empareja automáticamente).
-//   - *events.OfflineSyncPreview/*events.OfflineSyncCompleted -> abren y cierran el corchete de la
-//     RÁFAGA OFFLINE (ADR-0037): mientras está abierto, los entrantes se descartan en la puerta.
+//   - *events.OfflineSyncPreview/*events.OfflineSyncCompleted -> abren y cierran el corchete de la ráfaga
+//     offline SOLO para contar y reconciliar (ADR-0037 §4). NO deciden descartes: quien decide qué entra
+//     es la VENTANA TEMPORAL de onMessage, per-evento (ver inbound_window.go).
 //
 // La lógica de enrutado/mapeo vive en handleEvent(ctx, evt any), TESTEABLE con eventos sintéticos sin
 // un *whatsmeow.Client real. Register() solo cablea handleEvent al AddEventHandler real (no se cubre
@@ -81,54 +82,54 @@ type Listener struct {
 	// registro es opcional; el factory del sessionmgr lo liga a la sesión). No lleva PII: solo estados/tiempos.
 	reporter health.SessionReporter
 
-	// gate es el estado de la RÁFAGA OFFLINE de ESTA sesión (ADR-0037 corte A + §6) y el contador de los
-	// tres descartes de la puerta (gate, antigüedad, eco propio). Nunca nil: NewListener lo construye.
-	// Vive POR SESIÓN, jamás como global de paquete (ADR-0037 §6, primer punto).
-	gate *offlineGate
+	// brackets OBSERVA los corchetes de la ráfaga de esta sesión y lleva los contadores de la puerta.
+	// Solo observabilidad y reconciliación (ADR-0037 §4): NO decide ni un descarte. Nunca nil.
+	brackets *bracketObserver
 
-	// maxAge es el CINTURÓN por antigüedad (ADR-0037 corte B): un entrante cuya edad al procesarlo supere
-	// este plazo se descarta. Cubre las dos fugas que el propio upstream documenta y por las que el corte A
-	// no basta —cola llena (client.go:843) y nodo lento (client.go:874-886)—. Default defaultInboundMaxAge;
-	// configurable por Edge (WAPP_AGENT_INBOUND_MAX_AGE_SECONDS). <=0 lo DESACTIVA (solo para tests que
-	// ejercitan el gate aislado): en producción el guardarraíl de config nunca deja pasar un 0.
-	maxAge time.Duration
+	// connectSeal devuelve el INICIO DE LA CONEXIÓN vigente, leído FRESCO en cada llamada y jamás cacheado.
+	// Lo cablea Register a partir del cliente vivo (Client.LastSuccessfulConnect). nil ⇒ no hay sello y
+	// resolveThreshold cae a `now`, que es el respaldo estricto. En tests se inyecta un sello controlado.
+	connectSeal func() time.Time
+
+	// margin es el margen de la ventana temporal (ADR-0037): se descarta lo anterior a `sello − margin`.
+	// Default defaultConnectMargin; configurable por Edge (WAPP_AGENT_INBOUND_MARGIN_SECONDS).
+	margin time.Duration
 }
-
-// defaultInboundMaxAge es el umbral por defecto del cinturón B (ADR-0037 §B): 900 s / 15 min. No es a ojo.
-// Suelo: el cinturón mide edad AL PROCESAR, no al llegar, y nuestro propio pipeline se atrasa (en el
-// edge.log del 2026-08-06 hay 59 avisos "Node handling took…", los peores de ~37 s) más el desfase de reloj
-// de una máquina recién despertada de suspensión; 60 s ya estaría dentro del ruido medido y mataría vivos.
-// Techo: las caídas que motivan la ADR se miden en HORAS, y cualquier valor entre 5 y 30 min las corta
-// igual. La asimetría decide el sentido del error: descartar un vivo es pérdida de negocio INVISIBLE;
-// dejar pasar uno viejo llega deduplicado aguas abajo ⇒ el cinturón YERRA HACIA DEJAR PASAR.
-const defaultInboundMaxAge = 15 * time.Minute
 
 // SetHealthReporter liga el listener al registro de salud de SU sesión (Plan 031 T6). Se llama ANTES de
 // Register (al construir el ciclo de escucha). nil ⇒ no se reporta salud. No es secreto ni PII.
 func (l *Listener) SetHealthReporter(r health.SessionReporter) { l.reporter = r }
 
 // NewListener construye el listener con el sink y el logger dados, el backoff por defecto del spike y el
-// gate de ráfaga offline con los plazos por defecto (ADR-0037). SetInboundMaxAge ajusta el cinturón.
+// observador de corchetes. El margen de la ventana arranca en su default; SetConnectMargin lo ajusta.
 func NewListener(sink app.InboundSink, log logger.Logger) *Listener {
 	return &Listener{
-		sink:    sink,
-		log:     log,
-		backoff: DefaultBackoff(),
-		state:   StateDisconnected,
-		gate:    newOfflineGate(log, defaultOfflineWatchdog),
-		maxAge:  defaultInboundMaxAge,
+		sink:     sink,
+		log:      log,
+		backoff:  DefaultBackoff(),
+		state:    StateDisconnected,
+		brackets: newBracketObserver(log),
+		margin:   defaultConnectMargin,
 	}
 }
 
-// SetInboundMaxAge fija el umbral del cinturón B (ADR-0037). Se llama ANTES de Register (al construir el
-// ciclo de escucha). Un valor <=0 DESACTIVA el cinturón y deja solo el corte A: es una costura de test, no
-// una configuración de producción (config.Load aplica su propio guardarraíl al umbral).
-func (l *Listener) SetInboundMaxAge(d time.Duration) { l.maxAge = d }
+// SetConnectMargin fija el margen de la ventana temporal (ADR-0037). Se llama ANTES de Register (al
+// construir el ciclo de escucha). Un valor <=0 se ignora: el margen es lo que absorbe el desfase de reloj
+// que no podemos medir, así que dejarlo en cero descartaría tráfico vivo.
+func (l *Listener) SetConnectMargin(d time.Duration) {
+	if d > 0 {
+		l.margin = d
+	}
+}
 
-// OfflineStats devuelve el acumulado de descartes de la puerta de entrada de esta sesión (ADR-0037 §4):
-// corchetes cerrados, descartados por el gate (A), por antigüedad (B) y ecos propios. Son cardinalidades,
-// sin PII. Es el material que la telemetría de flota (ADR-0023) debe publicar.
-func (l *Listener) OfflineStats() OfflineStats { return l.gate.snapshot() }
+// SetConnectSeal inyecta la fuente del inicio de conexión. En producción la cablea Register desde el
+// cliente vivo; existe como costura para probar el criterio con un sello controlado.
+func (l *Listener) SetConnectSeal(fn func() time.Time) { l.connectSeal = fn }
+
+// InboundStats devuelve el acumulado de la puerta de entrada de esta sesión (ADR-0037 §4): corchetes
+// reconciliados, descartados por la ventana, ecos propios y admitidos sin hora. Son cardinalidades, sin
+// PII. Es el material que la telemetría de flota (ADR-0023) debe publicar.
+func (l *Listener) InboundStats() InboundStats { return l.brackets.snapshot() }
 
 // State devuelve el estado de conexión observado (para observabilidad/tests).
 func (l *Listener) State() ConnState {
@@ -140,6 +141,11 @@ func (l *Listener) State() ConnState {
 // Register cablea handleEvent al AddEventHandler REAL del cliente whatsmeow. El ctx (vida de la
 // sesión Listen) se propaga a cada entrega al sink. NO se cubre en tests (requiere un client real).
 func (l *Listener) Register(ctx context.Context, client *wm.Client) uint32 {
+	// Sello de la ventana temporal (ADR-0037): Client.LastSuccessfulConnect leído FRESCO en cada
+	// evaluación, nunca cacheado. Se lee desde el handler de mensaje, que es exactamente donde la cadena
+	// happens-before del handlerQueue ya lo ordena (ver la cabecera de inbound_window.go, y ahí también el
+	// residual F2/F3 que esta lectura NO cubre y por el que resolveThreshold desconfía del valor).
+	l.connectSeal = func() time.Time { return client.LastSuccessfulConnect }
 	return client.AddEventHandler(func(evt any) {
 		l.handleEvent(ctx, evt)
 	})
@@ -160,12 +166,11 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 	case *events.Receipt:
 		l.onReceiptEvent(e)
 	case *events.OfflineSyncPreview:
-		// Abre el corchete de la ráfaga (ADR-0037 corte A). Es la ÚNICA marca que el servidor nos da: no
-		// hay marcador por mensaje (whatsmeow descarta el atributo `offline` del nodo).
-		l.gate.arm(e)
+		// SOLO OBSERVABILIDAD (ADR-0037 §4): abre el corchete para poder reconciliar «el servidor anunció
+		// N, la ventana descartó M». NO decide descartes — eso es cosa de la ventana temporal, per-evento.
+		l.brackets.arm(e)
 	case *events.OfflineSyncCompleted:
-		// Cierra el corchete: lo que llegue a partir de aquí vuelve a ser tráfico vivo.
-		l.gate.close(closeCompleted)
+		l.brackets.close(closeCompleted)
 	default:
 		// Otros eventos (presencia, history sync, …) no son del alcance actual.
 	}
@@ -174,10 +179,10 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 // onMessage decide si el entrante se ADMITE y, si lo hace, lo mapea a domain.InboundEvent y lo entrega al
 // sink. Un fallo de entrega se registra pero NO tumba la escucha (el socket sigue vivo).
 //
-// Los tres descartes de la puerta, en este orden (ADR-0037 §A/§B + filtro de eco propio):
+// Los filtros de la puerta, en este orden:
 //  1. ECO PROPIO (IsFromMe): lo mandamos nosotros; no es una conversación entrante y no tiene por qué subir.
-//  2. GATE A: llegó dentro del corchete de la ráfaga que el servidor reencoló tras una caída.
-//  3. CINTURÓN B: es demasiado viejo, venga de donde venga (cubre las fugas de orden de A).
+//  2. SIN HORA UTILIZABLE: se ADMITE explícitamente (ver abajo).
+//  3. VENTANA TEMPORAL (ADR-0037, criterio único): anterior a `inicioDeConexión − margen` ⇒ se descarta.
 //
 // El descarte es SILENCIOSO hacia el cliente final y CONTADO hacia nosotros: un descarte invisible es
 // indistinguible de un bug. Se cuenta, no se transcribe (ADR-0034 nivel 3): ni texto ni teléfono al log.
@@ -192,28 +197,43 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 	// 1 · Eco propio. Hoy este dato solo se usaba para no gastar el clasificador (intent/sink.go:143); el
 	// evento subía igual a la nube. Descartarlo aquí es un CAMBIO DE COMPORTAMIENTO deliberado y aprobado.
 	if e.Info.IsFromMe {
-		l.gate.countSelfDrop()
+		l.brackets.countSelfDrop()
 		return
 	}
 
-	now := time.Now()
-	// 2 · Gate de la ráfaga offline. El resumen no nulo es un corchete que venció durante esta llamada
-	// (watchdog perezoso): se emite FUERA del lock del gate.
-	drop, closed := l.gate.dropInBurst(e.Info.Timestamp, now)
-	l.gate.emit(closed)
-	if drop {
-		return
-	}
-
-	// 3 · Cinturón por antigüedad. Info.Timestamp es el reloj del SERVIDOR del mensaje original
-	// (message.go:216, ag.UnixTime("t")). Solo se loguea la EDAD, nunca el mensaje.
-	if l.maxAge > 0 {
-		if age := now.Sub(e.Info.Timestamp); age > l.maxAge {
-			l.gate.countAgeDrop()
-			l.log.Warn("listener: entrante descartado por antigüedad (cinturón ADR-0037); si es habitual, el gate de ráfaga no está funcionando",
-				"edad", age.Round(time.Second).String(), "umbral", l.maxAge.String())
-			return
+	// 2 · Sin hora utilizable ⇒ SE ADMITE, explícitamente y contado. No es teórico: GetUnixTime devuelve
+	// un time.Time CERO y ok=true cuando el atributo `t` vale "0" (binary/attrs.go:116-123), sin registrar
+	// error, así que el mensaje llega hasta aquí con Info.Timestamp en cero. (Si `t` falta del todo,
+	// whatsmeow lo rechaza antes: UnixTime exige el atributo y parseMessageInfo corta en ag.OK().) Un cero
+	// es anterior a CUALQUIER umbral, así que dejarlo caer por la comparación lo descartaría en silencio —
+	// justo lo contrario de la asimetría del ADR: ante la duda, DEJAR PASAR.
+	if e.Info.Timestamp.IsZero() {
+		l.brackets.countNoTimestamp()
+		l.log.Warn("listener: entrante SIN hora utilizable; se admite por precaución (la ventana no puede juzgarlo)")
+		if err := l.sink.Deliver(ctx, toInboundEvent(e)); err != nil {
+			l.log.Error("listener: no se pudo entregar el evento entrante al sink", "error", err)
 		}
+		return
+	}
+
+	// 3 · Ventana temporal (ADR-0037): el criterio ÚNICO. Info.Timestamp es el reloj del SERVIDOR del
+	// mensaje original (message.go:216); el umbral sale del inicio de la conexión, NO de time.Now(), para
+	// que nuestro propio atasco no cuente como antigüedad. Solo se loguean edad y umbral, nunca el mensaje.
+	var seal time.Time
+	if l.connectSeal != nil {
+		seal = l.connectSeal() // lectura FRESCA, sin cachear (ver Register y la cabecera de inbound_window.go)
+	}
+	now := time.Now()
+	threshold := resolveThreshold(seal, l.margin, now)
+	if e.Info.Timestamp.Before(threshold) {
+		age := now.Sub(e.Info.Timestamp)
+		if age < 0 {
+			age = 0
+		}
+		l.brackets.countWindowDrop(age)
+		l.log.Warn("listener: entrante descartado por caer fuera de la ventana temporal (ADR-0037)",
+			"edad", age.Round(time.Second).String(), "margen", l.margin.String())
+		return
 	}
 
 	inbound := toInboundEvent(e)
@@ -287,11 +307,10 @@ func (l *Listener) onDisconnected() {
 	hook := l.onDisconnect
 	l.mu.Unlock()
 
-	// ADR-0037 §6: el socket murió — avanza la ÉPOCA y cierra el corchete si estaba abierto. Sin esto una
-	// bandera armada sobreviviría a la reconexión y descartaría tráfico VIVO para siempre (el fallo más
-	// grave que este mecanismo puede producir, y silencioso). NO se usa *events.Connected para esto: se
-	// despacha desde una goroutine que antes hace I/O de red y puede llegar DESPUÉS del preview.
-	l.gate.bumpEpoch()
+	// Cierra el corchete abierto, si lo hay, para no perder su reconciliación. Es BEST-EFFORT y solo
+	// observabilidad: este evento no es fiable (sale con `go` en client.go:512 y :580, y ni siquiera se
+	// emite en una desconexión ESPERADA, client.go:576-580). Da igual: no decide ningún descarte.
+	l.brackets.close(closeReconnect)
 
 	l.log.Warn("listener: socket desconectado; whatsmeow reintentará (política de backoff)",
 		"intento", attempt, "siguiente_delay", delay.String())
@@ -312,8 +331,8 @@ func (l *Listener) onLoggedOut(e *events.LoggedOut) {
 	l.state = StateLoggedOut
 	hook := l.onLoggedOutHook
 	l.mu.Unlock()
-	// ADR-0037 §6: mismo cierre de corchete que en la desconexión (ver onDisconnected).
-	l.gate.bumpEpoch()
+	// Mismo cierre best-effort del corchete que en la desconexión (ver onDisconnected).
+	l.brackets.close(closeReconnect)
 
 	l.log.Error("listener: sesión cerrada por WhatsApp (LoggedOut); requiere re-emparejar",
 		"on_connect", e.OnConnect, "reason", e.Reason.String())

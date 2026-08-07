@@ -72,15 +72,14 @@ type ListenGateway struct {
 	// serve() lo pasa al Listener; nil ⇒ no se reporta. Lo cablea el factory del sessionmgr (SetHealthReporter).
 	reporter health.SessionReporter
 
-	// inboundMaxAge es el umbral del cinturón por antigüedad de la ingesta (ADR-0037 corte B) que serve()
-	// pasa al Listener. 0 ⇒ no se toca el Listener y manda su default (defaultInboundMaxAge).
-	inboundMaxAge time.Duration
+	// inboundMargin es el margen de la ventana temporal de ingesta (ADR-0037) que serve() pasa al
+	// Listener. 0 ⇒ no se toca el Listener y manda su default (defaultConnectMargin).
+	inboundMargin time.Duration
 }
 
-// SetInboundMaxAge fija el umbral del cinturón por antigüedad de la ingesta de ESTA sesión (ADR-0037 corte
-// B). Se llama ANTES de Listen (al construir el gateway), como el resto de setters. <=0 ⇒ manda el default
-// del Listener.
-func (g *ListenGateway) SetInboundMaxAge(d time.Duration) { g.inboundMaxAge = d }
+// SetInboundMargin fija el margen de la ventana temporal de ingesta de ESTA sesión (ADR-0037). Se llama
+// ANTES de Listen (al construir el gateway), como el resto de setters. <=0 ⇒ manda el default del Listener.
+func (g *ListenGateway) SetInboundMargin(d time.Duration) { g.inboundMargin = d }
 
 // SetHealthReporter liga el gateway (y su Listener) al registro de salud de SU sesión (Plan 031 T6). Se
 // llama ANTES de Listen (al construir el gateway). nil ⇒ no se reporta. No es secreto ni PII.
@@ -162,9 +161,9 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	// Salud por sesión (Plan 031 T6): el Listener reporta connected/connecting/dead + edad del último
 	// entrante al registro. nil ⇒ no reporta.
 	listener.SetHealthReporter(g.reporter)
-	// Cinturón por antigüedad de la ingesta (ADR-0037 corte B); 0 ⇒ se respeta el default del Listener.
-	if g.inboundMaxAge > 0 {
-		listener.SetInboundMaxAge(g.inboundMaxAge)
+	// Ventana temporal de ingesta (ADR-0037); 0 ⇒ se respeta el default del Listener.
+	if g.inboundMargin > 0 {
+		listener.SetConnectMargin(g.inboundMargin)
 	}
 	// Acuses (delivered/read) → destino de la sesión (nil en T0; T2 lo cablea con SetReceiptHandler).
 	listener.onReceipt = g.onReceipt

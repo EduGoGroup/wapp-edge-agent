@@ -113,10 +113,10 @@ type Manager struct {
 	// reporter ligado es no-op, ver health.Registry.For). Lo inyecta WithHealthRegistry.
 	health *health.Registry
 
-	// inboundMaxAge es el umbral del cinturón por antigüedad de la ingesta (ADR-0037 corte B) que el
-	// factory pasa al gateway de cada sesión. 0 (opción no inyectada) ⇒ NO se toca el gateway y manda el
-	// default del propio Listener; así los tests del Manager que no cablean el corte siguen intactos.
-	inboundMaxAge time.Duration
+	// inboundMargin es el margen de la ventana temporal de ingesta (ADR-0037) que el factory pasa al
+	// gateway de cada sesión. 0 (opción no inyectada) ⇒ NO se toca el gateway y manda el default del propio
+	// Listener; así los tests del Manager que no cablean la ventana siguen intactos.
+	inboundMargin time.Duration
 }
 
 // Option configura un Manager en su construcción (inyección de dependencias opcionales como el
@@ -184,14 +184,14 @@ func WithInboundDecorator(wrap func(app.InboundSink) app.InboundSink) Option {
 	}
 }
 
-// WithInboundMaxAge fija el umbral del CINTURÓN POR ANTIGÜEDAD de la ingesta (ADR-0037 corte B) para todas
-// las sesiones: un entrante más viejo que esto al procesarlo se descarta en la puerta y no sube a la nube.
-// En producción lo cablea el daemon desde WAPP_AGENT_INBOUND_MAX_AGE_SECONDS. Un valor <=0 se IGNORA (no
-// desactiva nada): manda el default del Listener, porque el cinturón es una defensa, no un knob opcional.
-func WithInboundMaxAge(d time.Duration) Option {
+// WithInboundMargin fija el MARGEN de la ventana temporal de ingesta (ADR-0037) para todas las sesiones:
+// se descarta en la puerta lo anterior a `inicioDeConexión − margen`, y eso no sube a la nube. En
+// producción lo cablea el daemon desde WAPP_AGENT_INBOUND_MARGIN_SECONDS. Un valor <=0 se IGNORA (no
+// desactiva nada): manda el default del Listener, porque el margen es lo que absorbe el desfase de reloj.
+func WithInboundMargin(d time.Duration) Option {
 	return func(m *Manager) {
 		if d > 0 {
-			m.inboundMaxAge = d
+			m.inboundMargin = d
 		}
 	}
 }
