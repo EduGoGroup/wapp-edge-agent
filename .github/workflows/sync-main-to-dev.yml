@@ -1,0 +1,135 @@
+name: Sync Main to Dev
+
+# Deja `dev` alineada con `main` después de cada publicación.
+#
+# POR QUÉ ESTE SÍ SE DISPARA SOLO (única excepción al régimen local):
+# el régimen CI/CD de wApp (decisión del dueño, 2026-08-01) deja la validación
+# en la máquina de desarrollo (`make ci-local` / `make ci-docker`) y los demás
+# workflows en `workflow_dispatch`. La sincronización main→dev es de otra
+# naturaleza: no valida nada, no compila nada, y su omisión ya costó caro — el
+# 2026-08-08, tras publicar, `dev` quedó un commit por detrás de `main` en
+# varios repos y hubo que repararlo a mano. Un paso que depende de que alguien
+# se acuerde no es un paso.
+#
+# COSTE: un job de checkout + git, segundos. Además este repo es PÚBLICO, y en
+# repos públicos los minutos de Actions no consumen la cuota gratuita de la
+# cuenta (compartida con EduGo).
+#
+# CREDENCIAL: basta el GITHUB_TOKEN nativo con `permissions: contents: write`
+# (verificado: `default_workflow_permissions=write` y `dev` sin protección de
+# rama). No hace falta PAT. Efecto colateral conocido y DESEADO: un push hecho
+# con GITHUB_TOKEN no dispara otros workflows, así que esta sincronización no
+# puede encadenar corridas ni entrar en bucle.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Dos publicaciones seguidas no deben pelearse por el push a dev.
+concurrency:
+  group: sync-main-to-dev
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sincronizar main a dev
+    runs-on: ubuntu-latest
+    # Cinturón anti-bucle: nunca re-sincronizar sobre un commit de sincronización.
+    if: "!contains(github.event.head_commit.message, 'chore: sync')"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Verificar si dev existe
+        id: check_dev
+        run: |
+          if git ls-remote --heads origin dev | grep -q refs/heads/dev; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Rama dev existe"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Rama dev no existe; se creará desde main"
+          fi
+
+      - name: Crear dev si no existe
+        if: steps.check_dev.outputs.exists == 'false'
+        run: |
+          git checkout -b dev
+          git push -u origin dev
+          echo "Rama dev creada desde main"
+
+      - name: ¿main tiene commits que dev no tiene?
+        id: check_diff
+        run: |
+          git fetch origin dev
+          COMMITS_AHEAD=$(git rev-list --count origin/dev..origin/main)
+          if [ "$COMMITS_AHEAD" -eq 0 ]; then
+            echo "has_diff=false" >> "$GITHUB_OUTPUT"
+            echo "main y dev ya están sincronizados"
+          else
+            echo "has_diff=true" >> "$GITHUB_OUTPUT"
+            echo "main tiene $COMMITS_AHEAD commits que dev no tiene:"
+            git log --oneline origin/dev..origin/main
+          fi
+
+      - name: Sincronizar dev con main
+        if: steps.check_diff.outputs.has_diff == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          MAX_RETRIES=3
+          PUSHED=false
+
+          for attempt in $(seq 1 $MAX_RETRIES); do
+            echo "Intento $attempt/$MAX_RETRIES"
+            git fetch origin main dev
+            git checkout -B dev origin/dev
+
+            # Camino normal en wApp: dev no lleva commits propios cuando se
+            # publica, así que el fast-forward deja dev EXACTAMENTE en el mismo
+            # commit que main — divergencia 0/0, el criterio de "limpio" del
+            # proyecto. Solo si dev divergió se cae al merge, que sí crea un
+            # commit extra en dev.
+            if git merge --ff-only origin/main; then
+              echo "Fast-forward: dev queda en el mismo commit que main"
+            elif git merge origin/main --no-ff -m "chore: sync main to dev" -m "Sincronización automática tras un push a main (workflow sync-main-to-dev)."; then
+              echo "dev tenía commits propios: creado commit de sincronización"
+            else
+              echo "::error::Conflictos en el merge main a dev; requieren resolución manual"
+              git status --short
+              git merge --abort || true
+              exit 1
+            fi
+
+            if git push origin dev; then
+              PUSHED=true
+              echo "Sincronización exitosa: main a dev"
+              break
+            fi
+            echo "Push rechazado (dev se movió mientras tanto); reintentando"
+          done
+
+          if [ "$PUSHED" != "true" ]; then
+            echo "::error::No se pudo pushear dev tras $MAX_RETRIES intentos"
+            exit 1
+          fi
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "# Sincronización main a dev"
+            echo ""
+            echo "| Aspecto | Estado |"
+            echo "|---------|--------|"
+            echo "| Rama dev existía | ${{ steps.check_dev.outputs.exists }} |"
+            echo "| Había diferencias | ${{ steps.check_diff.outputs.has_diff }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
