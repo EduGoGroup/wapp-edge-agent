@@ -693,7 +693,8 @@ func TestE2E_ZeroKnowledge_NoSecretsOnWire(t *testing.T) {
 	})
 
 	// El único payload poblado debe ser Incoming; ningún otro variant del oneof.
-	if msg.GetAck() != nil || msg.GetHeartbeat() != nil || msg.GetPong() != nil || msg.GetDelivery() != nil {
+	// (GetDelivery salió de la lista el 2026-08-12: el campo 11 se retiró del contrato.)
+	if msg.GetAck() != nil || msg.GetHeartbeat() != nil || msg.GetPong() != nil {
 		t.Fatalf("EdgeToCloud trae payload distinto de Incoming: %+v", msg)
 	}
 
