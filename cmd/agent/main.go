@@ -1,13 +1,15 @@
 // Command agent es el daemon del Edge Agent de wApp.
 //
-// Bootstrap minimo (T0, Plan 002): carga configuracion, construye el logger y
-// registra el arranque. El subcomando `pair` (T3.4) ejecuta el emparejamiento por
-// QR local con los adaptadores REALES (store SQLite cifrado + whatsmeow + control
-// en terminal + custodia de la DEK en archivo). El subcomando `send` (T4.3) despacha
-// un texto a un destino usando la sesion ya pareada. El subcomando `listen` (T5.5)
-// mantiene el socket VIVO 24/7 (always-on), reenviando cada mensaje entrante al LogSink
-// (stub CloudLink del spike) hasta Ctrl-C / SIGINT. La logica restante (CloudLink real,
-// systray) se incorpora en chunks posteriores.
+// DOS subcomandos, y no hay mas:
+//
+//   - `enroll`: enrola el Edge contra la nube (mTLS por codigo de enrolamiento).
+//   - `serve`:  el daemon 24/7 — restaura las sesiones activas, mantiene un listener
+//     por sesion sobre el socket VIVO de whatsmeow, drena el outbox contra CloudLink
+//     y expone el plano de control /v1 sobre el Unix socket co-ubicado.
+//
+// Emparejar es `POST /v1/sessions/pair` contra ese plano de control (por terminal
+// ASCII o por la web local de wapp-ctl); enviar y escuchar los gobierna `serve`.
+// Sin subcomando, el binario registra el arranque y termina.
 package main
 
 import (

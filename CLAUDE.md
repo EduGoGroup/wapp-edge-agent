@@ -56,7 +56,7 @@ cmd/
                      reverse-proxy al socket /v1, sirve la web de onboarding
 internal/
   domain/     → Entidades: Session, SendJob, InboundEvent, Lease, DEK (en RAM)
-  app/        → Casos de uso: Pair, Connect, Listen, Send, RunFlowStep
+  app/        → Casos de uso: Pair, Listen, Send, Logout, Outbox (+ diagnostics, health, sessionmgr)
                → Puertos (interfaces): SessionStore, DeviceCascadeStore, AccountStore, etc.
   adapters/
     whatsmeow/   → WhatsAppGateway: socket persistente, QR, Send, handlers de eventos
