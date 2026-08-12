@@ -18,8 +18,9 @@
 // fijar los pragmas (WAL, foreign_keys, busy_timeout) y aplicar el set de migración que corresponda.
 //
 // Helpers legacy single-sesión (OpenAndMigrate = ambos sets a una db; OpenSessionStore = solo el set
-// store; OpenAndMigrateMeta/MigrateMeta/MigrateStore = un set) se CONSERVAN para los subcomandos
-// heredados de cmd/agent (pair/send/listen) y para el cryptostore; el daemon `serve` usa Open+Migrate.
+// store; OpenAndMigrateMeta/MigrateMeta/MigrateStore = un set) se CONSERVAN como COSTURA DE TESTS:
+// verificado 2026-08-12, ningún camino de producción los llama —solo los ejercitan los tests de este
+// paquete, de cryptostore, sessionstore y edgemigrate—. El daemon `serve` usa Open+Migrate.
 package db
 
 import (

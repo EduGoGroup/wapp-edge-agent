@@ -6,6 +6,8 @@ github.com/EduGoGroup/identity-shared/auth v0.3.1 h1:tvjzlKUewcldbmhagTiEsv5vGwe
 github.com/EduGoGroup/identity-shared/auth v0.3.1/go.mod h1:e3n7q0UDi6u2vFjcM+yFMbyHqW/BnPH0mNR00cvYuxM=
 github.com/EduGoGroup/wapp-cloudlink v0.10.1 h1:rsCs2ja8U5ePigL1/U9b3gdLhJZ5/c2iZ7FSQ3VZgp0=
 github.com/EduGoGroup/wapp-cloudlink v0.10.1/go.mod h1:/VyLjFHHIMILLtwtoDknslpxtstwRkmA9WSvwmeIrU0=
+github.com/EduGoGroup/wapp-cloudlink v0.11.0 h1:omWIbVGRAAvJvQXyz0HKzIEBuFytTYbw4Rd2bGno61g=
+github.com/EduGoGroup/wapp-cloudlink v0.11.0/go.mod h1:/VyLjFHHIMILLtwtoDknslpxtstwRkmA9WSvwmeIrU0=
 github.com/EduGoGroup/wapp-edge-intent v0.1.0 h1:BlH2bpIoHKnFLFEHkr7LrOZ2+DV8ZXZIUfZtNF0+ubo=
 github.com/EduGoGroup/wapp-edge-intent v0.1.0/go.mod h1:3nkv/BwsT76asjfKx6Fhww6RDTdyI77IrJ5wL71/j7s=
 github.com/EduGoGroup/wapp-shared/auth v0.4.0 h1:VCo7kOYGIMMedHvvy71NklkN4ojohg3A5lQyhdvp6AY=
