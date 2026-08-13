@@ -4,14 +4,12 @@ github.com/DATA-DOG/go-sqlmock v1.5.2 h1:OcvFkGmslmlZibjAjaHm3L//6LiuBgolP7Oputl
 github.com/DATA-DOG/go-sqlmock v1.5.2/go.mod h1:88MAG/4G7SMwSE3CeA0ZKzrT5CiOU3OJ+JlNzwDqpNU=
 github.com/EduGoGroup/identity-shared/auth v0.3.1 h1:tvjzlKUewcldbmhagTiEsv5vGweWBZR/MyrkK5WqsYE=
 github.com/EduGoGroup/identity-shared/auth v0.3.1/go.mod h1:e3n7q0UDi6u2vFjcM+yFMbyHqW/BnPH0mNR00cvYuxM=
-github.com/EduGoGroup/wapp-cloudlink v0.10.1 h1:rsCs2ja8U5ePigL1/U9b3gdLhJZ5/c2iZ7FSQ3VZgp0=
-github.com/EduGoGroup/wapp-cloudlink v0.10.1/go.mod h1:/VyLjFHHIMILLtwtoDknslpxtstwRkmA9WSvwmeIrU0=
 github.com/EduGoGroup/wapp-cloudlink v0.11.0 h1:omWIbVGRAAvJvQXyz0HKzIEBuFytTYbw4Rd2bGno61g=
 github.com/EduGoGroup/wapp-cloudlink v0.11.0/go.mod h1:/VyLjFHHIMILLtwtoDknslpxtstwRkmA9WSvwmeIrU0=
 github.com/EduGoGroup/wapp-edge-intent v0.1.0 h1:BlH2bpIoHKnFLFEHkr7LrOZ2+DV8ZXZIUfZtNF0+ubo=
 github.com/EduGoGroup/wapp-edge-intent v0.1.0/go.mod h1:3nkv/BwsT76asjfKx6Fhww6RDTdyI77IrJ5wL71/j7s=
-github.com/EduGoGroup/wapp-shared/auth v0.4.0 h1:VCo7kOYGIMMedHvvy71NklkN4ojohg3A5lQyhdvp6AY=
-github.com/EduGoGroup/wapp-shared/auth v0.4.0/go.mod h1:HhE13PHPpPKMDYPYh5qL8/KedX3itJZuVGs/WCENnmg=
+github.com/EduGoGroup/wapp-shared/auth v0.4.1 h1:MHEJ6I4n1abHiVVJZhKToYyH+ajswygQhegk2zIetFA=
+github.com/EduGoGroup/wapp-shared/auth v0.4.1/go.mod h1:DcoZTsKO30A2B0Fgh8Mqzvg8du4qd0CB0eMCIP6Dm9Y=
 github.com/EduGoGroup/wapp-shared/config v0.3.0 h1:wDV0+aieMC5ByiWDzwkNdUUe28Yc3LJBF2nO+CS7n/k=
 github.com/EduGoGroup/wapp-shared/config v0.3.0/go.mod h1:WCDy0MET1u/9rnKAWZwEHa1JQ7HA7rxXwWLqBJHS92w=
 github.com/EduGoGroup/wapp-shared/envelope v0.2.1 h1:5P5d6nDlbgUFVLjHalLrO4qk5qBZu3Dn7iGavbVfQR8=
