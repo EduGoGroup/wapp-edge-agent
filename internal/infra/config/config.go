@@ -200,6 +200,14 @@ type CloudLinkConfig struct {
 	// LeasePubKeyPath es la ruta a la clave pública Ed25519 del emisor de leases (servidor). Si está
 	// presente, se activa el gate de lease (kill-switch); si no, no se gatea (dev).
 	LeasePubKeyPath string `yaml:"lease_pubkey_path"`
+	// LeaseShadowMode activa el modo SOMBRA del gate de lease (D-055.4, Plan 055): con el validator
+	// presente (LeasePubKeyPath configurado), un lease no vigente se REGISTRA (WARN) pero el envío se
+	// despacha igual — no bloquea. Es una decisión DISTINTA de "¿hay validator?" (esa la gobierna
+	// LeasePubKeyPath): esta decide qué hace el gate con el resultado de CanOperate una vez que SÍ hay
+	// validator. Por defecto false (fail-closed real, el comportamiento de siempre); se enciende
+	// mientras se corre el gate en campo sin haberlo visto bloquear nunca (README §8.4, 72h en las tres
+	// máquinas). Se lee de WAPP_AGENT_CLOUDLINK_LEASE_SHADOW_MODE.
+	LeaseShadowMode bool `yaml:"lease_shadow_mode"`
 	// CloudEncPubKeyPath es la ruta a la clave pública X25519 (32B) de CIFRADO de la nube (Plan 011
 	// §6.3/§6.4). Se puebla desde el enrolamiento (EnrollEdgeResponse.cloud_enc_pubkey). Si está
 	// presente, el Edge SELLA los campos sensibles del entrante hacia esta pública (SealFor) antes de
@@ -319,6 +327,7 @@ func Load(path string) (Config, error) {
 	cfg.CloudLink.TLSCA = loader.GetString("CLOUDLINK_TLS_CA", cfg.CloudLink.TLSCA)
 	cfg.CloudLink.ServerName = loader.GetString("CLOUDLINK_SERVER_NAME", cfg.CloudLink.ServerName)
 	cfg.CloudLink.LeasePubKeyPath = loader.GetString("CLOUDLINK_LEASE_PUBKEY_PATH", cfg.CloudLink.LeasePubKeyPath)
+	cfg.CloudLink.LeaseShadowMode = loader.GetBool("CLOUDLINK_LEASE_SHADOW_MODE", cfg.CloudLink.LeaseShadowMode)
 	cfg.CloudLink.CloudEncPubKeyPath = loader.GetString("CLOUDLINK_CLOUD_ENC_PUBKEY_PATH", cfg.CloudLink.CloudEncPubKeyPath)
 	cfg.CloudLink.EnrollmentEndpoint = loader.GetString("CLOUDLINK_ENROLLMENT_ENDPOINT", cfg.CloudLink.EnrollmentEndpoint)
 	cfg.CloudLink.ActivationCode = loader.GetString("CLOUDLINK_ACTIVATION_CODE", cfg.CloudLink.ActivationCode)

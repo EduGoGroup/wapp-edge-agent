@@ -130,6 +130,14 @@ type Adapter struct {
 	baseDelay  time.Duration
 	maxDelay   time.Duration
 
+	// leaseShadowMode activa el modo SOMBRA del gate de lease (D-055.4, Plan 055): cuando CanOperate()
+	// devolvería false, se REGISTRA (WARN) como si hubiera bloqueado pero el envío SIGUE adelante — no se
+	// invoca a.ack(..., false, ...) ni se hace return. Por defecto false (el gate, una vez tiene
+	// validator, bloquea de verdad — comportamiento idéntico al de antes de este campo). Se enciende para
+	// correr el gate real contra tráfico real sin arriesgar una venta mientras se valida en campo (72h en
+	// las tres máquinas, README §8.4) antes de pasar a fail-closed.
+	leaseShadowMode bool
+
 	// cmdTimeout es el deadline POR OPERACIÓN del demux (Plan 027 T1, cierra H7): cada handleCommand se
 	// ejecuta bajo un context.WithTimeout de esta duración, de modo que un envío/descarga colgado no vive
 	// lo que vive el stream. cmdQueueSize es el buffer por sesión del despacho concurrente (backpressure
@@ -205,6 +213,13 @@ type Option func(*Adapter)
 // WithHeartbeatInterval fija la cadencia del Heartbeat. Por defecto 30s.
 func WithHeartbeatInterval(d time.Duration) Option {
 	return func(a *Adapter) { a.hbInterval = d }
+}
+
+// WithLeaseShadowMode activa el modo SOMBRA del gate de lease (D-055.4, Plan 055): cuando CanOperate()
+// devolvería false, se REGISTRA como si hubiera bloqueado pero el envío SIGUE adelante. Por defecto false
+// (el gate, una vez tiene validator, bloquea de verdad). Ver leaseShadowMode.
+func WithLeaseShadowMode(enabled bool) Option {
+	return func(a *Adapter) { a.leaseShadowMode = enabled }
 }
 
 // WithBackoff fija la política de reconexión (base y tope). Por defecto 1s..60s.
@@ -702,10 +717,16 @@ func (a *Adapter) handleCommand(ctx context.Context, cl *client.Client, c2e *clo
 // responde Ack{ok=false} — sin afectar a las demás sesiones.
 func (a *Adapter) handleSendText(ctx context.Context, cl *client.Client, sid string, e *sessionEntry, cmdID string, st *cloudlinkv1.SendText) {
 	if e.validator != nil && !e.validator.CanOperate(e.hasDEK()) {
-		a.log.Warn("CloudLink: SendText BLOQUEADO por lease no vigente (kill-switch)",
-			"command_id", cmdID, "session_id", sid)
-		a.ack(cl, sid, cmdID, false, "lease no vigente")
-		return
+		if a.leaseShadowMode {
+			a.log.Warn("CloudLink: SendText HABRÍA sido bloqueado por lease no vigente — MODO SOMBRA, se deja pasar",
+				"command_id", cmdID, "session_id", sid, "has_dek", e.hasDEK())
+			// sin return: cae al envío normal (D-055.4)
+		} else {
+			a.log.Warn("CloudLink: SendText BLOQUEADO por lease no vigente (kill-switch)",
+				"command_id", cmdID, "session_id", sid)
+			a.ack(cl, sid, cmdID, false, "lease no vigente")
+			return
+		}
 	}
 	if err := e.sendFunc(ctx, cmdID, st.GetTo(), st.GetText()); err != nil {
 		a.log.Error("CloudLink: SendText falló al despachar", "command_id", cmdID, "session_id", sid, "error", err)
@@ -722,10 +743,16 @@ func (a *Adapter) handleSendText(ctx context.Context, cl *client.Client, sid str
 // "image"; la presigned URL la DESCARGA el despachador (GET sin credenciales), no viaja binario por gRPC.
 func (a *Adapter) handleSendMedia(ctx context.Context, cl *client.Client, sid string, e *sessionEntry, cmdID string, sm *cloudlinkv1.SendMedia) {
 	if e.validator != nil && !e.validator.CanOperate(e.hasDEK()) {
-		a.log.Warn("CloudLink: SendMedia BLOQUEADO por lease no vigente (kill-switch)",
-			"command_id", cmdID, "session_id", sid)
-		a.ack(cl, sid, cmdID, false, "lease no vigente")
-		return
+		if a.leaseShadowMode {
+			a.log.Warn("CloudLink: SendMedia HABRÍA sido bloqueado por lease no vigente — MODO SOMBRA, se deja pasar",
+				"command_id", cmdID, "session_id", sid, "has_dek", e.hasDEK())
+			// sin return: cae al envío normal (D-055.4)
+		} else {
+			a.log.Warn("CloudLink: SendMedia BLOQUEADO por lease no vigente (kill-switch)",
+				"command_id", cmdID, "session_id", sid)
+			a.ack(cl, sid, cmdID, false, "lease no vigente")
+			return
+		}
 	}
 	if e.sendMediaFunc == nil {
 		a.log.Warn("CloudLink: SendMedia sin emisor de media configurado para la sesión (ignorado)",

@@ -463,6 +463,34 @@ func TestLoad_RuntimePortDefaultAndOverride(t *testing.T) {
 	}
 }
 
+// TestLoad_LeaseShadowMode_DefaultsFailClosed ancla el default fail-closed del gate de lease (D-055.4,
+// Plan 055): sin WAPP_AGENT_CLOUDLINK_LEASE_SHADOW_MODE en entorno ni YAML, LeaseShadowMode debe quedar en
+// false (ENFORCE real). Invertir el default en Load (p.ej. loader.GetBool(..., true)) rompe esta prueba sin
+// tocar el adapter — es la capa que faltaba cubrir (el adapter ya se prueba en lease_shadow_test.go).
+func TestLoad_LeaseShadowMode_DefaultsFailClosed(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.CloudLink.LeaseShadowMode {
+		t.Fatalf("default LeaseShadowMode debe ser false (fail-closed/ENFORCE), got true")
+	}
+
+	cases := map[string]bool{"1": true, "true": true, "0": false, "false": false}
+	for env, want := range cases {
+		t.Run("env="+env, func(t *testing.T) {
+			t.Setenv(EnvPrefix+"CLOUDLINK_LEASE_SHADOW_MODE", env)
+			cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+			if err != nil {
+				t.Fatalf("Load(%s): %v", env, err)
+			}
+			if cfg.CloudLink.LeaseShadowMode != want {
+				t.Fatalf("CLOUDLINK_LEASE_SHADOW_MODE=%s → got %v, want %v", env, cfg.CloudLink.LeaseShadowMode, want)
+			}
+		})
+	}
+}
+
 // TestLoad_RuntimeEndpointStateFallback verifica que `serve` (config.Load) RELEE el endpoint de runtime
 // persistido por el enroll en <data_dir>/cloudlink-endpoint cuando no viene por YAML/env (Plan 026 T3,
 // cierra follow-up 023): así el stream se levanta sin edición manual del config.yaml.

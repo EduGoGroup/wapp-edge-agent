@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"math/big"
 	"net"
@@ -98,6 +99,7 @@ type fakeEnroll struct {
 	ca             testCA
 	failPermission bool
 	encPub         []byte // Plan 011: pública de cifrado de la nube incluida en la respuesta (si no nil)
+	leasePub       []byte // Plan 055 D-055.5: pública del lease incluida en la respuesta (si no nil)
 
 	mu          sync.Mutex
 	gotCN       string
@@ -142,6 +144,7 @@ func (f *fakeEnroll) EnrollEdge(_ context.Context, req *cloudlinkv1.EnrollEdgeRe
 		CaChainPem:     f.ca.pem,
 		TenantId:       "tenant-test",
 		CloudEncPubkey: f.encPub,
+		LeasePubkey:    f.leasePub,
 	}, nil
 }
 
@@ -333,6 +336,63 @@ func TestRun_NoCloudEncPubKey_NoFile(t *testing.T) {
 	}
 	if _, err := os.Stat(encPath); !os.IsNotExist(err) {
 		t.Fatalf("no debió crearse archivo de pública sin cloud_enc_pubkey: err=%v", err)
+	}
+}
+
+// TestRun_PersistsLeasePubKey verifica (Plan 055 D-055.5/T4.3, cierra H-5) que el enrolamiento persiste
+// la pública del lease recibida en LeasePubKeyPath, codificada en HEX (una línea) — NO en base64, a
+// diferencia de CloudEncPubKeyPath: es el formato que loadValidatorFactory
+// (internal/infra/wiring/cloudlink.go) sabe leer. Se pone rojo si persistLeasePubKey deja de escribir
+// hex, o si deja de escribir los mismos bytes que trajo la respuesta.
+func TestRun_PersistsLeasePubKey(t *testing.T) {
+	ca := newTestCA(t)
+	wantPub := make([]byte, 32)
+	for i := range wantPub {
+		wantPub[i] = byte(255 - i)
+	}
+	fake := &fakeEnroll{ca: ca, leasePub: wantPub}
+	dialer := startServer(t, ca, fake)
+	cfg, _, _ := baseConfig(t, ca, "edge-lease")
+	leasePath := filepath.Join(t.TempDir(), "lease_pubkey")
+	cfg.CloudLink.LeasePubKeyPath = leasePath
+
+	if err := enroll.Run(context.Background(), cfg, sharedlogger.New(),
+		enroll.WithDialOptions(grpc.WithContextDialer(dialer))); err != nil {
+		t.Fatalf("Run devolvió error inesperado: %v", err)
+	}
+
+	data, err := os.ReadFile(leasePath)
+	if err != nil {
+		t.Fatalf("pública del lease no persistida: %v", err)
+	}
+	if _, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data))); err == nil && len(data) == 44 {
+		t.Fatalf("la pública del lease se persistió en base64 (%d chars); loadValidatorFactory solo acepta hex o 32 bytes crudos", len(data))
+	}
+	decoded, err := hex.DecodeString(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatalf("la pública del lease persistida no es hex válido: %v", err)
+	}
+	if !bytes.Equal(decoded, wantPub) {
+		t.Fatalf("pública del lease persistida distinta: got %x want %x", decoded, wantPub)
+	}
+}
+
+// TestRun_NoLeasePubKey_NoFile verifica que si el Gateway no devuelve lease_pubkey, no se crea archivo
+// (el gate de kill-switch queda desactivado, igual que hoy) y el enrolamiento no falla.
+func TestRun_NoLeasePubKey_NoFile(t *testing.T) {
+	ca := newTestCA(t)
+	fake := &fakeEnroll{ca: ca} // leasePub nil
+	dialer := startServer(t, ca, fake)
+	cfg, _, _ := baseConfig(t, ca, "edge-nolease")
+	leasePath := filepath.Join(t.TempDir(), "lease_pubkey")
+	cfg.CloudLink.LeasePubKeyPath = leasePath
+
+	if err := enroll.Run(context.Background(), cfg, sharedlogger.New(),
+		enroll.WithDialOptions(grpc.WithContextDialer(dialer))); err != nil {
+		t.Fatalf("Run devolvió error inesperado: %v", err)
+	}
+	if _, err := os.Stat(leasePath); !os.IsNotExist(err) {
+		t.Fatalf("no debió crearse archivo de pública del lease sin lease_pubkey: err=%v", err)
 	}
 }
 
