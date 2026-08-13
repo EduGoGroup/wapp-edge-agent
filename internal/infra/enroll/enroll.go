@@ -24,6 +24,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -154,6 +155,12 @@ func Run(ctx context.Context, cfg config.Config, log sharedlogger.Logger, opts .
 	// hay pública o no hay ruta configurada, se OMITE sin fallar (fallback claro §10.H en el reenvío).
 	persistCloudEncPubKey(cl.CloudEncPubKeyPath, resp.GetCloudEncPubkey(), log)
 
+	// Pública del lease (D-055.5, T4.3, cierra H-5): si el Gateway la incluyó, se persiste en
+	// LeasePubKeyPath para que loadValidatorFactory (internal/infra/wiring/cloudlink.go) active el gate
+	// de kill-switch. Formato HEX, no base64 (ver comentario de persistLeasePubKey). Si no hay pública o
+	// no hay ruta configurada, se OMITE sin fallar (el gate queda apagado, igual que hoy).
+	persistLeasePubKey(cl.LeasePubKeyPath, resp.GetLeasePubkey(), log)
+
 	// Endpoint de runtime CloudLink (Plan 026 T3, cierra follow-up 023): se DERIVA del host del
 	// enrollment_endpoint + el puerto de runtime (cfg.CloudLink.RuntimePort, default 8101) y se PERSISTE en
 	// el archivo de estado <data_dir>/cloudlink-endpoint para que `serve` levante el stream sin que un
@@ -275,6 +282,37 @@ func persistCloudEncPubKey(path string, pub []byte, log sharedlogger.Logger) {
 		return
 	}
 	log.Info("enroll: pública de cifrado de la nube persistida (sellado en tránsito habilitado)", "cloud_enc_pubkey_path", path)
+}
+
+// persistLeasePubKey persiste la pública Ed25519 del emisor de leases (D-055.5, T4.3, cierra H-5) en
+// path, en HEX (una línea, sin separadores, 0644 — material público). Es best-effort: si no hay pública
+// o no hay ruta, no hace nada; si falla la escritura, AVISA pero NO aborta el enrolamiento (el gate de
+// kill-switch queda apagado hasta el próximo enrolamiento exitoso, igual que hoy sin pública).
+//
+// ⚠️ FORMATO DISTINTO A PROPÓSITO de persistCloudEncPubKey (que escribe BASE64): el lector de
+// LeasePubKeyPath es loadValidatorFactory (internal/infra/wiring/cloudlink.go), y ESE lector solo acepta
+// hex (vía hex.DecodeString) o 32 bytes crudos — NUNCA intenta base64. Si esta función escribiera base64
+// como su hermana, el archivo resultante (44 caracteres) no sería ni hex válido de 64 caracteres ni 32
+// bytes crudos, y loadValidatorFactory fallaría en bucle con "clave pública de lease con tamaño
+// inválido" — el gate de kill-switch quedaría muerto en silencio en toda instalación nueva (H-5), que es
+// exactamente el bug que esta tarea existe para cerrar. NO "unifiques" este formato con el de
+// CloudEncPubKeyPath sin cambiar también loadValidatorFactory: son lectores distintos, con contratos
+// distintos, para dos claves públicas distintas (cifrado de la nube vs. verificación del lease). El
+// tamaño se valida al CARGARLA en el daemon (loadValidatorFactory), igual que CloudEncPubKeyPath.
+func persistLeasePubKey(path string, pub []byte, log sharedlogger.Logger) {
+	if len(pub) == 0 {
+		return
+	}
+	if path == "" {
+		log.Warn("enroll: el Gateway devolvió lease_pubkey pero no hay lease_pubkey_path configurado; se OMITE (gate de kill-switch queda desactivado)")
+		return
+	}
+	encoded := []byte(hex.EncodeToString(pub))
+	if err := writeFile(path, encoded, certFilePerm); err != nil {
+		log.Warn("enroll: no se pudo persistir lease_pubkey; el gate de kill-switch queda desactivado hasta el próximo enrolamiento", "path", path, "error", err)
+		return
+	}
+	log.Info("enroll: pública del lease persistida (gate de kill-switch puede activarse)", "lease_pubkey_path", path)
 }
 
 // persistRuntimeEndpoint deriva el Endpoint de runtime CloudLink y lo persiste en el archivo de estado

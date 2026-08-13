@@ -75,6 +75,10 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, o
 		cloudlink.WithHealthCollector(collector),
 		// Diagnóstico bajo demanda (Plan 031 T8): responde DiagnosticsRequest con el bundle saneado. nil-safe.
 		cloudlink.WithDiagnosticsBuilder(diagBuilder),
+		// Modo sombra del gate de lease (D-055.4, Plan 055): con validator presente, un lease no vigente se
+		// REGISTRA pero no bloquea mientras se corre el gate en campo sin haberlo visto bloquear nunca.
+		// Por defecto false (fail-closed real). WAPP_AGENT_CLOUDLINK_LEASE_SHADOW_MODE.
+		cloudlink.WithLeaseShadowMode(cfg.CloudLink.LeaseShadowMode),
 	)
 	go func() {
 		_ = adapter.Run(ctx)
@@ -181,7 +185,9 @@ func clientCreds(cl config.CloudLinkConfig, log sharedlogger.Logger) (credential
 // loadValidatorFactory construye la FACTORY del Validator del gate de lease si hay clave pública
 // configurada. Acepta la clave en hex o como 32 bytes crudos y la parsea UNA vez; la factory devuelve un
 // Validator FRESCO (estado de lease propio) por sesión (lease por sesión, ADR-0016 §5) sobre esa misma
-// clave del Edge. Devuelve nil (sin gate) si no hay ruta configurada.
+// clave del Edge. Devuelve nil (sin gate) si no hay ruta configurada o si el archivo aún no existe
+// (best-effort, mismo criterio que loadCloudEncPubKey); error solo si el archivo existe pero es
+// ilegible o de tamaño inválido.
 func loadValidatorFactory(cl config.CloudLinkConfig, log sharedlogger.Logger) (cloudlink.ValidatorFactory, error) {
 	if cl.LeasePubKeyPath == "" {
 		log.Warn("CloudLink: sin clave pública de lease; gate de kill-switch DESACTIVADO (solo desarrollo)")
@@ -189,6 +195,17 @@ func loadValidatorFactory(cl config.CloudLinkConfig, log sharedlogger.Logger) (c
 	}
 	raw, err := os.ReadFile(cl.LeasePubKeyPath)
 	if err != nil {
+		// Best-effort, MISMO patrón que loadCloudEncPubKey (H-5 fix, Plan 055 T4.3): si el archivo
+		// simplemente NO EXISTE TODAVÍA (lease_pubkey_path configurado por adelantado, p.ej. vía T5.3, pero
+		// el enrolamiento aún no corrió o corrió contra una nube vieja que no manda lease_pubkey), NO se
+		// propaga como error duro. Un error duro aquí hace que dialCloudLink() tire TODO el Adapter a
+		// LogMux (cae también el envío/recepción real, no solo el gate) — mucho peor que "gate apagado".
+		// Solo es error real un archivo que EXISTE pero es ilegible o corrupto.
+		if os.IsNotExist(err) {
+			log.Warn("CloudLink: lease_pubkey_path configurado pero el archivo aún no existe; gate de kill-switch DESACTIVADO hasta el próximo enrolamiento",
+				"path", cl.LeasePubKeyPath)
+			return nil, nil
+		}
 		return nil, err
 	}
 	pub := raw
