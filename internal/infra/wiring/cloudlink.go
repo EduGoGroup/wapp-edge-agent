@@ -85,8 +85,13 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, o
 		_ = cc.Close()
 	}()
 
+	// lease_shadow_mode va junto a lease_gate (D-055.4, Plan 055 criterio nº4): las 72h de campo se auditan
+	// por log, y un WAPP_AGENT_CLOUDLINK_LEASE_SHADOW_MODE heredado de un .env viejo debe verse aquí — si no,
+	// el kill-switch queda inerte y MUDO. Se loguea tal cual está configurado aunque solo tenga efecto con
+	// lease_gate=true (sin validator no hay gate que poner en sombra).
 	log.Info("CloudLink habilitado (multi-sesión): un stream multiplexado por session_id",
-		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil)
+		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil,
+		"lease_shadow_mode", cfg.CloudLink.LeaseShadowMode)
 	return adapter, adapter
 }
 
