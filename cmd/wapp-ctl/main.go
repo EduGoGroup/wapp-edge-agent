@@ -176,6 +176,8 @@ func newRouter(sup *supervisor.Supervisor, socketPath string, log sharedlogger.L
 	// Borde de autenticación (rutas propias de wapp-ctl, NO proxy).
 	mux.HandleFunc("POST /login", auth.handleLoginPost)
 	mux.HandleFunc("GET /login", auth.handleLoginGet)
+	mux.HandleFunc("POST /signup", auth.handleSignupPost)
+	mux.HandleFunc("GET /signup", auth.handleLoginGet)
 	mux.HandleFunc("POST /logout", auth.handleLogout)
 	mux.HandleFunc("GET /session", auth.handleSession)
 

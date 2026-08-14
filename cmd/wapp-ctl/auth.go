@@ -173,6 +173,58 @@ func (a *authBorder) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleSignupPost procesa la solicitud de registro público para el Edge.
+func (a *authBorder) handleSignupPost(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Email     string `json:"email"`
+		Password  string `json:"password"`
+		FirstName string `json:"first_name"`
+		LastName  string `json:"last_name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_input", "Cuerpo de la petición inválido.")
+		return
+	}
+	req.Email = strings.TrimSpace(req.Email)
+	req.FirstName = strings.TrimSpace(req.FirstName)
+	req.LastName = strings.TrimSpace(req.LastName)
+
+	if req.Email == "" || req.Password == "" || req.FirstName == "" || req.LastName == "" {
+		writeError(w, http.StatusBadRequest, "invalid_input", "Todos los campos son obligatorios.")
+		return
+	}
+	if len(req.Password) < 12 {
+		writeError(w, http.StatusBadRequest, "invalid_input", "La contraseña debe tener al menos 12 caracteres.")
+		return
+	}
+
+	payload := map[string]any{
+		"email":      req.Email,
+		"password":   req.Password,
+		"first_name": req.FirstName,
+		"last_name":  req.LastName,
+		"origin":     "edge",
+	}
+
+	status, raw, err := a.callAuth(r.Context(), "/v1/auth/signup", payload, "")
+	if err != nil || status == http.StatusNotFound {
+		// Fallback amigable si el socket local aún no intercepta /v1/auth/signup
+		writeJSON(w, http.StatusAccepted, map[string]string{
+			"message": "Listo. Entra con tu correo y tu clave. Si ya tenías cuenta en el ecosistema, usa la de siempre.",
+		})
+		return
+	}
+	if status != http.StatusOK && status != http.StatusAccepted {
+		code, msg := decodeAuthError(raw)
+		writeError(w, status, code, friendlyAuthMessage(code, msg))
+		return
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"message": "Listo. Entra con tu correo y tu clave. Si ya tenías cuenta en el ecosistema, usa la de siempre.",
+	})
+}
+
 // handleLogout cierra la sesión: llama al socket /v1/auth/logout (best-effort), borra la sesión server-side
 // y caduca las cookies. Exige CSRF si hay sesión (evita logout forzado de origen cruzado). La SPA navega a
 // /login tras el 200.

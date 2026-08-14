@@ -413,3 +413,49 @@ func TestLogoutClearsCookies(t *testing.T) {
 		t.Fatal("logout debe caducar la cookie de sesión")
 	}
 }
+
+// TestSignup_Success verifica que POST /signup responde 202 con mensaje amigable.
+func TestSignup_Success(t *testing.T) {
+	fc := newFakeCore(t)
+	router := fc.routerFor(t)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/signup", strings.NewReader(`{
+		"first_name": "Carlos",
+		"last_name": "Gomez",
+		"email": "carlos@edge.local",
+		"password": "Password123456!"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("POST /signup status = %d, want 202. Body: %s", rec.Code, rec.Body.String())
+	}
+	var res map[string]string
+	_ = json.NewDecoder(rec.Body).Decode(&res)
+	if !strings.Contains(res["message"], "Listo. Entra con tu correo y tu clave.") {
+		t.Fatalf("mensaje inesperado: %v", res)
+	}
+}
+
+// TestSignup_Validations valida campos requeridos y longitud mínima de clave.
+func TestSignup_Validations(t *testing.T) {
+	fc := newFakeCore(t)
+	router := fc.routerFor(t)
+
+	// Clave muy corta
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/signup", strings.NewReader(`{
+		"first_name": "Carlos",
+		"last_name": "Gomez",
+		"email": "carlos@edge.local",
+		"password": "corta"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /signup status = %d, want 400", rec.Code)
+	}
+}
