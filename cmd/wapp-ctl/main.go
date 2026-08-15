@@ -42,6 +42,7 @@ func main() {
 	addr := flag.String("addr", envOr("WAPP_CTL_ADDR", "127.0.0.1:8105"), "dirección loopback donde sirve el supervisor (host:puerto)")
 	agentBin := flag.String("agent-bin", envOr("WAPP_CTL_AGENT_BIN", defaultAgentBin()), "ruta del binario núcleo `agent` a lanzar (default: hermano de wapp-ctl, si no PATH)")
 	socketFlag := flag.String("socket", "", "ruta del Unix socket /v1 del núcleo (default: cfg.ControlSocketPath del config)")
+	platformURLFlag := flag.String("platform-api-base-url", "", "URL base de la API pública HTTP de la plataforma cloud, puerto 8103 (default: cfg.PlatformAPIBaseURL del config; C-03/T3.5)")
 	pidFile := flag.String("pid-file", "", "ruta del PID/lock file anti-duplicado (default: <socket>.pid)")
 	noOpen := flag.Bool("no-open", false, "no abrir el navegador automáticamente al arrancar")
 	autostart := flag.Bool("autostart", false, "arrancar el núcleo (agent serve) automáticamente al iniciar (lo usa el LaunchAgent, Plan 023 · T3); por defecto el núcleo se arranca bajo demanda por POST /v1/daemon/start")
@@ -66,13 +67,18 @@ func main() {
 		socketPath = *socketFlag
 	}
 
+	platformBaseURL := cfg.PlatformAPIBaseURL
+	if *platformURLFlag != "" {
+		platformBaseURL = *platformURLFlag
+	}
+
 	sup := supervisor.New(supervisor.Config{
 		AgentBin:   *agentBin,
 		SocketPath: socketPath,
 		PIDFile:    *pidFile, // vacío ⇒ el supervisor usa <socket>.pid
 	}, log)
 
-	router := newRouter(sup, socketPath, log)
+	router := newRouter(sup, socketPath, platformBaseURL, log)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -87,7 +93,7 @@ func main() {
 	go func() { serveErr <- srv.ListenAndServe() }()
 
 	log.Info("wapp-ctl: supervisor arriba",
-		"addr", *addr, "socket", socketPath, "agent_bin", *agentBin, "version", Version)
+		"addr", *addr, "socket", socketPath, "agent_bin", *agentBin, "platform_api_base_url", platformBaseURL, "version", Version)
 
 	// Autoarranque del núcleo (Plan 023 · T3): bajo el LaunchAgent por-usuario queremos recepción 24/7 y que
 	// el Restore del Plan 022 corra al iniciar sesión. Start es idempotente (si el núcleo ya corre no hace
@@ -125,14 +131,19 @@ func main() {
 
 // newRouter construye el mux del supervisor: control de proceso (/v1/daemon/*), reverse-proxy del resto
 // de /v1/* al socket del núcleo, y la web UI embebida en "/". Factorizado para los tests.
-func newRouter(sup *supervisor.Supervisor, socketPath string, log sharedlogger.Logger) *http.ServeMux {
+//
+// platformBaseURL es la URL base de la API pública HTTP de la plataforma cloud (puerto 8103), que
+// authBorder usa para el signup (C-03/T3.5) — llamada DIRECTA por red, distinta del socketClient (que
+// solo habla con el núcleo local por Unix socket).
+func newRouter(sup *supervisor.Supervisor, socketPath, platformBaseURL string, log sharedlogger.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Borde de sesión del operador (Plan 033 · Ola 3 · Paso B): sesión en cookie HttpOnly + CSRF, con el
 	// access token custodiado server-side y el refresh SIEMPRE en el núcleo.
 	store := newSessionStore()
 	socketClient := newSocketClient(socketPath)
-	auth := newAuthBorder(store, socketClient, log)
+	platformClient := newPlatformClient()
+	auth := newAuthBorder(store, socketClient, platformClient, platformBaseURL, log)
 
 	// Control de proceso: lo atiende el supervisor (no se proxya). Sin método en el patrón para devolver
 	// un 405 con envelope ante el verbo equivocado (en vez de proxyar la ruta /v1/daemon/* al núcleo).

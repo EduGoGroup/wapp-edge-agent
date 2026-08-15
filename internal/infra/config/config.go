@@ -53,6 +53,13 @@ const DefaultInboundMarginSeconds = 300
 // viejos que ese tiempo al encolar/drenar. Configurable por WAPP_AGENT_OUTBOX_TTL_HOURS.
 const DefaultOutboxTTLHours = 0
 
+// DefaultPlatformAPIBaseURL es la URL base por defecto de la API PÚBLICA HTTP de la plataforma cloud
+// (wapp-cloud-platform, puerto público 8103, rutas /api/v1/...): NO confundir con CloudLink (gRPC/mTLS,
+// 8101/8102). La usa wapp-ctl para hablar DIRECTO con la nube en rutas que el núcleo no relaya (p.ej.
+// POST /api/v1/signup, C-03/T3.5) — mismo default que WAPP_GUARDIAN_BFF usa para PUBLIC_API_BASE.
+// Configurable por WAPP_AGENT_PLATFORM_API_BASE_URL.
+const DefaultPlatformAPIBaseURL = "http://localhost:8103"
+
 // runtimeEndpointStateFile es el nombre del archivo de estado bajo data_dir donde el enroll persiste el
 // Endpoint de runtime derivado (Plan 026 T3, cierra follow-up 023) para que `serve` lo relea sin edición
 // manual del config.yaml. Material PÚBLICO (host:puerto), nunca secretos.
@@ -155,6 +162,11 @@ type Config struct {
 	Intent IntentConfig `yaml:"intent"`
 	// EnableAlphaTestAccounts activa el selector de usuarios de prueba (Alpha) en la UI de login. Default: false.
 	EnableAlphaTestAccounts bool `yaml:"enable_alpha_test_accounts"`
+	// PlatformAPIBaseURL es la URL base de la API PÚBLICA HTTP de la plataforma cloud (puerto 8103,
+	// /api/v1/...), usada por wapp-ctl para llamadas directas que el núcleo no relaya por el socket local
+	// (p.ej. el signup público, C-03/T3.5). Distinta de CloudLink.* (gRPC/mTLS 8101/8102). Se lee de
+	// WAPP_AGENT_PLATFORM_API_BASE_URL.
+	PlatformAPIBaseURL string `yaml:"platform_api_base_url"`
 }
 
 // DefaultIntentOllamaURL es la URL por defecto del Ollama local (loopback): el LLM corre en el MISMO equipo
@@ -283,6 +295,7 @@ func defaults() Config {
 			TimeoutMS: DefaultIntentTimeoutMS,
 		},
 		EnableAlphaTestAccounts: false,
+		PlatformAPIBaseURL:      DefaultPlatformAPIBaseURL,
 	}
 }
 
@@ -339,6 +352,7 @@ func Load(path string) (Config, error) {
 	cfg.Intent.Model = loader.GetString("INTENT_MODEL", cfg.Intent.Model)
 	cfg.Intent.TimeoutMS = loader.GetInt("INTENT_TIMEOUT_MS", cfg.Intent.TimeoutMS)
 	cfg.EnableAlphaTestAccounts = loader.GetBool("ALPHA_TEST_ACCOUNTS", loader.GetBool("ENABLE_ALPHA_LOGIN", cfg.EnableAlphaTestAccounts))
+	cfg.PlatformAPIBaseURL = loader.GetString("PLATFORM_API_BASE_URL", cfg.PlatformAPIBaseURL)
 
 	// Puerto de runtime CloudLink por defecto (Plan 026 T3): si nadie lo fijó (YAML/env), "8101"
 	// (topología de prod, design §1). Con él el enroll deriva y persiste el Endpoint de runtime.
@@ -381,6 +395,12 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Intent.TimeoutMS <= 0 {
 		cfg.Intent.TimeoutMS = DefaultIntentTimeoutMS
+	}
+
+	// API pública de la plataforma (C-03/T3.5): un valor vacío (tecleado mal en YAML/env) cae al default en
+	// vez de dejar el signup del Edge sin destino contra el que llamar.
+	if cfg.PlatformAPIBaseURL == "" {
+		cfg.PlatformAPIBaseURL = DefaultPlatformAPIBaseURL
 	}
 
 	// Dialecto de BD (Plan 022 T0): solo "sqlite" (default) o "postgres". Se valida aquí para fallar

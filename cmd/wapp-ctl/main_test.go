@@ -45,7 +45,7 @@ func startFakeCore(t *testing.T) string {
 func TestProxyRoutesToCore(t *testing.T) {
 	sock := startFakeCore(t)
 	sup := supervisor.New(supervisor.Config{SocketPath: sock}, nil)
-	router := newRouter(sup, sock, nil)
+	router := newRouter(sup, sock, "", nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/ping", nil)
@@ -64,7 +64,7 @@ func TestProxyRoutesToCore(t *testing.T) {
 func TestProxyDaemonDown(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "missing.sock")
 	sup := supervisor.New(supervisor.Config{SocketPath: sock}, nil)
-	router := newRouter(sup, sock, nil)
+	router := newRouter(sup, sock, "", nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
@@ -86,7 +86,7 @@ func TestProxyDaemonDown(t *testing.T) {
 func TestDaemonStatusStopped(t *testing.T) {
 	dir := t.TempDir()
 	sup := supervisor.New(supervisor.Config{SocketPath: filepath.Join(dir, "edge.sock")}, nil)
-	router := newRouter(sup, filepath.Join(dir, "edge.sock"), nil)
+	router := newRouter(sup, filepath.Join(dir, "edge.sock"), "", nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/daemon/status", nil)
@@ -108,7 +108,7 @@ func TestDaemonStatusStopped(t *testing.T) {
 func TestDaemonStartWrongMethod(t *testing.T) {
 	dir := t.TempDir()
 	sup := supervisor.New(supervisor.Config{SocketPath: filepath.Join(dir, "edge.sock")}, nil)
-	router := newRouter(sup, filepath.Join(dir, "edge.sock"), nil)
+	router := newRouter(sup, filepath.Join(dir, "edge.sock"), "", nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/daemon/start", nil)
@@ -124,7 +124,7 @@ func TestDaemonStartWrongMethod(t *testing.T) {
 func TestRootRedirectsToLoginWithoutSession(t *testing.T) {
 	dir := t.TempDir()
 	sup := supervisor.New(supervisor.Config{SocketPath: filepath.Join(dir, "edge.sock")}, nil)
-	router := newRouter(sup, filepath.Join(dir, "edge.sock"), nil)
+	router := newRouter(sup, filepath.Join(dir, "edge.sock"), "", nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -143,7 +143,7 @@ func TestRootRedirectsToLoginWithoutSession(t *testing.T) {
 func TestStaticAssetsServedWithoutSession(t *testing.T) {
 	dir := t.TempDir()
 	sup := supervisor.New(supervisor.Config{SocketPath: filepath.Join(dir, "edge.sock")}, nil)
-	router := newRouter(sup, filepath.Join(dir, "edge.sock"), nil)
+	router := newRouter(sup, filepath.Join(dir, "edge.sock"), "", nil)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/styles.css", nil)

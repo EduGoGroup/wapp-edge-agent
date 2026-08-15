@@ -39,6 +39,10 @@ const (
 	codeMethodNotAllowed = "method_not_allowed"
 	// codeNotFound: ruta no disponible desde el navegador (p.ej. /v1/auth/* se bloquea en el proxy).
 	codeNotFound = "not_found"
+	// codePlatformDown lo emite el signup (C-03, T3.5) cuando POST /api/v1/signup de la plataforma cloud
+	// no responde (fallo de red) o responde 503 (dependencia interna, p.ej. M2M sin configurar). Distinto
+	// de codeDaemonDown: aquí el núcleo local puede estar sano, es la NUBE la que no está disponible.
+	codePlatformDown = "platform_unavailable"
 )
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

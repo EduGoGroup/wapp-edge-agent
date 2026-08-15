@@ -131,10 +131,20 @@ func (fc *fakeCore) setValidAccess(v string) {
 	fc.mu.Unlock()
 }
 
+// routerFor monta el router con una URL de plataforma DUMMY (no hay servidor detrás): válido para todos
+// los tests que no llaman a /signup (login, proxy, csrf, logout, ...). Los tests de signup necesitan una
+// plataforma FALSA de verdad — usan routerForPlatform.
 func (fc *fakeCore) routerFor(t *testing.T) *http.ServeMux {
 	t.Helper()
+	return fc.routerForPlatform(t, "http://127.0.0.1:1")
+}
+
+// routerForPlatform monta el router apuntando el signup (C-03/T3.5) a platformBaseURL — normalmente un
+// httptest.Server que representa POST /api/v1/signup de wapp-cloud-platform.
+func (fc *fakeCore) routerForPlatform(t *testing.T, platformBaseURL string) *http.ServeMux {
+	t.Helper()
 	sup := supervisor.New(supervisor.Config{SocketPath: fc.socket}, nil)
-	return newRouter(sup, fc.socket, nil)
+	return newRouter(sup, fc.socket, platformBaseURL, nil)
 }
 
 // login realiza POST /login y devuelve las cookies emitidas (sesión + csrf).
@@ -414,10 +424,59 @@ func TestLogoutClearsCookies(t *testing.T) {
 	}
 }
 
-// TestSignup_Success verifica que POST /signup responde 202 con mensaje amigable.
+// fakePlatformSignup es un servidor HTTP REAL (no Unix socket) que representa `POST /api/v1/signup` de
+// wapp-cloud-platform (C-03/T3.5): el Edge lo llama por RED, no por el socket local del núcleo. Cuenta
+// invocaciones, guarda el último body decodificado, y devuelve el status/cuerpo que el test configure.
+type fakePlatformSignup struct {
+	mu       sync.Mutex
+	calls    int
+	lastBody map[string]any
+	status   int
+	body     string // cuerpo crudo de la respuesta; vacío ⇒ sin cuerpo
+}
+
+// newFakePlatformSignup levanta el servidor y lo registra para cerrarse al final del test.
+func newFakePlatformSignup(t *testing.T, status int, body string) (*httptest.Server, *fakePlatformSignup) {
+	t.Helper()
+	fp := &fakePlatformSignup{status: status, body: body}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/signup", func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		fp.mu.Lock()
+		fp.calls++
+		fp.lastBody = b
+		fp.mu.Unlock()
+		w.WriteHeader(fp.status)
+		if fp.body != "" {
+			_, _ = w.Write([]byte(fp.body))
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, fp
+}
+
+func (fp *fakePlatformSignup) invocations() int {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	return fp.calls
+}
+
+func (fp *fakePlatformSignup) lastRequestBody() map[string]any {
+	fp.mu.Lock()
+	defer fp.mu.Unlock()
+	return fp.lastBody
+}
+
+// TestSignup_Success: un signup válido hace EXACTAMENTE una llamada a POST /api/v1/signup de la
+// plataforma, con origin:"edge" en el cuerpo, y el operador ve 202 con el mensaje amigable — solo
+// DESPUÉS de que esa llamada haya tenido éxito (fija C-03: antes se fabricaba el mismo 202 sin llamar a
+// nadie).
 func TestSignup_Success(t *testing.T) {
 	fc := newFakeCore(t)
-	router := fc.routerFor(t)
+	srv, fp := newFakePlatformSignup(t, http.StatusAccepted, `{"message":"Listo. Entra con tu correo y tu clave."}`)
+	router := fc.routerForPlatform(t, srv.URL)
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/signup", strings.NewReader(`{
@@ -437,12 +496,24 @@ func TestSignup_Success(t *testing.T) {
 	if !strings.Contains(res["message"], "Listo. Entra con tu correo y tu clave.") {
 		t.Fatalf("mensaje inesperado: %v", res)
 	}
+	if got := fp.invocations(); got != 1 {
+		t.Fatalf("la plataforma se llamó %d veces; quería exactamente 1", got)
+	}
+	body := fp.lastRequestBody()
+	if body["origin"] != "edge" {
+		t.Fatalf("origin enviado = %v; quería \"edge\"", body["origin"])
+	}
+	if body["email"] != "carlos@edge.local" {
+		t.Fatalf("email enviado = %v; quería carlos@edge.local", body["email"])
+	}
 }
 
-// TestSignup_Validations valida campos requeridos y longitud mínima de clave.
+// TestSignup_Validations valida campos requeridos y longitud mínima de clave, SIN llamar a la plataforma
+// (falla antes, en el borde local).
 func TestSignup_Validations(t *testing.T) {
 	fc := newFakeCore(t)
-	router := fc.routerFor(t)
+	srv, fp := newFakePlatformSignup(t, http.StatusAccepted, `{"message":"ok"}`)
+	router := fc.routerForPlatform(t, srv.URL)
 
 	// Clave muy corta
 	rec := httptest.NewRecorder()
@@ -457,5 +528,96 @@ func TestSignup_Validations(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("POST /signup status = %d, want 400", rec.Code)
+	}
+	if got := fp.invocations(); got != 0 {
+		t.Fatalf("la validación local no debe llamar a la plataforma; se llamó %d veces", got)
+	}
+}
+
+// TestSignup_CoreNoDisponible: si la plataforma no responde (destino caído / conexión rechazada), el
+// operador recibe 503 con un envelope de error honesto — NUNCA el 202 verde que fabricaba el fallback
+// eliminado por C-03.
+func TestSignup_CoreNoDisponible(t *testing.T) {
+	fc := newFakeCore(t)
+	// Servidor que se cierra ANTES de la llamada: la conexión se rechaza, como un destino no disponible.
+	down := httptest.NewServer(http.NewServeMux())
+	downURL := down.URL
+	down.Close()
+
+	router := fc.routerForPlatform(t, downURL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/signup", strings.NewReader(`{
+		"first_name": "Carlos",
+		"last_name": "Gomez",
+		"email": "carlos@edge.local",
+		"password": "Password123456!"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("POST /signup con plataforma caída status = %d; quería 503. Body: %s", rec.Code, rec.Body.String())
+	}
+	var body errorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body no es el envelope de error: %v (%s)", err, rec.Body.String())
+	}
+	if body.Error.Code != codePlatformDown {
+		t.Fatalf("code = %q; quería %q", body.Error.Code, codePlatformDown)
+	}
+}
+
+// TestSignup_PlataformaResponde503_SePropaga: si la plataforma (no la red) responde 503 —p.ej. su
+// cliente M2M sin configurar—, el Edge propaga 503 tal cual, no lo convierte en 202.
+func TestSignup_PlataformaResponde503_SePropaga(t *testing.T) {
+	fc := newFakeCore(t)
+	srv, fp := newFakePlatformSignup(t, http.StatusServiceUnavailable, "registro no disponible")
+	router := fc.routerForPlatform(t, srv.URL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/signup", strings.NewReader(`{
+		"first_name": "Carlos",
+		"last_name": "Gomez",
+		"email": "carlos@edge.local",
+		"password": "Password123456!"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d; quería 503 (propagado de la plataforma)", rec.Code)
+	}
+	if got := fp.invocations(); got != 1 {
+		t.Fatalf("invocaciones = %d; quería 1", got)
+	}
+}
+
+// TestSignup_PlataformaResponde409_CorreoExistente: si la plataforma responde 409 (correo ya registrado
+// — contrato en evolución en paralelo a C-03), el Edge lo propaga con un mensaje honesto, no un 202.
+func TestSignup_PlataformaResponde409_CorreoExistente(t *testing.T) {
+	fc := newFakeCore(t)
+	srv, _ := newFakePlatformSignup(t, http.StatusConflict, `{"error":{"code":"email_taken","message":"ya existe una cuenta con ese correo"}}`)
+	router := fc.routerForPlatform(t, srv.URL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/signup", strings.NewReader(`{
+		"first_name": "Carlos",
+		"last_name": "Gomez",
+		"email": "carlos@edge.local",
+		"password": "Password123456!"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d; quería 409 (propagado de la plataforma)", rec.Code)
+	}
+	var body errorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body no es el envelope de error: %v (%s)", err, rec.Body.String())
+	}
+	if body.Error.Code != "email_taken" {
+		t.Fatalf("code = %q; quería email_taken", body.Error.Code)
 	}
 }

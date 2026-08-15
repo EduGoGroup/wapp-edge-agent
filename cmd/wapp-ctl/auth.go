@@ -48,15 +48,35 @@ func newSocketClient(socketPath string) *http.Client {
 	}
 }
 
+// newPlatformClient construye el http.Client que habla por RED (no Unix socket) con la API PÚBLICA de la
+// plataforma cloud (wapp-cloud-platform, puerto 8103) — lo usa el signup (C-03/T3.5), la única llamada
+// del borde de auth que sale de la máquina hacia la nube en vez de quedarse en el socket local del
+// núcleo. 15s: mismo timeout que usan los clientes salientes equivalentes del BFF y la consola
+// (guardian/wapp-guardian-bff/internal/apiclient/transport.go, guardian/wapp-platform-console/...).
+func newPlatformClient() *http.Client {
+	return &http.Client{Timeout: 15 * time.Second}
+}
+
 // authBorder agrupa las dependencias de los handlers de auth del borde.
 type authBorder struct {
 	store  *sessionStore
 	client *http.Client
 	log    sharedlogger.Logger
+
+	// platformClient/platformBaseURL sirven el signup (C-03/T3.5): llamada DIRECTA a
+	// POST {platformBaseURL}/api/v1/signup, distinta del socket local del núcleo (que no la relaya).
+	platformClient  *http.Client
+	platformBaseURL string
 }
 
-func newAuthBorder(store *sessionStore, client *http.Client, log sharedlogger.Logger) *authBorder {
-	return &authBorder{store: store, client: client, log: log}
+func newAuthBorder(store *sessionStore, client *http.Client, platformClient *http.Client, platformBaseURL string, log sharedlogger.Logger) *authBorder {
+	return &authBorder{
+		store:           store,
+		client:          client,
+		log:             log,
+		platformClient:  platformClient,
+		platformBaseURL: platformBaseURL,
+	}
 }
 
 // callAuth hace una llamada POST server-side a un endpoint /v1/auth/* del socket. Devuelve el status HTTP
@@ -77,6 +97,35 @@ func (a *authBorder) callAuth(ctx context.Context, path string, body any, bearer
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
 	resp, err := a.client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw := new(bytes.Buffer)
+	_, _ = raw.ReadFrom(resp.Body)
+	return resp.StatusCode, raw.Bytes(), nil
+}
+
+// callPlatformSignup hace la llamada POST REAL hacia el alta pública de la plataforma cloud
+// (`POST {platformBaseURL}/api/v1/signup`, C-03/T3.5). A diferencia de callAuth (que SIEMPRE marca el
+// Unix socket local del núcleo), esta sale por RED hacia wapp-cloud-platform con su propio http.Client y
+// timeout — el mismo camino que ya usa el BFF (guardian/wapp-guardian-bff/internal/apiclient/auth.go), no
+// uno inventado. Devuelve el status y el cuerpo crudo tal cual: /api/v1/signup hoy responde texto plano
+// en sus errores (no el envelope {"error":{code,message}} del resto de la plataforma), así que el caller
+// decodifica con decodePlatformError en vez de decodeAuthError.
+func (a *authBorder) callPlatformSignup(ctx context.Context, payload any) (int, []byte, error) {
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(payload); err != nil {
+		return 0, nil, err
+	}
+	url := strings.TrimRight(a.platformBaseURL, "/") + "/api/v1/signup"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, &buf)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := a.platformClient.Do(req)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -173,7 +222,10 @@ func (a *authBorder) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleSignupPost procesa la solicitud de registro público para el Edge.
+// handleSignupPost procesa la solicitud de registro público para el Edge (C-03/T3.5): tras validar el
+// input, llama DIRECTO a POST /api/v1/signup de la plataforma cloud — igual que hace el BFF — con
+// origin:"edge". NUNCA responde éxito sin que esa llamada haya tenido éxito: el fallback que fabricaba un
+// 202 sin llamar a nadie (el bug de C-03) queda eliminado.
 func (a *authBorder) handleSignupPost(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Email     string `json:"email"`
@@ -206,23 +258,73 @@ func (a *authBorder) handleSignupPost(w http.ResponseWriter, r *http.Request) {
 		"origin":     "edge",
 	}
 
-	status, raw, err := a.callAuth(r.Context(), "/v1/auth/signup", payload, "")
-	if err != nil || status == http.StatusNotFound {
-		// Fallback amigable si el socket local aún no intercepta /v1/auth/signup
+	status, raw, err := a.callPlatformSignup(r.Context(), payload)
+	if err != nil {
+		// La plataforma no respondió (red caída, DNS, timeout, etc.): error real, NUNCA un 202 fabricado.
+		writeError(w, http.StatusServiceUnavailable, codePlatformDown,
+			"No se pudo contactar la plataforma para completar el registro: inténtalo de nuevo.")
+		return
+	}
+	if status == http.StatusOK || status == http.StatusAccepted {
 		writeJSON(w, http.StatusAccepted, map[string]string{
 			"message": "Listo. Entra con tu correo y tu clave. Si ya tenías cuenta en el ecosistema, usa la de siempre.",
 		})
 		return
 	}
-	if status != http.StatusOK && status != http.StatusAccepted {
-		code, msg := decodeAuthError(raw)
-		writeError(w, status, code, friendlyAuthMessage(code, msg))
-		return
-	}
 
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"message": "Listo. Entra con tu correo y tu clave. Si ya tenías cuenta en el ecosistema, usa la de siempre.",
-	})
+	code, msg := friendlySignupMessage(status, raw)
+	writeError(w, status, code, msg)
+}
+
+// decodePlatformError extrae un mensaje legible del cuerpo de error de POST /api/v1/signup. A diferencia
+// del socket del núcleo (envelope estable {"error":{code,message}}, ver decodeAuthError), este endpoint
+// HOY devuelve texto plano en sus errores (http.Error, ver wapp-cloud-platform/internal/platformadmin/
+// signup.go) y su contrato de error está EN EVOLUCIÓN en paralelo a este cambio (C-03). Por eso se
+// prueba, en orden: (1) el envelope JSON estándar por si el endpoint lo adopta, (2) un objeto JSON simple
+// {"message":"..."}, (3) el cuerpo crudo como texto (recortado) — nunca se asume un shape concreto.
+func decodePlatformError(raw []byte) string {
+	var e errorBody
+	if err := json.Unmarshal(raw, &e); err == nil && e.Error.Message != "" {
+		return e.Error.Message
+	}
+	var m struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &m); err == nil && m.Message != "" {
+		return m.Message
+	}
+	msg := strings.TrimSpace(string(raw))
+	const maxLen = 300
+	if len(msg) > maxLen {
+		msg = msg[:maxLen]
+	}
+	return msg
+}
+
+// friendlySignupMessage traduce el status HTTP no-2xx de POST /api/v1/signup a (code, mensaje amigable)
+// para el operador. Cubre explícitamente 503 (la plataforma o una dependencia suya, p.ej. el cliente M2M,
+// no está disponible) y 409 (correo ya registrado); el resto cae a un mensaje genérico con el detalle
+// del cuerpo si lo hay. El status HTTP real se propaga siempre al navegador (nunca se colapsa a 202).
+func friendlySignupMessage(status int, raw []byte) (code, msg string) {
+	detail := decodePlatformError(raw)
+	switch status {
+	case http.StatusServiceUnavailable:
+		return codePlatformDown, "El alta no está disponible en este momento: inténtalo más tarde."
+	case http.StatusConflict:
+		return "email_taken", "Ya existe una cuenta con ese correo. Inicia sesión, o contacta al administrador si no la recuerdas."
+	case http.StatusTooManyRequests:
+		return "rate_limited", "Demasiados intentos. Espera un momento e inténtalo de nuevo."
+	case http.StatusBadRequest:
+		if detail != "" {
+			return "invalid_input", detail
+		}
+		return "invalid_input", "Revisa los datos del formulario."
+	default:
+		if detail != "" {
+			return "signup_failed", detail
+		}
+		return "signup_failed", "No se pudo completar el registro. Inténtalo de nuevo."
+	}
 }
 
 // handleLogout cierra la sesión: llama al socket /v1/auth/logout (best-effort), borra la sesión server-side
