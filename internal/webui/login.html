@@ -70,8 +70,8 @@
             </label>
             <select class="wapp-field__control" id="alpha-user-select" aria-label="Selecciona un usuario de prueba">
                 <option value="" selected disabled>Selecciona para autocompletar el email...</option>
-                <option value="admin@e2e.local" data-email="admin@e2e.local" data-password="1234567890AB">Administrador e2e (admin@e2e.local)</option>
-                <option value="admin-b@e2e.local" data-email="admin-b@e2e.local" data-password="1234567890AB">Admin Tenant B (admin-b@e2e.local)</option>
+                <option value="admin@e2e.local" data-email="admin@e2e.local" data-password="{{ .AlphaTestPassword }}">Administrador e2e (admin@e2e.local)</option>
+                <option value="admin-b@e2e.local" data-email="admin-b@e2e.local" data-password="{{ .AlphaTestPassword }}">Admin Tenant B (admin-b@e2e.local)</option>
             </select>
         </div>
         {{ end }}
@@ -340,8 +340,11 @@
         alphaSel.addEventListener("change", (e) => {
           const opt = e.target.options[e.target.selectedIndex];
           const em = opt.getAttribute("data-email");
-          const pw = opt.getAttribute("data-password");
-          if (em && pw) {
+          // data-password sale de WAPP_ALPHA_TEST_PASSWORD (M-13): puede venir vacío si la env var no
+          // está puesta, y el email se autocompleta igual — solo el campo de contraseña queda para
+          // que el operador la teclee.
+          const pw = opt.getAttribute("data-password") || "";
+          if (em) {
             const emailInp = $("login-email");
             const passInp = $("login-password");
             if (emailInp) emailInp.value = em;

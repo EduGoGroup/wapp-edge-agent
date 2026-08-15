@@ -219,6 +219,13 @@ func (a *authBorder) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = tmpl.Execute(w, map[string]any{
 		"EnableAlphaTestAccounts": enableAlpha,
+		// AlphaTestPassword (M-13, code review 056): la clave que el selector de "Usuario de prueba
+		// (Alpha)" autocompleta sale de WAPP_ALPHA_TEST_PASSWORD, NUNCA del fichero versionado. Vacía
+		// por default: el selector sigue autocompletando el correo, y el campo de contraseña queda
+		// vacío para que el operador la teclee. Mismo patrón y misma env var que el BFF
+		// (guardian/wapp-guardian-bff/internal/config/config.go), para que las dos superficies se
+		// configuren igual.
+		"AlphaTestPassword": os.Getenv("WAPP_ALPHA_TEST_PASSWORD"),
 	})
 }
 
