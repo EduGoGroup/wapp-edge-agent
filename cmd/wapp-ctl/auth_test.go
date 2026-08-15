@@ -593,6 +593,47 @@ func TestSignup_PlataformaResponde503_SePropaga(t *testing.T) {
 	}
 }
 
+// TestSignup_PlataformaResponde502_SePropaga: un 502 (p.ej. identity caído en registerIdentityUser, o
+// ReplaceUserSystems fallando) es, hoy, el caso COMÚN mientras T0.2 (credencial M2M de wApp hacia
+// identity) siga sin hacerse — no un caso raro. El Edge debe propagar 502 con el MISMO mensaje "no es
+// culpa tuya" que el 503, y NUNCA el texto crudo del upstream (que nombraría la pieza interna que
+// falló).
+func TestSignup_PlataformaResponde502_SePropaga(t *testing.T) {
+	fc := newFakeCore(t)
+	srv, fp := newFakePlatformSignup(t, http.StatusBadGateway, "servicio de identidad no disponible")
+	router := fc.routerForPlatform(t, srv.URL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/signup", strings.NewReader(`{
+		"first_name": "Carlos",
+		"last_name": "Gomez",
+		"email": "carlos@edge.local",
+		"password": "Password123456!"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d; quería 502 (propagado de la plataforma)", rec.Code)
+	}
+	if got := fp.invocations(); got != 1 {
+		t.Fatalf("invocaciones = %d; quería 1", got)
+	}
+	var body errorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body no es el envelope de error: %v (%s)", err, rec.Body.String())
+	}
+	if body.Error.Code != codePlatformDown {
+		t.Fatalf("code = %q; quería %q (mismo código que el 503)", body.Error.Code, codePlatformDown)
+	}
+	if !strings.Contains(body.Error.Message, "El alta no está disponible en este momento") {
+		t.Fatalf("mensaje = %q; quería el mismo tono que el 503", body.Error.Message)
+	}
+	if strings.Contains(body.Error.Message, "servicio de identidad no disponible") {
+		t.Fatalf("el texto crudo del upstream se filtró al operador: %q", body.Error.Message)
+	}
+}
+
 // TestSignup_PlataformaResponde409_CorreoExistente: si la plataforma responde 409 (correo ya registrado
 // — contrato en evolución en paralelo a C-03), el Edge lo propaga con un mensaje honesto, no un 202.
 func TestSignup_PlataformaResponde409_CorreoExistente(t *testing.T) {

@@ -309,13 +309,19 @@ func decodePlatformError(raw []byte) string {
 }
 
 // friendlySignupMessage traduce el status HTTP no-2xx de POST /api/v1/signup a (code, mensaje amigable)
-// para el operador. Cubre explícitamente 503 (la plataforma o una dependencia suya, p.ej. el cliente M2M,
-// no está disponible) y 409 (correo ya registrado); el resto cae a un mensaje genérico con el detalle
-// del cuerpo si lo hay. El status HTTP real se propaga siempre al navegador (nunca se colapsa a 202).
+// para el operador. Cubre explícitamente 503/502 (la plataforma o una dependencia suya —el cliente M2M,
+// identity, ReplaceUserSystems— no está disponible) y 409 (correo ya registrado); el resto cae a un
+// mensaje genérico con el detalle del cuerpo si lo hay. El status HTTP real se propaga siempre al
+// navegador (nunca se colapsa a 202).
+//
+// El 502 comparte el mensaje del 503 a propósito, en vez de caer al default (que SÍ filtraría el
+// detalle crudo del upstream): mientras T0.2 (credencial M2M de wApp hacia identity) siga sin hacerse,
+// el 502/503 es el caso COMÚN de todo despliegue, no el raro — y ninguno de los dos debe revelar qué
+// pieza interna falló (identity vs. ReplaceUserSystems).
 func friendlySignupMessage(status int, raw []byte) (code, msg string) {
 	detail := decodePlatformError(raw)
 	switch status {
-	case http.StatusServiceUnavailable:
+	case http.StatusServiceUnavailable, http.StatusBadGateway:
 		return codePlatformDown, "El alta no está disponible en este momento: inténtalo más tarde."
 	case http.StatusConflict:
 		return "email_taken", "Ya existe una cuenta con ese correo. Inicia sesión, o contacta al administrador si no la recuerdas."
