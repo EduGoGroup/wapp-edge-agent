@@ -13,7 +13,9 @@ package server
 //	POST /v1/auth/refresh  (sin cuerpo; usa el refresh custodiado) → 200 LoginResult | error
 //	POST /v1/auth/logout  body {"all_sessions":bool?}     → 200 {"ok":true} | error
 //
-// LoginResult = {"access_token","token_type","expires_at" (RFC3339),"roles":[...]}. NO incluye el refresh.
+// LoginResult = {"access_token","token_type","expires_at" (RFC3339),"roles":[...],"tenant_id"}. NO incluye
+// el refresh. tenant_id vacío ⇒ el operador aún no tiene empresa asignada ("en revisión", M-01 code
+// review 056 del Plan 056): wapp-ctl lo usa para decidir en servidor si la sesión abre la SPA.
 // Códigos de error (code): invalid_credentials(401) · user_inactive(403) · refresh_invalid(401) ·
 // invalid_input(400) · tenant_mismatch(403) · relay_offline(503) · internal(502). El Paso B mapea code→UI.
 

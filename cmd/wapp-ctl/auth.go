@@ -32,6 +32,9 @@ type loginResult struct {
 	TokenType   string    `json:"token_type"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	Roles       []string  `json:"roles"`
+	// TenantID decide si la sesión está "en revisión" (vacío) o puede abrir la SPA (M-01, code review
+	// 056): lo consumen rootGate (main.go) y handleSession, nunca el navegador contando roles.
+	TenantID string `json:"tenant_id"`
 }
 
 // newSocketClient construye un http.Client que marca SIEMPRE el Unix socket del núcleo (para las llamadas
@@ -195,20 +198,28 @@ func (a *authBorder) handleLoginPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "internal", "Respuesta de login inválida del núcleo.")
 		return
 	}
-	sess := a.store.create(res.AccessToken, res.Roles, res.ExpiresAt)
+	sess := a.store.create(res.AccessToken, res.Roles, res.TenantID, res.ExpiresAt)
 	setSessionCookies(w, sess)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
 		"roles":         res.Roles,
-		"expires_at":    res.ExpiresAt,
+		// pending (M-01, code review 056): decidido por el TENANT, no por contar roles — un usuario con
+		// membresía y sin rol (D-056.11) tiene tenant y NO está pendiente.
+		"pending":    res.TenantID == "",
+		"expires_at": res.ExpiresAt,
 	})
 }
 
-// handleLoginGet sirve la pantalla de login. Si ya hay sesión válida, redirige a la webui principal.
+// handleLoginGet sirve la pantalla de login. Si ya hay sesión válida CON tenant, redirige a la webui
+// principal. Una sesión válida SIN tenant ("en revisión", M-01 code review 056) NO se redirige a "/"
+// —rootGate (main.go) la rebotaría de vuelta aquí igualmente— sino que sirve login.html tal cual: su JS
+// consulta GET /session y pinta la sección "pending" en vez del formulario.
 func (a *authBorder) handleLoginGet(w http.ResponseWriter, r *http.Request) {
-	if a.store.fromRequest(r) != nil {
-		http.Redirect(w, r, "/", http.StatusSeeOther)
-		return
+	if sess := a.store.fromRequest(r); sess != nil {
+		if _, tenant, _ := sess.meta(); tenant != "" {
+			http.Redirect(w, r, "/", http.StatusSeeOther)
+			return
+		}
 	}
 	tmpl, err := template.ParseFS(webui.FS(), "login.html")
 	if err != nil {
@@ -366,17 +377,19 @@ func (a *authBorder) handleLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSession expone los datos NO sensibles de la sesión para que la webui pinte el rol / decida si
-// redirigir a login. Nunca devuelve el access token.
+// redirigir a login. Nunca devuelve el access token. "pending" (M-01, code review 056) es el estado REAL
+// —tenant vacío— y no una cuenta de roles: un usuario con membresía y sin rol (D-056.11) NO está pendiente.
 func (a *authBorder) handleSession(w http.ResponseWriter, r *http.Request) {
 	sess := a.store.fromRequest(r)
 	if sess == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"authenticated": false})
 		return
 	}
-	roles, expires := sess.meta()
+	roles, tenant, expires := sess.meta()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"authenticated": true,
 		"roles":         roles,
+		"pending":       tenant == "",
 		"expires_at":    expires,
 	})
 }

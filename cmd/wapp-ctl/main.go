@@ -199,13 +199,21 @@ func newRouter(sup *supervisor.Supervisor, socketPath, platformBaseURL string, l
 	return mux
 }
 
-// rootGate protege el documento raíz de la webui: "/" (index.html) exige sesión válida — sin ella redirige
-// a /login. El resto de rutas (assets estáticos) se delega al FileServer embebido sin restricción.
+// rootGate protege el documento raíz de la webui: "/" (index.html) exige sesión válida CON TENANT ASIGNADO
+// — sin sesión, o con sesión pero sin tenant ("en revisión", M-01 code review 056 del Plan 056), redirige a
+// /login. La decisión se toma AQUÍ, en servidor: escribir "/index.html" a mano no sirve de nada, a
+// diferencia del check anterior (solo en el JS del cliente) que sí se podía saltar. El resto de rutas
+// (assets estáticos) se delega al FileServer embebido sin restricción.
 func rootGate(store *sessionStore) http.Handler {
 	fs := webui.Handler()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/" || r.URL.Path == "/index.html" {
-			if store.fromRequest(r) == nil {
+			sess := store.fromRequest(r)
+			if sess == nil {
+				http.Redirect(w, r, "/login", http.StatusSeeOther)
+				return
+			}
+			if _, tenant, _ := sess.meta(); tenant == "" {
 				http.Redirect(w, r, "/login", http.StatusSeeOther)
 				return
 			}

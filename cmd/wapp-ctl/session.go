@@ -39,6 +39,7 @@ type opSession struct {
 	mu      sync.Mutex
 	access  string
 	roles   []string
+	tenant  string // vacío ⇒ el operador aún no tiene empresa asignada ("en revisión", M-01 code review 056)
 	expires time.Time
 	gen     uint64 // generación del access: la incrementa cada refresh (single-flight)
 
@@ -52,19 +53,24 @@ func (s *opSession) snapshot() (access string, gen uint64) {
 	return s.access, s.gen
 }
 
-// meta devuelve los datos NO sensibles para pintar la UI (roles + expiración).
-func (s *opSession) meta() (roles []string, expires time.Time) {
+// meta devuelve los datos NO sensibles para pintar la UI (roles + tenant + expiración). tenant vacío
+// marca el estado "en revisión" (M-01, code review 056): el operador aún no tiene empresa asignada.
+func (s *opSession) meta() (roles []string, tenant string, expires time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.roles, s.expires
+	return s.roles, s.tenant, s.expires
 }
 
-// apply actualiza el access/roles/expires de la sesión y avanza la generación.
-func (s *opSession) apply(access string, roles []string, expires time.Time) {
+// apply actualiza el access/roles/tenant/expires de la sesión y avanza la generación. Se llama tanto tras
+// el login inicial como tras cada refresh (proxy.go): si el tenant llega vacío en el login pero luego se
+// asigna (aprobación del administrador), el refresh siguiente lo propaga aquí — la sesión NO queda
+// congelada en el estado "en revisión" del primer login (M-01, code review 056).
+func (s *opSession) apply(access string, roles []string, tenant string, expires time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.access = access
 	s.roles = roles
+	s.tenant = tenant
 	s.expires = expires
 	s.gen++
 }
@@ -72,7 +78,7 @@ func (s *opSession) apply(access string, roles []string, expires time.Time) {
 // refreshIfStale implementa el SINGLE-FLIGHT del refresh: solo el primer caller que llega con la
 // generación vigente (gen0) ejecuta `do` (la llamada al socket /v1/auth/refresh); los que perdieron la
 // carrera reusan el access ya rotado sin volver a golpear el núcleo (la rotación invalidaría al perdedor).
-func (s *opSession) refreshIfStale(gen0 uint64, do func() (string, []string, time.Time, error)) (string, error) {
+func (s *opSession) refreshIfStale(gen0 uint64, do func() (string, []string, string, time.Time, error)) (string, error) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 
@@ -84,11 +90,11 @@ func (s *opSession) refreshIfStale(gen0 uint64, do func() (string, []string, tim
 		return curAccess, nil
 	}
 
-	access, roles, expires, err := do()
+	access, roles, tenant, expires, err := do()
 	if err != nil {
 		return "", err
 	}
-	s.apply(access, roles, expires)
+	s.apply(access, roles, tenant, expires)
 	return access, nil
 }
 
@@ -104,12 +110,13 @@ func newSessionStore() *sessionStore {
 
 // create registra una sesión nueva a partir del resultado de login del núcleo y devuelve la sesión con
 // su id opaco y su token CSRF ya generados.
-func (st *sessionStore) create(access string, roles []string, expires time.Time) *opSession {
+func (st *sessionStore) create(access string, roles []string, tenant string, expires time.Time) *opSession {
 	sess := &opSession{
 		id:      randToken(),
 		csrf:    randToken(),
 		access:  access,
 		roles:   roles,
+		tenant:  tenant,
 		expires: expires,
 		gen:     1,
 	}

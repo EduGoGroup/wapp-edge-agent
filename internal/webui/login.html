@@ -197,10 +197,23 @@
             show(secEnroll, true);
             return;
           }
-          show(secLogin, true);
         } catch (_) {
           show(secDown, true);
+          return;
         }
+        // Enrolado: si ya hay una sesión "en revisión" (rootGate nos rebotó aquí en vez de "/", M-01 code
+        // review 056), pinta la pantalla de espera directamente en vez del formulario de login.
+        try {
+          const sres = await fetch("/session", { headers: { Accept: "application/json" } });
+          const sbody = await sres.json();
+          if (sbody && sbody.authenticated && sbody.pending) {
+            show(secPending, true);
+            return;
+          }
+        } catch (_) {
+          // Si /session falla, cae al login normal (no bloquea el flujo de entrada).
+        }
+        show(secLogin, true);
       }
 
       $("link-show-signup").addEventListener("click", (e) => {
@@ -316,8 +329,9 @@
           });
           const body = await res.json().catch(() => ({}));
           if (res.ok) {
-            if (body.roles && body.roles.length === 0) {
-              // Sin roles ni tenant: estado en revisión
+            if (body.pending) {
+              // Sin empresa asignada (M-01, code review 056): "pending" lo decide el servidor por el
+              // tenant, no este script contando roles — un usuario con membresía y sin rol SÍ entra.
               show(secLogin, false);
               show(secPending, true);
               return;

@@ -138,6 +138,89 @@ func TestRootRedirectsToLoginWithoutSession(t *testing.T) {
 	}
 }
 
+// TestRootGateBlocksSessionWithoutTenant: M-01 (code review 056) — una sesión válida pero SIN tenant
+// asignado ("en revisión") no puede abrir la SPA aunque pida "/" directamente. La barrera es de SERVIDOR
+// (rootGate), no del cliente: antes de esta corrección, escribir "/index.html" a mano bastaba para
+// saltársela.
+func TestRootGateBlocksSessionWithoutTenant(t *testing.T) {
+	fc := newFakeCore(t)
+	router := fc.routerFor(t)
+	cookies := login(t, router, "pending@edge", "secret") // sin tenant_id
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	withCookies(req, cookies)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("/ con sesión sin tenant status = %d; quería 303 (redirect, NO la SPA)", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/login" {
+		t.Fatalf("/ con sesión sin tenant Location = %q; quería /login", loc)
+	}
+}
+
+// TestRootGateAllowsSessionWithTenantNoRoles: D-056.11 declara legítimo un usuario CON tenant pero SIN
+// roles (membresía sin rol asignado todavía). Antes de M-01, la detección contaba roles.length===0 y
+// confundía este caso con "en revisión"; ahora decide por el tenant y debe dejarlo entrar.
+func TestRootGateAllowsSessionWithTenantNoRoles(t *testing.T) {
+	fc := newFakeCore(t)
+	router := fc.routerFor(t)
+	cookies := login(t, router, "norole@edge", "secret") // tenant_id presente, roles vacíos
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	withCookies(req, cookies)
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/ con tenant y sin roles status = %d; quería 200 (la SPA)", rec.Code)
+	}
+}
+
+// TestRefreshPropagatesTenant: si el tenant llega vacío en el login pero el administrador aprueba al
+// operador justo después, el siguiente refresh (proxy.go, vía sess.apply) debe propagar el tenant nuevo:
+// la sesión no puede quedar CONGELADA en "en revisión" para siempre (M-01, code review 056).
+func TestRefreshPropagatesTenant(t *testing.T) {
+	fc := newFakeCore(t)
+	router := fc.routerFor(t)
+	cookies := login(t, router, "pending@edge", "secret") // sin tenant_id
+
+	// Antes del refresh: "/" rebota a /login (sigue "en revisión").
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	withCookies(req, cookies)
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("/ antes del refresh status = %d; quería 303 (aún en revisión)", rec.Code)
+	}
+
+	// Fuerza que el access de "pending@edge" ya no valga (simula expiración) y que el refresh
+	// devuelva un access nuevo CON tenant (simula la aprobación del administrador mientras tanto).
+	fc.mu.Lock()
+	fc.validAccess = "access-approved"
+	fc.refreshTo = "access-approved"
+	fc.refreshTenant = "tenant-later"
+	fc.mu.Unlock()
+
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "/v1/sessions", nil)
+	withCookies(req2, cookies)
+	router.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("GET /v1/sessions tras refresh status = %d; quería 200 (body=%s)", rec2.Code, rec2.Body.String())
+	}
+
+	// Tras el refresh: "/" ya deja pasar (el tenant recién asignado se propagó a la sesión).
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodGet, "/", nil)
+	withCookies(req3, cookies)
+	router.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("/ tras el refresh status = %d; quería 200 (el tenant recién asignado debe abrir la SPA)", rec3.Code)
+	}
+}
+
 // TestStaticAssetsServedWithoutSession: los assets estáticos (styles.css) se sirven SIN sesión (los
 // necesita también la pantalla de login).
 func TestStaticAssetsServedWithoutSession(t *testing.T) {

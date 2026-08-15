@@ -139,7 +139,7 @@ func (p *coreProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if cap1.status == http.StatusUnauthorized {
 		// Access expirado: refresh single-flight + un reintento.
-		newAccess, err := sess.refreshIfStale(gen, func() (string, []string, time.Time, error) {
+		newAccess, err := sess.refreshIfStale(gen, func() (string, []string, string, time.Time, error) {
 			return p.doRefresh(r.Context())
 		})
 		if err != nil {
@@ -170,18 +170,21 @@ func (p *coreProxy) attempt(orig *http.Request, body []byte, bearer string, cw *
 }
 
 // doRefresh llama al socket /v1/auth/refresh (sin body: el refresh lo custodia el núcleo) y devuelve el
-// access rotado + metadatos. Un status != 200 se traduce a error (dispara la limpieza de sesión).
-func (p *coreProxy) doRefresh(ctx context.Context) (string, []string, time.Time, error) {
+// access rotado + metadatos, incluido el tenant. Un status != 200 se traduce a error (dispara la limpieza
+// de sesión). Propagar el tenant aquí es lo que evita que una sesión quede CONGELADA en "en revisión"
+// (M-01, code review 056): si el administrador aprueba al operador entre login y login, el siguiente
+// refresh es lo único que se lo entera a wapp-ctl.
+func (p *coreProxy) doRefresh(ctx context.Context) (string, []string, string, time.Time, error) {
 	status, raw, err := p.auth.callAuth(ctx, "/v1/auth/refresh", nil, "")
 	if err != nil {
-		return "", nil, time.Time{}, err
+		return "", nil, "", time.Time{}, err
 	}
 	if status != http.StatusOK {
-		return "", nil, time.Time{}, errRefreshFailed
+		return "", nil, "", time.Time{}, errRefreshFailed
 	}
 	var res loginResult
 	if err := json.Unmarshal(raw, &res); err != nil || res.AccessToken == "" {
-		return "", nil, time.Time{}, errRefreshFailed
+		return "", nil, "", time.Time{}, errRefreshFailed
 	}
-	return res.AccessToken, res.Roles, res.ExpiresAt, nil
+	return res.AccessToken, res.Roles, res.TenantID, res.ExpiresAt, nil
 }

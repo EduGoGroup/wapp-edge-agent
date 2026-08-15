@@ -34,11 +34,12 @@ func shortSocketPath(t *testing.T) string {
 type fakeCore struct {
 	socket string
 
-	mu           sync.Mutex
-	validAccess  string // el único Bearer que la ruta protegida acepta
-	refreshCount int    // nº de veces que se llamó /v1/auth/refresh
-	refreshFails bool   // si true, /v1/auth/refresh responde 401 (refresh_invalid)
-	refreshTo    string // access que devuelve el refresh
+	mu            sync.Mutex
+	validAccess   string // el único Bearer que la ruta protegida acepta
+	refreshCount  int    // nº de veces que se llamó /v1/auth/refresh
+	refreshFails  bool   // si true, /v1/auth/refresh responde 401 (refresh_invalid)
+	refreshTo     string // access que devuelve el refresh
+	refreshTenant string // tenant_id que devuelve el refresh (M-01, code review 056)
 }
 
 func newFakeCore(t *testing.T) *fakeCore {
@@ -57,16 +58,39 @@ func newFakeCore(t *testing.T) *fakeCore {
 	mux.HandleFunc("POST /v1/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		var req struct{ Email, Password string }
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		if req.Email == "op@edge" && req.Password == "secret" {
+		if req.Password != "secret" {
+			writeError(w, http.StatusUnauthorized, "invalid_credentials", "credenciales inválidas")
+			return
+		}
+		switch req.Email {
+		case "op@edge":
 			writeJSON(w, http.StatusOK, map[string]any{
 				"access_token": "access-1",
 				"token_type":   "Bearer",
 				"expires_at":   time.Now().Add(time.Hour),
 				"roles":        []string{"edge.operator"},
+				"tenant_id":    "tenant-e2e",
 			})
-			return
+		case "pending@edge":
+			// Sin tenant_id: estado "en revisión" (M-01, code review 056).
+			writeJSON(w, http.StatusOK, map[string]any{
+				"access_token": "access-pending",
+				"token_type":   "Bearer",
+				"expires_at":   time.Now().Add(time.Hour),
+				"roles":        []string{},
+			})
+		case "norole@edge":
+			// Con tenant_id pero SIN roles: estado legítimo (D-056.11), NO es "en revisión".
+			writeJSON(w, http.StatusOK, map[string]any{
+				"access_token": "access-norole",
+				"token_type":   "Bearer",
+				"expires_at":   time.Now().Add(time.Hour),
+				"roles":        []string{},
+				"tenant_id":    "tenant-e2e",
+			})
+		default:
+			writeError(w, http.StatusUnauthorized, "invalid_credentials", "credenciales inválidas")
 		}
-		writeError(w, http.StatusUnauthorized, "invalid_credentials", "credenciales inválidas")
 	})
 
 	mux.HandleFunc("POST /v1/auth/refresh", func(w http.ResponseWriter, _ *http.Request) {
@@ -74,6 +98,7 @@ func newFakeCore(t *testing.T) *fakeCore {
 		fc.refreshCount++
 		fails := fc.refreshFails
 		to := fc.refreshTo
+		tenant := fc.refreshTenant
 		if !fails {
 			fc.validAccess = to // el refresh rota el access válido
 		}
@@ -88,6 +113,7 @@ func newFakeCore(t *testing.T) *fakeCore {
 			"token_type":   "Bearer",
 			"expires_at":   time.Now().Add(time.Hour),
 			"roles":        []string{"edge.operator"},
+			"tenant_id":    tenant,
 		})
 	})
 

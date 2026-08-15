@@ -33,6 +33,10 @@ type LoginResult struct {
 	TokenType   string    `json:"token_type"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	Roles       []string  `json:"roles,omitempty"`
+	// TenantID identifica la empresa asignada al operador (M-01, code review 056 del Plan 056). Vacío
+	// cuando aún no tiene tenant (estado "en revisión"): wapp-ctl lo usa para decidir EN SERVIDOR si la
+	// sesión puede abrir la SPA o debe quedarse en la pantalla de espera (nunca solo en el cliente).
+	TenantID string `json:"tenant_id,omitempty"`
 }
 
 // Manager es el session manager del operador (Plan 033 Ola 3 / ADR-0025): relaya
@@ -212,6 +216,7 @@ func (m *Manager) loginResult() LoginResult {
 	res := LoginResult{AccessToken: m.access, TokenType: "Bearer", ExpiresAt: m.expires}
 	if m.claims != nil {
 		res.Roles = m.claims.Roles
+		res.TenantID = m.claims.TenantID
 	}
 	return res
 }
