@@ -594,6 +594,44 @@ func TestSignup_CoreNoDisponible(t *testing.T) {
 	}
 }
 
+// TestSignup_InsecurePlatformURL_Rejected: si PlatformAPIBaseURL es "http://" contra un host que NO es
+// loopback, el signup se corta ANTES de llamar a la plataforma — mandar la contraseña en claro por la red
+// no es un fallo transitorio, así que lleva su propio código (Trabajo 1, code review 056 · T11).
+func TestSignup_InsecurePlatformURL_Rejected(t *testing.T) {
+	fc := newFakeCore(t)
+	srv, fp := newFakePlatformSignup(t, http.StatusAccepted, `{"message":"ok"}`)
+	// srv.URL es http://127.0.0.1:PUERTO (loopback). Se reescribe SOLO el host a uno NO loopback,
+	// manteniendo el mismo puerto, para simular una plataforma real detrás de un config inseguro sin
+	// depender de DNS real (el fakePlatform sigue escuchando en 127.0.0.1; si la llamada de verdad
+	// saliera, fallaría por conexión rechazada — la aserción clave es que NO se llega a intentar).
+	insecureURL := strings.Replace(srv.URL, "127.0.0.1", "cloud.wapp.example", 1)
+	router := fc.routerForPlatform(t, insecureURL)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/signup", strings.NewReader(`{
+		"first_name": "Carlos",
+		"last_name": "Gomez",
+		"email": "carlos@edge.local",
+		"password": "Password123456!"
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("POST /signup con plataforma insegura status = %d; quería 500. Body: %s", rec.Code, rec.Body.String())
+	}
+	var body errorBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("body no es el envelope de error: %v (%s)", err, rec.Body.String())
+	}
+	if body.Error.Code != codeInsecurePlatformConfig {
+		t.Fatalf("code = %q; quería %q", body.Error.Code, codeInsecurePlatformConfig)
+	}
+	if got := fp.invocations(); got != 0 {
+		t.Fatalf("no debe llamar a la plataforma cuando la URL configurada es insegura; se llamó %d veces", got)
+	}
+}
+
 // TestSignup_PlataformaResponde503_SePropaga: si la plataforma (no la red) responde 503 —p.ej. su
 // cliente M2M sin configurar—, el Edge propaga 503 tal cual, no lo convierte en 202.
 func TestSignup_PlataformaResponde503_SePropaga(t *testing.T) {

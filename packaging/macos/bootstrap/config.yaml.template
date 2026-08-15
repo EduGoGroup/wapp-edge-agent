@@ -11,6 +11,15 @@
 log_level: "info"
 data_dir: "@@DATA_DIR@@"
 
+# PRODUCCIÓN (Trabajo 1, code review 056 · T11): fija platform_api_base_url (o
+# WAPP_AGENT_PLATFORM_API_BASE_URL) a la URL PÚBLICA de tu plataforma cloud (wapp-cloud-platform,
+# /api/v1/...). A diferencia de cloudlink.endpoint, esta URL NO se deriva del enrolamiento: sin
+# fijarla, el botón "solicitar acceso" del Edge llama a SU PROPIO localhost:8103 (default de fábrica)
+# y el alta de usuarios nunca funciona. http:// solo se admite contra loopback
+# (localhost/127.0.0.1/::1); con cualquier otro host usa https:// — un host remoto por http://
+# mandaría la contraseña del operador en claro por la red y el signup lo rehúsa.
+# platform_api_base_url: "https://cloud.tu-nube.example"
+
 cloudlink:
   # Bootstrap de confianza pre-provisto en el paquete: valida el TLS-de-servidor del
   # Gateway durante el enroll. Reemplaza por el endpoint real de tu nube antes de

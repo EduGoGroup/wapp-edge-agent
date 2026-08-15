@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/webui"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -265,6 +266,20 @@ func (a *authBorder) handleSignupPost(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Password) < 12 {
 		writeError(w, http.StatusBadRequest, "invalid_input", "La contraseña debe tener al menos 12 caracteres.")
+		return
+	}
+
+	// Trabajo 1 (code review 056 · T11): PlatformAPIBaseURL es config del EDGE, no input del operador — si
+	// quedó en "http://" contra un host que no es loopback, seguir mandaría la contraseña en claro por la
+	// red. Se corta ANTES de marcar el socket: no es un fallo transitorio (reintentar no lo arregla), así
+	// que lleva su propio código para que la UI no lo confunda con "la plataforma no responde".
+	if config.PlatformAPIBaseURLInsecure(a.platformBaseURL) {
+		if a.log != nil {
+			a.log.Error("wapp-ctl: signup rechazado — PlatformAPIBaseURL insegura (http fuera de loopback)",
+				"platform_api_base_url", a.platformBaseURL)
+		}
+		writeError(w, http.StatusInternalServerError, codeInsecurePlatformConfig,
+			"No se puede completar el registro: la configuración de este Edge no es segura (mandaría tu contraseña sin cifrar por la red). Avisa al administrador para que revise la URL de la plataforma en este equipo.")
 		return
 	}
 

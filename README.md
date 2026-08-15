@@ -114,6 +114,7 @@ Prefijo **`WAPP_AGENT_`**. Precedencia: defaults < YAML < entorno.
 | `WAPP_AGENT_INTENT_OLLAMA_URL` | `http://127.0.0.1:11434` | URL del Ollama local (loopback). |
 | `WAPP_AGENT_INTENT_MODEL` | `qwen3:1.7b` | Modelo del clasificador. |
 | `WAPP_AGENT_INTENT_TIMEOUT_MS` | `3000` | Timeout por clasificación; al excederse degrada sin bloquear. |
+| `WAPP_AGENT_PLATFORM_API_BASE_URL` | `http://localhost:8103` | URL base de la API pública HTTP de la plataforma cloud (`/api/v1/...`) que usa `wapp-ctl` para el signup del Edge (C-03/T3.5) — llamada DIRECTA por red, no relayada por el socket local. **A diferencia de `CLOUDLINK_ENDPOINT`, NO se deriva del enrolamiento**: en cualquier instalación fuera de la máquina de desarrollo hay que fijarla a mano, o el botón "solicitar acceso" llamará al propio `localhost` del Edge y nunca funcionará (queda constancia en el log de arranque mientras siga en el default, ver ⁴). `http://` solo se admite contra loopback (`localhost`/`127.0.0.1`/`::1`); con cualquier otro host el signup se rehúsa (nunca manda la contraseña en claro por la red) — usa `https://`. |
 | `WAPP_LOG_FILE` | (vacío) | Redirige el log a archivo (útil bajo LaunchAgent/systemd). |
 
 ¹ macOS `~/Library/Application Support/wApp/edge` · Linux `~/.config/wApp/edge`
@@ -136,6 +137,18 @@ fuera un segundo por delante del servidor.
 ⚠️ Junto con esto, los **ecos propios** (`IsFromMe`) dejaron de subir a la nube. Si echas en
 falta mensajes en el Cloud tras una caída larga, **es el comportamiento esperado**, no una
 pérdida: revisa este margen antes de buscar el fallo en otro sitio.
+
+⁴ **`PLATFORM_API_BASE_URL` fuera de desarrollo (Trabajo 1, code review 056 · T11).** Si al
+arrancar `wapp-ctl` la URL sigue en el default de fábrica (`http://localhost:8103`), el log deja
+constancia en `warn` — un log mudo es justo lo que hizo que este defecto pasara desapercibido.
+Además, si la URL configurada es `http://` contra un host que **no** es loopback (mandaría la
+contraseña del operador en claro por la red), el signup se **rehúsa** con el código
+`platform_url_insecure` en vez de romper el arranque completo de `wapp-ctl`: esta URL solo la usa
+el signup (C-03/T3.5), y `wapp-ctl` también controla el arranque/parada del núcleo 24/7 y sirve la
+UI de operador — abortar el proceso entero por un problema acotado al alta de usuarios dejaría sin
+control (y, en instalaciones con autoarranque por systemd, sin el propio núcleo `agent serve`,
+que `wapp-ctl --autostart` lanza) a un Edge cuya única falla real está en un botón. `https://` y
+loopback siempre se permiten.
 
 ## Store y custodia (zero-knowledge)
 

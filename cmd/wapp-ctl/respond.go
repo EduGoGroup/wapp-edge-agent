@@ -43,6 +43,12 @@ const (
 	// no responde (fallo de red) o responde 503 (dependencia interna, p.ej. M2M sin configurar). Distinto
 	// de codeDaemonDown: aquí el núcleo local puede estar sano, es la NUBE la que no está disponible.
 	codePlatformDown = "platform_unavailable"
+	// codeInsecurePlatformConfig lo emite el signup (Trabajo 1, code review 056 · T11) cuando
+	// PlatformAPIBaseURL es "http://" contra un host que NO es loopback: mandar la contraseña del
+	// operador en claro por la red. Es un error de CONFIGURACIÓN del Edge, no de la plataforma ni del
+	// operador — reintentar NO lo arregla, hace falta que un administrador corrija
+	// WAPP_AGENT_PLATFORM_API_BASE_URL (a "https://" o a un valor de desarrollo en loopback).
+	codeInsecurePlatformConfig = "platform_url_insecure"
 )
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

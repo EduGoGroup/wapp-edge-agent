@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/supervisor"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 )
 
 // startFakeCore levanta un núcleo falso escuchando en un Unix socket en dir temporal: responde
@@ -218,6 +219,21 @@ func TestRefreshPropagatesTenant(t *testing.T) {
 	router.ServeHTTP(rec3, req3)
 	if rec3.Code != http.StatusOK {
 		t.Fatalf("/ tras el refresh status = %d; quería 200 (el tenant recién asignado debe abrir la SPA)", rec3.Code)
+	}
+}
+
+// TestPlatformAPIBaseURLLeftAtDevDefault: el default de fábrica ("http://localhost:8103") debe marcarse
+// para que main() avise en el log de arranque (Trabajo 1, code review 056 · T11); cualquier otro valor —
+// típicamente una URL de producción fijada por el operador— no debe disparar el aviso.
+func TestPlatformAPIBaseURLLeftAtDevDefault(t *testing.T) {
+	if !platformAPIBaseURLLeftAtDevDefault(config.Config{PlatformAPIBaseURL: config.DefaultPlatformAPIBaseURL}) {
+		t.Fatalf("el default de desarrollo (%q) no se detectó como tal", config.DefaultPlatformAPIBaseURL)
+	}
+	if platformAPIBaseURLLeftAtDevDefault(config.Config{PlatformAPIBaseURL: "https://cloud.wapp.example"}) {
+		t.Fatalf("una URL de producción no debe marcarse como default de desarrollo")
+	}
+	if platformAPIBaseURLLeftAtDevDefault(config.Config{PlatformAPIBaseURL: ""}) {
+		t.Fatalf("una URL vacía no debe marcarse como default de desarrollo (no es el valor de fábrica)")
 	}
 }
 

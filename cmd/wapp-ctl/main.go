@@ -62,6 +62,15 @@ func main() {
 	}
 	log := logger.New(cfg)
 
+	// Trabajo 1 (code review 056 · T11): PlatformAPIBaseURL NO se deriva del enrolamiento (a diferencia de
+	// CloudLink.Endpoint) — si nadie la fijó, el signup del Edge llamará SIEMPRE al propio localhost del
+	// equipo. Un log mudo es justo lo que hizo que este defecto pasara desapercibido fuera de la máquina de
+	// desarrollo; avisa en cada arranque mientras siga en el default.
+	if platformAPIBaseURLLeftAtDevDefault(cfg) {
+		log.Warn("wapp-ctl: PlatformAPIBaseURL sigue en el default de desarrollo — el alta de usuarios (signup) apuntará a localhost y fallará fuera de esta máquina; fija WAPP_AGENT_PLATFORM_API_BASE_URL (ver README §Variables de entorno)",
+			"platform_api_base_url", cfg.PlatformAPIBaseURL)
+	}
+
 	socketPath := cfg.ControlSocketPath
 	if *socketFlag != "" {
 		socketPath = *socketFlag
@@ -271,6 +280,14 @@ func openBrowser(url string, log sharedlogger.Logger) {
 	if err := exec.Command(name, args...).Start(); err != nil && log != nil { //nolint:gosec // comando fijo del SO, url loopback propia.
 		log.Warn("wapp-ctl: no se pudo abrir el navegador (best-effort)", "url", url, "error", err)
 	}
+}
+
+// platformAPIBaseURLLeftAtDevDefault reporta si PlatformAPIBaseURL se quedó en el default de desarrollo
+// (config.DefaultPlatformAPIBaseURL, "http://localhost:8103"): fuera de la máquina de desarrollo eso
+// significa que el signup del Edge llama a un puerto local vacío y falla siempre (Trabajo 1, code review
+// 056 · T11). Extraída de main() para poder probar la decisión sin arrancar el supervisor completo.
+func platformAPIBaseURLLeftAtDevDefault(cfg config.Config) bool {
+	return cfg.PlatformAPIBaseURL == config.DefaultPlatformAPIBaseURL
 }
 
 func envOr(key, def string) string {
