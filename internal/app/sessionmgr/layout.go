@@ -27,6 +27,9 @@ const (
 	keysDirName = "keys"
 	// dekFileExt es la extensión del fichero de DEK por sesión (<session_id>.key).
 	dekFileExt = ".key"
+	// colaDBName es la COLA DE ENTRANTES (Plan 051): una BD SQLite propia a nivel de <data_dir>, fuera
+	// de sessions/ porque es GLOBAL a todas las sesiones (ver ColaDB).
+	colaDBName = "cola_entrantes.db"
 )
 
 // uuidPattern valida el formato UUID canónico (8-4-4-4-12 hex). El session_id es SIEMPRE un UUIDv4
@@ -82,6 +85,20 @@ func (l Layout) StoreDB(id string) (string, error) {
 	}
 	return filepath.Join(dir, storeDBName), nil
 }
+
+// ColaDB devuelve <data_dir>/cola_entrantes.db (la COLA DE ENTRANTES del Edge, Plan 051).
+//
+// NO recibe session_id y NO cuelga de sessions/<id>/, a diferencia de StoreDB, por tres razones:
+// la cola es GLOBAL a todas las sesiones (un solo fichero donde anotan los N listeners); su `seq` es
+// una secuencia monotónica GLOBAL, que con una BD por sesión no podría ordenar el drenaje entre ellas;
+// y el worker-cajero de la O4 hará round-robin sobre N data_dir's —uno por instalación—, no sobre N
+// sesiones, así que su unidad de trabajo es exactamente este fichero. Cada fila sigue llevando su
+// `session_id` en claro y su contenido sellado con la DEK DE ESA sesión (INV-051.1), de modo que la BD
+// compartida no mezcla llaves.
+//
+// Al no haber id que validar no hay ruta que pueda escaparse de data_dir, así que devuelve solo string
+// (mismo criterio que DataDir/SessionsRoot).
+func (l Layout) ColaDB() string { return filepath.Join(l.dataDir, colaDBName) }
 
 // DEKPath devuelve <data_dir>/keys/<session_id>.key (DEK de la sesión, custodiada por FileCustody).
 //

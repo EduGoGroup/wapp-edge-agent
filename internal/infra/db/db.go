@@ -6,6 +6,10 @@
 //     0004_accounts_devices.sql → tablas accounts/devices; sessions/sessions_v2 son legacy):
 //     metadatos de NEGOCIO en claro de las sesiones (número/JID/estado/rol/timestamps).
 //
+// Desde el Plan 051 hay además un TERCER set, "cola" (migrations/cola → tabla cola_entrantes), que NO
+// va a edge.db sino a un fichero APARTE (<data_dir>/cola_entrantes.db): se aplica solo con MigrateCola,
+// nunca desde Migrate. Ver el comentario de MigrateCola para el porqué de la separación.
+//
 // MODELO BD ÚNICA (ADR-0018, Plan 022): el Edge usa UNA sola *sql.DB (<data_dir>/edge.db en SQLite,
 // o la cadena Postgres) que aloja AMBOS sets — metadatos (accounts/devices), el Container whatsmeow
 // compartido y el store cifrado per-device (msg_enc_*) — retirando el modelo previo de un store.db
@@ -36,10 +40,11 @@ import (
 	_ "modernc.org/sqlite" // driver "sqlite" (CGO-free)
 )
 
-// embeddedMigrations embebe los DOS sets de migraciones (store/ y meta/). Cada set se aplica en
-// orden lexicográfico del nombre dentro de su subdirectorio (el prefijo NNNN_ garantiza el orden).
+// embeddedMigrations embebe los sets de migraciones (store/, meta/ y cola/). Cada set se aplica en
+// orden lexicográfico del nombre dentro de su subdirectorio (el prefijo NNNN_ garantiza el orden). El
+// patrón NO es recursivo: cada subdirectorio nuevo hay que añadirlo explícitamente aquí.
 //
-//go:embed migrations/store/*.sql migrations/meta/*.sql
+//go:embed migrations/store/*.sql migrations/meta/*.sql migrations/cola/*.sql
 var embeddedMigrations embed.FS
 
 // migrationsFS es la fuente de las migraciones. Es una var (no la embed.FS directa) para que los
@@ -53,6 +58,9 @@ const (
 	// metaMigrationsDir aloja el esquema de metadatos de negocio (tablas accounts/devices; sessions/
 	// sessions_v2 son legacy).
 	metaMigrationsDir = "migrations/meta"
+	// colaMigrationsDir aloja el esquema de la COLA DE ENTRANTES (tabla cola_entrantes, Plan 051). Va a
+	// una BD PROPIA (<data_dir>/cola_entrantes.db), NO a edge.db: ver MigrateCola.
+	colaMigrationsDir = "migrations/cola"
 )
 
 // Dialectos SQL soportados por Open (Plan 022 T0, design §5). El default del Edge es SQLite embebido
@@ -198,6 +206,21 @@ func ensureDeviceMetadataColumns(ctx context.Context, database *sql.DB) error {
 // database. Es la migración de la db CENTRAL de metadatos de negocio (ADR-0016 §2). Idempotente.
 func MigrateMeta(ctx context.Context, database *sql.DB) error {
 	return applyMigrations(ctx, database, metaMigrationsDir)
+}
+
+// MigrateCola aplica el set "cola" (migrations/cola/*.sql → tabla cola_entrantes) sobre database. Es
+// la migración de la COLA DE ENTRANTES del Edge (Plan 051 Ola 1 · T1.1 / ADR-0038 Enmienda 1).
+// Idempotente.
+//
+// 🔴 NO la llames desde Migrate(): NO es un descuido. Migrate() migra la BD ÚNICA del Edge
+// (<data_dir>/edge.db), y la cola vive en OTRA base de datos, un fichero APARTE
+// (<data_dir>/cola_entrantes.db, Layout.ColaDB()). Están separadas a propósito (design §2, D-2): la
+// poda agresiva por TTL de la cola no debe tocar la BD principal, y el SetMaxOpenConns(1) de edge.db
+// se volvería el cuello de botella entre el agente y el worker-cajero, que es OTRO proceso. Meter este
+// set en Migrate() crearía una tabla cola_entrantes fantasma dentro de edge.db —que nadie leería— y no
+// migraría la cola real. La llama quien abre la cola, con SU propio *sql.DB.
+func MigrateCola(ctx context.Context, database *sql.DB) error {
+	return applyMigrations(ctx, database, colaMigrationsDir)
 }
 
 // Migrate aplica AMBOS sets (store y luego meta) sobre una sola db. Es el camino single-sesión

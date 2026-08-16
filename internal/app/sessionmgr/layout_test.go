@@ -47,6 +47,12 @@ func TestLayout_Paths(t *testing.T) {
 	if want := filepath.Join(base, "keys", uuidA+".key"); dek != want {
 		t.Fatalf("DEKPath: got %q, want %q", dek, want)
 	}
+
+	// La cola de entrantes es GLOBAL a todas las sesiones (Plan 051): cuelga de data_dir, NO de
+	// sessions/<id>/, y por eso ColaDB no recibe id ni puede fallar.
+	if got, want := l.ColaDB(), filepath.Join(base, "cola_entrantes.db"); got != want {
+		t.Fatalf("ColaDB: got %q, want %q", got, want)
+	}
 }
 
 // TestLayout_RejectsEscape comprueba que un id malicioso (con "..", separadores o vacío) NO produce
