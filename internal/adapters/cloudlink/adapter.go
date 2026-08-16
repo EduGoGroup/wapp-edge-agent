@@ -867,18 +867,30 @@ func (a *Adapter) handleDiagnosticsRequest(ctx context.Context, cl *client.Clien
 
 // handleLeaseUpdate aplica un LeaseUpdate firmado al Validator de ESA sesión (verifica firma, expiración,
 // counter). El estado de lease es por sesión: un LeaseUpdate de una sesión no toca el de las otras.
+//
+// El log se decide por el ESTADO DEL VALIDATOR (antes/después de Apply), NUNCA por los campos top-level
+// del LeaseUpdate: esos no van firmados y el paquete lease es explícito en que no son fuente de verdad.
+// Mirar lu.GetRevoked() hacía que el Edge escribiera "lease renovado/aplicado" en cada latido posterior a
+// una revocación mientras seguía rechazando TODOS los envíos —la revocación es PEGAJOSA a propósito
+// (anti-clon, ADR-0007) y Apply ignora en silencio cualquier renovación posterior, devolviendo nil—, así
+// que el operador leía un servicio sano donde había un servicio cortado. De ahí los tres casos separados.
 func (a *Adapter) handleLeaseUpdate(sid string, e *sessionEntry, lu *cloudlinkv1.LeaseUpdate) {
 	if e.validator == nil {
 		a.log.Warn("CloudLink: LeaseUpdate recibido sin Validator configurado (ignorado)", "session_id", sid)
 		return
 	}
+	yaRevocado := e.validator.Revoked() // ANTES de aplicar: es lo único que distingue renovar de tirar a la basura
 	if err := e.validator.Apply(lu); err != nil {
 		a.log.Warn("CloudLink: LeaseUpdate rechazado", "session_id", sid, "error", err)
 		return
 	}
-	if lu.GetRevoked() {
+	switch {
+	case yaRevocado:
+		a.log.Warn("CloudLink: LeaseUpdate IGNORADO tras la revocación (renovación en vano): el kill-switch ya está disparado y la revocación es PEGAJOSA por diseño anti-clon (ADR-0007), ningún lease posterior la levanta — los envíos SIGUEN BLOQUEADOS. Recuperar exige RE-REGISTRAR la sesión (reconectar el stream de CloudLink): el ValidatorFactory construye un Validator nuevo por sesión y solo ese nace sin revocar",
+			"session_id", sid, "expires_unix", lu.GetExpiresUnix(), "envios_bloqueados", true)
+	case e.validator.Revoked():
 		a.log.Warn("CloudLink: lease REVOCADO (kill-switch activo): envíos bloqueados", "session_id", sid)
-	} else {
+	default:
 		a.log.Info("CloudLink: lease renovado/aplicado", "session_id", sid, "expires_unix", lu.GetExpiresUnix())
 	}
 }
