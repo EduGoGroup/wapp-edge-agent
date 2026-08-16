@@ -25,8 +25,10 @@
 -- de enrutado, no contenido de negocio.
 --
 -- IDEMPOTENCIA LOCAL: unicidad por (session_id, wa_message_id) — el mismo mensaje de WhatsApp anotado
--- dos veces (reintento del handler, reconexión que re-emite el evento) no duplica fila; el encolado es
--- INSERT OR IGNORE por esa clave. Este índice único es la ÚNICA adición sobre el DDL literal del design
+-- dos veces (reintento del handler, reconexión que re-emite el evento) no duplica fila; el encolado
+-- hace un INSERT normal y TRAGA el choque contra este índice reconociéndolo por su código de error
+-- (T2.11; antes era un `INSERT OR IGNORE`, que ignoraba de más — ver la nota de portabilidad abajo).
+-- Este índice único es la ÚNICA adición sobre el DDL literal del design
 -- §2 (que no declara unicidad): sin él, el contrato "Enqueue idempotente" del puerto app.ColaEntrantes
 -- exigiría un SELECT previo, que en dos procesos concurrentes tiene carrera. Es aditivo y no cambia
 -- ninguna columna del design. El ORDEN lo da `seq`, secuencia monotónica GLOBAL generada por el Edge
@@ -42,9 +44,15 @@
 -- AUTOINCREMENT, índices y unicidad con sintaxis común. IDEMPOTENTE de arriba abajo (CREATE TABLE/INDEX
 -- IF NOT EXISTS): el runner applyMigrations (db.go) NO lleva tabla de versión y RE-EJECUTA el fichero
 -- entero en CADA arranque, así que ninguna sentencia aquí puede fallar la segunda vez.
--- ⚠️ La portabilidad es la del DDL, NO la del código que lo usa: el ENCOLADO (Store.Enqueue) resuelve la
--- idempotencia con `INSERT OR IGNORE`, que es sintaxis ESPECÍFICA DE SQLite. Un puerto a Postgres tendría
--- que reescribir esa sentencia como `INSERT ... ON CONFLICT (session_id, wa_message_id) DO NOTHING`.
+-- ⚠️ La portabilidad es la del DDL, NO la del código que lo usa. Desde T2.11 la SENTENCIA del encolado
+-- (Store.Enqueue) ya es un `INSERT` estándar —portable tal cual—, pero la idempotencia se resolvió
+-- moviendo el problema al MANEJO DEL ERROR: se inserta siempre y se TRAGA el choque contra
+-- ux_cola_session_wamid inspeccionando el código de error EXTENDIDO **2067** (`SQLITE_CONSTRAINT_UNIQUE`)
+-- que devuelve el driver `modernc.org/sqlite`; cualquier otra violación de restricción sí sube como error
+-- (con `INSERT OR IGNORE` se tragaban TODAS, en silencio). Ese 2067 es lo específico de driver que un
+-- puerto a Postgres tendría que reescribir —allí el equivalente es el SQLSTATE `23505` de `*pq.Error`/
+-- `*pgconn.PgError`—, no la sentencia. El cambio, por tanto, no elimina la deuda de portabilidad: la
+-- mueve del SQL al Go, donde al menos el compilador y los tests la ven.
 --
 -- EXCEPCIÓN DOCUMENTADA a la convención de nombres: la convención dura del repo es sufijo `_unix` para
 -- los timestamps epoch-segundos (ver created_unix/updated_unix en 0005_outbox.sql), pero `tomado_en` y

@@ -19,6 +19,7 @@ package colaentrantes
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -27,6 +28,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-shared/envelope"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
+	sqlitedriver "modernc.org/sqlite" // NO es el blank import del driver: se usa su tipo *sqlite.Error (ver sqliteConstraintUnique)
 )
 
 // Defaults del Store (decisiones cerradas del Plan 051).
@@ -34,6 +36,22 @@ const (
 	defaultMaxRows  = 50000
 	defaultTTLHours = 24
 )
+
+// sqliteConstraintUnique es el código de resultado EXTENDIDO SQLITE_CONSTRAINT_UNIQUE (19 | (8<<8) =
+// 2067): «este INSERT chocó contra un índice UNIQUE». Es la firma EXACTA del duplicado que Enqueue
+// tiene que tragarse en silencio (el choque contra ux_cola_session_wamid), y solo esa.
+//
+// El porqué del número desnudo: modernc.org/sqlite expone las constantes en su subpaquete `lib`
+// (modernc.org/sqlite/lib), que es la traducción a Go de la biblioteca C entera —importarlo aquí
+// arrastraría ese peso al Edge por UN entero—. El driver activa los códigos extendidos al abrir la
+// conexión (sqlite3_extended_result_codes(db, 1) en newConn) y `(*sqlite.Error).Code()` devuelve el
+// `rc` crudo, sin enmascarar, así que aquí llega el 2067 y no el 19 pelado.
+//
+// 🔴 NO lo generalices a `Code()&0xff == 19` (SQLITE_CONSTRAINT a secas): eso englobaría también
+// NOT NULL (1299), FK (787) y CHECK (275) — justo las violaciones que T2.11 existe para NO tragarse.
+// Tampoco se acepta 1555 (SQLITE_CONSTRAINT_PRIMARYKEY): un choque de rowid en esta tabla sería un
+// bug real del `id INTEGER PRIMARY KEY` autoasignado, no un mensaje repetido.
+const sqliteConstraintUnique = 2067
 
 // crypterFailureCooldown es cuánto se RECUERDA un fallo de CrypterFor antes de volver a intentarlo.
 //
@@ -211,27 +229,40 @@ func (s *Store) Enqueue(ctx context.Context, item app.ColaItem) error {
 	}
 
 	seq := s.seq.Add(1)
-	// IDEMPOTENCIA (contrato de app.ColaEntrantes.Enqueue): INSERT OR IGNORE contra el índice único
-	// ux_cola_session_wamid (session_id, wa_message_id). Un INSERT pelado devolvería un error de
-	// constraint en un caso PERFECTAMENTE NORMAL —whatsmeow re-emite eventos al reconectar y el handler
-	// se puede reintentar—, y el listener lo escupiría como Error en cada reconexión.
-	res, err := s.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO cola_entrantes (seq, session_id, chat_jid, wa_message_id, ts_whatsapp, texto_enc, meta_enc, intent_json, estado)
+	// IDEMPOTENCIA (contrato de app.ColaEntrantes.Enqueue) por la vía del ERROR CLASIFICADO, no del
+	// `INSERT OR IGNORE` (T2.11). El duplicado sigue siendo un caso PERFECTAMENTE NORMAL —whatsmeow
+	// re-emite eventos al reconectar y el handler se puede reintentar— y se sigue devolviendo nil; lo
+	// que cambia es que ahora se RECONOCE cuál es.
+	//
+	// El porqué del cambio: `INSERT OR IGNORE` no ignora solo el choque de unicidad, ignora CUALQUIER
+	// violación de restricción de la fila. Hoy no hay otra alcanzable desde onMessage (ninguna columna
+	// NOT NULL puede llegar a NULL y Seal devuelve ≥28 B aun con texto vacío), pero el día que alguien
+	// añada un CHECK al DDL su violación se degradaría a «duplicado» y el mensaje se PERDERÍA con un
+	// log.Debug —silencio absoluto sobre una pérdida de datos—. Con el INSERT pelado, solo el
+	// SQLITE_CONSTRAINT_UNIQUE se traga; todo lo demás sube por el error de abajo.
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO cola_entrantes (seq, session_id, chat_jid, wa_message_id, ts_whatsapp, texto_enc, meta_enc, intent_json, estado)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		seq, item.SessionID, item.ChatJID, item.WAMessageID, item.TSWhatsApp, textoEnc, metaEnc, intent, estado)
 	if err != nil {
+		// Choque contra ux_cola_session_wamid ⇒ la fila YA estaba (duplicado esperado). NO es un fallo:
+		// se devuelve nil, y como mucho se deja constancia en Debug. Jamás un Error: llenaría el log en
+		// campo en cada reconexión.
+		//
+		// El `seq` de esta llamada YA SE CONSUMIÓ y se pierde: la secuencia deja un HUECO. Sigue
+		// existiendo igual que con el INSERT OR IGNORE, solo que ahora el hueco lo abre el camino del
+		// error en vez del de las 0 filas afectadas. Es aceptable y deliberado —el claim y el
+		// despachador ordenan con ORDER BY seq, no exigen contigüidad— y se prefiere a reservar el
+		// número dentro del candado tras comprobar la existencia (un SELECT extra por mensaje).
+		var sqliteErr *sqlitedriver.Error
+		if errors.As(err, &sqliteErr) && sqliteErr.Code() == sqliteConstraintUnique {
+			s.log.Debug("colaentrantes: entrante duplicado, ya estaba en la cola (idempotencia)",
+				"session_id", item.SessionID, "wa_message_id", item.WAMessageID)
+			return nil
+		}
+		// INV-051.1: ni texto ni meta en el error; solo identificadores y el seq consumido.
 		return fmt.Errorf("colaentrantes: encolar entrante (session_id=%s, wa_message_id=%s, seq=%d): %w",
 			item.SessionID, item.WAMessageID, seq, err)
-	}
-	// 0 filas afectadas ⇒ la fila YA estaba (duplicado esperado). NO es un fallo: se devuelve nil, y como
-	// mucho se deja constancia en Debug. Jamás un Error: llenaría el log en campo en cada reconexión.
-	//
-	// El `seq` de esta llamada YA SE CONSUMIÓ y se pierde: la secuencia deja un HUECO. Es aceptable y
-	// deliberado —el claim y el despachador ordenan con ORDER BY seq, no exigen contigüidad— y se prefiere
-	// a reservar el número dentro del candado tras comprobar la existencia (un SELECT extra por mensaje).
-	if n, _ := res.RowsAffected(); n == 0 {
-		s.log.Debug("colaentrantes: entrante duplicado, ya estaba en la cola (idempotencia)",
-			"session_id", item.SessionID, "wa_message_id", item.WAMessageID)
 	}
 	return nil
 }
@@ -323,8 +354,34 @@ func (s *Store) pruneTTLLocked(ctx context.Context, nowUnix int64) error {
 	return nil
 }
 
-// dropOldestLocked descarta las filas más viejas (menor seq) si la cola alcanzó el tope, dejando sitio
-// para una nueva (política drop-oldest, igual que el outbox). Debe llamarse bajo s.mu.
+// dropOldestLocked descarta filas si la cola alcanzó el tope, dejando sitio para UNA nueva (política
+// drop-oldest, igual que el outbox). Debe llamarse bajo s.mu.
+//
+// 🔴 SACRIFICIO POR CAPAS, Y NO ES UN ADORNO (T2.10): el drop-oldest ORIGINAL borraba por `seq` más
+// bajo SIN MIRAR EL ESTADO, y eso podía PARTIR UNA CONVERSACIÓN POR LA MITAD. El claim del cajero
+// (Ola 2) reclama TODAS las filas `nuevo` de una misma (session_id, chat_jid) y las CONCATENA en una
+// sola inferencia; si el tope se llevó un fragmento intermedio, el LLM lee como continuo un texto al
+// que le falta un trozo. No hay error, no hay log, no hay nada que revisar después: es una MENTIRA
+// SEMÁNTICA, la peor clase de fallo que puede tener esta cola.
+//
+// De ahí las tres capas, de menos a más doloroso, aplicadas EN ORDEN hasta que quepa la fila nueva:
+//
+//  1. `despachado` — ya salieron al cable (cloudlink/outbox las tienen). Son basura pura: se borran
+//     de una en una, las de menor seq.
+//  2. `clasificado` — tienen su intent y el claim NUNCA las vuelve a concatenar, así que borrarlas es
+//     PÉRDIDA (ese mensaje no se despachará) pero NO abre hueco. Se borran las de menor seq.
+//  3. `nuevo`/`tomado` — aquí sí hay riesgo de hueco, así que NO se borran filas sueltas: se borra la
+//     CONVERSACIÓN COMPLETA más antigua (la (session_id, chat_jid) con el MIN(seq) más bajo entre sus
+//     filas pendientes) de golpe, y se repite con la siguiente mientras siga faltando sitio. Invariante
+//     que compra: una conversación o está ENTERA o no está.
+//
+// ⚠️ LA CAPA 3 SE PASA DE LARGO A PROPÓSITO: si sobraban 2 huecos y la conversación más vieja tiene 8
+// fragmentos, se van los 8. Es deliberado —se prefiere sacrificar de más antes que dejar un hueco— y
+// por eso el bucle PARA en cuanto hay sitio, sin intentar afinar el corte.
+//
+// GUARDARRAÍL: si una vuelta de la capa 3 no borra NADA (no queda conversación pendiente que borrar,
+// p. ej. porque el resto de la tabla está en un estado que estas capas no cubren), se sale con lo
+// hecho en vez de girar para siempre.
 func (s *Store) dropOldestLocked(ctx context.Context) error {
 	var count int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cola_entrantes`).Scan(&count); err != nil {
@@ -333,17 +390,125 @@ func (s *Store) dropOldestLocked(ctx context.Context) error {
 	if count < s.maxRows {
 		return nil
 	}
-	// Descarta las que sobran para dejar hueco a 1 nueva (normalmente 1, pero cubre un tope reducido).
-	toDrop := count - s.maxRows + 1
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM cola_entrantes WHERE id IN (SELECT id FROM cola_entrantes ORDER BY seq ASC LIMIT ?)`, toDrop)
+	// Cuántos huecos hay que abrir para que quepa 1 fila nueva (normalmente 1, pero cubre un tope
+	// reducido o una cola que ya venía pasada). Cada capa lo va bajando.
+	faltan := count - s.maxRows + 1
+
+	// Capa 1: las ya despachadas.
+	despachadas, err := s.dropPorEstadoLocked(ctx, app.EstadoDespachado, faltan)
 	if err != nil {
-		return fmt.Errorf("colaentrantes: drop-oldest: %w", err)
+		return err
+	}
+	faltan -= int(despachadas)
+
+	// Capa 2: las ya clasificadas (pérdida, pero nunca hueco).
+	var clasificadas int64
+	if faltan > 0 {
+		clasificadas, err = s.dropPorEstadoLocked(ctx, app.EstadoClasificado, faltan)
+		if err != nil {
+			return err
+		}
+		faltan -= int(clasificadas)
+	}
+
+	// Capa 3: conversaciones pendientes ENTERAS, de la más vieja hacia adelante.
+	var pendientes, conversaciones int64
+	for faltan > 0 {
+		n, err := s.dropConversacionPendienteMasViejaLocked(ctx)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			break // guardarraíl: no queda conversación pendiente; nos vamos con lo hecho.
+		}
+		conversaciones++
+		pendientes += n
+		faltan -= int(n) // puede quedar NEGATIVO: es el "pasarse de largo" documentado arriba.
+	}
+
+	descartadas := despachadas + clasificadas + pendientes
+	// 🔴 EL WARN Y EL CONTADOR SOLO CUANDO DE VERDAD SE DESCARTÓ ALGO. Antes se ejecutaban también con
+	// `descartadas == 0` —el camino del guardarraíl de arriba—, y eso era lo peor de dos mundos: una línea
+	// de Warn POR MENSAJE ENTRANTE (a ritmo de socket, la misma tormenta que crypterFailureCooldown
+	// combate 380 líneas más arriba) diciendo «descartando» con `descartadas=0`, que no informa de nada.
+	// El `Add(0)` era además ruido puro sobre un acumulado que solo debe contar pérdidas reales.
+	if descartadas > 0 {
+		// INV-051.3: la degradación se CUENTA, no solo se loguea (un log se pierde; el acumulado no).
+		total := s.descartadasPorTope.Add(descartadas)
+		// INV-051.1: ni texto ni meta; solo cardinalidades y el tope. `conversaciones` es la señal de que
+		// se llegó a la capa 3, que es la única que duele de verdad (mensajes que el cajero nunca leerá).
+		s.log.Warn("colaentrantes: LLENA, descartando por capas (drop-oldest sin partir conversaciones)",
+			"descartadas", descartadas, "despachadas", despachadas, "clasificadas", clasificadas,
+			"pendientes", pendientes, "conversaciones", conversaciones,
+			"tope", s.maxRows, "descartadas_acumuladas", total)
+		return nil
+	}
+	// TOPE ALCANZADO Y NADA QUE SE PUEDA SACRIFICAR: sí es una anomalía —la cola está llena de filas que
+	// las tres capas no cubren, o de pendientes que no se pueden borrar sin partir una conversación— y por
+	// eso NO se calla del todo; pero se deja en Debug, que es el nivel que este mismo fichero ya usa para
+	// el otro suceso normal-pero-frecuente del camino caliente (el duplicado idempotente de Enqueue).
+	//
+	// Debug y no un throttle al estilo del caché negativo: el throttle exigiría memoria + reloj DENTRO de
+	// s.mu (el candado que serializa todo Enqueue) para un suceso que ya tiene testigo durable —la tabla
+	// por encima de `tope`, visible en cualquier inspección—; Debug lo hace diagnosticable en campo
+	// (subiendo el nivel un rato) sin estado nuevo ni un byte más en el camino caliente de producción.
+	s.log.Debug("colaentrantes: en el tope pero NINGUNA capa encontró qué descartar; la cola se pasa del tope (mal menor frente a colgar el listener)",
+		"filas", count, "tope", s.maxRows, "faltaban", faltan)
+	return nil
+}
+
+// dropPorEstadoLocked borra hasta `limite` filas del estado dado, las de menor seq (capas 1 y 2 del
+// sacrificio). Debe llamarse bajo s.mu. Devuelve cuántas borró.
+//
+// La forma `DELETE … WHERE id IN (SELECT id … ORDER BY seq ASC LIMIT ?)` es OBLIGATORIA, no un rodeo:
+// un LIMIT directo en el DELETE es sintaxis que este driver (modernc.org/sqlite, compilado sin
+// SQLITE_ENABLE_UPDATE_DELETE_LIMIT) rechaza con error de sintaxis.
+func (s *Store) dropPorEstadoLocked(ctx context.Context, estado string, limite int) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM cola_entrantes
+		   WHERE id IN (SELECT id FROM cola_entrantes WHERE estado = ? ORDER BY seq ASC LIMIT ?)`,
+		estado, limite)
+	if err != nil {
+		return 0, fmt.Errorf("colaentrantes: drop-oldest de filas en estado %q: %w", estado, err)
 	}
 	n, _ := res.RowsAffected()
-	// INV-051.3: la degradación se CUENTA, no solo se loguea (un log se pierde; el acumulado no).
-	total := s.descartadasPorTope.Add(n)
-	s.log.Warn("colaentrantes: LLENA, descartando las más viejas (drop-oldest)",
-		"descartadas", n, "tope", s.maxRows, "descartadas_acumuladas", total)
-	return nil
+	return n, nil
+}
+
+// dropConversacionPendienteMasViejaLocked borra DE GOLPE todas las filas `nuevo`/`tomado` de la
+// conversación (session_id, chat_jid) más antigua —la del MIN(seq) más bajo— y devuelve cuántas borró.
+// Debe llamarse bajo s.mu. Devuelve 0, nil cuando ya no queda ninguna conversación pendiente: ese 0 es
+// la señal de parada del guardarraíl del llamante, NO un error.
+//
+// Se elige por MIN(seq) y no por el seq de cada fila porque la unidad de sacrificio aquí es la
+// CONVERSACIÓN ENTERA: lo que se ordena es "qué conversación empezó antes", no "qué fila es más vieja".
+// Y se borran `nuevo` Y `tomado` juntos porque un `tomado` es un `nuevo` con lease vivo: si el lease
+// vence, el barrido lo devuelve a `nuevo` y volvería a ser candidato del claim —dejarlo atrás
+// reintroduciría exactamente el hueco que esta capa existe para evitar—.
+func (s *Store) dropConversacionPendienteMasViejaLocked(ctx context.Context) (int64, error) {
+	var sessionID, chatJID string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT session_id, chat_jid FROM cola_entrantes
+		   WHERE estado IN (?, ?)
+		   GROUP BY session_id, chat_jid
+		   ORDER BY MIN(seq) ASC
+		   LIMIT 1`,
+		app.EstadoNuevo, app.EstadoTomado).Scan(&sessionID, &chatJID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("colaentrantes: elegir la conversación pendiente más vieja: %w", err)
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM cola_entrantes WHERE session_id = ? AND chat_jid = ? AND estado IN (?, ?)`,
+		sessionID, chatJID, app.EstadoNuevo, app.EstadoTomado)
+	if err != nil {
+		// INV-051.1: session_id y chat_jid son metadato de ENRUTADO (viajan en claro en la tabla), no
+		// contenido; el texto y la meta no aparecen aquí ni truncados.
+		return 0, fmt.Errorf("colaentrantes: descartar la conversación pendiente más vieja (session_id=%s, chat_jid=%s): %w",
+			sessionID, chatJID, err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
