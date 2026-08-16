@@ -122,6 +122,23 @@ type Store struct {
 	// gravedad distintos, y desde un acumulado agregado no hay forma de separarlos.
 	pendientesDescartadasPorTope atomic.Int64
 
+	// rescatadasPorLease acumula las filas que BarrerLeasesVencidos devolvió a `nuevo` porque su lease
+	// venció: el número de mensajes que un cajero se llevó y no cerró. Mismo molde atómico que los dos de
+	// arriba, y por la misma razón (INV-051.3: una degradación no se cierra solo con un log).
+	//
+	// EL RELEVO NO ERA CONTABLE, y ese era el agujero: el único testigo de un lease vencido eran dos líneas
+	// de Warn. Un log se rota y se pierde; el acumulado no. Y el worker NO puede llevar esta cuenta por su
+	// lado —el barrido lo hace el Store por su cuenta, sobre filas de OTRO proceso que quizá ya murió—, así
+	// que si no se cuenta aquí no se cuenta en ninguna parte.
+	rescatadasPorLease atomic.Int64
+
+	// cierresDescartadosPorFence acumula los CIERRES (lotes, no filas) que MarcarClasificado tuvo que tirar
+	// enteros porque el fence no mordió: el lote dejó de ser de este cajero mientras se clasificaba. Es la
+	// otra cara de rescatadasPorLease —una cuenta las filas que se rescataron, la otra el trabajo que se
+	// perdió por ello— y se cuentan APARTE porque no son la misma magnitud: un solo cierre descartado puede
+	// corresponder a 20 filas rescatadas, y cada inferencia tirada es un coste de LLM que sí se pagó.
+	cierresDescartadosPorFence atomic.Int64
+
 	// seq es la secuencia monotónica del orden de la cola, sembrada de MAX(seq) en New. Atómica: el Edge
 	// encola desde varios listeners (uno por sesión) en paralelo.
 	seq atomic.Int64
@@ -336,6 +353,44 @@ func (s *Store) crypter(sessionID string) (envelope.Crypter, error) {
 	return c, nil
 }
 
+// Forget OLVIDA lo que el Store sabe del sobre de una sesión: borra su entrada del caché positivo Y la del
+// caché negativo, bajo el MISMO candado que las escribe (s.cryptersMu). Tras un Forget, el siguiente
+// Enqueue/Reclamar de esa sesión vuelve a invocar CrypterFor UNA vez y re-cachea el resultado.
+//
+// Se llama en el TEARDOWN de la sesión (sessionmgr.stopLive, el mismo punto donde se suelta el listener).
+// Es idempotente y no-op si la sesión nunca estuvo cacheada; nunca entra en pánico ni devuelve error,
+// porque un teardown no puede fallar por no poder olvidar algo.
+//
+// 🟢 HOY ESTO ES UNA FUGA DE ~60 B, NO UN FALLO DE CIFRADO, y conviene decirlo para que nadie lo lea como
+// más grave —ni menos— de lo que es: cada emparejamiento acuña un `session_id` NUEVO (UUIDv4,
+// sessionmgr/pairing.go), así que una sesión re-pareada nunca vuelve a consultar la entrada vieja del
+// caché. Lo que quedaba sin Forget era la DEK de una sesión muerta retenida dentro de su AEAD hasta que el
+// daemon reiniciara.
+//
+// 🔴 RECUPERA SU GRAVEDAD el día que se ROTE LA DEK CONSERVANDO EL `session_id` (rotación de llaves sin
+// re-emparejar, que es justo lo que traería un KMS/custodia con rotación). Ahí el caché seguiría sellando
+// con la DEK VIEJA sin que nada falle en el momento: el síntoma llega después, y es un tag GCM que no
+// valida al abrir la fila —el worker no puede clasificar un mensaje que sí se guardó—. Es decir: pérdida
+// silenciosa, no un error ruidoso. Si se implementa esa rotación, Forget deja de ser higiene y pasa a ser
+// parte del contrato: hay que llamarlo en el mismo sitio donde se rota.
+// 🔴 RECEPTOR NIL ⇒ NO-OP, y es el otro extremo de la guarda de sessionmgr.forgetColaCrypter. El llamante
+// alcanza este método por una ASERCIÓN DE TIPO sobre `app.ColaEntrantes` (`m.cola.(interface{ Forget(string) })`),
+// y una interfaz que envuelve un `(*Store)(nil)` —un typed nil, lo que sale de `var s *Store; return s`—
+// pasa esa aserción sin problema. Sin este `if`, el `s.cryptersMu.Lock()` de abajo desreferenciaría nil y
+// el teardown moriría en pánico. Es una línea, es idiomático en Go para métodos de limpieza, y encaja con
+// lo que este método ya promete tres párrafos más arriba: «nunca entra en pánico».
+func (s *Store) Forget(sessionID string) {
+	if s == nil {
+		return
+	}
+	s.cryptersMu.Lock()
+	defer s.cryptersMu.Unlock()
+	// Los dos mapas son el mismo estado ("qué sé yo hoy del sobre de esta sesión", ver crypterFails), así
+	// que olvidar a medias dejaría a la sesión arrastrando un fallo memorizado de una encarnación anterior.
+	delete(s.crypters, sessionID)
+	delete(s.crypterFails, sessionID)
+}
+
 // DescartadasPorTope devuelve cuántas filas ha PERDIDO el drop-oldest desde que arrancó el proceso
 // (INV-051.3): las `clasificado` y las `nuevo`/`tomado`, NO las `despachado` (esas ya salieron al cable;
 // borrarlas es limpieza, ver descartadasPorTope). Es un acumulado monotónico, sin PII: solo una
@@ -347,6 +402,20 @@ func (s *Store) DescartadasPorTope() int64 { return s.descartadasPorTope.Load() 
 // mensajes que el worker-cajero NUNCA llegó a leer (capa 3, conversaciones sacrificadas enteras). Mismo
 // contrato que el anterior: acumulado monotónico, sin PII.
 func (s *Store) PendientesDescartadasPorTope() int64 { return s.pendientesDescartadasPorTope.Load() }
+
+// RescatadasPorLease devuelve cuántas FILAS ha devuelto a `nuevo` el barrido de leases desde que arrancó
+// el proceso: la cuenta de mensajes que un cajero reclamó y no cerró a tiempo (proceso muerto, inferencia
+// eternizada, relevo). Acumulado monotónico, sin PII: solo una cardinalidad.
+//
+// Cero es el valor SANO: el barrido no debería encontrar nunca nada. Un número que crece sostenidamente es
+// la señal de que el lease se queda corto para el modelo o de que el worker se está cayendo — y es la
+// única forma de verlo sin tener el log delante en el momento exacto.
+func (s *Store) RescatadasPorLease() int64 { return s.rescatadasPorLease.Load() }
+
+// CierresDescartadosPorFence devuelve cuántos CIERRES DE LOTE se han descartado enteros porque el fence
+// (estado `tomado` + mismo `claim_token`) ya no mordía: el lote había dejado de ser de ese cajero. Cuenta
+// LOTES, no filas — es el número de inferencias pagadas y tiradas—. Acumulado monotónico, sin PII.
+func (s *Store) CierresDescartadosPorFence() int64 { return s.cierresDescartadosPorFence.Load() }
 
 // pruneTTLLocked borra las filas YA DESPACHADAS más viejas que el TTL. Debe llamarse bajo s.mu.
 //

@@ -212,6 +212,30 @@ func MigrateMeta(ctx context.Context, database *sql.DB) error {
 // la migración de la COLA DE ENTRANTES del Edge (Plan 051 Ola 1 · T1.1 / ADR-0038 Enmienda 1).
 // Idempotente.
 //
+// Tras los .sql aplica, igual que MigrateStore, las migraciones GUARDADAS de columnas nuevas que un ALTER
+// pelado no puede hacer idempotentes: ver ensureColaClaimToken (columna `claim_token`, T2.18) y
+// ensureColaIntentos (columna `intentos`, T2.19). Esos pasos son los que hacen que una cola YA CREADA por
+// un binario anterior se ponga al día en vez de quedarse coja en silencio.
+//
+// 🔴 ESTE MIGRADOR ES **SQLite-ONLY**, y a diferencia de Migrate() no admite Postgres ni con el build-tag.
+// No es una limitación temporal que se pueda quitar cambiando el DSN: los pasos guardados leen
+// `PRAGMA table_info(...)`, que es sintaxis EXCLUSIVA de SQLite (en Postgres se consultaría
+// `information_schema.columns`), así que sobre una conexión Postgres esta función falla en el paso
+// guardado, no en los .sql. Se documenta en vez de discriminar por dialecto en tiempo de ejecución por dos
+// razones concretas:
+//
+//   - No hay dialecto que discriminar. La cola NO es la BD conmutable del Edge: es un fichero PROPIO
+//     (<data_dir>/cola_entrantes.db) que el daemon abre SIEMPRE con Open(DialectSQLite, …) —el `dialect` de
+//     config solo rige edge.db—, así que un chequeo aquí sería una rama muerta comprobando algo que el
+//     llamante ya fijó. Meter el dialecto en la firma obligaría además a tocar a los tres llamantes
+//     (daemon.go, cmd/agent/cajero.go y los tests) para propagar una constante.
+//   - Los .sql del set "cola" tampoco son portables por su cuenta (ver migrations/cola/0001), así que la
+//     no-portabilidad no la introduce este paso: solo la hereda.
+//
+// EL DÍA QUE LA COLA TENGA QUE HABLAR POSTGRES —worker-cajero remoto, varias colas compartidas—, lo que
+// hay que cambiar es este migrador ENTERO (firma con dialecto + el .sql + una variante de CADA paso
+// guardado sobre information_schema), no envolver estos pasos en un `if`.
+//
 // 🔴 NO la llames desde Migrate(): NO es un descuido. Migrate() migra la BD ÚNICA del Edge
 // (<data_dir>/edge.db), y la cola vive en OTRA base de datos, un fichero APARTE
 // (<data_dir>/cola_entrantes.db, Layout.ColaDB()). Están separadas a propósito (design §2, D-2): la
@@ -220,7 +244,186 @@ func MigrateMeta(ctx context.Context, database *sql.DB) error {
 // set en Migrate() crearía una tabla cola_entrantes fantasma dentro de edge.db —que nadie leería— y no
 // migraría la cola real. La llama quien abre la cola, con SU propio *sql.DB.
 func MigrateCola(ctx context.Context, database *sql.DB) error {
-	return applyMigrations(ctx, database, colaMigrationsDir)
+	if err := applyMigrations(ctx, database, colaMigrationsDir); err != nil {
+		return err
+	}
+	// DESPUÉS de los .sql, y no dentro de ellos: la columna `claim_token` se añade con un ALTER GUARDADO
+	// en Go (ver ensureColaClaimToken). Sobre una BD virgen el CREATE TABLE del 0001 acaba de correr y el
+	// ALTER se emite sobre la tabla ya creada; sobre una BD que nació SIN la columna, este es el único
+	// paso que la añade.
+	if err := ensureColaClaimToken(ctx, database); err != nil {
+		return err
+	}
+	// Y lo mismo con `intentos` (T2.19), por la MISMA razón mecánica y con el mismo camino: editar el
+	// CREATE TABLE del 0001 sería un no-op silencioso sobre las colas que ya existen en disco. El orden
+	// entre los dos pasos guardados es indiferente —columnas distintas, sin dependencia—, pero se dejan en
+	// orden cronológico para que la lista se lea como la historia del esquema.
+	return ensureColaIntentos(ctx, database)
+}
+
+// colaClaimTokenColumn es la columna de FENCING del claim del cajero (Plan 051 Ola 2): identifica al
+// CLAIM, no a la fila. TEXT nullable (hex de 16 bytes de CSPRNG); NULL = «esta fila no la tiene nadie».
+const colaClaimTokenColumn = "claim_token"
+
+// ensureColaClaimToken añade de forma IDEMPOTENTE la columna `claim_token` a `cola_entrantes` si aún no
+// existe. Es la gemela de ensureDeviceMetadataColumns, y existe por la misma razón mecánica: el runner
+// (applyMigrations) NO lleva tabla de versión y RE-EJECUTA cada .sql en cada arranque, así que un
+// `ALTER TABLE … ADD COLUMN` pelado dentro del .sql reventaría en el 2.º arranque con "duplicate column"
+// (y modernc SQLite sin CGO no soporta `ADD COLUMN IF NOT EXISTS`). Leyendo PRAGMA table_info(...) el
+// ALTER solo se emite cuando falta, y reabrir la cola N veces es seguro.
+//
+// 🔴 POR QUÉ NO BASTABA EDITAR EL `CREATE TABLE` DEL 0001, que es como nació esta columna (T2.15): se
+// apoyaba en que «la cola no ha corrido todavía en ningún entorno», y esa premisa caduca sola —el commit
+// del 0001 ya está en `dev` y el daemon aplica MigrateCola al arrancar, así que cualquier binario de `dev`
+// ya creó <data_dir>/cola_entrantes.db sin que nadie usara la cola—. Sobre una BD así, el CREATE TABLE
+// editado es un NO-OP SILENCIOSO: no falla al arrancar, `Enqueue` sigue insertando (su INSERT no nombra la
+// columna), la cola se llena… y el PRIMER Reclamar muere con `no such column: claim_token`, dejando
+// mensajes que ningún cajero podrá vaciar hasta que el tope los descarte. Fallo mudo al arrancar, pérdida
+// de mensajes al cabo del tiempo.
+//
+// La columna es NULLABLE a propósito: las filas preexistentes quedan con NULL, que es exactamente el mismo
+// valor que deja el cierre de lote y el barrido de leases ("de nadie"), así que una cola migrada en caliente
+// se comporta igual que una nueva sin ninguna reescritura de datos.
+//
+// NINGÚN ÍNDICE del 0001 menciona `claim_token` (ux_cola_session_wamid, ix_cola_estado_seq e ix_cola_conv
+// se apoyan en session_id/wa_message_id/estado/seq/chat_jid), así que no hay que mover ningún CREATE INDEX
+// detrás de este ALTER. Si algún día se indexa el token, su índice va AQUÍ, después del ALTER, nunca en el
+// .sql: en una BD vieja el .sql se ejecuta antes de que la columna exista.
+//
+// ⚠️ SQLite-ONLY por el `PRAGMA table_info`: el porqué y qué habría que cambiar para portarlo, en el doc de
+// MigrateCola (su único llamante).
+func ensureColaClaimToken(ctx context.Context, database *sql.DB) error {
+	rows, err := database.QueryContext(ctx, `PRAGMA table_info(cola_entrantes)`)
+	if err != nil {
+		return fmt.Errorf("db: leer columnas de cola_entrantes: %w", err)
+	}
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("db: escanear PRAGMA table_info(cola_entrantes): %w", err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("db: recorrer PRAGMA table_info(cola_entrantes): %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("db: cerrar PRAGMA table_info(cola_entrantes): %w", err)
+	}
+
+	// TABLA AUSENTE ⇒ ERROR EXPLÍCITO, y esta guarda no es defensiva por gusto: `PRAGMA table_info` de una
+	// tabla que NO existe no falla, devuelve CERO filas. Sin esto, `existing` sale vacío, el flujo cae al
+	// ALTER de abajo y el usuario recibe un `no such table: cola_entrantes` crudo del driver, envuelto en un
+	// mensaje que habla de «añadir columna claim_token» — que apunta al sitio equivocado. El fallo real es
+	// que los .sql del set "cola" no se aplicaron (BD que no es la de la cola, un embed roto, un
+	// applyMigrations que no corrió), y eso es lo que hay que decir. Una tabla que existe siempre tiene al
+	// menos una columna, así que `len(existing) == 0` no tiene otra causa.
+	if len(existing) == 0 {
+		return fmt.Errorf("db: la tabla cola_entrantes no existe en esta BD; el set de migraciones %q no se aplicó "+
+			"(¿es esta la BD de la cola, <data_dir>/cola_entrantes.db?)", colaMigrationsDir)
+	}
+
+	if _, ok := existing[colaClaimTokenColumn]; ok {
+		return nil // ya existe (BD nueva o 2.º arranque): no reemitir el ALTER.
+	}
+	// Identificador de una constante en código (no viene de entrada externa): SQLite no admite placeholder
+	// para nombres de columna, así que la interpolación es necesaria y aquí es segura.
+	stmt := fmt.Sprintf(`ALTER TABLE cola_entrantes ADD COLUMN %s TEXT`, colaClaimTokenColumn)
+	if _, err := database.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("db: añadir columna %q a cola_entrantes: %w", colaClaimTokenColumn, err)
+	}
+	return nil
+}
+
+// colaIntentosColumn es el contador de RECLAMOS de una fila de la cola (Plan 051 Ola 2 · T2.19): cuántas
+// veces un cajero se la ha llevado. INTEGER NOT NULL DEFAULT 0; lo incrementa el propio UPDATE del claim.
+const colaIntentosColumn = "intentos"
+
+// ensureColaIntentos añade de forma IDEMPOTENTE la columna `intentos` a `cola_entrantes` si aún no existe.
+// Es la gemela de ensureColaClaimToken —mismo patrón, misma guarda, mismo modo de fallo— y la duplicación
+// del bloque de lectura de columnas es deliberada: es el tercer sitio del repo que hace esto
+// (ensureDeviceMetadataColumns fue el primero) y factorizar un helper genérico ahora obligaría a reescribir
+// dos funciones que ya están probadas, a cambio de ahorrar veinte líneas. Cuando aparezca el cuarto.
+//
+// 🔴 POR QUÉ NO SE EDITA EL `CREATE TABLE` DEL 0001, que es la tentación obvia: `CREATE TABLE IF NOT EXISTS`
+// es un NO-OP sobre una BD que ya existe, y las colas del campo YA existen (cualquier binario de `dev` creó
+// <data_dir>/cola_entrantes.db al arrancar). Sobre una de ellas la columna editada no aparecería nunca: el
+// arranque no falla, `Enqueue` sigue insertando, y el primer `Reclamar` muere con `no such column:
+// intentos` — el mismo camino que T2.18 ya recorrió con `claim_token`, y por el que el 0001 se revirtió a
+// propósito para no volver a tocarlo.
+//
+// LA COLUMNA ES `NOT NULL DEFAULT 0` Y ESO ES LO QUE LA HACE SEGURA EN CALIENTE: SQLite exige un DEFAULT
+// no nulo para un ADD COLUMN con NOT NULL, y ese default rellena las filas preexistentes con 0 en el propio
+// ALTER. Así una cola migrada en caliente se comporta EXACTAMENTE como una nueva —las filas que ya estaban
+// esperando empiezan a contar desde cero, con sus intentos íntegros— sin reescribir un solo dato. Un
+// NULLABLE, en cambio, dejaría filas con NULL y `intentos + 1` sobre NULL da NULL: el contador no avanzaría
+// nunca y el corte del cajero no se dispararía justo en las filas más viejas, que son las candidatas a ser
+// el lote venenoso.
+//
+// NINGÚN ÍNDICE del 0001 menciona `intentos`, así que no hay CREATE INDEX que mover detrás de este ALTER.
+// Si algún día se indexa (una consulta de «lotes a punto de agotar intentos», por ejemplo), su índice va
+// AQUÍ, después del ALTER, nunca en el .sql.
+//
+// ⚠️ SQLite-ONLY por el `PRAGMA table_info`: el porqué y qué habría que cambiar para portarlo, en el doc de
+// MigrateCola (su único llamante).
+func ensureColaIntentos(ctx context.Context, database *sql.DB) error {
+	rows, err := database.QueryContext(ctx, `PRAGMA table_info(cola_entrantes)`)
+	if err != nil {
+		return fmt.Errorf("db: leer columnas de cola_entrantes: %w", err)
+	}
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("db: escanear PRAGMA table_info(cola_entrantes): %w", err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("db: recorrer PRAGMA table_info(cola_entrantes): %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("db: cerrar PRAGMA table_info(cola_entrantes): %w", err)
+	}
+
+	// TABLA AUSENTE ⇒ ERROR EXPLÍCITO, por la MISMA razón que en ensureColaClaimToken: `PRAGMA table_info`
+	// de una tabla inexistente no falla, devuelve cero filas, y sin esta guarda el operador recibiría un
+	// `no such table` envuelto en un mensaje que habla de añadir una columna — apuntando al sitio
+	// equivocado cuando el fallo real es que el set de migraciones no se aplicó.
+	if len(existing) == 0 {
+		return fmt.Errorf("db: la tabla cola_entrantes no existe en esta BD; el set de migraciones %q no se aplicó "+
+			"(¿es esta la BD de la cola, <data_dir>/cola_entrantes.db?)", colaMigrationsDir)
+	}
+
+	if _, ok := existing[colaIntentosColumn]; ok {
+		return nil // ya existe (BD nueva o 2.º arranque): no reemitir el ALTER.
+	}
+	// Identificador de una constante en código (no viene de entrada externa): SQLite no admite placeholder
+	// para nombres de columna, así que la interpolación es necesaria y aquí es segura.
+	stmt := fmt.Sprintf(`ALTER TABLE cola_entrantes ADD COLUMN %s INTEGER NOT NULL DEFAULT 0`, colaIntentosColumn)
+	if _, err := database.ExecContext(ctx, stmt); err != nil {
+		return fmt.Errorf("db: añadir columna %q a cola_entrantes: %w", colaIntentosColumn, err)
+	}
+	return nil
 }
 
 // Migrate aplica AMBOS sets (store y luego meta) sobre una sola db. Es el camino single-sesión

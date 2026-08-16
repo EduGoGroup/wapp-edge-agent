@@ -58,6 +58,24 @@
 -- lease caducó. Son dos preguntas distintas —«¿cuándo se tomó?» y «¿quién lo tiene?»— y ahora cada una
 -- tiene su columna. Ambas se ponen a NULL a la vez: al cerrar el lote y al rescatarlo el barrido.
 --
+-- 🔴 `claim_token` NO ESTÁ EN EL `CREATE TABLE` DE ABAJO, Y ES A PROPÓSITO (T2.18). Nació editando ESTE
+-- fichero, apoyándose en que «la cola no ha corrido todavía en ningún entorno». Esa premisa CADUCA SOLA:
+-- el commit que introdujo esta migración ya está en `dev` y el daemon la aplica al arrancar, así que
+-- cualquier binario compilado desde `dev` ya creó `<data_dir>/cola_entrantes.db` sin que nadie «usara la
+-- cola» (hay equipos de prueba delegados). Sobre una BD así, editar el `CREATE TABLE ... IF NOT EXISTS`
+-- es un NO-OP SILENCIOSO: la columna nunca se añade, el arranque no falla, `Enqueue` sigue insertando
+-- (su INSERT no la nombra) y el PRIMER `Reclamar` muere con `no such column: claim_token` — una cola que
+-- acepta mensajes que ningún cajero podrá vaciar jamás, hasta que el tope empiece a descartarlos.
+-- Por eso la columna la añade GO, de forma guardada: `ensureColaClaimToken` (db.go) lee
+-- `PRAGMA table_info(cola_entrantes)` y emite el `ALTER TABLE ... ADD COLUMN claim_token TEXT` solo si
+-- falta, igual que `ensureDeviceMetadataColumns` hace con `msg_enc_device`. Un `ALTER` pelado AQUÍ no
+-- vale: este runner no lleva tabla de versión y re-ejecuta el fichero entero en cada arranque, y modernc
+-- SQLite (sin CGO) no soporta `ADD COLUMN IF NOT EXISTS`.
+--
+-- ⚠️ REGLA, no anécdota: NINGUNA columna nueva se añade editando este `CREATE TABLE`. El permiso que
+-- justificaba hacerlo («todavía no hay bases desplegadas») no se puede volver a comprobar una vez el
+-- fichero está en `dev`. Columna nueva ⇒ `ensure…` en Go, al lado de la de arriba.
+--
 -- PORTABLE SQLite/Postgres (ADR-0002 §Migración): solo TEXT/INTEGER/BLOB (BYTEA->BLOB), sin PRAGMAs, sin
 -- AUTOINCREMENT, índices y unicidad con sintaxis común. IDEMPOTENTE de arriba abajo (CREATE TABLE/INDEX
 -- IF NOT EXISTS): el runner applyMigrations (db.go) NO lleva tabla de versión y RE-EJECUTA el fichero
@@ -91,8 +109,8 @@ CREATE TABLE IF NOT EXISTS cola_entrantes (
     intent_json   TEXT,                              -- lo escribe el worker-cajero (o el fastlane al nacer la fila); NULL si aún no hay
     estado        TEXT    NOT NULL DEFAULT 'nuevo',  -- 'nuevo' | 'tomado' | 'clasificado' | 'despachado'
     tomado_en     INTEGER,                           -- epoch-segundos del claim (lease): el barrido devuelve a 'nuevo' si venció
-    claim_token   TEXT,                              -- TOKEN DE FENCING del claim (ver abajo): identidad del claim, NO su instante
     despachado_en INTEGER                            -- epoch-segundos del despacho: ÚNICA base de la poda por TTL (ver arriba)
+    -- claim_token TEXT — NO va aquí: la añade ensureColaClaimToken (db.go) con un ALTER guardado. Ver arriba.
 );
 
 -- Idempotencia local del encolado: el MISMO mensaje de WhatsApp, en la MISMA sesión, una sola fila.
