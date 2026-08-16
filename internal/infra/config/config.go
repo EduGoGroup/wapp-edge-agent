@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	sharedconfig "github.com/EduGoGroup/wapp-shared/config"
 )
 
@@ -63,6 +64,29 @@ const DefaultColaTTLHours = 24
 // REQ-051.7): al alcanzarlo se descartan las de menor `seq` (drop-oldest) en vez de crecer sin límite.
 // Configurable por WAPP_AGENT_COLA_MAX_ROWS; un valor <=0 cae al default (guardarraíl).
 const DefaultColaMaxRows = 50000
+
+// Los dos defaults del lado CAJERO de la cola (Plan 051 Ola 2, T2.1/T2.7) se REEXPORTAN, no se declaran:
+// el número vive UNA sola vez, en internal/app/cola.go, porque es parte del contrato de app.ColaCajero
+// (lo que el puerto promete cuando el llamante pasa 0), no de la config ni del adaptador. Tenerlo
+// tecleado también aquí era una segunda fuente de verdad sin nada que las atara: subir el tope en un
+// sitio dejaba al otro mintiendo en silencio.
+//
+// Se mantienen los NOMBRES de config (…Seconds, no …Segundos) para no romper a quien ya los referencie;
+// lo que cambia es de dónde sale el valor. La dirección del import es config → app y NO al revés:
+// internal/app no importa nada de internal/infra (solo internal/domain e internal/infra/watchdog, que a
+// su vez no importan nada interno), así que no hay ciclo — y no debe crearse: si algún día app necesitara
+// leer configuración, se le pasa por parámetro.
+
+// DefaultColaClaimMaxFilas es el TOPE DE FILAS que el worker-cajero se lleva en un solo claim (design §4):
+// que una conversación gigante no monopolice al cajero. El porqué del 20, en app.DefaultColaClaimMaxFilas.
+// Configurable por WAPP_AGENT_COLA_CLAIM_MAX_FILAS; un valor <=0 cae al default.
+const DefaultColaClaimMaxFilas = app.DefaultColaClaimMaxFilas
+
+// DefaultColaLeaseSeconds es el LEASE del claim en segundos: pasado ese tiempo, una fila `tomado` vuelve
+// a `nuevo` porque se asume que el cajero que la reclamó murió a mitad. El margen es AMPLIO A PROPÓSITO y
+// acortarlo empeora las cosas — el argumento completo (p95 de 3.736 ms, 16× por debajo) está en
+// app.DefaultColaLeaseSegundos. Configurable por WAPP_AGENT_COLA_LEASE_SECONDS; <=0 cae al default.
+const DefaultColaLeaseSeconds = app.DefaultColaLeaseSegundos
 
 // DefaultPlatformAPIBaseURL es la URL base por defecto de la API PÚBLICA HTTP de la plataforma cloud
 // (wapp-cloud-platform, puerto público 8103, rutas /api/v1/...): NO confundir con CloudLink (gRPC/mTLS,
@@ -162,6 +186,18 @@ type Config struct {
 	// ColaMaxRows es el tope de filas de la COLA DE ENTRANTES: al llenarse se descartan las más viejas
 	// (drop-oldest). Default 50 000. Se lee de WAPP_AGENT_COLA_MAX_ROWS; un valor <=0 cae al default.
 	ColaMaxRows int `yaml:"cola_max_rows"`
+	// ColaClaimMaxFilas es el tope de filas que el worker-cajero se lleva en UN claim (Plan 051 Ola 2,
+	// T2.1): que una conversación gigante no monopolice al cajero. Default 20. Se lee de
+	// WAPP_AGENT_COLA_CLAIM_MAX_FILAS; un valor <=0 cae al default.
+	//
+	// AÚN NO SE CABLEA en wiring/daemon: el proceso worker que la consume se construye en otra tanda.
+	// Aquí solo se declara y se lee, para que el operador ya la pueda fijar y el gate de config la cubra.
+	ColaClaimMaxFilas int `yaml:"cola_claim_max_filas"`
+	// ColaLeaseSeconds es el lease del claim en segundos (Plan 051 Ola 2, T2.7): una fila `tomado` más
+	// vieja que esto vuelve a `nuevo`. Default 60, margen amplio A PROPÓSITO (ver
+	// DefaultColaLeaseSeconds). Se lee de WAPP_AGENT_COLA_LEASE_SECONDS; un valor <=0 cae al default.
+	// Igual que ColaClaimMaxFilas, aún no se cablea: la consume el worker de otra tanda.
+	ColaLeaseSeconds int `yaml:"cola_lease_seconds"`
 	// DiagLogLines es cuántas líneas del ring buffer de logs incluye el bundle de diagnóstico bajo demanda
 	// (Plan 031 T8, ADR-0023). Default 500 (contexto reciente amplio sin acercarse al tope de 4 MiB del
 	// frame). Se lee de WAPP_AGENT_DIAG_LOG_LINES; <=0 cae al default.
@@ -302,6 +338,8 @@ func defaults() Config {
 		OutboxTTLHours:        DefaultOutboxTTLHours,
 		ColaTTLHours:          DefaultColaTTLHours,
 		ColaMaxRows:           DefaultColaMaxRows,
+		ColaClaimMaxFilas:     DefaultColaClaimMaxFilas,
+		ColaLeaseSeconds:      DefaultColaLeaseSeconds,
 		DiagLogLines:          DefaultDiagLogLines,
 		InboundMarginSeconds:  DefaultInboundMarginSeconds,
 		CloudLink: CloudLinkConfig{
@@ -353,6 +391,8 @@ func Load(path string) (Config, error) {
 	cfg.OutboxTTLHours = loader.GetInt("OUTBOX_TTL_HOURS", cfg.OutboxTTLHours)
 	cfg.ColaTTLHours = loader.GetInt("COLA_TTL_HOURS", cfg.ColaTTLHours)
 	cfg.ColaMaxRows = loader.GetInt("COLA_MAX_ROWS", cfg.ColaMaxRows)
+	cfg.ColaClaimMaxFilas = loader.GetInt("COLA_CLAIM_MAX_FILAS", cfg.ColaClaimMaxFilas)
+	cfg.ColaLeaseSeconds = loader.GetInt("COLA_LEASE_SECONDS", cfg.ColaLeaseSeconds)
 	cfg.DiagLogLines = loader.GetInt("DIAG_LOG_LINES", cfg.DiagLogLines)
 	cfg.InboundMarginSeconds = loader.GetInt("INBOUND_MARGIN_SECONDS", cfg.InboundMarginSeconds)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
@@ -405,6 +445,16 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.ColaTTLHours <= 0 {
 		cfg.ColaTTLHours = DefaultColaTTLHours
+	}
+	// Lado CAJERO de la cola (Plan 051 Ola 2, T2.1/T2.7): mismo guardarraíl. Un tope de claim a 0 dejaría
+	// al cajero sin llevarse nada (cola parada en silencio) y un lease a 0 declararía vencidos TODOS los
+	// leases al instante, re-clasificando cada lote una y otra vez. Ninguno de los dos es un invariante
+	// de seguridad, pero los dos son formas fáciles de romper el worker tecleando un cero en el YAML.
+	if cfg.ColaClaimMaxFilas <= 0 {
+		cfg.ColaClaimMaxFilas = DefaultColaClaimMaxFilas
+	}
+	if cfg.ColaLeaseSeconds <= 0 {
+		cfg.ColaLeaseSeconds = DefaultColaLeaseSeconds
 	}
 	// Bundle de diagnóstico (Plan 031 T8): nº de líneas de log no positivo cae al default.
 	if cfg.DiagLogLines <= 0 {

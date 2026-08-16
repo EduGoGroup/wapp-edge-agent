@@ -527,6 +527,87 @@ func TestLoad_ColaLimits(t *testing.T) {
 	}
 }
 
+// TestLoad_ColaClaimMaxFilas cubre el TOPE DE FILAS POR CLAIM del worker-cajero (Plan 051 Ola 2, T2.1):
+// default 20, override por WAPP_AGENT_COLA_CLAIM_MAX_FILAS, y el guardarraíl de que un valor no positivo
+// cae al default.
+//
+// Por qué existe este test y no bastaba con el comentario del código: `ColaClaimMaxFilas` aún NO se cablea
+// (lo consumirá el worker de otra tanda), así que el gate de config es HOY el único sitio donde este
+// parámetro se puede romper sin que nada más se entere. Un 0 colándose hasta el claim significa un cajero
+// que reclama cero filas: la cola deja de drenar EN SILENCIO, sin error y sin log.
+func TestLoad_ColaClaimMaxFilas(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaClaimMaxFilas != DefaultColaClaimMaxFilas {
+		t.Fatalf("default del claim: got %d, want %d", cfg.ColaClaimMaxFilas, DefaultColaClaimMaxFilas)
+	}
+
+	t.Setenv(EnvPrefix+"COLA_CLAIM_MAX_FILAS", "7")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaClaimMaxFilas != 7 {
+		t.Fatalf("override del claim: got %d, want 7", cfg.ColaClaimMaxFilas)
+	}
+
+	// Guardarraíl: 0 (y cualquier valor <=0) NO significa «sin tope» ni «cero filas»; cae al default.
+	for _, crudo := range []string{"0", "-5"} {
+		t.Run("no_positivo="+crudo, func(t *testing.T) {
+			t.Setenv(EnvPrefix+"COLA_CLAIM_MAX_FILAS", crudo)
+			cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+			if err != nil {
+				t.Fatalf("Load(%s): %v", crudo, err)
+			}
+			if cfg.ColaClaimMaxFilas != DefaultColaClaimMaxFilas {
+				t.Fatalf("guardarraíl del claim con %s: got %d, want %d",
+					crudo, cfg.ColaClaimMaxFilas, DefaultColaClaimMaxFilas)
+			}
+		})
+	}
+}
+
+// TestLoad_ColaLeaseSeconds cubre el LEASE del claim (Plan 051 Ola 2, T2.7): default 60 s, override por
+// WAPP_AGENT_COLA_LEASE_SECONDS, y el guardarraíl de que un valor no positivo cae al default.
+//
+// El caso que de verdad importa aquí es el <=0: un lease de 0 s vencería INSTANTÁNEAMENTE y el barrido
+// devolvería a `nuevo` lotes que un cajero vivo aún está clasificando — se pagaría una segunda inferencia
+// por el mismo texto, en bucle. El guardarraíl es lo único que separa esa configuración del disco.
+func TestLoad_ColaLeaseSeconds(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaLeaseSeconds != DefaultColaLeaseSeconds {
+		t.Fatalf("default del lease: got %d, want %d", cfg.ColaLeaseSeconds, DefaultColaLeaseSeconds)
+	}
+
+	t.Setenv(EnvPrefix+"COLA_LEASE_SECONDS", "15")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaLeaseSeconds != 15 {
+		t.Fatalf("override del lease: got %d, want 15", cfg.ColaLeaseSeconds)
+	}
+
+	for _, crudo := range []string{"0", "-1"} {
+		t.Run("no_positivo="+crudo, func(t *testing.T) {
+			t.Setenv(EnvPrefix+"COLA_LEASE_SECONDS", crudo)
+			cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+			if err != nil {
+				t.Fatalf("Load(%s): %v", crudo, err)
+			}
+			if cfg.ColaLeaseSeconds != DefaultColaLeaseSeconds {
+				t.Fatalf("guardarraíl del lease con %s: got %d, want %d",
+					crudo, cfg.ColaLeaseSeconds, DefaultColaLeaseSeconds)
+			}
+		})
+	}
+}
+
 // TestLoad_RuntimeEndpointStateFallback verifica que `serve` (config.Load) RELEE el endpoint de runtime
 // persistido por el enroll en <data_dir>/cloudlink-endpoint cuando no viene por YAML/env (Plan 026 T3,
 // cierra follow-up 023): así el stream se levanta sin edición manual del config.yaml.
