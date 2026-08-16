@@ -106,6 +106,17 @@ func intentDe(t *testing.T, db *sql.DB, id int64) sql.NullString {
 	return intent
 }
 
+// claimTokenDe lee el token de fencing persistido en una fila. Es la ÚNICA forma de comprobar de quién
+// es la fila realmente: el estado dice que está tomada, pero no por quién.
+func claimTokenDe(t *testing.T, db *sql.DB, id int64) sql.NullString {
+	t.Helper()
+	var tok sql.NullString
+	if err := db.QueryRow(`SELECT claim_token FROM cola_entrantes WHERE id = ?`, id).Scan(&tok); err != nil {
+		t.Fatalf("leer claim_token de id=%d: %v", id, err)
+	}
+	return tok
+}
+
 // contarEnEstado devuelve cuántas filas hay en un estado (cardinalidad, nunca contenido).
 func contarEnEstado(t *testing.T, db *sql.DB, estado string) int {
 	t.Helper()
@@ -525,20 +536,20 @@ func TestMarcarClasificadoLoteVacioEsNoOp(t *testing.T) {
 
 // ────────────── T2.1 · EL FENCING DEL CIERRE (la carrera del lease relevado) ──────────────
 
-// TestMarcarClasificadoTardioNoPisaAlRelevo ES LA ASERCIÓN QUE IMPORTA DEL CIERRE, y la que un
-// guardarraíl por RowsAffected NO puede dar: cuenta filas, y aquí las filas están todas — lo que ha
-// cambiado es de QUIÉN son.
+// TestMarcarClasificadoTardioNoPisaAlRelevo cubre el cierre tardío contra un relevo QUE YA TERMINÓ.
 //
 // La secuencia es la de campo, paso a paso: (1) el cajero A reclama y empieza la inferencia; (2) la
 // inferencia se pasa de los 60 s del lease; (3) el barrido devuelve las filas a `nuevo`; (4) el cajero B
-// las reclama, clasifica y CIERRA; (5) A termina y cierra igual. Sin el fence por `tomado_en`, ese quinto
-// paso pisa el intent_json de B y nada falla ni se loguea: el mensaje sale a la nube con la clasificación
-// de un lote que ya no existía.
+// las reclama, clasifica y CIERRA; (5) A termina y cierra igual, y debe descartarse.
 //
-// El reloj va INYECTADO porque el fence se apoya en que el sello de B es distinto del de A, y eso lo
-// garantiza el propio lease (una fila no vuelve a ser reclamable hasta que hayan pasado ≥60 s desde su
-// sello, así que dos claims de la misma fila no pueden compartir segundo). Aquí se avanza 61 s a mano
-// para materializarlo de forma determinista, sin dormir.
+// ⚠️ NO ES EL TEST DEL FENCE, aunque lo pareciera: en el paso (5) las filas ya están `clasificado` por B,
+// así que el `AND estado = 'tomado'` del WHERE las excluye sin ayuda del token. Medido por mutación el
+// 2026-08-16: quitando el predicado del token, este test sigue en VERDE. Lo que prueba de verdad es que
+// un cierre que llega tarde no revive filas ya cerradas, que es un camino distinto y también hay que
+// sostener. El fence lo prueba TestMarcarClasificadoTardioConElRelevoAUNVIVO, justo debajo.
+//
+// El reloj va INYECTADO para materializar el vencimiento del lease de forma determinista (61 s a mano),
+// sin dormir.
 func TestMarcarClasificadoTardioNoPisaAlRelevo(t *testing.T) {
 	ctx := context.Background()
 	db := openDB(t)
@@ -559,8 +570,8 @@ func TestMarcarClasificadoTardioNoPisaAlRelevo(t *testing.T) {
 	if loteA == nil || len(loteA.Mensajes) != 2 {
 		t.Fatalf("el cajero A debía llevarse 2 filas, got %s", resumenLote(loteA))
 	}
-	if loteA.TomadoEn == 0 {
-		t.Fatal("Reclamar no devolvió el sello de fencing en ColaLote.TomadoEn: sin él NO hay fence posible")
+	if loteA.ClaimToken == "" {
+		t.Fatal("Reclamar no devolvió el token de fencing en ColaLote.ClaimToken: sin él NO hay fence posible")
 	}
 
 	// (2) y (3): la inferencia de A se pasa del lease y el barrido rescata las filas.
@@ -581,8 +592,8 @@ func TestMarcarClasificadoTardioNoPisaAlRelevo(t *testing.T) {
 	if loteB == nil || len(loteB.Mensajes) != 2 {
 		t.Fatalf("el cajero B debía re-reclamar las 2 filas, got %s", resumenLote(loteB))
 	}
-	if loteB.TomadoEn == loteA.TomadoEn {
-		t.Fatalf("los dos claims comparten sello (%d): el fence no podría distinguirlos", loteB.TomadoEn)
+	if loteB.ClaimToken == loteA.ClaimToken {
+		t.Fatal("los dos claims comparten token: el fence no podría distinguirlos")
 	}
 	const intentB = `{"intent":"pedido","confidence":0.91}`
 	if err := s.MarcarClasificado(ctx, loteB, intentB); err != nil {
@@ -618,6 +629,115 @@ func TestMarcarClasificadoTardioNoPisaAlRelevo(t *testing.T) {
 	}
 	if got := contarEnEstado(t, db, app.EstadoNuevo); got != 0 {
 		t.Fatalf("el cierre tardío dejó %d filas en 'nuevo'", got)
+	}
+}
+
+// TestMarcarClasificadoTardioConElRelevoAUNVIVO ES EL TEST QUE PRUEBA EL FENCE DE VERDAD, y existe
+// porque el de arriba NO lo prueba: allí B ya ha CERRADO cuando A llega tarde, así que sus filas están en
+// `clasificado` y el `AND estado = 'tomado'` del WHERE ya las excluye él solo. Se verificó por mutación
+// (2026-08-16): quitando el predicado del token, aquel test seguía en verde. Cubre otro camino —el del
+// relevo que ya terminó—, y por eso se queda; pero la ventana peligrosa es esta otra.
+//
+// LA VENTANA REAL: B ha reclamado y TODAVÍA ESTÁ CLASIFICANDO. Sus filas siguen `tomado`, que es
+// exactamente el estado que A cree tener. Todo lo que distingue el lote de A del de B en ese instante es
+// el token del claim: sin él, el `WHERE id IN (…) AND estado = 'tomado'` de A casa las dos filas, el
+// RowsAffected cuadra, se hace COMMIT y A cierra el lote de B —le escribe SU intent y se lo pasa a
+// `clasificado`— mientras B sigue infiriendo. B terminará y su cierre será el que se descarte. Nada falla,
+// nada se loguea: sale a la nube la clasificación del cajero equivocado.
+func TestMarcarClasificadoTardioConElRelevoAUNVIVO(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s := newStore(t, db, newFakeCrypterFor().fn, 100, 0, WithClock(clock.Now))
+
+	for i := 1; i <= 2; i++ {
+		if err := s.Enqueue(ctx, item("A", "chat@s", fmt.Sprintf("wa-%d", i), fmt.Sprintf("m%d", i))); err != nil {
+			t.Fatalf("Enqueue %d: %v", i, err)
+		}
+	}
+
+	// (1) El cajero A reclama y se pone a clasificar.
+	loteA, err := s.Reclamar(ctx, 0)
+	if err != nil {
+		t.Fatalf("Reclamar (cajero A): %v", err)
+	}
+	if loteA == nil || len(loteA.Mensajes) != 2 {
+		t.Fatalf("el cajero A debía llevarse 2 filas, got %s", resumenLote(loteA))
+	}
+	if loteA.ClaimToken == "" {
+		t.Fatal("Reclamar no devolvió token de fencing: sin él no hay nada que probar aquí")
+	}
+
+	// (2) y (3): la inferencia de A se pasa del lease y el barrido devuelve las filas a `nuevo`.
+	clock.t = clock.t.Add(61 * time.Second)
+	n, err := s.BarrerLeasesVencidos(ctx, 0) // 0 ⇒ default de 60 s
+	if err != nil {
+		t.Fatalf("BarrerLeasesVencidos: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("el barrido debía rescatar las 2 filas del lease vencido, rescató %d", n)
+	}
+	// El rescate suelta la fila del todo: si el token de A sobreviviera en una fila ya libre, quedaría
+	// diciendo que pertenece a un cajero que la soltó.
+	for _, m := range loteA.Mensajes {
+		if tok := claimTokenDe(t, db, m.ID); tok.Valid {
+			t.Fatalf("la fila %s volvió a 'nuevo' con el token del claim muerto (%q): el barrido debe limpiarlo",
+				resumenMensaje(&m), tok.String)
+		}
+	}
+
+	// (4) EL RELEVO: B las reclama y SE QUEDA CLASIFICANDO. No cierra. Sus filas están `tomado`, igual que
+	// A cree que están las suyas — es el instante en el que el estado ya no distingue a nadie.
+	loteB, err := s.Reclamar(ctx, 0)
+	if err != nil {
+		t.Fatalf("Reclamar (cajero B, el relevo): %v", err)
+	}
+	if loteB == nil || len(loteB.Mensajes) != 2 {
+		t.Fatalf("el cajero B debía re-reclamar las 2 filas, got %s", resumenLote(loteB))
+	}
+	if loteB.ClaimToken == loteA.ClaimToken {
+		t.Fatal("los dos claims comparten token: el fence no podría distinguirlos")
+	}
+	if got := contarEnEstado(t, db, app.EstadoTomado); got != 2 {
+		t.Fatalf("las 2 filas debían quedar 'tomado' por B (lote vivo, sin cerrar), hay %d", got)
+	}
+
+	// (5) A TERMINA TARDE Y CIERRA IGUAL, contra un lote que ahora es de B y que sigue abierto. Aquí es
+	// donde el fence tiene que morder, y donde SOLO el token puede hacerlo.
+	const intentA = `{"intent":"saludo","confidence":0.42}`
+	err = s.MarcarClasificado(ctx, loteA, intentA)
+	if !errors.Is(err, app.ErrLoteRelevado) {
+		t.Fatalf("el cierre tardío sobre un lote AÚN VIVO del relevo debía devolver app.ErrLoteRelevado; got %v", err)
+	}
+
+	// Y no tocó nada: las filas siguen siendo de B, abiertas y sin intent.
+	for _, m := range loteB.Mensajes {
+		if got := estadoDe(t, db, m.ID); got != app.EstadoTomado {
+			t.Fatalf("la fila %s quedó en %q: el cierre de A la sacó del lote VIVO de B (debía seguir 'tomado')",
+				resumenMensaje(&m), got)
+		}
+		tok := claimTokenDe(t, db, m.ID)
+		if !tok.Valid || tok.String != loteB.ClaimToken {
+			t.Fatalf("la fila %s perdió el token del relevo: got %+v, want el de B", resumenMensaje(&m), tok)
+		}
+		if got := intentDe(t, db, m.ID); got.Valid {
+			t.Fatalf("la fila %s ganó el intent del cajero TARDÍO: %q", resumenMensaje(&m), got.String)
+		}
+	}
+	if got := contarEnEstado(t, db, app.EstadoClasificado); got != 0 {
+		t.Fatalf("el cierre tardío dejó %d filas en 'clasificado': la transacción debía revertirse ENTERA", got)
+	}
+
+	// Y B, cuando termine, SÍ puede cerrar: el fence descarta al tardío, no bloquea al dueño.
+	const intentB = `{"intent":"pedido","confidence":0.91}`
+	if err := s.MarcarClasificado(ctx, loteB, intentB); err != nil {
+		t.Fatalf("el dueño del lote debía poder cerrar tras el intento tardío de A: %v", err)
+	}
+	if got := intentDe(t, db, loteB.Ultimo().ID); !got.Valid || got.String != intentB {
+		t.Fatalf("intent de la última fila tras el cierre de B: got %+v want %q", got, intentB)
+	}
+	if got := contarEnEstado(t, db, app.EstadoClasificado); got != 2 {
+		t.Fatalf("filas 'clasificado' tras el cierre de B: got %d want 2", got)
 	}
 }
 
@@ -661,7 +781,7 @@ func TestMarcarClasificadoCierraYLimpiaElSello(t *testing.T) {
 	if got := contarEnEstado(t, db, app.EstadoClasificado); got != 3 {
 		t.Fatalf("filas 'clasificado': got %d want 3 (el cierre es todo o nada)", got)
 	}
-	// El sello se limpia en TODAS las filas del lote, no solo en la última.
+	// El sello Y el token se limpian en TODAS las filas del lote, no solo en la última.
 	for i := range lote.Mensajes {
 		m := lote.Mensajes[i]
 		var tomadoEn sql.NullInt64
@@ -671,6 +791,10 @@ func TestMarcarClasificadoCierraYLimpiaElSello(t *testing.T) {
 		if tomadoEn.Valid {
 			t.Fatalf("la fila %s quedó `clasificado` con el sello vivo (tomado_en=%d): el cierre debe ponerlo a NULL",
 				resumenMensaje(&m), tomadoEn.Int64)
+		}
+		if tok := claimTokenDe(t, db, m.ID); tok.Valid {
+			t.Fatalf("la fila %s quedó `clasificado` con el token del claim vivo (%q): el cierre debe ponerlo a NULL",
+				resumenMensaje(&m), tok.String)
 		}
 	}
 }

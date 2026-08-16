@@ -40,6 +40,24 @@
 -- que el TTL. El crecimiento de lo pendiente lo contiene el TOPE DE FILAS del Store (drop-oldest), que
 -- descarta bajo presión real y lo deja anotado en el log.
 --
+-- FENCING DEL CLAIM POR `claim_token`, NO POR `tomado_en` (Plan 051 Ola 2): el cierre del lote
+-- (MarcarClasificado) solo escribe sobre las filas que siguen `tomado` CON EL MISMO `claim_token` que
+-- devolvió el claim. Es lo único que demuestra que el lote sigue siendo de ESTE cajero y no de otro que lo
+-- relevó tras vencer el lease — contar filas afectadas no caza nada, porque las filas siguen ahí: lo que
+-- ha cambiado es de quién son.
+--
+-- ⚠️ POR QUÉ NO SIRVE `tomado_en`, que es lo que había antes y parece bastar: es el reloj de PARED
+-- (`s.now().Unix()`, epoch-SEGUNDOS). El argumento de que dos claims de la misma fila no pueden compartir
+-- segundo se apoya en que entre uno y otro han de pasar ≥60 s de lease, y ESO ASUME QUE EL RELOJ AVANZA.
+-- La plataforma objetivo es un portátil: un salto de NTP hacia atrás tras suspender la máquina hace que el
+-- sello del relevo repita el del claim original, y entonces un cierre tardío pisa el intent del cajero que
+-- lo relevó — en silencio, con todos los contadores cuadrando. Un token aleatorio (16 bytes de CSPRNG en
+-- hex) no depende del reloj en absoluto.
+--
+-- `tomado_en` SE QUEDA, con su otro papel: es el instante que mide BarrerLeasesVencidos para saber si el
+-- lease caducó. Son dos preguntas distintas —«¿cuándo se tomó?» y «¿quién lo tiene?»— y ahora cada una
+-- tiene su columna. Ambas se ponen a NULL a la vez: al cerrar el lote y al rescatarlo el barrido.
+--
 -- PORTABLE SQLite/Postgres (ADR-0002 §Migración): solo TEXT/INTEGER/BLOB (BYTEA->BLOB), sin PRAGMAs, sin
 -- AUTOINCREMENT, índices y unicidad con sintaxis común. IDEMPOTENTE de arriba abajo (CREATE TABLE/INDEX
 -- IF NOT EXISTS): el runner applyMigrations (db.go) NO lleva tabla de versión y RE-EJECUTA el fichero
@@ -73,6 +91,7 @@ CREATE TABLE IF NOT EXISTS cola_entrantes (
     intent_json   TEXT,                              -- lo escribe el worker-cajero (o el fastlane al nacer la fila); NULL si aún no hay
     estado        TEXT    NOT NULL DEFAULT 'nuevo',  -- 'nuevo' | 'tomado' | 'clasificado' | 'despachado'
     tomado_en     INTEGER,                           -- epoch-segundos del claim (lease): el barrido devuelve a 'nuevo' si venció
+    claim_token   TEXT,                              -- TOKEN DE FENCING del claim (ver abajo): identidad del claim, NO su instante
     despachado_en INTEGER                            -- epoch-segundos del despacho: ÚNICA base de la poda por TTL (ver arriba)
 );
 

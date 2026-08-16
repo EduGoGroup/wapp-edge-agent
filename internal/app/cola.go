@@ -249,21 +249,28 @@ type ColaLote struct {
 	// SessionID y ChatJID son la clave de conversación por la que se reclamó el lote.
 	SessionID string
 	ChatJID   string
-	// TomadoEn es EL TOKEN DE FENCING DEL CLAIM: el sello epoch-segundos con el que Reclamar marcó estas
-	// filas como `tomado`.
+	// TomadoEn es el sello epoch-segundos con el que Reclamar marcó estas filas como `tomado`. Es CUÁNDO
+	// se tomó el lote, y sirve para UNA sola cosa: que BarrerLeasesVencidos sepa si el lease ya caducó.
+	//
+	// ⚠️ NO ES EL FENCE. Lo fue, y era un error: ver ClaimToken.
+	TomadoEn int64
+	// ClaimToken es EL TOKEN DE FENCING DEL CLAIM: 16 bytes de CSPRNG en hex, generados por Reclamar y
+	// escritos en las filas del lote en el mismo UPDATE que las marca `tomado`.
 	//
 	// 🔴 NO ES INFORMATIVO, ES DE CORRECCIÓN. Es lo único que demuestra que el lote SIGUE SIENDO DE ESTE
 	// CAJERO y no de otro que lo relevó. La carrera que cierra es real y silenciosa: el cajero A reclama y
 	// se pasa del lease clasificando → BarrerLeasesVencidos devuelve las filas a `nuevo` → el cajero B las
-	// reclama, clasifica y cierra → A termina y cierra TAMBIÉN, pisando el intent de B. Las filas existen y
-	// el número cuadra, así que contar filas afectadas NO caza nada: hay que comprobar la IDENTIDAD del
-	// claim, y eso es este sello.
+	// reclama y las toma → A termina y cierra IGUAL, pisando el trabajo de B. Las filas existen y el número
+	// cuadra, así que contar filas afectadas NO caza nada: hay que comprobar la IDENTIDAD del claim.
 	//
-	// POR QUÉ EL SELLO BASTA pese a tener granularidad de SEGUNDO: una fila solo vuelve a ser reclamable
-	// después de que el barrido la rescate, y el barrido exige que hayan pasado al menos `lease` segundos
-	// (60 por defecto) desde el sello. El sello del relevo, por tanto, no puede coincidir con el del claim
-	// original — no hay ventana en la que dos claims de la misma fila compartan segundo.
-	TomadoEn int64
+	// POR QUÉ UN TOKEN Y NO EL SELLO `TomadoEn`, que es lo que había antes: el sello es el reloj de PARED
+	// con granularidad de SEGUNDO, y el argumento de que dos claims de la misma fila no pueden compartir
+	// segundo (entre uno y otro han de pasar ≥60 s de lease) asume que EL RELOJ AVANZA. La plataforma
+	// objetivo es un portátil: un salto de NTP hacia atrás al despertar de la suspensión hace que el sello
+	// del relevo repita el del claim original, y entonces el fence deja de morder exactamente en el caso
+	// para el que existe. Un token aleatorio no depende del reloj en absoluto, y de paso separa las dos
+	// preguntas que la columna única confundía: «¿cuándo se tomó?» y «¿quién lo tiene?».
+	ClaimToken string
 	// Mensajes son las filas reclamadas, GARANTIZADAS EN ORDEN ASCENDENTE DE Seq.
 	//
 	// 🔴 Esa garantía es del ADAPTADOR y hay que sostenerla a mano: `UPDATE … RETURNING` NO respeta el
@@ -317,9 +324,9 @@ const DefaultColaLeaseSegundos = 60
 // poder llamar por accidente a los métodos del otro.
 type ColaCajero interface {
 	// Reclamar toma atómicamente hasta maxFilas filas `nuevo` de la conversación MÁS ANTIGUA (la que
-	// tiene la fila `nuevo` de menor Seq), las marca `tomado` con su sello de lease y las devuelve ya
-	// descifradas y ORDENADAS POR Seq. El sello que escribió viaja de vuelta en ColaLote.TomadoEn, y es
-	// lo que MarcarClasificado exige después para poder cerrar el lote.
+	// tiene la fila `nuevo` de menor Seq), las marca `tomado` con su sello de lease y su token de claim, y
+	// las devuelve ya descifradas y ORDENADAS POR Seq. El token que escribió viaja de vuelta en
+	// ColaLote.ClaimToken, y es lo que MarcarClasificado exige después para poder cerrar el lote.
 	//
 	// maxFilas <= 0 CAE AL DEFAULT (DefaultColaClaimMaxFilas): es el modo normal de llamar desde el
 	// worker, que no tiene por qué conocer el número. Un 0 nunca significa «no te lleves nada» —eso
@@ -340,7 +347,7 @@ type ColaCajero interface {
 	// dejaría filas en `tomado` que solo el barrido de leases rescataría, 60 s después.
 	//
 	// 🔴 EL CIERRE VA CON FENCING: solo escribe sobre las filas que SIGUEN `tomado` con el MISMO
-	// lote.TomadoEn con el que Reclamar las selló. Si el lease venció y otro cajero relevó el lote, este
+	// lote.ClaimToken con el que Reclamar las marcó. Si el lease venció y otro cajero relevó el lote, este
 	// cierre NO toca nada y devuelve ErrLoteRelevado. Un lote nil o vacío es no-op sin error.
 	MarcarClasificado(ctx context.Context, lote *ColaLote, intentJSON string) error
 
@@ -369,8 +376,8 @@ type ColaCajero interface {
 var ErrColaFalloRepetido = errors.New("cola de entrantes: fallo ya reportado para esta sesión (en enfriamiento)")
 
 // ErrLoteRelevado marca un MarcarClasificado que llegó TARDE: el lease del lote venció, el barrido
-// devolvió las filas a `nuevo` y otro cajero ya las reclamó (y probablemente ya las cerró). El fencing
-// por lote.TomadoEn lo detecta, la transacción se revierte entera y NO se escribe una sola fila.
+// devolvió las filas a `nuevo` y otro cajero ya las reclamó (y quizá ya las cerró). El fencing por
+// lote.ClaimToken lo detecta, la transacción se revierte entera y NO se escribe una sola fila.
 //
 // 🔴 NO ES UN FALLO DEL CAJERO NI UNA CORRUPCIÓN: es la carrera funcionando como debe. Lo que se pierde
 // es UNA INFERENCIA (trabajo de CPU ya gastado), nunca un mensaje: las filas están sanas y con el intent

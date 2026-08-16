@@ -15,7 +15,9 @@ package colaentrantes
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"sort"
 	"strings"
@@ -36,7 +38,29 @@ const (
 	// defaultLease: el margen del lease (T2.7), aquí ya como Duration porque es lo que recibe el barrido.
 	// El porqué del 60 —y de por qué acortarlo empeora las cosas— en app.DefaultColaLeaseSegundos.
 	defaultLease = app.DefaultColaLeaseSegundos * time.Second
+
+	// claimTokenBytes es el tamaño en BYTES del token de fencing (se persiste en hex, así que la columna
+	// guarda el doble de caracteres). 16 bytes = 128 bits: la única propiedad que se le pide al token es
+	// no repetirse nunca, y con 128 bits de CSPRNG la colisión no es un caso que haya que razonar. No es
+	// material criptográfico —no firma ni cifra nada—, así que no crece con el tamaño de una llave.
+	claimTokenBytes = 16
 )
+
+// nuevoClaimToken genera el token de fencing de UN claim: 16 bytes de CSPRNG en hex.
+//
+// SI FALLA, SE PROPAGA EL ERROR Y NO SE RECLAMA NADA. La tentación es caer a algo derivado del reloj o de
+// un contador «solo por esta vez», y es exactamente el fallo que este token viene a corregir: un fence
+// predecible o repetible no es un fence, y el cierre tardío volvería a pisar el trabajo del relevo sin que
+// nada lo delate. Un `crypto/rand` que falla es un sistema roto de verdad (en Go moderno solo ocurre si el
+// SO no puede dar entropía), y lo correcto entonces es que el cajero no trabaje: la fila se queda `nuevo`
+// y el claim siguiente la recoge.
+func nuevoClaimToken() (string, error) {
+	b := make([]byte, claimTokenBytes)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("colaentrantes: generar token de fencing del claim: %w", err)
+	}
+	return hex.EncodeToString(b), nil
+}
 
 // var _ app.ColaCajero: el Store respalda TAMBIÉN el lado cajero del puerto. La aserción va aquí, en el
 // fichero que aporta los métodos, para que borrar este fichero rompa la compilación en el sitio obvio.
@@ -61,7 +85,7 @@ var _ app.ColaCajero = (*Store)(nil)
 // el precio de equivocarse aquí es concatenar dos conversaciones distintas en un mismo prompt.
 const sqlReclamar = `
 UPDATE cola_entrantes
-SET estado = ?, tomado_en = ?
+SET estado = ?, tomado_en = ?, claim_token = ?
 WHERE id IN (
   SELECT id FROM cola_entrantes
   WHERE session_id = (SELECT session_id FROM cola_entrantes WHERE estado = ? ORDER BY seq LIMIT 1)
@@ -128,10 +152,20 @@ func (s *Store) Reclamar(ctx context.Context, maxFilas int) (*app.ColaLote, erro
 	// s.now() y no time.Now(): el reloj es inyectable (WithClock) y el barrido de leases mide contra
 	// ESTE mismo sello. Dos relojes distintos entre el claim y el barrido harían que los tests de lease
 	// pasaran mintiendo. Epoch-SEGUNDOS, como el resto de la tabla (ts_whatsapp, despachado_en).
+	//
+	// El sello dice CUÁNDO se tomó el lote —es lo único que mide el barrido—; QUIÉN lo tiene lo dice el
+	// token de abajo. Fueron la misma columna y era un bug: ver app.ColaLote.ClaimToken.
 	tomadoEn := s.now().Unix()
 
+	// El token se genera ANTES del UPDATE y se propaga si falla: sin token no hay fence, y sin fence este
+	// claim no debe existir (ver nuevoClaimToken). No se toca la BD, así que la cola queda como estaba.
+	claimToken, err := nuevoClaimToken()
+	if err != nil {
+		return nil, err
+	}
+
 	rows, err := s.db.QueryContext(ctx, sqlReclamar,
-		app.EstadoTomado, tomadoEn,
+		app.EstadoTomado, tomadoEn, claimToken,
 		app.EstadoNuevo, app.EstadoNuevo, app.EstadoNuevo,
 		maxFilas)
 	if err != nil {
@@ -219,10 +253,17 @@ func (s *Store) Reclamar(ctx context.Context, maxFilas int) (*app.ColaLote, erro
 		"session_id", sessionID, "chat_jid", chatJID, "filas", len(mensajes),
 		"seq_min", mensajes[0].Seq, "seq_max", mensajes[len(mensajes)-1].Seq)
 
-	// TomadoEn viaja en el lote y es EL MISMO `now` que se acaba de escribir en la columna `tomado_en`:
-	// es el token de fencing que MarcarClasificado exigirá para poder cerrar (ver app.ColaLote.TomadoEn).
-	// Recalcularlo allí con otro s.now() sería tener dos números distintos y ningún fencing.
-	return &app.ColaLote{SessionID: sessionID, ChatJID: chatJID, TomadoEn: tomadoEn, Mensajes: mensajes}, nil
+	// ClaimToken viaja en el lote y es EL MISMO valor que se acaba de escribir en la columna `claim_token`:
+	// es el token de fencing que MarcarClasificado exigirá para poder cerrar (ver app.ColaLote.ClaimToken).
+	// Regenerarlo allí sería tener dos tokens distintos y ningún fencing. TomadoEn viaja también, pero solo
+	// como dato del lease: NO es lo que se compara al cerrar.
+	return &app.ColaLote{
+		SessionID:  sessionID,
+		ChatJID:    chatJID,
+		TomadoEn:   tomadoEn,
+		ClaimToken: claimToken,
+		Mensajes:   mensajes,
+	}, nil
 }
 
 // MarcarClasificado cierra un lote ya clasificado: escribe intentJSON en la ÚLTIMA fila (la de mayor
@@ -236,11 +277,17 @@ func (s *Store) Reclamar(ctx context.Context, maxFilas int) (*app.ColaLote, erro
 // 🔴 LA TRANSACCIÓN NO BASTA, Y CREER QUE SÍ ERA EL BUG. La atomicidad resuelve «las dos sentencias se
 // ven como una»; NO resuelve «este lote sigue siendo mío». La carrera que faltaba cerrar es esta: el
 // cajero A reclama, la inferencia se pasa de los 60 s del lease, BarrerLeasesVencidos devuelve las filas
-// a `nuevo`, el cajero B las reclama, clasifica y cierra — y A termina y cierra IGUAL, pisando el
-// intent_json de B. Un `WHERE id IN (…)` pelado escribe encantado: las filas existen, RowsAffected cuadra
-// y no se loguea nada. De ahí el FENCING: las dos sentencias llevan `AND estado = 'tomado' AND
-// tomado_en = ?` con el sello que Reclamar devolvió en lote.TomadoEn (ver app.ColaLote.TomadoEn), que es
-// lo único que identifica al claim y no solo a la fila.
+// a `nuevo`, el cajero B las reclama — y A termina y cierra IGUAL, pisando el trabajo de B. Un
+// `WHERE id IN (…)` pelado escribe encantado: las filas existen, RowsAffected cuadra y no se loguea nada.
+// De ahí el FENCING: las dos sentencias llevan `AND estado = 'tomado' AND claim_token = ?` con el token
+// que Reclamar devolvió en lote.ClaimToken, que es lo único que identifica al CLAIM y no solo a la fila.
+//
+// ⚠️ EL FENCE ES EL TOKEN, NO `tomado_en`. Fue el sello, y era frágil por una razón que ningún test veía:
+// es el reloj de pared con granularidad de segundo, y el argumento que lo sostenía («entre dos claims de
+// la misma fila median ≥60 s de lease») asume que el reloj avanza. En un portátil —la plataforma
+// objetivo— un salto de NTP hacia atrás al despertar de la suspensión hace que el sello del relevo repita
+// el del claim original, y el fence deja de morder justo en el caso para el que existe. El token de
+// CSPRNG no depende del reloj. `tomado_en` conserva su otro papel, el del lease (ver BarrerLeasesVencidos).
 //
 // Y SI EL FENCE FALLA, SE HACE ROLLBACK, NO COMMIT: cerrar «las que quedan» dejaría el lote a medias —el
 // intent en una fila que no es la última del turno del relevo, o filas `clasificado` sueltas—, que es
@@ -270,11 +317,11 @@ func (s *Store) MarcarClasificado(ctx context.Context, lote *app.ColaLote, inten
 	// tiene intent», y una cadena vacía significaría «tiene un intent que es la cadena vacía».
 	intent := sql.NullString{String: intentJSON, Valid: intentJSON != ""}
 	// FENCE también aquí, y no solo en la sentencia de estado: es ESTA la que pisa contenido (el
-	// intent_json del relevo). Va primero a propósito, mientras la fila todavía está `tomado` con el sello
+	// intent_json del relevo). Va primero a propósito, mientras la fila todavía está `tomado` con el token
 	// original — la sentencia siguiente es la que lo borra.
 	if _, err := tx.ExecContext(ctx,
-		`UPDATE cola_entrantes SET intent_json = ? WHERE id = ? AND estado = ? AND tomado_en = ?`,
-		intent, ultimo.ID, app.EstadoTomado, lote.TomadoEn); err != nil {
+		`UPDATE cola_entrantes SET intent_json = ? WHERE id = ? AND estado = ? AND claim_token = ?`,
+		intent, ultimo.ID, app.EstadoTomado, lote.ClaimToken); err != nil {
 		return fmt.Errorf("colaentrantes: escribir intent en la última fila del lote (session_id=%s, wa_message_id=%s, seq=%d): %w",
 			lote.SessionID, ultimo.WAMessageID, ultimo.Seq, err)
 	}
@@ -283,37 +330,41 @@ func (s *Store) MarcarClasificado(ctx context.Context, lote *app.ColaLote, inten
 	// aquí los ids sean int64 nuestros (no entrada de usuario), el hábito de construir SQL por
 	// concatenación es lo que hay que no tener.
 	//
-	// `tomado_en = NULL` cierra el ciclo del sello: ya se ha usado como fence, y dejarlo puesto haría que
-	// una fila `clasificado` siguiera pareciendo reclamada. Hoy es inocuo (el barrido filtra por
-	// estado='tomado'), pero el despachador de la Ola 3 leerá esta tabla y no debe encontrarse un campo
-	// que miente sobre quién tiene la fila.
+	// `tomado_en = NULL, claim_token = NULL` cierra el ciclo del claim: el token ya se ha usado como fence
+	// y el sello ya no mide ningún lease; dejarlos puestos haría que una fila `clasificado` siguiera
+	// pareciendo reclamada, y por alguien concreto. Hoy es inocuo (el barrido filtra por estado='tomado'),
+	// pero el despachador de la Ola 3 leerá esta tabla y no debe encontrarse dos campos que mienten sobre
+	// quién tiene la fila.
 	args := make([]any, 0, len(lote.Mensajes)+3)
 	args = append(args, app.EstadoClasificado)
 	for i := range lote.Mensajes {
 		args = append(args, lote.Mensajes[i].ID)
 	}
-	args = append(args, app.EstadoTomado, lote.TomadoEn)
+	args = append(args, app.EstadoTomado, lote.ClaimToken)
 	marcas := strings.TrimSuffix(strings.Repeat("?,", len(lote.Mensajes)), ",")
 	res, err := tx.ExecContext(ctx,
-		`UPDATE cola_entrantes SET estado = ?, tomado_en = NULL
-		 WHERE id IN (`+marcas+`) AND estado = ? AND tomado_en = ?`, args...)
+		`UPDATE cola_entrantes SET estado = ?, tomado_en = NULL, claim_token = NULL
+		 WHERE id IN (`+marcas+`) AND estado = ? AND claim_token = ?`, args...)
 	if err != nil {
 		return fmt.Errorf("colaentrantes: marcar lote clasificado (session_id=%s, chat_jid=%s, filas=%d): %w",
 			lote.SessionID, lote.ChatJID, len(lote.Mensajes), err)
 	}
 
 	// EL FENCE, COMPROBADO ANTES DEL COMMIT (y por eso este bloque está aquí y no después, como estaba).
-	// Con `AND estado = 'tomado' AND tomado_en = ?` en el WHERE, afectar MENOS filas de las esperadas ya
+	// Con `AND estado = 'tomado' AND claim_token = ?` en el WHERE, afectar MENOS filas de las esperadas ya
 	// no significa «la poda se llevó una»: significa que el lote —entero o en parte— DEJÓ DE SER NUESTRO
 	// mientras clasificábamos. La causa dominante es el relevo por lease vencido; la poda es la otra, y se
 	// tratan igual porque en ambos casos este cierre ya no puede ser íntegro, y un cierre parcial deja el
 	// lote a medias (ver la cabecera). Así que se sale SIN Commit: el defer de arriba revierte.
 	if n, _ := res.RowsAffected(); n < int64(len(lote.Mensajes)) {
 		// Warn y no Error: no es un fallo del cajero, es la carrera funcionando. Lo que se pierde es una
-		// inferencia, no un mensaje. INV-051.1: solo identificadores y cardinalidades, nunca texto.
+		// inferencia, no un mensaje. INV-051.1: solo identificadores y cardinalidades, nunca texto — el
+		// claim_token es un identificador de claim (aleatorio, sin significado fuera de esta tabla) y es
+		// justo lo que permite emparejar este descarte con el claim que lo originó.
 		s.log.Warn("colaentrantes: el lote fue relevado (lease vencido) mientras se clasificaba; este cierre se DESCARTA entero",
 			"session_id", lote.SessionID, "chat_jid", lote.ChatJID,
-			"esperadas", len(lote.Mensajes), "afectadas", n, "tomado_en", lote.TomadoEn)
+			"esperadas", len(lote.Mensajes), "afectadas", n,
+			"claim_token", lote.ClaimToken, "tomado_en", lote.TomadoEn)
 		return fmt.Errorf("colaentrantes: cierre de lote descartado (session_id=%s, chat_jid=%s, esperadas=%d, afectadas=%d): %w",
 			lote.SessionID, lote.ChatJID, len(lote.Mensajes), n, app.ErrLoteRelevado)
 	}
@@ -351,8 +402,16 @@ func (s *Store) BarrerLeasesVencidos(ctx context.Context, lease time.Duration) (
 	// `tomado_en IS NOT NULL` además del estado: una fila `tomado` SIN sello es un bug del claim, y ante
 	// la duda no se toca (mismo criterio que la poda por TTL con `despachado_en`). Rescatarla a ciegas
 	// podría devolver a `nuevo` un lote que se está clasificando ahora mismo.
+	//
+	// Se rescata POR EL SELLO y no por el token, y no es un descuido: la pregunta del barrido es «¿cuándo
+	// se tomó esto?», que es justo lo que mide `tomado_en`; el token responde a otra («¿de quién es?») y no
+	// se ordena por él. El `claim_token = NULL` va por la MISMA razón que el `tomado_en = NULL` que ya
+	// estaba, y con la misma honestidad sobre su alcance: no es lo que impide el cierre tardío —de eso se
+	// encargan el `estado = 'tomado'` del fence y, si el relevo llega, su propio token, que sobrescribe
+	// este—, sino que una fila libre no se quede diciendo que pertenece a un cajero que ya la soltó. El
+	// despachador de la Ola 3 lee estas columnas.
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE cola_entrantes SET estado = ?, tomado_en = NULL
+		`UPDATE cola_entrantes SET estado = ?, tomado_en = NULL, claim_token = NULL
 		 WHERE estado = ? AND tomado_en IS NOT NULL AND tomado_en < ?`,
 		app.EstadoNuevo, app.EstadoTomado, corte)
 	if err != nil {
