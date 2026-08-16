@@ -94,15 +94,20 @@ const (
 // un motivo que no esté en la lista no tiene sobre y el test lo caza.
 type MotivoOmitido string
 
-// Los SIETE motivos. Son siete, no seis: `sin_texto` se añadió el 2026-08-16 (T1.8) porque
-// `classifier.FastLane("")` devuelve true y hacía pasar por `fastlane` todo mensaje NO textual
-// (imagen, audio, sticker, ubicación) — una mentira en la telemetría, no un detalle.
+// Los OCHO motivos. Fueron siete hasta el 2026-08-16 y cada añadido tiene su causa de campo:
+// `sin_texto` entró en T1.8 porque `classifier.FastLane("")` devuelve true y hacía pasar por `fastlane`
+// todo mensaje NO textual (imagen, audio, sticker, ubicación) —una mentira en la telemetría, no un
+// detalle—, y `fallo_repetido` entró en T2.19 porque un lote que siempre falla congelaba la cola entera.
 const (
 	// MotivoFastlane: el regex del fastlane resolvió el intent en µs; el cajero nunca reclama la fila.
 	// Lo escribe el LISTENER, al nacer la fila (Ola 1, T1.8).
 	MotivoFastlane MotivoOmitido = "fastlane"
 	// MotivoSinTexto: el mensaje no tiene cuerpo textual que clasificar (imagen, audio, sticker,
-	// ubicación). Lo escribe el LISTENER, y se comprueba ANTES que el fastlane (ver arriba).
+	// ubicación). Lo escribe el LISTENER, y se comprueba ANTES que el fastlane (ver arriba); y, como
+	// DEFENSA EN PROFUNDIDAD, también el CAJERO (Ola 2), cuando un lote le llega sin texto que concatenar.
+	// El cajero no debería ver nunca ese caso —el listener lo corta en T1.8—, así que si lo ve es por un
+	// bug de ese corte o por un descifrado que devolvió cadena vacía; el motivo es el mismo porque el
+	// hecho es el mismo (no había qué clasificar), y así el contador de la Ola 4 no se parte en dos.
 	MotivoSinTexto MotivoOmitido = "sin_texto"
 	// MotivoNoElegible: el mensaje no cumple las condiciones de elegibilidad del clasificador
 	// (ver intent.Decorator.eligible). No se intentó clasificar.
@@ -124,9 +129,27 @@ const (
 	MotivoDesconocido MotivoOmitido = intents.ReservedUnknown
 	// MotivoApagado: la feature `llm_intent` está apagada para esta sesión/empresa (entitlement).
 	MotivoApagado MotivoOmitido = "apagado"
+	// MotivoFalloRepetido: el lote AGOTÓ SUS INTENTOS de clasificación (ColaLote.Intentos llegó al tope
+	// WAPP_WORKER_MAX_INTENTOS) y se cierra SIN intent para que la cola pueda avanzar. Lo escribe el
+	// CAJERO (Ola 2, T2.19).
+	//
+	// 🔴 EXISTE POR UN LOTE VENENOSO QUE CONGELABA LA COLA ENTERA, y el mecanismo es peor de lo que
+	// parece. Un fallo de inferencia NO cierra el lote a propósito (es un reintento gratis: ver el bloque
+	// «QUIÉN ESCRIBE app.MotivoBreaker» en cajero.bucle), así que las filas se quedan en `tomado` y el
+	// barrido de leases las devuelve a `nuevo` a los 60 s — SIN TOCAR SU `seq`. Y el claim elige siempre
+	// la conversación con el `seq` MÁS BAJO. Un lote cuyo texto siempre hace fallar la inferencia
+	// conserva su seq, vuelve a `nuevo` y se lo lleva OTRA VEZ el siguiente claim, para siempre. Con
+	// WAPP_WORKER_MAX_CONCURRENT=1 —el default— eso es la cola entera parada: ningún otro mensaje se
+	// clasifica jamás, y el único síntoma es el contador de fallos subiendo.
+	//
+	// El reintento gratis sigue siendo lo correcto para un fallo TRANSITORIO (Ollama reiniciándose, un
+	// pico de carga); lo que faltaba era distinguirlo de un fallo PERMANENTE. El contador de intentos es
+	// esa distinción, y este motivo es lo que se escribe cuando ya no hay duda: el mensaje sale igual,
+	// sin intent, que es el fallo seguro — se pierde una clasificación, nunca un mensaje.
+	MotivoFalloRepetido MotivoOmitido = "fallo_repetido"
 )
 
-// motivosOmitido es la LISTA CANÓNICA de los siete motivos, en el orden en que se documentan. Es la
+// motivosOmitido es la LISTA CANÓNICA de los ocho motivos, en el orden en que se documentan. Es la
 // fuente de la que salen los sobres precalculados y la que debe recorrer la telemetría de la Ola 4
 // para publicar el desglose (INV-051.3: nunca agregado).
 var motivosOmitido = []MotivoOmitido{
@@ -137,6 +160,7 @@ var motivosOmitido = []MotivoOmitido{
 	MotivoBreaker,
 	MotivoDesconocido,
 	MotivoApagado,
+	MotivoFalloRepetido,
 }
 
 // MotivosOmitido devuelve una COPIA de la lista canónica de motivos. Copia y no el slice interno: un
@@ -271,6 +295,22 @@ type ColaLote struct {
 	// para el que existe. Un token aleatorio no depende del reloj en absoluto, y de paso separa las dos
 	// preguntas que la columna única confundía: «¿cuándo se tomó?» y «¿quién lo tiene?».
 	ClaimToken string
+	// Intentos es CUÁNTAS VECES SE HA RECLAMADO este lote, contando el claim que lo acaba de devolver
+	// (así que en un lote recién nacido vale 1, nunca 0). Es lo que permite al cajero distinguir un fallo
+	// TRANSITORIO —que merece su reintento gratis— de un lote VENENOSO que hay que abandonar con
+	// MotivoFalloRepetido para que la cola avance. El porqué entero está en ese motivo.
+	//
+	// SE CUENTAN RECLAMOS, NO FALLOS, y la diferencia importa: el contador lo incrementa el propio UPDATE
+	// del claim (adapters/colaentrantes/claim.go), de forma atómica con él, así que también cuenta los
+	// intentos que NADIE llegó a reportar —el cajero muerto a media inferencia, el SIGKILL, el lease
+	// vencido—, que son justo los casos que un contador escrito en el camino de fallo perdería. «Cuántas
+	// veces se ha intentado esto» es exactamente la pregunta que hay que responder.
+	//
+	// ⚠️ ES EL MÁXIMO DE LAS FILAS DEL LOTE, no una suma ni un promedio. Un claim no siempre se lleva las
+	// mismas filas (llegan mensajes nuevos a la conversación entre un intento y otro, y el tope de
+	// maxFilas puede partir el turno), así que un lote puede mezclar filas veteranas con filas recién
+	// encoladas. Basta con que UNA fila lleve N intentos para que este lote sea el que no progresa.
+	Intentos int64
 	// Mensajes son las filas reclamadas, GARANTIZADAS EN ORDEN ASCENDENTE DE Seq.
 	//
 	// 🔴 Esa garantía es del ADAPTADOR y hay que sostenerla a mano: `UPDATE … RETURNING` NO respeta el
@@ -327,6 +367,10 @@ type ColaCajero interface {
 	// tiene la fila `nuevo` de menor Seq), las marca `tomado` con su sello de lease y su token de claim, y
 	// las devuelve ya descifradas y ORDENADAS POR Seq. El token que escribió viaja de vuelta en
 	// ColaLote.ClaimToken, y es lo que MarcarClasificado exige después para poder cerrar el lote.
+	//
+	// INCREMENTA EL CONTADOR DE INTENTOS de las filas que se lleva, en el mismo UPDATE, y devuelve el
+	// máximo resultante en ColaLote.Intentos (≥1 siempre). Es lo que hace que un lote venenoso sea
+	// distinguible de un fallo transitorio: ver ColaLote.Intentos y MotivoFalloRepetido.
 	//
 	// maxFilas <= 0 CAE AL DEFAULT (DefaultColaClaimMaxFilas): es el modo normal de llamar desde el
 	// worker, que no tiene por qué conocer el número. Un 0 nunca significa «no te lleves nada» —eso

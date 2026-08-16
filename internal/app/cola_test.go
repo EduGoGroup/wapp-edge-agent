@@ -16,12 +16,12 @@ import (
 // El paquete es `app` (no `app_test`), igual que send_test.go / pair_test.go / listen_test.go, y aquí
 // hace falta: la exhaustividad se asoma a `motivosOmitido` y a `sobreOmitido`, que son privados.
 
-// TestMotivosOmitidoEsExhaustiva es EL test que hace verdadero el comentario de cola.go: las siete
-// constantes del enum están todas en la lista canónica, la lista tiene exactamente siete elementos y
+// TestMotivosOmitidoEsExhaustiva es EL test que hace verdadero el comentario de cola.go: las ocho
+// constantes del enum están todas en la lista canónica, la lista tiene exactamente ocho elementos y
 // ninguno repetido.
 //
-// Las siete se enumeran A MANO aquí, no se derivan de `motivosOmitido`: derivarlas convertiría el test en
-// una tautología («la lista contiene lo que la lista contiene»). Añadir un octavo motivo al enum sin
+// Las ocho se enumeran A MANO aquí, no se derivan de `motivosOmitido`: derivarlas convertiría el test en
+// una tautología («la lista contiene lo que la lista contiene»). Añadir un noveno motivo al enum sin
 // añadirlo a la lista canónica —el olvido exacto que rompe SobreOmitido en silencio, y con él la
 // telemetría por motivo de la Ola 4— tiene que romper AQUÍ.
 func TestMotivosOmitidoEsExhaustiva(t *testing.T) {
@@ -33,11 +33,12 @@ func TestMotivosOmitidoEsExhaustiva(t *testing.T) {
 		MotivoBreaker,
 		MotivoDesconocido,
 		MotivoApagado,
+		MotivoFalloRepetido,
 	}
 
 	lista := MotivosOmitido()
-	if len(lista) != 7 {
-		t.Fatalf("la lista canónica debe tener exactamente 7 motivos, tiene %d: %v", len(lista), lista)
+	if len(lista) != 8 {
+		t.Fatalf("la lista canónica debe tener exactamente 8 motivos, tiene %d: %v", len(lista), lista)
 	}
 
 	vistos := make(map[MotivoOmitido]int, len(lista))
@@ -86,7 +87,7 @@ func TestMotivosOmitidoDevuelveCopia(t *testing.T) {
 	}
 }
 
-// TestSobreOmitidoFormatoDeCable fija el FORMATO DE CABLE del sobre `omitido` para los siete motivos.
+// TestSobreOmitidoFormatoDeCable fija el FORMATO DE CABLE del sobre `omitido` para los ocho motivos.
 //
 // 🔴 Los JSON se escriben como LITERALES, no derivados de las constantes: si el esperado se construyera
 // con `"{\"omitido\":\""+string(m)+"\"}"` el test pasaría igual aunque alguien renombrara un motivo o
@@ -109,6 +110,7 @@ func TestSobreOmitidoFormatoDeCable(t *testing.T) {
 		{"breaker", MotivoBreaker, `{"omitido":"breaker"}`},
 		{"desconocido", MotivoDesconocido, `{"omitido":"desconocido"}`},
 		{"apagado", MotivoApagado, `{"omitido":"apagado"}`},
+		{"fallo_repetido", MotivoFalloRepetido, `{"omitido":"fallo_repetido"}`},
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
@@ -133,10 +135,10 @@ func TestSobreOmitidoFueraDeLaListaDevuelveVacio(t *testing.T) {
 	}
 }
 
-// TestEsOmitidoReconoceLosSieteSobres: la puerta que usará el despachador (Ola 3) reconoce el sobre de
-// omisión de cada uno de los siete motivos, y devuelve el motivo exacto (el desglose de la telemetría
+// TestEsOmitidoReconoceLosOchoSobres: la puerta que usará el despachador (Ola 3) reconoce el sobre de
+// omisión de cada uno de los ocho motivos, y devuelve el motivo exacto (el desglose de la telemetría
 // nunca se agrega, INV-051.3).
-func TestEsOmitidoReconoceLosSieteSobres(t *testing.T) {
+func TestEsOmitidoReconoceLosOchoSobres(t *testing.T) {
 	casos := []struct {
 		sobre string
 		want  MotivoOmitido
@@ -148,6 +150,7 @@ func TestEsOmitidoReconoceLosSieteSobres(t *testing.T) {
 		{`{"omitido":"breaker"}`, MotivoBreaker},
 		{`{"omitido":"desconocido"}`, MotivoDesconocido},
 		{`{"omitido":"apagado"}`, MotivoApagado},
+		{`{"omitido":"fallo_repetido"}`, MotivoFalloRepetido},
 	}
 	for _, c := range casos {
 		t.Run(string(c.want), func(t *testing.T) {

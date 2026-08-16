@@ -870,3 +870,155 @@ func TestBarrerLeasesSinNadaQueRescatar(t *testing.T) {
 		t.Fatalf("una fila 'tomado' SIN tomado_en no se toca; quedó en %q", got)
 	}
 }
+
+// ─────────────────────────── T2.19 · el contador de intentos ───────────────────────────
+
+// intentosDe lee el contador de reclamos persistido en una fila. Es lo único que distingue un lote que
+// falló una vez de uno que lleva fallando desde ayer.
+func intentosDe(t *testing.T, db *sql.DB, id int64) int64 {
+	t.Helper()
+	var n int64
+	if err := db.QueryRow(`SELECT intentos FROM cola_entrantes WHERE id = ?`, id).Scan(&n); err != nil {
+		t.Fatalf("leer intentos de id=%d: %v", id, err)
+	}
+	return n
+}
+
+// TestReclamarIncrementaIntentos ES EL TEST DEL DEFECTO, visto desde el store: reproduce el CICLO DEL LOTE
+// VENENOSO (claim → la inferencia falla, así que nadie cierra → el lease vence → el barrido lo devuelve a
+// `nuevo` → el claim se lo vuelve a llevar, porque conserva el `seq` más bajo) y exige que cada vuelta deje
+// rastro.
+//
+// Sin el `intentos = intentos + 1` del claim, este bucle es indistinguible de una cola sana: las filas
+// vuelven a `nuevo` intactas, el claim se las lleva otra vez y no hay un solo número que diga que esto ya
+// pasó. El contador es lo único que permite al cajero decidir; el resto del ciclo ya funcionaba —y ese es
+// justo el problema—.
+func TestReclamarIncrementaIntentos(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	clock := &fakeClock{t: time.Unix(1_700_000_000, 0)}
+	s := newStore(t, db, newFakeCrypterFor().fn, 100, 0, WithClock(clock.Now))
+
+	if err := s.Enqueue(ctx, item("A", "chat@s", "wa-1", "el texto que siempre falla")); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	// La fila nace en 0: el contador cuenta reclamos, no encolados.
+	if got := intentosDe(t, db, 1); got != 0 {
+		t.Fatalf("una fila recién encolada debe tener intentos = 0, got %d", got)
+	}
+
+	for vuelta := int64(1); vuelta <= 3; vuelta++ {
+		lote, err := s.Reclamar(ctx, 0)
+		if err != nil {
+			t.Fatalf("Reclamar (vuelta %d): %v", vuelta, err)
+		}
+		if lote == nil {
+			t.Fatalf("el claim de la vuelta %d devolvió nil con la fila en `nuevo`", vuelta)
+		}
+		// El valor que ve el CAJERO es el YA INCREMENTADO: en la primera vuelta vale 1, no 0. Si valiera 0
+		// el corte se dispararía una vuelta tarde, y en el peor caso (max_intentos = 1) nunca.
+		if lote.Intentos != vuelta {
+			t.Fatalf("lote.Intentos en la vuelta %d: got %d want %d (el RETURNING entrega el valor POSTERIOR al UPDATE)",
+				vuelta, lote.Intentos, vuelta)
+		}
+		if got := intentosDe(t, db, 1); got != vuelta {
+			t.Fatalf("intentos persistidos tras la vuelta %d: got %d want %d", vuelta, got, vuelta)
+		}
+
+		// La inferencia falla ⇒ NADIE cierra el lote. El lease vence y el barrido lo devuelve a `nuevo`,
+		// que es exactamente el camino por el que un lote venenoso se reclama para siempre.
+		clock.t = clock.t.Add(61 * time.Second)
+		n, err := s.BarrerLeasesVencidos(ctx, 0)
+		if err != nil {
+			t.Fatalf("BarrerLeasesVencidos (vuelta %d): %v", vuelta, err)
+		}
+		if n != 1 {
+			t.Fatalf("el barrido de la vuelta %d debía rescatar la fila, rescató %d", vuelta, n)
+		}
+		// 🔴 Y EL RESCATE NO REINICIA EL CONTADOR. Si el barrido pusiera `intentos = 0` —o si la columna
+		// fuera nullable y el barrido la dejara NULL—, el lote venenoso recuperaría su inmunidad en cada
+		// vuelta y el freno del cajero no se dispararía JAMÁS. El bug volvería entero, con el contador
+		// puesto y todo.
+		if got := intentosDe(t, db, 1); got != vuelta {
+			t.Fatalf("el barrido de leases NO puede reiniciar el contador: intentos = %d tras la vuelta %d", got, vuelta)
+		}
+	}
+}
+
+// TestReclamarIntentosEsElMaximoDelLote fija el criterio de agregación de app.ColaLote.Intentos: el MÁXIMO
+// de las filas, nunca la suma ni el promedio.
+//
+// El caso es real, no de laboratorio: entre un intento y el siguiente llegan mensajes NUEVOS a la misma
+// conversación, así que el claim de la tercera vuelta se lleva filas veteranas Y filas recién encoladas.
+// Con la SUMA, dos filas de un intento cada una parecerían un lote agotado y se abandonaría un turno que
+// nunca falló; con el PROMEDIO, una fila veterana se diluye entre las nuevas y el lote venenoso sobrevive
+// para siempre sin más que recibir un mensaje de vez en cuando. Basta con que UNA fila lleve N intentos
+// para que este lote sea el que no progresa.
+func TestReclamarIntentosEsElMaximoDelLote(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	s := newStore(t, db, newFakeCrypterFor().fn, 100, 0)
+
+	// Dos filas de la MISMA conversación: una veterana (ya reclamada 4 veces) y una recién llegada.
+	sembrarNuevo(t, db, 1, 10, "A", "chat@s", "wa-veterana", "el fragmento que revienta")
+	sembrarNuevo(t, db, 2, 20, "A", "chat@s", "wa-nueva", "y esto lo escribí ahora")
+	if _, err := db.Exec(`UPDATE cola_entrantes SET intentos = 4 WHERE id = 1`); err != nil {
+		t.Fatalf("envejecer la fila veterana: %v", err)
+	}
+
+	lote, err := s.Reclamar(ctx, 0)
+	if err != nil {
+		t.Fatalf("Reclamar: %v", err)
+	}
+	if lote == nil || len(lote.Mensajes) != 2 {
+		t.Fatalf("el claim debía llevarse las dos filas de la conversación, got %s", resumenLote(lote))
+	}
+	// 5 = 4 + 1 (el claim que acaba de ocurrir). Con la suma saldría 6, con el promedio 3.
+	if lote.Intentos != 5 {
+		t.Fatalf("lote.Intentos = %d, want 5 (el MÁXIMO de las filas: la veterana iba por 4 y este claim la sube a 5; "+
+			"la suma daría 6 y el promedio 3)", lote.Intentos)
+	}
+	// Y las dos filas se incrementaron por separado: el lote agrega para decidir, pero la BD no pierde el
+	// historial individual de cada fila.
+	if got := intentosDe(t, db, 1); got != 5 {
+		t.Fatalf("intentos de la fila veterana: got %d want 5", got)
+	}
+	if got := intentosDe(t, db, 2); got != 1 {
+		t.Fatalf("intentos de la fila nueva: got %d want 1", got)
+	}
+}
+
+// TestMarcarClasificadoNoTocaIntentos: cerrar un lote no reinicia el contador de sus filas.
+//
+// Importa por el ciclo de vida de la fila: `MarcarClasificado` sí limpia `tomado_en` y `claim_token`
+// (dejan de significar algo cuando la fila ya no está reclamada), y la tentación de limpiar «lo otro que
+// puso el claim» de paso es exactamente lo que no hay que hacer — el contador es el historial de la fila,
+// no el estado de un claim, y el despachador de la Ola 3 leerá esta tabla queriendo saber cuánto costó
+// clasificar cada cosa.
+func TestMarcarClasificadoNoTocaIntentos(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	s := newStore(t, db, newFakeCrypterFor().fn, 100, 0)
+
+	sembrarNuevo(t, db, 1, 10, "A", "chat@s", "wa-1", "quiero una pizza")
+	if _, err := db.Exec(`UPDATE cola_entrantes SET intentos = 2 WHERE id = 1`); err != nil {
+		t.Fatalf("envejecer la fila: %v", err)
+	}
+
+	lote, err := s.Reclamar(ctx, 0)
+	if err != nil {
+		t.Fatalf("Reclamar: %v", err)
+	}
+	if lote == nil {
+		t.Fatal("el claim devolvió nil")
+	}
+	if err := s.MarcarClasificado(ctx, lote, `{"intent":"crear_pedido"}`); err != nil {
+		t.Fatalf("MarcarClasificado: %v", err)
+	}
+	if got := estadoDe(t, db, 1); got != app.EstadoClasificado {
+		t.Fatalf("la fila debía quedar clasificada, está en %q", got)
+	}
+	if got := intentosDe(t, db, 1); got != 3 {
+		t.Fatalf("el cierre no puede reiniciar el contador: intentos = %d, want 3 (2 previos + este claim)", got)
+	}
+}
