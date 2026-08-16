@@ -31,10 +31,21 @@ func TestMain(m *testing.M) {
 //   - "" (normal): escucha y responde 200 a /v1/health; SIGTERM ⇒ shutdown limpio.
 //   - "noready":   escucha pero /v1/health responde 503 ⇒ el supervisor nunca lo ve ready.
 //   - "crash":     sale de inmediato (no llega a escuchar) ⇒ readiness falla por muerte temprana.
+//   - "diesoon":   NO escucha (hijo sin plano HTTP, como el cajero del Plan 051): vive
+//     SUPERVISOR_FAKE_LIFETIME_MS (default 300 ms) y se muere SOLO ⇒ ejercita el relanzado automático.
 func fakeAgentMain() {
 	switch os.Getenv("SUPERVISOR_FAKE_MODE") {
 	case "crash":
 		os.Exit(1)
+	case "diesoon":
+		vida := 300 * time.Millisecond
+		if raw := os.Getenv("SUPERVISOR_FAKE_LIFETIME_MS"); raw != "" {
+			if ms, err := strconv.Atoi(raw); err == nil {
+				vida = time.Duration(ms) * time.Millisecond
+			}
+		}
+		time.Sleep(vida)
+		os.Exit(3)
 	}
 
 	sock := os.Getenv("WAPP_AGENT_CONTROL_SOCKET_PATH")
