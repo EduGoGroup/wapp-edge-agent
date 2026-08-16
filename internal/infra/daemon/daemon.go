@@ -29,8 +29,16 @@ import (
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
-// singleDBFileName es el nombre de la BD ÚNICA del Edge (Plan 022 T3) bajo data_dir.
-const singleDBFileName = "edge.db"
+// SingleDBFileName es el nombre de la BD ÚNICA del Edge (Plan 022 T3) bajo data_dir.
+//
+// ESTÁ EXPORTADA porque el daemon ya NO es el único proceso que abre ese fichero: el worker-cajero
+// (`agent cajero`, Plan 051 Ola 2) lee de ahí el contrato de intenciones. Tenía el nombre duplicado en
+// un literal de cmd/agent y ese duplicado fallaba EN SILENCIO: si el nombre cambiara aquí, el cajero
+// abriría un `edge.db` vacío, `Listo()` devolvería false para siempre y el worker no reclamaría nada,
+// sin un solo error. Un símbolo compartido cuesta menos que ese modo de fallo.
+//
+// Sigue siendo el daemon el DUEÑO del fichero: es quien lo migra. El cajero sólo lo abre para leer.
+const SingleDBFileName = "edge.db"
 
 // Daemon encapsula el ciclo de vida y la orquestación de componentes del Edge Agent multi-sesión.
 type Daemon struct {
@@ -62,7 +70,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	dbDSN := cfg.DBDSN
 	if cfg.DBDialect == db.DialectSQLite && dbDSN == "" {
-		dbDSN = filepath.Join(cfg.DataDir, singleDBFileName)
+		dbDSN = filepath.Join(cfg.DataDir, SingleDBFileName)
 	}
 	database, err := db.Open(ctx, cfg.DBDialect, dbDSN)
 	if err != nil {

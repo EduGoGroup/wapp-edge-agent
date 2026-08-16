@@ -16,8 +16,14 @@ import (
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
-// intentsConfigKind es el kind de config empujada que gobierna el clasificador (Plan 029, ADR-0021).
-const intentsConfigKind = "intents"
+// IntentsConfigKind es el kind de config empujada que gobierna el clasificador (Plan 029, ADR-0021).
+//
+// ESTÁ EXPORTADA porque el worker-cajero (`agent cajero`, Plan 051 Ola 2) es OTRO PROCESO y lee ese
+// mismo registro de edge.db por su cuenta (sondea, porque el ConfigUpdate del Cloud llega por el
+// stream CloudLink que vive en `agent serve`). Tenerlo duplicado en un literal de cmd/agent fallaba en
+// silencio: con el kind desalineado el `Get` no encontraría nada, `Listo()` devolvería false para
+// siempre y el cajero no reclamaría ni una fila, sin un solo error en el log.
+const IntentsConfigKind = "intents"
 
 // IntentStack agrupa las piezas del CLASIFICADOR de intenciones (Plan 029) que el arranque cablea al conducto
 // CloudLink y al plano de control. Con la feature OFF, Decorator/Applier/Service/Prober son nil (cableado
@@ -74,7 +80,7 @@ func (s *IntentStack) ConfigVersion() string {
 	if s == nil || s.Store == nil {
 		return ""
 	}
-	rec, ok, err := s.Store.Get(context.Background(), intentsConfigKind)
+	rec, ok, err := s.Store.Get(context.Background(), IntentsConfigKind)
 	if err != nil || !ok {
 		return ""
 	}
@@ -141,7 +147,7 @@ func BuildIntent(cfg config.Config, database *sql.DB, log sharedlogger.Logger) *
 	dec := intent.New(cls, time.Duration(cfg.Intent.TimeoutMS)*time.Millisecond, log)
 
 	svc := edgeconfig.NewService(store, log)
-	svc.RegisterKind(intentsConfigKind,
+	svc.RegisterKind(IntentsConfigKind,
 		func(payload []byte) error { _, err := intents.ParseAndValidate(payload); return err },
 		func(rec edgeconfig.Record) {
 			parsed, err := intents.ParseAndValidate(rec.Payload)

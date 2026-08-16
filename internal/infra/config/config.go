@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/cajero"
 	sharedconfig "github.com/EduGoGroup/wapp-shared/config"
 )
 
@@ -87,6 +88,151 @@ const DefaultColaClaimMaxFilas = app.DefaultColaClaimMaxFilas
 // acortarlo empeora las cosas — el argumento completo (p95 de 3.736 ms, 16× por debajo) está en
 // app.DefaultColaLeaseSegundos. Configurable por WAPP_AGENT_COLA_LEASE_SECONDS; <=0 cae al default.
 const DefaultColaLeaseSeconds = app.DefaultColaLeaseSegundos
+
+// ─────────────────────────────────────────────────────────────────────────────
+// El WORKER-CAJERO (Plan 051 Ola 2) — prefijo WAPP_WORKER_, NO WAPP_AGENT_
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// WorkerEnvPrefix es el prefijo de las variables del worker-cajero. Es DISTINTO de EnvPrefix a
+// propósito y no es un descuido: el design §4 y las tareas T2.3/T2.5 nombran literalmente
+// `WAPP_WORKER_MAX_CONCURRENT`, `WAPP_WORKER_POLL_MS`, etc., porque el cajero es un PROCESO APARTE
+// (el tercer hijo de `wapp-ctl`) y su unidad de systemd/LaunchAgent tiene su propio bloque de entorno.
+// Meterlas bajo WAPP_AGENT_ las mezclaría con las del daemon, que es justo lo que la separación de
+// procesos evita.
+//
+// Se leen con un SEGUNDO Loader (ver Load) en vez de con os.Getenv a pelo, para heredar el mismo
+// comportamiento que el resto del fichero: un valor presente-pero-inválido no se traga en silencio,
+// se avisa y se cae al default.
+const WorkerEnvPrefix = "WAPP_WORKER_"
+
+// DefaultWorkerMaxConcurrent son las inferencias SIMULTÁNEAS que el cajero permite. Es 1 y está
+// CERRADO por la medición de la O0 en el VPS AMD real (ADR-0038 Enmienda 1 §(d)): con una sola
+// instancia de Ollama, dos inferencias a la vez se pisan los hilos. El design §4 y el ADR-0038 §3
+// decían «2» y quedan corregidos. Configurable por WAPP_WORKER_MAX_CONCURRENT; <=0 cae al default.
+const DefaultWorkerMaxConcurrent = 1
+
+// DefaultWorkerPollMS es cada cuánto (ms) el cajero vuelve a mirar la cola cuando está vacía. 500 ms
+// es <15 % del coste de la inferencia que viene después (p95 medida: 3.736 ms) y deja el proceso a
+// ~2 consultas/s contra un SQLite local. La ALTERNATIVA —`PRAGMA data_version`— sigue SIN DECIDIR y
+// exige medición con el worker vivo delante (T2.7, segunda mitad). Configurable por
+// WAPP_WORKER_POLL_MS; <=0 cae al default.
+const DefaultWorkerPollMS = 500
+
+// DefaultWorkerInferenceTimeoutMS es el plazo de UNA inferencia del worker-cajero.
+//
+// 🔴 ES UN NÚMERO DISTINTO DE DefaultIntentTimeoutMS (3000 ms) Y TIENE QUE SERLO. Aquel es el
+// presupuesto del camino INLINE —el decorador que clasifica dentro del handler de whatsmeow— y es
+// corto porque su trabajo es SOLTAR EL HANDLER: pasado el plazo, el mensaje se entrega sin intent y la
+// sesión sigue viva. El worker existe justo para lo contrario: se sacó la inferencia a otro proceso
+// PARA PODER TARDAR sin comerse el proceso que mantiene los sockets.
+//
+// Heredar aquí los 3 s lo calibraba PARA FALLAR. La O0 midió p50 = 2.613 ms y p95 = 3.736 ms sobre el
+// VPS real (docs/plans/051-worker-cajero-edge/O0-resultados-2026-08-09.md), o sea que 3 s queda POR
+// DEBAJO de la p95: ~20-40 % de las inferencias abortarían, cada aborto es un fallo, 5 seguidos abren
+// el breaker 60 s, las filas se quedan en `tomado`, el barrido las devuelve a `nuevo`, se re-reclaman
+// y vuelven a expirar. Un bucle que no progresa hasta que el tope de la cola las descarta — y sin un
+// solo error que lo delate.
+//
+// 15 s son ≈4× la p95, la misma clase de holgura con la que se eligió el lease de 60 s (≈16×).
+// Configurable por WAPP_WORKER_INFERENCE_TIMEOUT_MS; <=0 cae al default.
+const DefaultWorkerInferenceTimeoutMS = cajero.DefaultInferenceTimeoutMS
+
+// DefaultWorkerMaxIntentos es cuántas veces se RECLAMA un lote antes de que el cajero lo abandone con el
+// sobre `{"omitido":"fallo_repetido"}` (T2.19). Es 3: dos reintentos gratis y a la tercera se cierra.
+//
+// 🔴 EXISTE PORQUE UN SOLO LOTE VENENOSO CONGELABA LA COLA ENTERA. Un fallo de inferencia no cierra el
+// lote a propósito (reintento gratis: las filas se quedan en `tomado` y el barrido las devuelve a `nuevo`),
+// pero el barrido NO toca el `seq` y el claim elige siempre la conversación de `seq` más bajo — así que un
+// lote cuyo texto siempre falla se lo vuelve a llevar el claim siguiente, y el siguiente, para siempre. Con
+// WAPP_WORKER_MAX_CONCURRENT=1 (el default) ningún otro mensaje se clasifica jamás, y el único síntoma es
+// el contador de fallos subiendo.
+//
+// EL PORQUÉ DEL 3: dos reintentos —hasta ~2·lease, o sea unos 2 minutos con los defaults— cubren de sobra
+// un Ollama que se reinicia o un pico de carga, que es la clase de fallo que se arregla sola y merece el
+// reintento. Un tercer fallo consecutivo del MISMO lote ya no se explica por el azar: es un patrón, y a
+// partir de ahí cada reintento es una inferencia pagada que no va a funcionar mientras bloquea a los demás.
+// Configurable por WAPP_WORKER_MAX_INTENTOS; <=0 cae al default (un 0 significaría abandonar cada lote en
+// su primer claim, sin llegar a clasificar nada).
+const DefaultWorkerMaxIntentos = cajero.DefaultMaxIntentos
+
+// DefaultWorkerStatsEveryMS es cada cuánto el bucle del cajero emite el bloque COMPLETO de contadores
+// en un Info. El cajero NO tiene plano de control (deliberado: no se levanta un socket /v1 para
+// exponer seis contadores), así que sin este latido los contadores sólo son legibles cuando el proceso
+// muere. La publicación al HEARTBEAT —la que los saca de la máquina— es de la OLA 4.
+//
+// 🔴 SU GUARDARRAÍL ES DISTINTO DEL DE LOS DEMÁS: aquí el CERO ES VÁLIDO y significa DESACTIVADO (un
+// operador con el log a nivel info y muchos tenants puede querer callarlo). Sólo un valor NEGATIVO cae
+// al default. Configurable por WAPP_WORKER_STATS_EVERY_MS.
+const DefaultWorkerStatsEveryMS = 5 * 60 * 1000
+
+// Los CUATRO números del modelo (techo de entrada, hilos, contexto y tokens de salida) se REEXPORTAN,
+// NO se teclean aquí: el número tiene un dueño y tenerlo escrito dos veces es la duplicación
+// silenciosa de siempre — alguien sube el techo en un sitio y el otro sigue mintiendo.
+//
+// SE REEXPORTAN DESDE internal/app/cajero, NO desde el módulo del clasificador. El origen último sigue
+// siendo `classifier` (que los exporta EXPRESAMENTE para este consumidor: «el caller (el worker cajero
+// del Edge) las necesita para su config y NO debe duplicar los números a ciegas», classifier.go:22-23),
+// pero el escalón intermedio es el paquete del WORKER, que es quien los usa por derecho propio.
+// Es el mismo criterio que arriba con los dos defaults del lado cajero (internal/app/cola.go): el
+// default de un puerto vive en el puerto, no en la infraestructura que lo configura. Importar
+// `classifier` desde aquí sólo para reexportar cuatro enteros metía además ollama→net/http en el grafo
+// de todo el que importa `config`, wapp-ctl incluido.
+//
+// Lo que config aporta encima es (a) el nombre de la variable de entorno, (b) el guardarraíl del <=0
+// y (c) el punto donde el operador los ve juntos. El porqué de cada valor está en el doc comment de la
+// constante de origen y no se repite aquí.
+
+// DefaultWorkerMaxRunes es el TECHO de runas del texto que se manda a clasificar (T2.5): sin techo,
+// pegar ~65 KB en un chat basta para que la inferencia tarde lo bastante como para contar fallos y
+// ABRIR EL BREAKER COMPARTIDO, apagando la clasificación de todas las sesiones. Es la vía más barata
+// que existe hoy para denegar el servicio del clasificador desde fuera. El porqué del 4000, en
+// classifier.DefaultMaxRunes. Configurable por WAPP_WORKER_MAX_RUNES; <=0 cae al default.
+const DefaultWorkerMaxRunes = cajero.DefaultMaxRunes
+
+// DefaultWorkerNumThread son los hilos de inferencia que se le piden a Ollama. Lo fijó la medición de
+// la O0 sobre el VPS AMD real (el ADR-0038 §3 y el design §4 decían «2» y quedaron corregidos); no se
+// re-discute sin medición. Configurable por WAPP_WORKER_NUM_THREAD; <=0 cae al default.
+const DefaultWorkerNumThread = cajero.DefaultNumThread
+
+// DefaultWorkerNumPredict es el tope de tokens que el modelo puede GENERAR en una clasificación: acota
+// una generación desbocada (un modelo pequeño que entra en bucle ante una entrada degenerada no puede
+// quemar tiempo sin límite). El porqué del número, en classifier.DefaultNumPredict. Configurable por
+// WAPP_WORKER_NUM_PREDICT; <=0 cae al default.
+const DefaultWorkerNumPredict = cajero.DefaultNumPredict
+
+// DefaultWorkerNumCtx es la ventana de contexto (tokens) que se le pide a Ollama. Se manda EXPLÍCITA
+// para no depender del default del build de Ollama ni del Modelfile del modelo, que cambian entre
+// versiones, y hace de segundo techo si el de runas fallara. Subirla cuesta RAM permanente en la caja
+// del cliente (la KV cache crece lineal con num_ctx), así que no se sube «por si acaso»: el argumento
+// completo está en classifier.DefaultNumCtx. Configurable por WAPP_WORKER_NUM_CTX; <=0 cae al default.
+const DefaultWorkerNumCtx = cajero.DefaultNumCtx
+
+// WorkerConfig agrupa los parámetros del worker-cajero (Plan 051 Ola 2). Se leen del bloque `worker:`
+// del YAML y del entorno con prefijo WAPP_WORKER_ (ver WorkerEnvPrefix).
+type WorkerConfig struct {
+	// MaxConcurrent son las plazas del semáforo de inferencias (T2.3). Default 1, CERRADO por la O0.
+	MaxConcurrent int `yaml:"max_concurrent"`
+	// PollMS es el intervalo del poll cuando la cola está vacía (T2.7, primera opción). Default 500.
+	PollMS int `yaml:"poll_ms"`
+	// MaxRunes es el techo de runas de la entrada a clasificar (T2.5). Default 4000.
+	MaxRunes int `yaml:"max_runes"`
+	// NumThread son los hilos que se le piden a Ollama por inferencia (T2.5). Default 5.
+	NumThread int `yaml:"num_thread"`
+	// NumPredict es el tope de tokens generados (T2.5). Default DefaultWorkerNumPredict (256).
+	NumPredict int `yaml:"num_predict"`
+	// NumCtx es la ventana de contexto en tokens (T2.5). Default 4096.
+	NumCtx int `yaml:"num_ctx"`
+	// MaxIntentos es cuántos reclamos aguanta un lote antes de abandonarlo con `fallo_repetido` (T2.19).
+	// Default DefaultWorkerMaxIntentos (3). Es el freno del lote venenoso: ver la constante.
+	MaxIntentos int `yaml:"max_intentos"`
+	// InferenceTimeoutMS acota UNA inferencia del worker. Default DefaultWorkerInferenceTimeoutMS
+	// (15000). NO es Intent.TimeoutMS: ver el doc comment de la constante, el porqué está ahí entero.
+	InferenceTimeoutMS int `yaml:"inference_timeout_ms"`
+	// StatsEveryMS es la cadencia del latido de contadores en el log del cajero. Default
+	// DefaultWorkerStatsEveryMS (300000 = 5 min). 0 lo DESACTIVA (guardarraíl distinto: sólo lo
+	// negativo cae al default).
+	StatsEveryMS int `yaml:"stats_every_ms"`
+}
 
 // DefaultPlatformAPIBaseURL es la URL base por defecto de la API PÚBLICA HTTP de la plataforma cloud
 // (wapp-cloud-platform, puerto público 8103, rutas /api/v1/...): NO confundir con CloudLink (gRPC/mTLS,
@@ -190,13 +336,15 @@ type Config struct {
 	// T2.1): que una conversación gigante no monopolice al cajero. Default 20. Se lee de
 	// WAPP_AGENT_COLA_CLAIM_MAX_FILAS; un valor <=0 cae al default.
 	//
-	// AÚN NO SE CABLEA en wiring/daemon: el proceso worker que la consume se construye en otra tanda.
-	// Aquí solo se declara y se lee, para que el operador ya la pueda fijar y el gate de config la cubra.
+	// CABLEADA desde T2.2: la consume `agent cajero` (cmd/agent/cajero.go) como cajero.Deps.MaxFilas.
 	ColaClaimMaxFilas int `yaml:"cola_claim_max_filas"`
 	// ColaLeaseSeconds es el lease del claim en segundos (Plan 051 Ola 2, T2.7): una fila `tomado` más
 	// vieja que esto vuelve a `nuevo`. Default 60, margen amplio A PROPÓSITO (ver
 	// DefaultColaLeaseSeconds). Se lee de WAPP_AGENT_COLA_LEASE_SECONDS; un valor <=0 cae al default.
-	// Igual que ColaClaimMaxFilas, aún no se cablea: la consume el worker de otra tanda.
+	//
+	// CABLEADA desde T2.2: `agent cajero` la usa a la vez como lease del claim y como PERIODO del
+	// barrido de leases vencidos (cajero.Deps.Lease), de modo que la espera de rescate queda acotada a
+	// [lease, 2·lease] sin un segundo número que mantener sincronizado.
 	ColaLeaseSeconds int `yaml:"cola_lease_seconds"`
 	// DiagLogLines es cuántas líneas del ring buffer de logs incluye el bundle de diagnóstico bajo demanda
 	// (Plan 031 T8, ADR-0023). Default 500 (contexto reciente amplio sin acercarse al tope de 4 MiB del
@@ -214,6 +362,10 @@ type Config struct {
 	// el Edge envuelve el sink de entrada con el clasificador (Ollama local) y persiste/aplica la config de
 	// intenciones que empuja el Cloud.
 	Intent IntentConfig `yaml:"intent"`
+	// Worker configura el WORKER-CAJERO (Plan 051 Ola 2), el tercer hijo de `wapp-ctl`. OJO: sus
+	// variables de entorno NO llevan el prefijo WAPP_AGENT_ sino WAPP_WORKER_ (ver WorkerEnvPrefix);
+	// el bloque YAML sí es `worker:` dentro del mismo config.yaml, porque el fichero es compartido.
+	Worker WorkerConfig `yaml:"worker"`
 	// EnableAlphaTestAccounts activa el selector de usuarios de prueba (Alpha) en la UI de login. Default: false.
 	EnableAlphaTestAccounts bool `yaml:"enable_alpha_test_accounts"`
 	// PlatformAPIBaseURL es la URL base de la API PÚBLICA HTTP de la plataforma cloud (puerto 8103,
@@ -352,6 +504,17 @@ func defaults() Config {
 			Model:     DefaultIntentModel,
 			TimeoutMS: DefaultIntentTimeoutMS,
 		},
+		Worker: WorkerConfig{
+			MaxConcurrent:      DefaultWorkerMaxConcurrent,
+			PollMS:             DefaultWorkerPollMS,
+			MaxRunes:           DefaultWorkerMaxRunes,
+			NumThread:          DefaultWorkerNumThread,
+			NumPredict:         DefaultWorkerNumPredict,
+			NumCtx:             DefaultWorkerNumCtx,
+			MaxIntentos:        DefaultWorkerMaxIntentos,
+			InferenceTimeoutMS: DefaultWorkerInferenceTimeoutMS,
+			StatsEveryMS:       DefaultWorkerStatsEveryMS,
+		},
 		EnableAlphaTestAccounts: false,
 		PlatformAPIBaseURL:      DefaultPlatformAPIBaseURL,
 	}
@@ -416,6 +579,21 @@ func Load(path string) (Config, error) {
 	cfg.EnableAlphaTestAccounts = loader.GetBool("ALPHA_TEST_ACCOUNTS", loader.GetBool("ENABLE_ALPHA_LOGIN", cfg.EnableAlphaTestAccounts))
 	cfg.PlatformAPIBaseURL = loader.GetString("PLATFORM_API_BASE_URL", cfg.PlatformAPIBaseURL)
 
+	// El WORKER-CAJERO se lee con un SEGUNDO loader, con prefijo WAPP_WORKER_ y SIN fichero: el YAML
+	// del bloque `worker:` ya lo pobló el Unmarshal de arriba (es el mismo config.yaml), así que aquí
+	// sólo hace falta el overlay de entorno. La razón del prefijo distinto está en WorkerEnvPrefix: el
+	// cajero es otro proceso, con su propio bloque de entorno en la unidad que lo lanza.
+	workerLoader := sharedconfig.New(sharedconfig.WithEnvPrefix(WorkerEnvPrefix))
+	cfg.Worker.MaxConcurrent = workerLoader.GetInt("MAX_CONCURRENT", cfg.Worker.MaxConcurrent)
+	cfg.Worker.PollMS = workerLoader.GetInt("POLL_MS", cfg.Worker.PollMS)
+	cfg.Worker.MaxRunes = workerLoader.GetInt("MAX_RUNES", cfg.Worker.MaxRunes)
+	cfg.Worker.NumThread = workerLoader.GetInt("NUM_THREAD", cfg.Worker.NumThread)
+	cfg.Worker.NumPredict = workerLoader.GetInt("NUM_PREDICT", cfg.Worker.NumPredict)
+	cfg.Worker.NumCtx = workerLoader.GetInt("NUM_CTX", cfg.Worker.NumCtx)
+	cfg.Worker.MaxIntentos = workerLoader.GetInt("MAX_INTENTOS", cfg.Worker.MaxIntentos)
+	cfg.Worker.InferenceTimeoutMS = workerLoader.GetInt("INFERENCE_TIMEOUT_MS", cfg.Worker.InferenceTimeoutMS)
+	cfg.Worker.StatsEveryMS = workerLoader.GetInt("STATS_EVERY_MS", cfg.Worker.StatsEveryMS)
+
 	// Puerto de runtime CloudLink por defecto (Plan 026 T3): si nadie lo fijó (YAML/env), "8101"
 	// (topología de prod, design §1). Con él el enroll deriva y persiste el Endpoint de runtime.
 	if cfg.CloudLink.RuntimePort == "" {
@@ -477,6 +655,48 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Intent.TimeoutMS <= 0 {
 		cfg.Intent.TimeoutMS = DefaultIntentTimeoutMS
+	}
+
+	// Worker-cajero (Plan 051 Ola 2): TODOS sus números caen al default si son <=0. Ninguno es un
+	// invariante de seguridad, pero cada uno tiene su forma propia de romper el worker con un cero:
+	// max_concurrent=0 dejaría un semáforo sin plazas (el bucle se bloquearía para siempre en el claim),
+	// poll_ms=0 convertiría la espera en espera ACTIVA quemando un core con la cola vacía, max_runes=0
+	// dejaría la entrada sin techo (la DoS de T2.5 de vuelta), y num_thread/num_predict/num_ctx a 0
+	// viajarían a Ollama como opciones explícitas absurdas en vez de dejar que él aplique las suyas.
+	if cfg.Worker.MaxConcurrent <= 0 {
+		cfg.Worker.MaxConcurrent = DefaultWorkerMaxConcurrent
+	}
+	if cfg.Worker.PollMS <= 0 {
+		cfg.Worker.PollMS = DefaultWorkerPollMS
+	}
+	if cfg.Worker.MaxRunes <= 0 {
+		cfg.Worker.MaxRunes = DefaultWorkerMaxRunes
+	}
+	if cfg.Worker.NumThread <= 0 {
+		cfg.Worker.NumThread = DefaultWorkerNumThread
+	}
+	if cfg.Worker.NumPredict <= 0 {
+		cfg.Worker.NumPredict = DefaultWorkerNumPredict
+	}
+	if cfg.Worker.NumCtx <= 0 {
+		cfg.Worker.NumCtx = DefaultWorkerNumCtx
+	}
+	// max_intentos=0 abandonaría TODOS los lotes en su primer claim, con el sobre `fallo_repetido` y sin
+	// haber llamado a Ollama ni una vez: la clasificación entera apagada en silencio, que es peor que no
+	// tener el freno. Y un negativo no significa nada. Los dos caen al default.
+	if cfg.Worker.MaxIntentos <= 0 {
+		cfg.Worker.MaxIntentos = DefaultWorkerMaxIntentos
+	}
+	// inference_timeout_ms=0 dejaría la inferencia SIN plazo propio (colgada del ctx del proceso, o sea
+	// sin plazo en la práctica), que es peor que un plazo mal elegido: una inferencia patológica se
+	// quedaría con la plaza del semáforo hasta que el lease la relevara.
+	if cfg.Worker.InferenceTimeoutMS <= 0 {
+		cfg.Worker.InferenceTimeoutMS = DefaultWorkerInferenceTimeoutMS
+	}
+	// 🔴 EL GUARDARRAÍL DE stats_every_ms ES DISTINTO Y A PROPÓSITO: el CERO es un valor legítimo que
+	// significa DESACTIVADO, no un dedazo. Sólo lo NEGATIVO —que no significa nada— cae al default.
+	if cfg.Worker.StatsEveryMS < 0 {
+		cfg.Worker.StatsEveryMS = DefaultWorkerStatsEveryMS
 	}
 
 	// API pública de la plataforma (C-03/T3.5): un valor vacío (tecleado mal en YAML/env) cae al default en
