@@ -555,6 +555,10 @@ func TestOnMessage_Cola_SinTextoNaceConMotivoPropio(t *testing.T) {
 	if item.Estado != app.EstadoClasificado {
 		t.Fatalf("estado = %q, quería %q (el cajero no tiene nada que clasificar)", item.Estado, app.EstadoClasificado)
 	}
+	// LITERAL A PROPÓSITO, no app.SobreOmitido(app.MotivoSinTexto): este test fija el FORMATO DE CABLE
+	// que se persiste en la columna, y hacerlo contra la misma función que lo produce no probaría nada
+	// (un cambio en el enum pasaría verde arrastrando el test consigo). El literal es el testigo
+	// independiente; si el sobre cambia de forma, aquí tiene que doler.
 	if item.IntentJSON != `{"omitido":"sin_texto"}` {
 		t.Fatalf("intent = %q, quería la marca de omisión por falta de texto", item.IntentJSON)
 	}
@@ -621,6 +625,8 @@ func TestOnMessage_Cola_FastLaneNaceClasificado(t *testing.T) {
 	if item.Estado != app.EstadoClasificado {
 		t.Fatalf("estado = %q, quería %q", item.Estado, app.EstadoClasificado)
 	}
+	// LITERAL A PROPÓSITO (mismo criterio que en el test de sin_texto, ver arriba): el test fija el
+	// formato de cable con independencia de la constante que hoy lo produce.
 	if item.IntentJSON != `{"omitido":"fastlane"}` {
 		t.Fatalf("intent = %q, quería la marca de omisión del fastlane", item.IntentJSON)
 	}
@@ -648,6 +654,206 @@ func TestOnMessage_Cola_SinHoraUtilizableEncolaConSelloLocal(t *testing.T) {
 	}
 	if got := calls.snapshot(); len(got) != 2 || got[0] != "enqueue" || got[1] != "deliver" {
 		t.Fatalf("orden de llamadas = %v, quería [enqueue deliver]", got)
+	}
+}
+
+// --- puerta de elegibilidad en el listener (Plan 051 Ola 2 · T2.12) ---
+
+// apagado es el predicado de un clasificador APAGADO, para WithClasificadorActivo. Existe con nombre
+// propio porque aparece en casi todos los tests de esta sección y un `func() bool { return false }` suelto
+// en cada uno esconde de qué va el caso.
+func apagado() bool { return false }
+
+// grupoMessage arma un entrante EN VIVO que viene de un GRUPO. Solo marca IsGroup: es el único campo que
+// el listener consulta para juzgar la elegibilidad (igual que intent.Decorator.eligible mira evt.IsGroup),
+// así que fabricar un JID @g.us no probaría nada más y ataría el test a un detalle que el código no usa.
+func grupoMessage(id, text string) *events.Message {
+	msg := liveMessage(id, text)
+	msg.Info.IsGroup = true
+	return msg
+}
+
+// grupoSinTexto es una imagen/sticker recibida EN UN GRUPO: el caso que solapa las dos primeras ramas del
+// switch y donde tiene que ganar `sin_texto` (ver TestOnMessage_Cola_OrdenDeLosMotivos).
+func grupoSinTexto(id string) *events.Message {
+	msg := grupoMessage(id, "")
+	msg.Message = nil
+	return msg
+}
+
+// TestOnMessage_Cola_GrupoNaceNoElegible: T2.12 — el defecto que esta tarea cierra. Antes, un mensaje de
+// GRUPO con texto nacía `nuevo`, el cajero lo reclamaba y lo mandaba a Ollama: carga que el Edge NUNCA ha
+// clasificado (intent.Decorator.eligible la filtra desde el Plan 029) colándose por la puerta nueva de la
+// cola, y justo sobre el recurso que el semáforo de 1 plaza existe para gobernar. Ahora nace resuelto.
+func TestOnMessage_Cola_GrupoNaceNoElegible(t *testing.T) {
+	cola := &spyCola{}
+	l := NewListener(&spySink{}, quietLogger(), WithCola(cola), WithSessionID("sess-1"))
+
+	l.handleEvent(context.Background(), grupoMessage("MSG-GRUPO", "quiero dos empanadas"))
+
+	if len(cola.got) != 1 {
+		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
+	}
+	item := cola.got[0]
+	if item.Estado != app.EstadoClasificado {
+		t.Fatalf("estado = %q, quería %q: un mensaje de grupo NO puede quedar reclamable por el cajero",
+			item.Estado, app.EstadoClasificado)
+	}
+	// LITERAL A PROPÓSITO (mismo criterio que sin_texto/fastlane, ver arriba): el test fija el FORMATO DE
+	// CABLE que se persiste en la columna, con independencia de la constante que hoy lo produce.
+	if item.IntentJSON != `{"omitido":"no_elegible"}` {
+		t.Fatalf("intent = %q, quería la marca de omisión por no elegible", item.IntentJSON)
+	}
+}
+
+// TestOnMessage_Cola_ClasificadorApagadoNaceApagado: con la feature apagada, un mensaje que por lo demás
+// sería perfectamente clasificable (directo, con texto, que el fastlane no atrapa) nace resuelto con
+// `apagado`. Filtrarlo AQUÍ y no en el cajero es el punto de T2.12: en el cajero ya habría costado una
+// plaza del semáforo y un claim.
+func TestOnMessage_Cola_ClasificadorApagadoNaceApagado(t *testing.T) {
+	cola := &spyCola{}
+	l := NewListener(&spySink{}, quietLogger(),
+		WithCola(cola), WithSessionID("sess-1"), WithClasificadorActivo(apagado))
+
+	l.handleEvent(context.Background(), liveMessage("MSG-OFF", "quiero dos empanadas"))
+
+	if len(cola.got) != 1 {
+		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
+	}
+	item := cola.got[0]
+	if item.Estado != app.EstadoClasificado {
+		t.Fatalf("estado = %q, quería %q: con la feature apagada no hay a quién preguntar",
+			item.Estado, app.EstadoClasificado)
+	}
+	if item.IntentJSON != `{"omitido":"apagado"}` {
+		t.Fatalf("intent = %q, quería la marca de omisión por feature apagada", item.IntentJSON)
+	}
+}
+
+// TestOnMessage_Cola_OrdenDeLosMotivos: el ORDEN de las ramas es contrato, no casualidad. Se comprueban los
+// tres solapes que importan; en los tres los cinco caminos acabarían igual (mensaje SIN intención), así que
+// lo único que se está fijando es QUÉ SE APRENDE al mirar la telemetría — que es de lo que va INV-051.3.
+func TestOnMessage_Cola_OrdenDeLosMotivos(t *testing.T) {
+	cases := []struct {
+		nombre  string
+		activo  func() bool // nil ⇒ opción no cableada (clasificador activo por default)
+		mensaje func() *events.Message
+		want    string
+		porque  string
+	}{
+		{
+			nombre:  "grupo sin texto gana sin_texto",
+			mensaje: func() *events.Message { return grupoSinTexto("MSG-G-IMG") },
+			want:    `{"omitido":"sin_texto"}`,
+			porque:  "una imagen de grupo no tiene NADA que clasificar; contarla como no_elegible escondería el volumen de tráfico no textual",
+		},
+		{
+			nombre:  "grupo con la feature apagada gana no_elegible",
+			activo:  apagado,
+			mensaje: func() *events.Message { return grupoMessage("MSG-G-OFF", "quiero dos empanadas") },
+			want:    `{"omitido":"no_elegible"}`,
+			porque:  "ser de grupo es una propiedad del MENSAJE y no cambia al encender la feature; el estado del sistema se juzga después",
+		},
+		{
+			nombre:  "texto del fastlane con la feature apagada gana apagado",
+			activo:  apagado,
+			mensaje: func() *events.Message { return liveMessage("MSG-FAST-OFF", "2") },
+			want:    `{"omitido":"apagado"}`,
+			porque:  "si el fastlane fuera antes, con la feature apagada la telemetría mostraría una MEZCLA de fastlane y apagado en vez del 100 % de apagado que explica lo que pasa",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.nombre, func(t *testing.T) {
+			cola := &spyCola{}
+			opts := []ListenerOption{WithCola(cola), WithSessionID("sess-1")}
+			if c.activo != nil {
+				opts = append(opts, WithClasificadorActivo(c.activo))
+			}
+			l := NewListener(&spySink{}, quietLogger(), opts...)
+
+			l.handleEvent(context.Background(), c.mensaje())
+
+			if len(cola.got) != 1 {
+				t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
+			}
+			item := cola.got[0]
+			if item.Estado != app.EstadoClasificado {
+				t.Fatalf("estado = %q, quería %q", item.Estado, app.EstadoClasificado)
+			}
+			if item.IntentJSON != c.want {
+				t.Fatalf("intent = %q, quería %q — %s", item.IntentJSON, c.want, c.porque)
+			}
+		})
+	}
+}
+
+// TestOnMessage_Cola_SinPredicadoNoSeFiltraPorApagado: el DEFAULT SEGURO. Sin WithClasificadorActivo (la
+// opción no cableada, o cableada con nil) el filtro NO se activa por accidente: un mensaje normal sigue
+// naciendo `nuevo` y llega al cajero. La asimetría es deliberada — un cableado incompleto debe clasificar
+// de más (ruidoso, medible, sin pérdida de negocio), nunca dejar de clasificar en silencio.
+func TestOnMessage_Cola_SinPredicadoNoSeFiltraPorApagado(t *testing.T) {
+	for _, c := range []struct {
+		nombre string
+		opts   []ListenerOption
+	}{
+		{"opción no cableada", nil},
+		{"opción cableada con nil", []ListenerOption{WithClasificadorActivo(nil)}},
+	} {
+		t.Run(c.nombre, func(t *testing.T) {
+			cola := &spyCola{}
+			opts := append([]ListenerOption{WithCola(cola), WithSessionID("sess-1")}, c.opts...)
+			l := NewListener(&spySink{}, quietLogger(), opts...)
+
+			l.handleEvent(context.Background(), liveMessage("MSG-DEFAULT", "quiero dos empanadas"))
+
+			if len(cola.got) != 1 {
+				t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
+			}
+			item := cola.got[0]
+			if item.Estado != app.EstadoNuevo || item.IntentJSON != "" {
+				t.Fatalf("estado=%q intent=%q; sin predicado el clasificador se considera ACTIVO y la fila debe quedar reclamable",
+					item.Estado, item.IntentJSON)
+			}
+		})
+	}
+}
+
+// TestOnMessage_Cola_DirectoConClasificadorActivoNaceNuevo: la NO-REGRESIÓN del camino que SÍ debe llegar
+// al cajero. Un mensaje directo, con texto, con el clasificador activo y que el fastlane no atrapa sigue
+// naciendo `nuevo` y sin sobre — si esto se rompe, T2.12 habría apagado el clasificador entero en vez de
+// filtrar lo que sobra.
+func TestOnMessage_Cola_DirectoConClasificadorActivoNaceNuevo(t *testing.T) {
+	cola := &spyCola{}
+	l := NewListener(&spySink{}, quietLogger(),
+		WithCola(cola), WithSessionID("sess-1"),
+		WithClasificadorActivo(func() bool { return true }))
+
+	l.handleEvent(context.Background(), liveMessage("MSG-VIVO", "quiero dos empanadas"))
+
+	if len(cola.got) != 1 {
+		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
+	}
+	item := cola.got[0]
+	if item.Estado != app.EstadoNuevo || item.IntentJSON != "" {
+		t.Fatalf("estado=%q intent=%q; el camino sano debe nacer nuevo y SIN sobre (lo reclama el cajero)",
+			item.Estado, item.IntentJSON)
+	}
+}
+
+// TestOnMessage_Cola_ColaNilNoConsultaElInterruptor: el predicado NO se llama cuando no hay cola — el
+// interruptor solo gobierna el nacimiento de una fila, y enqueueCola vuelve antes de tocarlo. Fija que el
+// camino previo al Plan 051 sigue sin coste añadido (ni una llamada por mensaje).
+func TestOnMessage_Cola_ColaNilNoConsultaElInterruptor(t *testing.T) {
+	consultas := 0
+	l := NewListener(&spySink{}, quietLogger(), WithClasificadorActivo(func() bool {
+		consultas++
+		return false
+	})) // sin WithCola
+
+	l.handleEvent(context.Background(), liveMessage("MSG-SINCOLA", "quiero dos empanadas"))
+
+	if consultas != 0 {
+		t.Fatalf("el interruptor se consultó %d veces sin cola cableada; no debía consultarse ninguna", consultas)
 	}
 }
 

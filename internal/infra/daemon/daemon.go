@@ -138,6 +138,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// la DEK de SU sesión) antes de entregarlo al sink. nil (cola no disponible) ⇒ la opción no cambia
 		// nada y el cableado queda idéntico al previo.
 		sessionmgr.WithColaEntrantes(cola),
+		// Interruptor del clasificador (Plan 051 Ola 2, T2.12): con la feature apagada, el entrante nace en
+		// la cola YA resuelto (marca `apagado`) en vez de que el cajero gaste una plaza del semáforo para
+		// descartarlo igual. Sale del MISMO stack que ya alimenta el decorador inline (línea de arriba), de
+		// modo que ambos caminos leen un solo interruptor mientras dure la escritura doble de la Ola 1.
+		sessionmgr.WithClasificadorActivo(intentStack.ClasificadorActivoFunc()),
 	)
 
 	if err := mgr.Restore(ctx); err != nil {

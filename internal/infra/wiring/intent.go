@@ -81,6 +81,35 @@ func (s *IntentStack) ConfigVersion() string {
 	return rec.Version
 }
 
+// ClasificadorActivo reporta si el CLASIFICADOR de intenciones está vivo en este Edge. Se lee del
+// DECORADOR, no del flag de config: BuildIntent solo construye el decorador con la feature ON, así que
+// `Decorator != nil` es exactamente «hay a quién preguntar». Lo consume el listener (Plan 051 Ola 2, T2.12)
+// para que una fila que llega con el clasificador apagado nazca ya resuelta (`apagado`) en vez de gastar
+// una plaza del semáforo del cajero.
+//
+// ⚠️ HONESTIDAD SOBRE EL ALCANCE — esto NO es `intent.Decorator.ready`, que es la condición que el camino
+// inline usa en `eligible` (sink.go:148). `ready` añade «además hay config de intenciones cargada» (por
+// push del Cloud o por Bootstrap) y es PRIVADO, sin accesor público, y añadir uno sería tocar un fichero
+// que no es de esta tarea. La diferencia es una sola ventana: feature ON pero aún sin config, donde esto
+// dice ACTIVO y `ready` diría que no. Se acepta a sabiendas porque el error cae del lado barato (el cajero
+// clasifica de más y se ve en la telemetría) y porque coincide con la semántica documentada de
+// `app.MotivoApagado`: «la feature llm_intent está apagada», que es un interruptor, no un estado de carga.
+// Si algún día hace falta la verdad exacta, la firma que la daría es `func (d *Decorator) Ready() bool`.
+func (s *IntentStack) ClasificadorActivo() bool {
+	return s != nil && s.Decorator != nil
+}
+
+// ClasificadorActivoFunc devuelve el predicado que el sessionmgr cablea en cada listener
+// (sessionmgr.WithClasificadorActivo). Devuelve un MÉTODO y no un bool ya evaluado para no congelar la foto
+// del arranque: quien lo llame lee el estado del stack en el momento del mensaje. Con el stack nil devuelve
+// nil, y el Listener cae a su default SEGURO (activo).
+func (s *IntentStack) ClasificadorActivoFunc() func() bool {
+	if s == nil {
+		return nil
+	}
+	return s.ClasificadorActivo
+}
+
 // CircuitFunc devuelve el lector del estado del circuito para el status (nil si la feature está off).
 func (s *IntentStack) CircuitFunc() func() string {
 	if s == nil || s.Decorator == nil {

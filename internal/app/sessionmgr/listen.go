@@ -122,6 +122,12 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// sella la fila, y el Listener no lo conoce por sí mismo. m.cola nil (opción no inyectada o cola
 			// que no se pudo abrir) ⇒ no se toca el gateway: el listener queda con el camino de siempre.
 			gateway.SetCola(m.cola, sid)
+			// Interruptor del clasificador (Plan 051 Ola 2, T2.12): a diferencia de la cola —que va ligada a
+			// SU sesión porque el session_id elige la DEK—, esto es COMPARTIDO (un solo clasificador por
+			// Edge), así que se pasa tal cual a todos los gateways. Decide si la fila nace reclamable por el
+			// cajero o ya resuelta con la marca `apagado`. nil (opción no inyectada) ⇒ no se toca el gateway
+			// y manda el default SEGURO del Listener: se considera ACTIVO y se clasifica de más.
+			gateway.SetClasificadorActivo(m.clasificadorActivo)
 			// Rota el live-sender de ESTE ciclo: el mux ya tiene registrado s.sendVia; aquí solo apunta la
 			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo). Usa la variante
 			// TRACKED (Plan 013 §10.E): cada SendText puebla el Correlator (command_id ↔ MessageID) para
