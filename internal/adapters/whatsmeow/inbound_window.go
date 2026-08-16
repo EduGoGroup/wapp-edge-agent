@@ -97,6 +97,15 @@ type InboundStats struct {
 	// AdmittedNoTimestamp son los entrantes ADMITIDOS por no traer hora utilizable (t="0"). Se cuentan
 	// porque son el punto ciego del criterio: si crecen, la ventana está dejando pasar a ojos cerrados.
 	AdmittedNoTimestamp uint64
+	// ColaEnqueueErrors son los entrantes que NO pudieron anotarse en la cola durable porque Enqueue
+	// devolvió error (Plan 051 · INV-051.3). El mensaje se entregó igual al sink (REQ-051.8), así que
+	// nada se perdió HOY; lo que se pierde es la durabilidad, y por eso se cuenta aparte del panic:
+	// distinguir "la cola dijo que no" de "la cola explotó" es la diferencia entre un disco lleno o una
+	// DEK ausente y un bug del adaptador.
+	ColaEnqueueErrors uint64
+	// ColaEnqueuePanics son los pánicos RECUPERADOS dentro del encolado. Separado del anterior a
+	// propósito: cualquier valor > 0 aquí es un defecto, no una condición de campo.
+	ColaEnqueuePanics uint64
 }
 
 // resolveThreshold calcula el umbral de la ventana: `sello − margen`. Es una función PURA para poder
@@ -267,6 +276,20 @@ func (b *bracketObserver) countSelfDrop() {
 func (b *bracketObserver) countNoTimestamp() {
 	b.mu.Lock()
 	b.stats.AdmittedNoTimestamp++
+	b.mu.Unlock()
+}
+
+// countColaEnqueueError contabiliza un entrante que la cola durable RECHAZÓ (Enqueue devolvió error).
+func (b *bracketObserver) countColaEnqueueError() {
+	b.mu.Lock()
+	b.stats.ColaEnqueueErrors++
+	b.mu.Unlock()
+}
+
+// countColaEnqueuePanic contabiliza un panic RECUPERADO dentro del encolado.
+func (b *bracketObserver) countColaEnqueuePanic() {
+	b.mu.Lock()
+	b.stats.ColaEnqueuePanics++
 	b.mu.Unlock()
 }
 
