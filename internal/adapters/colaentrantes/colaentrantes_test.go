@@ -15,26 +15,37 @@ import (
 	infradb "github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 	"github.com/EduGoGroup/wapp-shared/envelope"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
-	_ "modernc.org/sqlite" // driver "sqlite" (CGO-free), el mismo que internal/infra/db
 )
 
 func testLogger() sharedlogger.Logger {
 	return sharedlogger.New(sharedlogger.WithWriter(&bytes.Buffer{}), sharedlogger.WithJSON(true))
 }
 
-// openDB abre una BD de cola temporal y le aplica la MIGRACIÓN REAL (db.MigrateCola), no una copia a
-// mano del DDL. Es deliberado: un esquema replicado en el test se desincroniza del de producción sin que
-// nadie se entere —así fue como el índice único ux_cola_session_wamid faltó en los tests y la
-// idempotencia del Enqueue quedó sin cubrir—. Aquí no hay ciclo de imports: internal/infra/db no importa
-// ningún paquete interno del agente.
+// openDB abre una BD de cola temporal POR EL MISMO CAMINO QUE PRODUCCIÓN (db.Open, el que usa el daemon
+// en daemon.go para <data_dir>/cola_entrantes.db) y le aplica la MIGRACIÓN REAL (db.MigrateCola), no una
+// copia a mano del DDL. Es deliberado por partida doble:
+//
+//   - El esquema: un DDL replicado en el test se desincroniza del de producción sin que nadie se entere
+//     —así fue como el índice único ux_cola_session_wamid faltó en los tests y la idempotencia del
+//     Enqueue quedó sin cubrir—.
+//   - LOS PRAGMAS: antes se abría con un `sql.Open` pelado, así que los tests corrían en journal
+//     ROLLBACK y sin busy_timeout mientras producción va en WAL con 5 s de espera (db.go, openSQLite).
+//     Eso es el MODO DE CONCURRENCIA del motor, no un detalle cosmético: ningún test de esta cola estaba
+//     ejercitando el modo real, y justo aquí (drop-oldest, claim, barrido) es donde la concurrencia
+//     decide si algo es correcto. Llamando a db.Open no se replican los pragmas: se HEREDAN, y el día
+//     que producción cambie uno los tests lo cambian con ella.
+//
+// Sigue siendo autocontenido: SQLite sobre un fichero en t.TempDir(), sin servidores, sin Docker y sin
+// variables de entorno. Aquí no hay ciclo de imports: internal/infra/db no importa ningún paquete
+// interno del agente (y es él quien enlaza el driver modernc.org/sqlite, por eso este fichero ya no
+// necesita el blank import).
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "cola_entrantes.db")
-	database, err := sql.Open("sqlite", path)
+	database, err := infradb.Open(context.Background(), infradb.DialectSQLite, path)
 	if err != nil {
-		t.Fatalf("sql.Open: %v", err)
+		t.Fatalf("db.Open: %v", err)
 	}
-	database.SetMaxOpenConns(1)
 	t.Cleanup(func() { _ = database.Close() })
 	if err := infradb.MigrateCola(context.Background(), database); err != nil {
 		t.Fatalf("MigrateCola: %v", err)
@@ -609,6 +620,10 @@ func TestDescartadasPorTopeSeCuenta(t *testing.T) {
 	if got := s.DescartadasPorTope(); got != 2 {
 		t.Fatalf("DescartadasPorTope = %d, quería 2", got)
 	}
+	// Todas eran `nuevo`, así que la pérdida es ÍNTEGRAMENTE de la clase que el cajero nunca leerá.
+	if got := s.PendientesDescartadasPorTope(); got != 2 {
+		t.Fatalf("PendientesDescartadasPorTope = %d, quería 2", got)
+	}
 }
 
 // TestTopeNoParteConversaciones (T2.10) es LA REGRESIÓN QUE IMPORTA de esta tarea: el drop-oldest
@@ -710,6 +725,12 @@ func TestTopeSacrificaPorCapas(t *testing.T) {
 	if !existe(t, db, "wa-clas") || !existe(t, db, "wa-nue") {
 		t.Fatal("capa 1: solo debía caer la 'despachado'; 'clasificado' y 'nuevo' siguen vivas")
 	}
+	// 🔴 Y LA CAPA 1 NO CUENTA COMO PÉRDIDA: esa fila ya salió al cable, borrarla es limpieza. Si el
+	// acumulado subiera aquí, una cola que rota SANO alarmaría igual que una que está tirando mensajes,
+	// y la señal de degradación de INV-051.3 dejaría de significar nada.
+	if got := s.DescartadasPorTope(); got != 0 {
+		t.Fatalf("capa 1: DescartadasPorTope = %d, quería 0 (una 'despachado' borrada no es pérdida)", got)
+	}
 
 	// 2º empujón: ya no quedan despachadas ⇒ capa 2, se va la CLASIFICADA, no la 'nuevo'.
 	if err := s.Enqueue(ctx, item("A", "chat-y@s", "wa-x2", "hola")); err != nil {
@@ -721,6 +742,13 @@ func TestTopeSacrificaPorCapas(t *testing.T) {
 	if !existe(t, db, "wa-nue") {
 		t.Fatal("capa 2: la 'nuevo' NO debía caer mientras quedara una 'clasificado'")
 	}
+	// La capa 2 SÍ es pérdida (esa fila tenía intent y nunca se despachará), pero no es pendiente.
+	if got := s.DescartadasPorTope(); got != 1 {
+		t.Fatalf("capa 2: DescartadasPorTope = %d, quería 1 (la 'clasificado' sí se pierde)", got)
+	}
+	if got := s.PendientesDescartadasPorTope(); got != 0 {
+		t.Fatalf("capa 2: PendientesDescartadasPorTope = %d, quería 0 (aún no se tocó ninguna pendiente)", got)
+	}
 
 	// 3er empujón: solo quedan pendientes ⇒ capa 3, cae la conversación pendiente MÁS VIEJA (chat-n@s).
 	if err := s.Enqueue(ctx, item("A", "chat-z@s", "wa-x3", "hola")); err != nil {
@@ -728,6 +756,12 @@ func TestTopeSacrificaPorCapas(t *testing.T) {
 	}
 	if existe(t, db, "wa-nue") {
 		t.Fatal("capa 3: agotadas las otras capas, debía caer la conversación pendiente más vieja")
+	}
+	if got := s.DescartadasPorTope(); got != 2 {
+		t.Fatalf("capa 3: DescartadasPorTope = %d, quería 2 (clasificada + pendiente, nunca la despachada)", got)
+	}
+	if got := s.PendientesDescartadasPorTope(); got != 1 {
+		t.Fatalf("capa 3: PendientesDescartadasPorTope = %d, quería 1 (el mensaje que el cajero nunca leerá)", got)
 	}
 }
 
@@ -752,6 +786,93 @@ func TestTopeConUnaSolaConversacionTermina(t *testing.T) {
 	}
 	if got := s.DescartadasPorTope(); got != 3 {
 		t.Fatalf("DescartadasPorTope = %d, quería 3 (la conversación entera)", got)
+	}
+}
+
+// TestCapa3ArrastraLosTomadosDeLaConversacion: la capa 3 borra `nuevo` Y `tomado` de la conversación
+// sacrificada, y hasta esta tarea NADIE lo probaba —el único `EstadoTomado` del fichero estaba en el test
+// del TTL—. Es el estado peligroso: un `tomado` es un `nuevo` con lease vivo, así que si el barrido de
+// leases lo devuelve a `nuevo` vuelve a ser candidato del claim; dejarlo atrás al sacrificar sus hermanas
+// reintroduce el HUECO exacto que la capa 3 existe para impedir, y el cajero concatenaría un fragmento
+// suelto como si fuera la conversación entera.
+func TestCapa3ArrastraLosTomadosDeLaConversacion(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	s := newStore(t, db, newFakeCrypterFor().fn, 4, 0) // tope 4
+
+	// La conversación MÁS VIEJA va mezclada: un fragmento `nuevo` y otro ya reclamado (`tomado`).
+	if err := s.Enqueue(ctx, item("A", "chat-1@s", "wa-a1", "quiero dos")); err != nil {
+		t.Fatalf("Enqueue a1: %v", err)
+	}
+	tomada := item("A", "chat-1@s", "wa-a2", "empanadas")
+	tomada.Estado = app.EstadoTomado
+	if err := s.Enqueue(ctx, tomada); err != nil {
+		t.Fatalf("Enqueue a2 (tomado): %v", err)
+	}
+	// Una segunda conversación, más nueva: NO se la puede llevar el sacrificio.
+	for _, id := range []string{"wa-b1", "wa-b2"} {
+		if err := s.Enqueue(ctx, item("A", "chat-2@s", id, "hola")); err != nil {
+			t.Fatalf("Enqueue %s: %v", id, err)
+		}
+	}
+
+	// Con la cola en el tope, este encolado dispara la capa 3 sobre chat-1@s (la del MIN(seq) más bajo).
+	if err := s.Enqueue(ctx, item("A", "chat-3@s", "wa-c1", "hola")); err != nil {
+		t.Fatalf("Enqueue c1: %v", err)
+	}
+
+	if existe(t, db, "wa-a2") {
+		t.Fatal("capa 3: el fragmento 'tomado' sobrevivió al sacrificio de sus hermanas — eso es el hueco")
+	}
+	if existe(t, db, "wa-a1") {
+		t.Fatal("capa 3: la conversación más vieja debía irse ENTERA")
+	}
+	ids := waIDs(t, db)
+	if len(ids) != 3 || ids[0] != "wa-b1" || ids[1] != "wa-b2" || ids[2] != "wa-c1" {
+		t.Fatalf("capa 3: esperaba [wa-b1,wa-b2,wa-c1], got %v", ids)
+	}
+	// Las dos filas de la conversación sacrificada son pérdida, y de la clase que más duele.
+	if got := s.DescartadasPorTope(); got != 2 {
+		t.Fatalf("DescartadasPorTope = %d, quería 2 (nuevo + tomado)", got)
+	}
+	if got := s.PendientesDescartadasPorTope(); got != 2 {
+		t.Fatalf("PendientesDescartadasPorTope = %d, quería 2 (ninguna de las dos llegó al cajero)", got)
+	}
+}
+
+// TestCapa3EligeConversacionSoloTomada: la conversación más vieja puede no tener NI UNA fila `nuevo` —el
+// cajero la reclamó entera y aún no ha cerrado el lote— y aun así es la que toca sacrificar. Fija que la
+// elección mira `estado IN (nuevo, tomado)` en las DOS mitades de la sentencia (la que elige y la que
+// borra): si la subconsulta solo mirara `nuevo`, esta conversación sería invisible para la capa 3 y el
+// bucle del llamante se iría por el guardarraíl dejando la cola por encima del tope sin motivo.
+func TestCapa3EligeConversacionSoloTomada(t *testing.T) {
+	ctx := context.Background()
+	db := openDB(t)
+	s := newStore(t, db, newFakeCrypterFor().fn, 4, 0) // tope 4
+
+	for _, id := range []string{"wa-a1", "wa-a2"} {
+		tomada := item("A", "chat-1@s", id, "hola")
+		tomada.Estado = app.EstadoTomado
+		if err := s.Enqueue(ctx, tomada); err != nil {
+			t.Fatalf("Enqueue %s (tomado): %v", id, err)
+		}
+	}
+	for _, id := range []string{"wa-b1", "wa-b2"} {
+		if err := s.Enqueue(ctx, item("A", "chat-2@s", id, "hola")); err != nil {
+			t.Fatalf("Enqueue %s: %v", id, err)
+		}
+	}
+
+	if err := s.Enqueue(ctx, item("A", "chat-3@s", "wa-c1", "hola")); err != nil {
+		t.Fatalf("Enqueue c1: %v", err)
+	}
+
+	ids := waIDs(t, db)
+	if len(ids) != 3 || ids[0] != "wa-b1" || ids[1] != "wa-b2" || ids[2] != "wa-c1" {
+		t.Fatalf("la conversación 100%% 'tomado' era la más vieja y debía caer entera: got %v", ids)
+	}
+	if got := s.PendientesDescartadasPorTope(); got != 2 {
+		t.Fatalf("PendientesDescartadasPorTope = %d, quería 2", got)
 	}
 }
 

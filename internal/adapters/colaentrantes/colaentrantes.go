@@ -101,11 +101,26 @@ type Store struct {
 	// now inyecta el reloj (tests de TTL). Producción usa time.Now.
 	now func() time.Time
 
-	// descartadasPorTope acumula cuántas filas se han tirado por drop-oldest desde que arrancó el proceso
+	// descartadasPorTope acumula la PÉRDIDA REAL del drop-oldest desde que arrancó el proceso
 	// (INV-051.3: ninguna degradación se cierra con solo un log). Atómico porque se toca bajo s.mu pero se
 	// LEE desde fuera. La publicación al heartbeat es de la Ola 4; aquí solo se garantiza que el número
 	// exista y sea legible (DescartadasPorTope).
+	//
+	// 🔴 "PÉRDIDA REAL" EXCLUYE LA CAPA 1: las filas `despachado` YA salieron al cable (cloudlink/outbox
+	// las tienen), así que borrarlas es LIMPIEZA, no pérdida. Contarlas aquí —como se hacía— convertía
+	// este número en una alarma que se dispara sola: una cola que rota sano por su capa 1 inflaría el
+	// acumulado sin que se haya perdido un solo mensaje, y la señal de degradación dejaría de significar
+	// nada. El desglose de las tres capas sigue entero en el log de Warn, que es donde sirve para
+	// diagnosticar; el acumulado es para ALARMAR, y solo alarma lo que se perdió.
 	descartadasPorTope atomic.Int64
+
+	// pendientesDescartadasPorTope acumula, del total anterior, SOLO las filas `nuevo`/`tomado` — la capa
+	// 3, el sacrificio de conversaciones enteras. Es el subconjunto que más duele: una `clasificado` al
+	// menos llegó a pasar por el cajero, mientras que una pendiente es un mensaje que el cajero NUNCA
+	// llegará a leer. Se expone aparte (mismo patrón atómico, ver PendientesDescartadasPorTope) porque
+	// "hemos perdido cosas" y "hemos perdido cosas que nadie había mirado siquiera" son dos niveles de
+	// gravedad distintos, y desde un acumulado agregado no hay forma de separarlos.
+	pendientesDescartadasPorTope atomic.Int64
 
 	// seq es la secuencia monotónica del orden de la cola, sembrada de MAX(seq) en New. Atómica: el Edge
 	// encola desde varios listeners (uno por sesión) en paralelo.
@@ -321,10 +336,17 @@ func (s *Store) crypter(sessionID string) (envelope.Crypter, error) {
 	return c, nil
 }
 
-// DescartadasPorTope devuelve cuántas filas ha tirado el drop-oldest desde que arrancó el proceso
-// (INV-051.3). Es un acumulado monotónico, sin PII: solo una cardinalidad. Quien lo publique al
-// heartbeat es la Ola 4; aquí solo se garantiza que el número exista y sea legible.
+// DescartadasPorTope devuelve cuántas filas ha PERDIDO el drop-oldest desde que arrancó el proceso
+// (INV-051.3): las `clasificado` y las `nuevo`/`tomado`, NO las `despachado` (esas ya salieron al cable;
+// borrarlas es limpieza, ver descartadasPorTope). Es un acumulado monotónico, sin PII: solo una
+// cardinalidad. Quien lo publique al heartbeat es la Ola 4; aquí solo se garantiza que exista y sea
+// legible.
 func (s *Store) DescartadasPorTope() int64 { return s.descartadasPorTope.Load() }
+
+// PendientesDescartadasPorTope devuelve, del total de DescartadasPorTope, cuántas eran `nuevo`/`tomado`:
+// mensajes que el worker-cajero NUNCA llegó a leer (capa 3, conversaciones sacrificadas enteras). Mismo
+// contrato que el anterior: acumulado monotónico, sin PII.
+func (s *Store) PendientesDescartadasPorTope() int64 { return s.pendientesDescartadasPorTope.Load() }
 
 // pruneTTLLocked borra las filas YA DESPACHADAS más viejas que el TTL. Debe llamarse bajo s.mu.
 //
@@ -426,21 +448,31 @@ func (s *Store) dropOldestLocked(ctx context.Context) error {
 		faltan -= int(n) // puede quedar NEGATIVO: es el "pasarse de largo" documentado arriba.
 	}
 
-	descartadas := despachadas + clasificadas + pendientes
-	// 🔴 EL WARN Y EL CONTADOR SOLO CUANDO DE VERDAD SE DESCARTÓ ALGO. Antes se ejecutaban también con
-	// `descartadas == 0` —el camino del guardarraíl de arriba—, y eso era lo peor de dos mundos: una línea
+	borradas := despachadas + clasificadas + pendientes
+	// PÉRDIDA ≠ BORRADO: lo que se acumula es solo lo que NO había salido al cable (ver
+	// descartadasPorTope). Las `despachado` de la capa 1 se borran y se loguean, pero no se cuentan como
+	// pérdida: contarlas hacía que una cola rotando sano alarmara igual que una que está tirando mensajes.
+	perdidas := clasificadas + pendientes
+	// 🔴 EL WARN Y EL CONTADOR SOLO CUANDO DE VERDAD SE BORRÓ ALGO. Antes se ejecutaban también con
+	// `borradas == 0` —el camino del guardarraíl de arriba—, y eso era lo peor de dos mundos: una línea
 	// de Warn POR MENSAJE ENTRANTE (a ritmo de socket, la misma tormenta que crypterFailureCooldown
 	// combate 380 líneas más arriba) diciendo «descartando» con `descartadas=0`, que no informa de nada.
-	// El `Add(0)` era además ruido puro sobre un acumulado que solo debe contar pérdidas reales.
-	if descartadas > 0 {
+	if borradas > 0 {
 		// INV-051.3: la degradación se CUENTA, no solo se loguea (un log se pierde; el acumulado no).
-		total := s.descartadasPorTope.Add(descartadas)
-		// INV-051.1: ni texto ni meta; solo cardinalidades y el tope. `conversaciones` es la señal de que
-		// se llegó a la capa 3, que es la única que duele de verdad (mensajes que el cajero nunca leerá).
+		// Los Add pueden sumar 0 (una poda que solo tocó la capa 1): eso NO es el ruido que se quitó
+		// arriba —aquí sí hubo poda real, y el acumulado sin cambios es justo lo que hay que reportar—,
+		// y Add(0) devuelve el valor vigente, que es lo que el log necesita.
+		total := s.descartadasPorTope.Add(perdidas)
+		totalPendientes := s.pendientesDescartadasPorTope.Add(pendientes)
+		// INV-051.1: ni texto ni meta; solo cardinalidades y el tope. El desglose de las TRES capas se
+		// mantiene entero —`despachadas` incluida, aunque no cuente como pérdida— porque para diagnosticar
+		// en campo importa saber por qué capa se fue la poda. `conversaciones` es la señal de que se llegó
+		// a la capa 3, la única que duele de verdad (mensajes que el cajero nunca leerá).
 		s.log.Warn("colaentrantes: LLENA, descartando por capas (drop-oldest sin partir conversaciones)",
-			"descartadas", descartadas, "despachadas", despachadas, "clasificadas", clasificadas,
+			"borradas", borradas, "perdidas", perdidas,
+			"despachadas", despachadas, "clasificadas", clasificadas,
 			"pendientes", pendientes, "conversaciones", conversaciones,
-			"tope", s.maxRows, "descartadas_acumuladas", total)
+			"tope", s.maxRows, "descartadas_acumuladas", total, "pendientes_acumuladas", totalPendientes)
 		return nil
 	}
 	// TOPE ALCANZADO Y NADA QUE SE PUEDA SACRIFICAR: sí es una anomalía —la cola está llena de filas que
@@ -485,30 +517,38 @@ func (s *Store) dropPorEstadoLocked(ctx context.Context, estado string, limite i
 // Y se borran `nuevo` Y `tomado` juntos porque un `tomado` es un `nuevo` con lease vivo: si el lease
 // vence, el barrido lo devuelve a `nuevo` y volvería a ser candidato del claim —dejarlo atrás
 // reintroduciría exactamente el hueco que esta capa existe para evitar—.
+//
+// 🔴 UNA SOLA SENTENCIA, Y NO ES ESTILO: antes eran DOS (un SELECT que elegía la conversación y un
+// DELETE que la borraba). Entre ambas cabe OTRO PROCESO —el worker-cajero corre fuera de este binario,
+// y la cola es un .db aparte precisamente para eso (design §2 D-2)— pasando una fila de `tomado` a
+// `clasificado`: esa fila ya no encajaría en el `estado IN (nuevo, tomado)` del DELETE, sobreviviría al
+// borrado de sus hermanas y dejaría EXACTAMENTE el hueco que esta capa entera existe para impedir. Ni
+// s.mu ni SetMaxOpenConns(1) cubren eso: son intra-proceso. Colapsadas en un solo DELETE, la elección y
+// el borrado ocurren dentro de la misma sentencia y bajo el mismo lock de escritura del motor, así que
+// no queda ventana en medio.
+//
+// Los ROW VALUES `(session_id, chat_jid) IN (SELECT …)` están VERIFICADOS EJECUTANDO contra este driver
+// (modernc.org/sqlite v1.53.0 ⇒ SQLite 3.53.2; los row values existen desde 3.15), no supuestos. El
+// LIMIT va DENTRO de la subconsulta, que es lo que el driver acepta: en el DELETE directo lo rechaza por
+// sintaxis, igual que en dropPorEstadoLocked (compilado sin SQLITE_ENABLE_UPDATE_DELETE_LIMIT).
 func (s *Store) dropConversacionPendienteMasViejaLocked(ctx context.Context) (int64, error) {
-	var sessionID, chatJID string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT session_id, chat_jid FROM cola_entrantes
-		   WHERE estado IN (?, ?)
-		   GROUP BY session_id, chat_jid
-		   ORDER BY MIN(seq) ASC
-		   LIMIT 1`,
-		app.EstadoNuevo, app.EstadoTomado).Scan(&sessionID, &chatJID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("colaentrantes: elegir la conversación pendiente más vieja: %w", err)
-	}
 	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM cola_entrantes WHERE session_id = ? AND chat_jid = ? AND estado IN (?, ?)`,
-		sessionID, chatJID, app.EstadoNuevo, app.EstadoTomado)
+		`DELETE FROM cola_entrantes
+		   WHERE estado IN (?, ?)
+		     AND (session_id, chat_jid) IN (
+		           SELECT session_id, chat_jid FROM cola_entrantes
+		             WHERE estado IN (?, ?)
+		             GROUP BY session_id, chat_jid
+		             ORDER BY MIN(seq) ASC
+		             LIMIT 1)`,
+		app.EstadoNuevo, app.EstadoTomado, app.EstadoNuevo, app.EstadoTomado)
 	if err != nil {
-		// INV-051.1: session_id y chat_jid son metadato de ENRUTADO (viajan en claro en la tabla), no
-		// contenido; el texto y la meta no aparecen aquí ni truncados.
-		return 0, fmt.Errorf("colaentrantes: descartar la conversación pendiente más vieja (session_id=%s, chat_jid=%s): %w",
-			sessionID, chatJID, err)
+		// INV-051.1: ni texto ni meta en el error. Aquí ya no hay ni identificadores que citar —la
+		// conversación la elige el propio SQL y nunca sube a Go—, así que el error va desnudo.
+		return 0, fmt.Errorf("colaentrantes: descartar la conversación pendiente más vieja: %w", err)
 	}
+	// 0 filas ⇒ no quedaba conversación pendiente (antes lo decía el sql.ErrNoRows del SELECT). Es la
+	// señal de parada del guardarraíl del llamante, no un error.
 	n, _ := res.RowsAffected()
 	return n, nil
 }
