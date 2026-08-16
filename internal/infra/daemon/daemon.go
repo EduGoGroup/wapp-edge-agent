@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -80,6 +81,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 	sessions := sessionstore.New(database)
 	layout := sessionmgr.NewLayout(cfg.DataDir)
 
+	// Custodia de la DEK por sesión: ÚNICO punto de verdad sobre cómo se custodia (Plan 035 · DIP). Lo
+	// comparten el session manager (WithKeyCustodyFactory) y la cola de entrantes (CrypterFor), para que no
+	// existan dos criterios distintos de dónde vive la DEK.
+	custodyFor := func(p string) app.KeyCustody { return keycustody.NewFileCustody(p) }
+
+	// Cola durable de entrantes (Plan 051 Ola 1): vive en su PROPIA BD SQLite (<data_dir>/cola_entrantes.db),
+	// NUNCA dentro de edge.db — por eso se abre aparte y se migra con MigrateCola (set "cola"), no con
+	// Migrate. NO es fatal en ningún paso: si el fichero no se puede abrir o migrar, se loguea y el daemon
+	// sigue con los listeners SIN cola (comportamiento idéntico al previo). El handle se cierra igual que el
+	// de edge.db (defer, apagado ordenado §10.I).
+	var colaDB *sql.DB
+	if opened, colaErr := db.Open(ctx, db.DialectSQLite, layout.ColaDB()); colaErr != nil {
+		log.Error("cola de entrantes: no se pudo abrir su BD; el Edge sigue SIN cola durable",
+			"error", colaErr, "path", layout.ColaDB())
+	} else {
+		defer func() { _ = opened.Close() }()
+		if err := db.MigrateCola(ctx, opened); err != nil {
+			log.Error("cola de entrantes: no se pudo migrar su BD; el Edge sigue SIN cola durable",
+				"error", err, "path", layout.ColaDB())
+		} else {
+			colaDB = opened
+		}
+	}
+	cola := wiring.BuildCola(ctx, cfg, colaDB, layout, custodyFor, log)
+
 	outbox := wiring.BuildOutbox(ctx, cfg, database, log)
 	intentStack := wiring.BuildIntent(cfg, database, log)
 
@@ -107,9 +133,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// caída no se ingiere. config.Load ya garantiza un margen > 0.
 		sessionmgr.WithInboundMargin(time.Duration(cfg.InboundMarginSeconds)*time.Second),
 		sessionmgr.WithInboundDecorator(intentStack.DecoratorWrap()),
-		sessionmgr.WithKeyCustodyFactory(func(p string) app.KeyCustody {
-			return keycustody.NewFileCustody(p)
-		}),
+		sessionmgr.WithKeyCustodyFactory(custodyFor),
+		// Cola durable de entrantes (Plan 051 Ola 1): cada listener anota el entrante en disco (cifrado con
+		// la DEK de SU sesión) antes de entregarlo al sink. nil (cola no disponible) ⇒ la opción no cambia
+		// nada y el cableado queda idéntico al previo.
+		sessionmgr.WithColaEntrantes(cola),
 	)
 
 	if err := mgr.Restore(ctx); err != nil {

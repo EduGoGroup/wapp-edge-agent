@@ -24,11 +24,13 @@ import (
 	"github.com/EduGoGroup/wapp-cloudlink/lease"
 	"github.com/EduGoGroup/wapp-cloudlink/mtls"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cloudlink"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/colaentrantes"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/outbox"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
 	edgeauth "github.com/EduGoGroup/wapp-edge-agent/internal/auth"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
+	"github.com/EduGoGroup/wapp-shared/envelope"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -108,6 +110,48 @@ func BuildOutbox(ctx context.Context, cfg config.Config, database *sql.DB, log s
 	log.Info("outbox durable habilitado (ADR-0003): entrantes/acuses con stream caído se encolan y drenan al reconectar",
 		"max_eventos", cfg.OutboxMaxEvents, "ttl_horas", cfg.OutboxTTLHours)
 	return ob
+}
+
+// BuildCola construye la COLA DURABLE DE ENTRANTES (Plan 051 Ola 1) sobre la BD PROPIA de la cola —ya
+// abierta y migrada por el daemon con db.MigrateCola—, con los límites de config (tope de filas + TTL).
+// Sigue el molde de BuildOutbox: NO es fatal. Si la BD no está (colaDB nil porque no se pudo abrir/migrar)
+// o el Store no se puede construir, devuelve nil y los listeners se quedan SIN cola, con el comportamiento
+// byte a byte del camino de siempre (solo sink.Deliver). La durabilidad es una mejora, no un requisito de
+// arranque: nada de esto puede impedir que una sesión arranque.
+//
+// ZERO-KNOWLEDGE (ADR-0007): el CrypterFor resuelve la DEK de CADA sesión por su custodia local (la misma
+// factory que usa el session manager, un único punto de verdad) y la mantiene dentro del sobre AES; la DEK
+// nunca se loguea ni sale del equipo. El caché de sobres vive dentro del Store, así que este resolutor se
+// invoca una sola vez por sesión viva.
+func BuildCola(ctx context.Context, cfg config.Config, colaDB *sql.DB, layout sessionmgr.Layout, custodyFor func(path string) app.KeyCustody, log sharedlogger.Logger) app.ColaEntrantes {
+	if colaDB == nil || custodyFor == nil {
+		return nil
+	}
+	crypterFor := func(sessionID string) (envelope.Crypter, error) {
+		// layout.DEKPath valida el UUID: es la barrera que impide que un session_id raro construya una ruta
+		// fuera de data_dir.
+		path, err := layout.DEKPath(sessionID)
+		if err != nil {
+			return nil, err
+		}
+		dek, err := custodyFor(path).Load()
+		if err != nil {
+			return nil, fmt.Errorf("cola de entrantes: cargar la DEK de la sesión %s: %w", sessionID, err)
+		}
+		env, err := envelope.NewEnvelope(dek)
+		if err != nil {
+			return nil, fmt.Errorf("cola de entrantes: construir el sobre de la sesión %s: %w", sessionID, err)
+		}
+		return env, nil
+	}
+	store, err := colaentrantes.New(ctx, colaDB, crypterFor, cfg.ColaMaxRows, cfg.ColaTTLHours, log)
+	if err != nil {
+		log.Error("cola de entrantes: no se pudo inicializar; los listeners siguen SIN cola (camino previo)", "error", err)
+		return nil
+	}
+	log.Info("cola de entrantes habilitada (Plan 051): el entrante se anota en disco cifrado ANTES de entregarse",
+		"max_filas", cfg.ColaMaxRows, "ttl_horas", cfg.ColaTTLHours)
+	return store
 }
 
 // dialCloudLink concentra el bloque COMÚN de BuildSink/BuildMux (H3: antes duplicado ~90 líneas): valida

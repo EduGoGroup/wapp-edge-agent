@@ -113,6 +113,14 @@ type Manager struct {
 	// reporter ligado es no-op, ver health.Registry.For). Lo inyecta WithHealthRegistry.
 	health *health.Registry
 
+	// cola es la COLA DURABLE DE ENTRANTES del Edge (Plan 051 Ola 1): el factory la pasa al gateway de cada
+	// sesión JUNTO CON su session_id, para que el listener anote el mensaje en disco (sellado con la DEK de
+	// ESA sesión) antes de entregarlo al sink. Es COMPARTIDA por todas las sesiones (una sola BD, un `seq`
+	// global). nil (opción no inyectada, o cola que no se pudo abrir) ⇒ NO se toca el gateway y el listener
+	// se queda con el camino de siempre: es el fallback explícito de la ola, y jamás impide arrancar una
+	// sesión. Lo inyecta WithColaEntrantes.
+	cola app.ColaEntrantes
+
 	// inboundMargin es el margen de la ventana temporal de ingesta (ADR-0037) que el factory pasa al
 	// gateway de cada sesión. 0 (opción no inyectada) ⇒ NO se toca el gateway y manda el default del propio
 	// Listener; así los tests del Manager que no cablean la ventana siguen intactos.
@@ -192,6 +200,19 @@ func WithInboundMargin(d time.Duration) Option {
 	return func(m *Manager) {
 		if d > 0 {
 			m.inboundMargin = d
+		}
+	}
+}
+
+// WithColaEntrantes inyecta la COLA DURABLE DE ENTRANTES compartida (Plan 051 Ola 1): cada listener anota
+// el entrante en disco —cifrado con la DEK de SU sesión— ANTES de entregarlo al sink, de modo que el acuse
+// de WhatsApp salga con el mensaje ya durable. En producción la cablea el daemon desde wiring.BuildCola;
+// los tests que no la pasan quedan con el comportamiento previo intacto. nil se IGNORA (fallback explícito
+// de la ola: sin cola, camino de siempre; nunca se impide arrancar una sesión).
+func WithColaEntrantes(c app.ColaEntrantes) Option {
+	return func(m *Manager) {
+		if c != nil {
+			m.cola = c
 		}
 	}
 }

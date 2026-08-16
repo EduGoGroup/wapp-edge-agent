@@ -53,6 +53,17 @@ const DefaultInboundMarginSeconds = 300
 // viejos que ese tiempo al encolar/drenar. Configurable por WAPP_AGENT_OUTBOX_TTL_HOURS.
 const DefaultOutboxTTLHours = 0
 
+// DefaultColaTTLHours es el TTL por defecto (en horas) de una fila en la COLA DE ENTRANTES (Plan 051,
+// REQ-051.7). A diferencia del outbox, 0 aquí NO desactiva nada: la cola es un buzón de paso con poda
+// agresiva (decisión cerrada del Plan 051) y un valor <=0 cae a este default. Configurable por
+// WAPP_AGENT_COLA_TTL_HOURS.
+const DefaultColaTTLHours = 24
+
+// DefaultColaMaxRows es el tope por defecto de filas retenidas en la COLA DE ENTRANTES (Plan 051,
+// REQ-051.7): al alcanzarlo se descartan las de menor `seq` (drop-oldest) en vez de crecer sin límite.
+// Configurable por WAPP_AGENT_COLA_MAX_ROWS; un valor <=0 cae al default (guardarraíl).
+const DefaultColaMaxRows = 50000
+
 // DefaultPlatformAPIBaseURL es la URL base por defecto de la API PÚBLICA HTTP de la plataforma cloud
 // (wapp-cloud-platform, puerto público 8103, rutas /api/v1/...): NO confundir con CloudLink (gRPC/mTLS,
 // 8101/8102). La usa wapp-ctl para hablar DIRECTO con la nube en rutas que el núcleo no relaya (p.ej.
@@ -144,6 +155,13 @@ type Config struct {
 	// OutboxTTLHours es el TTL (horas) de un evento del outbox: 0 = desactivado (solo recorta el drop-oldest
 	// por tamaño). Con >0 se podan los eventos más viejos que ese tiempo. Se lee de WAPP_AGENT_OUTBOX_TTL_HOURS.
 	OutboxTTLHours int `yaml:"outbox_ttl_hours"`
+	// ColaTTLHours es el TTL (horas) de una fila de la COLA DE ENTRANTES (Plan 051, REQ-051.7). Default 24;
+	// OJO: aquí 0 NO desactiva el TTL como en el outbox (la cola es un buzón de paso, no un archivo), sino
+	// que cae al default. Se lee de WAPP_AGENT_COLA_TTL_HOURS.
+	ColaTTLHours int `yaml:"cola_ttl_hours"`
+	// ColaMaxRows es el tope de filas de la COLA DE ENTRANTES: al llenarse se descartan las más viejas
+	// (drop-oldest). Default 50 000. Se lee de WAPP_AGENT_COLA_MAX_ROWS; un valor <=0 cae al default.
+	ColaMaxRows int `yaml:"cola_max_rows"`
 	// DiagLogLines es cuántas líneas del ring buffer de logs incluye el bundle de diagnóstico bajo demanda
 	// (Plan 031 T8, ADR-0023). Default 500 (contexto reciente amplio sin acercarse al tope de 4 MiB del
 	// frame). Se lee de WAPP_AGENT_DIAG_LOG_LINES; <=0 cae al default.
@@ -282,6 +300,8 @@ func defaults() Config {
 		ControlSocketPath:     "wapp-edge.sock",
 		OutboxMaxEvents:       DefaultOutboxMaxEvents,
 		OutboxTTLHours:        DefaultOutboxTTLHours,
+		ColaTTLHours:          DefaultColaTTLHours,
+		ColaMaxRows:           DefaultColaMaxRows,
 		DiagLogLines:          DefaultDiagLogLines,
 		InboundMarginSeconds:  DefaultInboundMarginSeconds,
 		CloudLink: CloudLinkConfig{
@@ -331,6 +351,8 @@ func Load(path string) (Config, error) {
 	cfg.ControlSocketPath = loader.GetString("CONTROL_SOCKET_PATH", cfg.ControlSocketPath)
 	cfg.OutboxMaxEvents = loader.GetInt("OUTBOX_MAX_EVENTS", cfg.OutboxMaxEvents)
 	cfg.OutboxTTLHours = loader.GetInt("OUTBOX_TTL_HOURS", cfg.OutboxTTLHours)
+	cfg.ColaTTLHours = loader.GetInt("COLA_TTL_HOURS", cfg.ColaTTLHours)
+	cfg.ColaMaxRows = loader.GetInt("COLA_MAX_ROWS", cfg.ColaMaxRows)
 	cfg.DiagLogLines = loader.GetInt("DIAG_LOG_LINES", cfg.DiagLogLines)
 	cfg.InboundMarginSeconds = loader.GetInt("INBOUND_MARGIN_SECONDS", cfg.InboundMarginSeconds)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
@@ -373,6 +395,16 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.OutboxTTLHours < 0 {
 		cfg.OutboxTTLHours = 0
+	}
+
+	// Cola de entrantes (Plan 051, REQ-051.7): tope y TTL no positivos caen al default. Aquí el TTL NO se
+	// puede apagar poniendo 0 (a diferencia del outbox): la cola es un buzón de paso y una cola sin TTL
+	// crecería con las filas que el worker nunca llegue a tomar (decisión cerrada del Plan 051).
+	if cfg.ColaMaxRows <= 0 {
+		cfg.ColaMaxRows = DefaultColaMaxRows
+	}
+	if cfg.ColaTTLHours <= 0 {
+		cfg.ColaTTLHours = DefaultColaTTLHours
 	}
 	// Bundle de diagnóstico (Plan 031 T8): nº de líneas de log no positivo cae al default.
 	if cfg.DiagLogLines <= 0 {

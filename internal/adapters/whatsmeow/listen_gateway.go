@@ -75,6 +75,25 @@ type ListenGateway struct {
 	// inboundMargin es el margen de la ventana temporal de ingesta (ADR-0037) que serve() pasa al
 	// Listener. 0 ⇒ no se toca el Listener y manda su default (defaultConnectMargin).
 	inboundMargin time.Duration
+
+	// cola es la COLA DURABLE DE ENTRANTES compartida (Plan 051 Ola 1) y sessionID la sesión con la que se
+	// etiquetan (y sellan) sus filas. serve() los pasa al Listener SIEMPRE JUNTOS: la cola sin session_id
+	// dejaría filas que el adaptador no sabría con qué DEK cifrar. Ambos vacíos/nil ⇒ el Listener queda
+	// SIN cola, con el camino de siempre (solo sink.Deliver). Lo cablea el factory del sessionmgr (SetCola).
+	cola      app.ColaEntrantes
+	sessionID string
+}
+
+// SetCola liga el gateway (y su Listener) a la cola durable de entrantes de ESTA sesión (Plan 051 Ola 1).
+// Se llama ANTES de Listen (al construir el gateway), como el resto de setters. Exige AMBOS: una cola nil
+// o un session_id vacío dejan el gateway SIN cola (no se cablea a medias), que es el fallback explícito de
+// la ola. El session_id no es secreto ni PII.
+func (g *ListenGateway) SetCola(c app.ColaEntrantes, sessionID string) {
+	if c == nil || sessionID == "" {
+		return
+	}
+	g.cola = c
+	g.sessionID = sessionID
 }
 
 // SetInboundMargin fija el margen de la ventana temporal de ingesta de ESTA sesión (ADR-0037). Se llama
@@ -157,7 +176,14 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	g.setLiveClient(client)
 	defer g.setLiveClient(nil)
 
-	listener := NewListener(sink, g.log)
+	// Cola durable de entrantes (Plan 051 Ola 1): las dos opciones viajan JUNTAS o no viaja ninguna, de modo
+	// que nunca se llega a WithCola sin WithSessionID (ese caso degrada con un log de Error en el Listener).
+	// Sin cola cableada, NewListener recibe cero opciones: el comportamiento es byte a byte el de hoy.
+	var listenerOpts []ListenerOption
+	if g.cola != nil && g.sessionID != "" {
+		listenerOpts = append(listenerOpts, WithCola(g.cola), WithSessionID(g.sessionID))
+	}
+	listener := NewListener(sink, g.log, listenerOpts...)
 	// Salud por sesión (Plan 031 T6): el Listener reporta connected/connecting/dead + edad del último
 	// entrante al registro. nil ⇒ no reporta.
 	listener.SetHealthReporter(g.reporter)

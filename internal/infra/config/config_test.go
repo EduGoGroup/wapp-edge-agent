@@ -491,6 +491,42 @@ func TestLoad_LeaseShadowMode_DefaultsFailClosed(t *testing.T) {
 	}
 }
 
+// TestLoad_ColaLimits cubre los límites de la cola de entrantes (Plan 051, REQ-051.7): defaults 24 h /
+// 50 000 filas, override por WAPP_AGENT_COLA_TTL_HOURS y WAPP_AGENT_COLA_MAX_ROWS, y el guardarraíl de que
+// un valor no positivo cae al default — OJO: a diferencia del outbox, aquí 0 NO desactiva el TTL.
+func TestLoad_ColaLimits(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaTTLHours != DefaultColaTTLHours || cfg.ColaMaxRows != DefaultColaMaxRows {
+		t.Fatalf("defaults de la cola: got ttl=%d max=%d, want ttl=%d max=%d",
+			cfg.ColaTTLHours, cfg.ColaMaxRows, DefaultColaTTLHours, DefaultColaMaxRows)
+	}
+
+	t.Setenv(EnvPrefix+"COLA_TTL_HOURS", "6")
+	t.Setenv(EnvPrefix+"COLA_MAX_ROWS", "1234")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaTTLHours != 6 || cfg.ColaMaxRows != 1234 {
+		t.Fatalf("override de la cola: got ttl=%d max=%d, want ttl=6 max=1234", cfg.ColaTTLHours, cfg.ColaMaxRows)
+	}
+
+	// 0 no apaga el TTL de la cola (buzón de paso): cae al default, igual que un tope no positivo.
+	t.Setenv(EnvPrefix+"COLA_TTL_HOURS", "0")
+	t.Setenv(EnvPrefix+"COLA_MAX_ROWS", "-1")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaTTLHours != DefaultColaTTLHours || cfg.ColaMaxRows != DefaultColaMaxRows {
+		t.Fatalf("guardarraíl de la cola: got ttl=%d max=%d, want ttl=%d max=%d",
+			cfg.ColaTTLHours, cfg.ColaMaxRows, DefaultColaTTLHours, DefaultColaMaxRows)
+	}
+}
+
 // TestLoad_RuntimeEndpointStateFallback verifica que `serve` (config.Load) RELEE el endpoint de runtime
 // persistido por el enroll en <data_dir>/cloudlink-endpoint cuando no viene por YAML/env (Plan 026 T3,
 // cierra follow-up 023): así el stream se levanta sin edición manual del config.yaml.

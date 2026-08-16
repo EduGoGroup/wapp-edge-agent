@@ -116,6 +116,12 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 				gateway.SetInboundMargin(m.inboundMargin)
 			}
 			sid := s.meta.SessionID
+			// Cola durable de entrantes (Plan 051 Ola 1): mismo precedente que SetHealthReporter — algo
+			// COMPARTIDO por el daemon que se inyecta POR SESIÓN en el gateway. Van SIEMPRE las dos juntas
+			// (cola + session_id): el session_id es la clave con la que el adaptador elige la DEK con que
+			// sella la fila, y el Listener no lo conoce por sí mismo. m.cola nil (opción no inyectada o cola
+			// que no se pudo abrir) ⇒ no se toca el gateway: el listener queda con el camino de siempre.
+			gateway.SetCola(m.cola, sid)
 			// Rota el live-sender de ESTE ciclo: el mux ya tiene registrado s.sendVia; aquí solo apunta la
 			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo). Usa la variante
 			// TRACKED (Plan 013 §10.E): cada SendText puebla el Correlator (command_id ↔ MessageID) para
