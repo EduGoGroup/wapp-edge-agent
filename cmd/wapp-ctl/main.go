@@ -5,6 +5,9 @@
 //     (ADR-0015) → single-origin, sin CORS, el socket nunca se expone a red (decisión §10.A).
 //  3. Arranca/detiene el núcleo (`agent serve`) como proceso HIJO vía internal/adapters/supervisor
 //     (exec + PID file + SIGTERM; §10.D), expuesto en POST /v1/daemon/start|stop y GET /v1/daemon/status.
+//  4. Arranca/detiene el WORKER CAJERO (`agent cajero`, Plan 051 · T2.2) como SEGUNDO hijo, con su propio
+//     PID file, readiness de proceso vivo y RELANZADO AUTOMÁTICO; expuesto en POST /v1/cajero/start|stop
+//     y GET /v1/cajero/status. Se apaga con -cajero-enabled=false / WAPP_CTL_CAJERO_ENABLED=false.
 //
 // La UI y /v1/daemon/* SIGUEN respondiendo aunque el núcleo esté caído (ese es el punto: poder
 // arrancarlo). Solo el proxy /v1/* depende de que el núcleo viva; si el socket no responde se traduce a
@@ -21,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -43,9 +47,12 @@ func main() {
 	agentBin := flag.String("agent-bin", envOr("WAPP_CTL_AGENT_BIN", defaultAgentBin()), "ruta del binario núcleo `agent` a lanzar (default: hermano de wapp-ctl, si no PATH)")
 	socketFlag := flag.String("socket", "", "ruta del Unix socket /v1 del núcleo (default: cfg.ControlSocketPath del config)")
 	platformURLFlag := flag.String("platform-api-base-url", "", "URL base de la API pública HTTP de la plataforma cloud, puerto 8103 (default: cfg.PlatformAPIBaseURL del config; C-03/T3.5)")
-	pidFile := flag.String("pid-file", "", "ruta del PID/lock file anti-duplicado (default: <socket>.pid)")
+	pidFile := flag.String("pid-file", "", "ruta del PID/lock file anti-duplicado DEL NÚCLEO (default: <socket>.pid); NO afecta al cajero, cuyo lock cuelga siempre del socket (ver cajeroPIDFile)")
+	// Sin comillas invertidas en el uso: en un flag booleano flag.UnquoteUsage las tomaría por el NOMBRE
+	// del valor y las imprimiría como si el flag llevara argumento (ver -agent-bin, que sí lo lleva).
+	cajeroEnabled := flag.Bool("cajero-enabled", envBoolOr("WAPP_CTL_CAJERO_ENABLED", true), "supervisar también el worker cajero (agent cajero, Plan 051 · T2.2) como SEGUNDO hijo; false ⇒ wapp-ctl se comporta como antes del Plan 051")
 	noOpen := flag.Bool("no-open", false, "no abrir el navegador automáticamente al arrancar")
-	autostart := flag.Bool("autostart", false, "arrancar el núcleo (agent serve) automáticamente al iniciar (lo usa el LaunchAgent, Plan 023 · T3); por defecto el núcleo se arranca bajo demanda por POST /v1/daemon/start")
+	autostart := flag.Bool("autostart", false, "arrancar el núcleo (agent serve) —y el cajero, si está habilitado— automáticamente al iniciar (lo usa el LaunchAgent, Plan 023 · T3); por defecto se arrancan bajo demanda por POST /v1/daemon/start y /v1/cajero/start")
 	flag.Parse()
 
 	// Config del Edge: MISMA fuente y overlay que el núcleo (WAPP_AGENT_CONFIG / config.yaml + WAPP_AGENT_*).
@@ -87,7 +94,34 @@ func main() {
 		PIDFile:    *pidFile, // vacío ⇒ el supervisor usa <socket>.pid
 	}, log)
 
-	router := newRouter(sup, socketPath, platformBaseURL, log)
+	// SEGUNDO hijo (Plan 051 · T2.2): el worker cajero. MISMO binario del ecosistema, papel distinto
+	// (`agent cajero`), como el manager del Plan 048. Diferencias con el núcleo, todas deliberadas:
+	//
+	//   - PIDFile PROPIO Y EXPLÍCITO: el default del supervisor se deriva del socket (<socket>.pid) y dos
+	//     supervisores sobre el mismo socket colisionarían en el mismo lock file, matándose entre ellos.
+	//   - ReadyProbe de proceso vivo: el cajero NO tiene plano HTTP que sondear (no escucha en ningún
+	//     socket; reclama trabajo de la cola). Ver ProbeProcesoVivo y sus límites.
+	//   - Relanzado automático: si el worker se cae, la cola deja de vaciarse en silencio. El núcleo NO
+	//     lo lleva (lo rearranca el operador por /v1/daemon/start); el cajero sí (REQ-051.10).
+	//   - StopTimeout de 20s en vez de los 10s por defecto: al recibir el SIGTERM el cajero intenta CERRAR
+	//     EL LOTE EN VUELO (marcar en la base local la inferencia que ya pagó) antes de irse. Ese plazo
+	//     interno empataba con los 10s del supervisor, y un empate aquí lo gana el SIGKILL: se tiraría
+	//     trabajo ya hecho y el lote volvería a la cola para pagarse dos veces. Los 20s existen para que el
+	//     cierre del lote gane esa carrera con margen. No se toca el del núcleo (su cierre limpio es otro).
+	var cajeroSup *supervisor.Supervisor
+	if *cajeroEnabled {
+		cajeroSup = supervisor.New(supervisor.Config{
+			AgentBin:    *agentBin,
+			SocketPath:  socketPath,
+			PIDFile:     cajeroPIDFile(socketPath),
+			Args:        []string{"cajero"},
+			ReadyProbe:  supervisor.ProbeProcesoVivo(2 * time.Second),
+			StopTimeout: 20 * time.Second,
+			Restart:     supervisor.RestartPolicy{Enabled: true},
+		}, log)
+	}
+
+	router := newRouterConCajero(sup, cajeroSup, socketPath, platformBaseURL, log)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -102,7 +136,8 @@ func main() {
 	go func() { serveErr <- srv.ListenAndServe() }()
 
 	log.Info("wapp-ctl: supervisor arriba",
-		"addr", *addr, "socket", socketPath, "agent_bin", *agentBin, "platform_api_base_url", platformBaseURL, "version", Version)
+		"addr", *addr, "socket", socketPath, "agent_bin", *agentBin, "platform_api_base_url", platformBaseURL,
+		"cajero_enabled", *cajeroEnabled, "version", Version)
 
 	// Autoarranque del núcleo (Plan 023 · T3): bajo el LaunchAgent por-usuario queremos recepción 24/7 y que
 	// el Restore del Plan 022 corra al iniciar sesión. Start es idempotente (si el núcleo ya corre no hace
@@ -116,6 +151,19 @@ func main() {
 			}
 			log.Info("wapp-ctl: núcleo autoarrancado (agent serve) — recepción 24/7 y Restore del Plan 022 en curso")
 		}()
+
+		// El cajero va en SU PROPIA goroutine y su fallo NO puede impedir que el núcleo arranque ni tumbar
+		// wapp-ctl: el núcleo manda (sin él no hay recepción 24/7; sin cajero solo se deja de clasificar, y
+		// la cola conserva lo entrante hasta que vuelva). Por eso Error + seguir, nunca os.Exit.
+		if cajeroSup != nil {
+			go func() {
+				if err := cajeroSup.Start(ctx); err != nil {
+					log.Error("wapp-ctl: no se pudo autoarrancar el cajero; el núcleo sigue su curso, arráncalo por POST /v1/cajero/start", "error", err)
+					return
+				}
+				log.Info("wapp-ctl: cajero autoarrancado (agent cajero) — clasificación de la cola en curso")
+			}()
+		}
 	}
 
 	if !*noOpen {
@@ -132,19 +180,31 @@ func main() {
 	}
 
 	// Cierre ordenado del loopback. NOTA: NO se detiene el núcleo aquí (el supervisor controla su ciclo
-	// por /v1/daemon/*; parar el supervisor no implica parar el daemon 24/7).
+	// por /v1/daemon/*; parar el supervisor no implica parar el daemon 24/7). LO MISMO VALE PARA EL
+	// CAJERO (Plan 051 · T2.2): sobrevive a wapp-ctl y se para por POST /v1/cajero/stop; al volver
+	// wapp-ctl, su Start es idempotente contra el PID file que dejó vivo.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
 }
 
-// newRouter construye el mux del supervisor: control de proceso (/v1/daemon/*), reverse-proxy del resto
-// de /v1/* al socket del núcleo, y la web UI embebida en "/". Factorizado para los tests.
+// newRouter construye el mux del supervisor SIN cajero (el ecosistema tal como era antes del Plan 051).
+// Firma intacta a propósito: la usan los tests del paquete.
+func newRouter(sup *supervisor.Supervisor, socketPath, platformBaseURL string, log sharedlogger.Logger) *http.ServeMux {
+	return newRouterConCajero(sup, nil, socketPath, platformBaseURL, log)
+}
+
+// newRouterConCajero construye el mux del supervisor: control de proceso (/v1/daemon/*), control del
+// worker cajero (/v1/cajero/*, solo si cajeroSup != nil), reverse-proxy del resto de /v1/* al socket del
+// núcleo, y la web UI embebida en "/". Factorizado para los tests.
 //
 // platformBaseURL es la URL base de la API pública HTTP de la plataforma cloud (puerto 8103), que
 // authBorder usa para el signup (C-03/T3.5) — llamada DIRECTA por red, distinta del socketClient (que
 // solo habla con el núcleo local por Unix socket).
-func newRouter(sup *supervisor.Supervisor, socketPath, platformBaseURL string, log sharedlogger.Logger) *http.ServeMux {
+//
+// cajeroSup nil ⇒ NO se monta ninguna ruta /v1/cajero/* (con -cajero-enabled=false wapp-ctl responde
+// exactamente lo que respondía antes: esas rutas caen en el proxy genérico de /v1/*).
+func newRouterConCajero(sup, cajeroSup *supervisor.Supervisor, socketPath, platformBaseURL string, log sharedlogger.Logger) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Borde de sesión del operador (Plan 033 · Ola 3 · Paso B): sesión en cookie HttpOnly + CSRF, con el
@@ -189,6 +249,45 @@ func newRouter(sup *supervisor.Supervisor, socketPath, platformBaseURL string, l
 		writeJSON(w, http.StatusOK, toDaemonStatus(sup.Status(r.Context())))
 	})
 
+	// Control del worker cajero (Plan 051 · T2.2), simétrico al del núcleo y con EL MISMO
+	// requireCSRFIfSession en las mutadoras. Va APARTE: la respuesta de /v1/daemon/status no cambia de
+	// forma (hay consumidores) — quien quiera el estado del worker pregunta por /v1/cajero/status, que
+	// reutiliza el cuerpo {state,pid,healthy} del núcleo MÁS un campo "probe" propio (ver
+	// cajeroStatusResponse): el healthy del cajero es una señal más débil y hay que decirlo.
+	if cajeroSup != nil {
+		mux.HandleFunc("/v1/cajero/start", requireCSRFIfSession(store, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				methodNotAllowed(w, http.MethodPost)
+				return
+			}
+			if err := cajeroSup.Start(r.Context()); err != nil {
+				writeError(w, http.StatusInternalServerError, codeStartFailed, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, toCajeroStatus(cajeroSup.Status(r.Context())))
+		}))
+
+		mux.HandleFunc("/v1/cajero/stop", requireCSRFIfSession(store, func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				methodNotAllowed(w, http.MethodPost)
+				return
+			}
+			if err := cajeroSup.Stop(r.Context()); err != nil {
+				writeError(w, http.StatusInternalServerError, codeStopFailed, err.Error())
+				return
+			}
+			writeJSON(w, http.StatusOK, toCajeroStatus(cajeroSup.Status(r.Context())))
+		}))
+
+		mux.HandleFunc("/v1/cajero/status", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodGet {
+				methodNotAllowed(w, http.MethodGet)
+				return
+			}
+			writeJSON(w, http.StatusOK, toCajeroStatus(cajeroSup.Status(r.Context())))
+		})
+	}
+
 	// Reverse-proxy endurecido del resto de /v1/* al Unix socket del núcleo (Bearer de la cookie + CSRF +
 	// retry-on-401 con refresh single-flight). /v1/daemon/* gana por especificidad del ServeMux.
 	mux.Handle("/v1/", newCoreProxy(socketPath, auth, store, log))
@@ -206,6 +305,25 @@ func newRouter(sup *supervisor.Supervisor, socketPath, platformBaseURL string, l
 	// secretos y los necesita también la pantalla de login).
 	mux.Handle("/", rootGate(store))
 	return mux
+}
+
+// cajeroStatusResponse es el cuerpo de /v1/cajero/{start,stop,status}. Es el MISMO cuerpo del núcleo
+// (embebido: state, pid, healthy — un solo contrato) más un campo propio, "probe", que dice de qué
+// criterio viene ese healthy:
+//
+//   - "http": el healthy fuerte del núcleo (GET /v1/health respondió 200).
+//   - "proceso-vivo": el cajero NO tiene plano HTTP; lo más que se puede afirmar es que su proceso está
+//     arriba y no está en mitad de un relanzado. Un worker vivo pero bloqueado o sin Ollama seguirá
+//     diciendo healthy:true, y quien pinte esta respuesta debe saberlo.
+//
+// El campo va SOLO aquí: la respuesta de /v1/daemon/status no cambia de forma (tiene consumidores).
+type cajeroStatusResponse struct {
+	daemonStatusResponse
+	Probe string `json:"probe"`
+}
+
+func toCajeroStatus(s supervisor.Status) cajeroStatusResponse {
+	return cajeroStatusResponse{daemonStatusResponse: toDaemonStatus(s), Probe: s.Probe}
 }
 
 // rootGate protege el documento raíz de la webui: "/" (index.html) exige sesión válida CON TENANT ASIGNADO
@@ -290,9 +408,40 @@ func platformAPIBaseURLLeftAtDevDefault(cfg config.Config) bool {
 	return cfg.PlatformAPIBaseURL == config.DefaultPlatformAPIBaseURL
 }
 
+// cajeroPIDFile deriva el PID/lock file del cajero SIEMPRE del socket: <socket>.cajero.pid. Que sea
+// EXPLÍCITO y DISTINTO del núcleo no es cosmético (los dos supervisores comparten SocketPath y con el
+// default derivado escribirían el mismo lock file, cada uno leyendo el pid del otro).
+//
+// Y que NO dependa de -pid-file tampoco lo es: la identidad de un lock tiene que ser estable entre
+// arranques o deja de ser un lock. Antes, con -pid-file el del cajero era "X.cajero" y sin él
+// "<socket>.cajero.pid": un operador que añadiera o quitara ese flag entre dos arranques dejaba huérfano
+// el lock anterior, el supervisor nuevo no veía al cajero vivo y lanzaba un SEGUNDO worker sobre la misma
+// cola — dos clientes de Ollama reclamando los mismos mensajes. El socket, en cambio, es la identidad
+// real del Edge (misma fuente que usa el hijo para hablar con el núcleo), así que el lock cuelga de él.
+// Si algún día hace falta moverlo, que sea con un flag PROPIO (-cajero-pid-file), no reaprovechando el
+// del núcleo.
+func cajeroPIDFile(socketPath string) string {
+	return socketPath + ".cajero.pid"
+}
+
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
 	return def
+}
+
+// envBoolOr es el molde de envOr para flags booleanos (WAPP_CTL_CAJERO_ENABLED). Acepta lo que acepta
+// strconv.ParseBool ("1/0", "true/false", "t/f", "T/F", "TRUE/FALSE"…); un valor ilegible NO tumba el
+// arranque: se queda en el default y el flag de línea de comandos siempre puede sobreescribirlo.
+func envBoolOr(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
 }
