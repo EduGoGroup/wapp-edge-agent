@@ -89,7 +89,28 @@ func fakeAgentMain() {
 func fakeCfg(t *testing.T, mode string) Config {
 	t.Helper()
 	dir := t.TempDir()
-	sock := filepath.Join(dir, "edge.sock")
+	// 🔴 EL SOCKET NO PUEDE VIVIR EN t.TempDir(), Y ESTO NO ES MANÍA: `sun_path` de un socket Unix son
+	// 104 bytes en macOS (108 en Linux), y `t.TempDir()` mete el NOMBRE DEL TEST en la ruta. En macOS la
+	// base ya es larga (`/var/folders/xx/…/T/`), así que un test con nombre largo se pasa del límite,
+	// `net.Listen("unix", …)` falla en el hijo y el fake sale con `os.Exit(2)` ANTES de escuchar.
+	//
+	// Lo caro no es que falle: es que el test SEGUÍA EN VERDE. Los tests de readiness sólo comprueban que
+	// `Start` devuelva error, y «el hijo murió a los 10 ms» es un error tan válido como el que buscaban —
+	// así que pasaban sin ejercer NADA de lo que dicen fijar. Y como en Linux la ruta sí cabe, el mismo
+	// test sí corría de verdad en `make ci-docker`: el verde de `go test` en macOS y el del CI NO
+	// significaban lo mismo. Se descubrió porque el CI cazó un test que en local pasaba siempre.
+	//
+	// El directorio del socket va aparte y con nombre CORTO; el resto (PID file) se queda en t.TempDir(),
+	// que no tiene este límite y sí da limpieza automática.
+	sockDir, err := os.MkdirTemp("", "wsup")
+	if err != nil {
+		t.Fatalf("crear el directorio del socket: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "e.sock")
+	if len(sock) > 100 {
+		t.Fatalf("la ruta del socket mide %d bytes y sun_path son 104 en macOS: %s", len(sock), sock)
+	}
 	env := append(os.Environ(),
 		"SUPERVISOR_FAKE_AGENT=1",
 		"WAPP_AGENT_CONTROL_SOCKET_PATH="+sock,

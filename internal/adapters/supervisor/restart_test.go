@@ -375,8 +375,25 @@ func TestReadyProbeQueIgnoraElCtxNoCuelgaAlSupervisor(t *testing.T) {
 		_ = sup.Stop(context.Background())
 		t.Fatal("Start debía fallar: el probe nunca da por listo al hijo")
 	}
-	if tardanza > 1200*time.Millisecond {
-		t.Fatalf("Start tardó %s: se quedó esperando a la goroutine del probe (ReadyTimeout era %s)", tardanza, cfg.ReadyTimeout)
+
+	// 🔴 LA ASERCIÓN QUE DECIDE ES ÉSTA, Y NO ES DE RELOJ: si `Start` ha vuelto y el probe TODAVÍA no,
+	// entonces no lo esperó. Punto. Antes esto se medía comparando la tardanza contra un umbral de pared
+	// (1200 ms) que había que colocar entre el caso bueno (~300 ms, el ReadyTimeout) y el malo (1500 ms,
+	// lo que duerme el probe). Ese umbral era ambiguo por construcción: bastaba con que el contenedor del
+	// CI fuera un segundo más lento para que un supervisor CORRECTO diera 1,31 s y el test lo llamara
+	// colgado — que es exactamente lo que pasó en `make ci-docker`, con `go test` local en verde.
+	// El canal ya existía (se usaba abajo para no ensuciar los tests siguientes); sólo faltaba leerlo aquí.
+	select {
+	case <-probeVolvio:
+		t.Fatalf("Start esperó a la goroutine del probe: volvió DESPUÉS que él (tardanza %s, ReadyTimeout %s)",
+			tardanza, cfg.ReadyTimeout)
+	default:
+	}
+
+	// Red secundaria, deliberadamente HOLGADA: sólo caza una espera desbocada (un supervisor que se cuelgue
+	// de verdad), no la lentitud de la máquina. El contrato fino lo fija el `select` de arriba.
+	if tardanza > 3*time.Second {
+		t.Fatalf("Start tardó %s, muy por encima de su ReadyTimeout de %s", tardanza, cfg.ReadyTimeout)
 	}
 	if st := sup.Status(context.Background()); st.State != StateStopped {
 		t.Fatalf("tras el fallo de readiness Status = %+v; quería stopped", st)
