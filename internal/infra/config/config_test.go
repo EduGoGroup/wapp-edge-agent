@@ -719,35 +719,141 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	}
 }
 
-// TestLoad_InferenceTimeout_NoEsElDelDecorador es el arreglo de la calibración del worker, aseverado.
+// TestLoad_InferenceTimeout_NoEsElPresupuestoDelDespachador es el arreglo de la calibración del worker,
+// aseverado.
 //
-// El plazo de UNA inferencia del cajero (WAPP_WORKER_INFERENCE_TIMEOUT_MS, 15 s) y el del camino
-// INLINE (WAPP_AGENT_INTENT_TIMEOUT_MS, 3 s) son dos presupuestos de dos caminos distintos, y el
-// segundo NO puede gobernar al primero: la O0 midió p95 = 3.736 ms, así que un plazo de 3 s aborta
-// cerca de la mitad de las inferencias del worker, abre el breaker y deja la cola dando vueltas sin
+// El plazo de UNA inferencia del cajero (WAPP_WORKER_INFERENCE_TIMEOUT_MS, 15 s) y el presupuesto de
+// espera del DESPACHADOR (WAPP_AGENT_INTENT_WAIT_MS, 4 s) son dos números de dos caminos distintos, y
+// el segundo NO puede gobernar al primero: la O0 midió p95 = 3.736 ms, así que un plazo de 4 s aborta
+// buena parte de las inferencias del worker, abre el breaker y deja la cola dando vueltas sin
 // progresar. Este test vigila las TRES mitades del contrato: el default, que son números distintos, y
-// que mover el del decorador no mueve el del worker.
-func TestLoad_InferenceTimeout_NoEsElDelDecorador(t *testing.T) {
-	if DefaultWorkerInferenceTimeoutMS == DefaultIntentTimeoutMS {
-		t.Fatal("el plazo del worker y el del decorador inline NO pueden ser el mismo número")
+// que mover el del despachador no mueve el del worker.
+//
+// (Antes este test miraba WAPP_AGENT_INTENT_TIMEOUT_MS, el plazo del camino inline; esa variable se
+// RETIRÓ en T3.1 y su sitio en el contrato lo ocupa ahora el presupuesto del despachador.)
+func TestLoad_InferenceTimeout_NoEsElPresupuestoDelDespachador(t *testing.T) {
+	if DefaultWorkerInferenceTimeoutMS == DefaultIntentWaitMS {
+		t.Fatal("el plazo del worker y el presupuesto del despachador NO pueden ser el mismo número")
 	}
 	if DefaultWorkerInferenceTimeoutMS != 15000 {
 		t.Fatalf("el default del worker es 15000 ms (≈4× la p95 de la O0): got %d", DefaultWorkerInferenceTimeoutMS)
 	}
 
-	// Mover el del decorador no debe arrastrar al del worker.
-	t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "1500")
+	// Mover el del despachador no debe arrastrar al del worker.
+	t.Setenv(EnvPrefix+"INTENT_WAIT_MS", "1500")
 	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
 	if err != nil {
 		t.Fatalf("Load devolvió error inesperado: %v", err)
 	}
-	if cfg.Intent.TimeoutMS != 1500 {
-		t.Fatalf("el plazo del decorador debe seguir siendo configurable: got %d", cfg.Intent.TimeoutMS)
+	if cfg.Intent.WaitMS != 1500 {
+		t.Fatalf("el presupuesto del despachador debe ser configurable: got %d", cfg.Intent.WaitMS)
 	}
 	if cfg.Worker.InferenceTimeoutMS != DefaultWorkerInferenceTimeoutMS {
-		t.Fatalf("WAPP_AGENT_INTENT_TIMEOUT_MS NO gobierna al worker: got %d, want %d",
+		t.Fatalf("WAPP_AGENT_INTENT_WAIT_MS NO gobierna al worker: got %d, want %d",
 			cfg.Worker.InferenceTimeoutMS, DefaultWorkerInferenceTimeoutMS)
 	}
+}
+
+// TestLoad_IntentWaitMS_Default: sin fichero ni entorno, el presupuesto de espera del despachador vale
+// 4000 ms. NO es un número redondo cualquiera: lo fijó la medición de la O0 en el VPS AMD real
+// (ADR-0038 Enmienda 1 §(d)). Con los 3000 que decía el ADR original y num_thread=4, el 55 % de los
+// mensajes se habría despachado SIN INTENT Y EN SILENCIO — un default que degrada la mitad del tráfico
+// sin un solo log no es un default, es un fallo. De ahí que el número se clave en un test.
+func TestLoad_IntentWaitMS_Default(t *testing.T) {
+	t.Setenv(EnvPrefix+"DATA_DIR", t.TempDir()) // hermético: Load lee estado bajo data_dir
+
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if DefaultIntentWaitMS != 4000 {
+		t.Fatalf("el default del presupuesto de espera es 4000 ms (fijado por la O0): got %d", DefaultIntentWaitMS)
+	}
+	if cfg.Intent.WaitMS != DefaultIntentWaitMS {
+		t.Fatalf("presupuesto de espera por defecto: got %d, want %d", cfg.Intent.WaitMS, DefaultIntentWaitMS)
+	}
+}
+
+// TestLoad_IntentWaitMS_Override: la variable se lee del entorno, y un valor no positivo cae al default
+// (un 0 significaría no esperar nunca: todo el tráfico saldría sin intent y el cajero clasificaría para
+// nadie, que es justo el modo de fallo silencioso que la O0 destapó).
+func TestLoad_IntentWaitMS_Override(t *testing.T) {
+	t.Run("valor explícito", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"INTENT_WAIT_MS", "1234")
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Intent.WaitMS != 1234 {
+			t.Fatalf("WAPP_AGENT_INTENT_WAIT_MS no se leyó: got %d, want 1234", cfg.Intent.WaitMS)
+		}
+	})
+	t.Run("cero y negativo caen al default", func(t *testing.T) {
+		for _, valor := range []string{"0", "-1"} {
+			t.Setenv(EnvPrefix+"INTENT_WAIT_MS", valor)
+			cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+			if err != nil {
+				t.Fatalf("Load con %q: %v", valor, err)
+			}
+			if cfg.Intent.WaitMS != DefaultIntentWaitMS {
+				t.Fatalf("con %q el presupuesto debe caer al default: got %d, want %d",
+					valor, cfg.Intent.WaitMS, DefaultIntentWaitMS)
+			}
+		}
+	})
+}
+
+// TestVariablesRetiradas_IntentTimeoutMS vigila el aviso que evita el fallo silencioso de T3.1.
+//
+// Retirar una variable de entorno no rompe nada visible: el operador la deja puesta en su unidad, el
+// proceso arranca sin quejarse y el número que él cree haber fijado no gobierna nada. Este test asevera
+// las dos mitades del contrato —hay aviso cuando está puesta, NO hay ruido cuando no lo está— y que el
+// texto nombra literalmente la retirada y la sustituta, para que el operador sepa qué escribir en su
+// lugar sin abrir el plan.
+func TestVariablesRetiradas_IntentTimeoutMS(t *testing.T) {
+	t.Run("sin la variable no hay aviso", func(t *testing.T) {
+		// Se fuerza la AUSENCIA: t.Setenv + Unsetenv deja el entorno restaurado al salir del test aunque
+		// quien ejecute la suite la tuviera puesta de verdad en su shell.
+		t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "")
+		if err := os.Unsetenv(EnvPrefix + "INTENT_TIMEOUT_MS"); err != nil {
+			t.Fatalf("Unsetenv: %v", err)
+		}
+		if avisos := VariablesRetiradas(); len(avisos) != 0 {
+			t.Fatalf("sin variables retiradas puestas no debe haber ningún aviso: got %+v", avisos)
+		}
+	})
+
+	t.Run("con la variable puesta hay UN aviso que nombra a las dos", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "3000")
+		avisos := VariablesRetiradas()
+		if len(avisos) != 1 {
+			t.Fatalf("se esperaba exactamente 1 aviso: got %d (%+v)", len(avisos), avisos)
+		}
+		aviso := avisos[0]
+		if aviso.Variable != EnvPrefix+"INTENT_TIMEOUT_MS" {
+			t.Fatalf("el aviso debe nombrar LITERALMENTE la variable retirada: got %q", aviso.Variable)
+		}
+		// La sustituta es la que el código LEE de verdad (WAPP_WORKER_INFERENCE_TIMEOUT_MS), no la que
+		// nombran los docs del plan (WAPP_WORKER_TIMEOUT_MS): mandar al operador a una variable que nadie
+		// lee reproduciría el mismo fallo silencioso que este aviso existe para cerrar.
+		if aviso.Sustituta != WorkerEnvPrefix+"INFERENCE_TIMEOUT_MS" {
+			t.Fatalf("la sustituta debe ser la variable que Load lee de verdad: got %q", aviso.Sustituta)
+		}
+		if !strings.Contains(aviso.Motivo, WorkerEnvPrefix+"INFERENCE_TIMEOUT_MS") {
+			t.Fatalf("el motivo debe nombrar el timeout de INFERENCIA vigente: got %q", aviso.Motivo)
+		}
+		if !strings.Contains(aviso.Motivo, EnvPrefix+"INTENT_WAIT_MS") {
+			t.Fatalf("el motivo debe nombrar el presupuesto de ESPERA vigente: got %q", aviso.Motivo)
+		}
+	})
+
+	t.Run("puesta a vacío también avisa", func(t *testing.T) {
+		// Se mira la PRESENCIA, no el valor: quien la escribió tenía una intención y ya no se cumple.
+		t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "")
+		if avisos := VariablesRetiradas(); len(avisos) != 1 {
+			t.Fatalf("una variable retirada presente-pero-vacía también se avisa: got %d", len(avisos))
+		}
+	})
 }
 
 // TestLoad_StatsEveryMS_ElCeroDesactiva: el latido de contadores es el ÚNICO número del worker cuyo
