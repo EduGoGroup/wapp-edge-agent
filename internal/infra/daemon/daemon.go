@@ -5,7 +5,6 @@ package daemon
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -68,6 +67,21 @@ func (d *Daemon) Run(ctx context.Context) error {
 	cfg := d.cfg
 	log := d.log
 
+	// VARIABLES RETIRADAS (Plan 051 Ola 3, T3.1): lo PRIMERO del arranque, antes de tocar la BD, porque
+	// es un aviso al operador y no debe depender de que el resto del arranque llegue a algún sitio.
+	//
+	// Se emite AQUÍ y no en config.Load por dos razones: (1) Load se ejecuta antes de que exista el
+	// logger —meterle uno sería invertir la dependencia—, y (2) éste es el proceso que CONSUMÍA la
+	// variable retirada (el camino inline vivía en el daemon), así que es su operador el que necesita
+	// leerlo. El logger del daemon es además el que alimenta el ring buffer del plano de control, de
+	// modo que el aviso también se ve por `wapp-ctl logs` y no sólo en stderr al arrancar.
+	//
+	// NO es fatal: una variable de más no impide operar, sólo miente sobre lo que gobierna.
+	for _, aviso := range config.VariablesRetiradas() {
+		log.Warn("variable de entorno RETIRADA presente: ya no gobierna nada",
+			"variable", aviso.Variable, "sustituta", aviso.Sustituta, "motivo", aviso.Motivo)
+	}
+
 	dbDSN := cfg.DBDSN
 	if cfg.DBDialect == db.DialectSQLite && dbDSN == "" {
 		dbDSN = filepath.Join(cfg.DataDir, SingleDBFileName)
@@ -96,23 +110,41 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	// Cola durable de entrantes (Plan 051 Ola 1): vive en su PROPIA BD SQLite (<data_dir>/cola_entrantes.db),
 	// NUNCA dentro de edge.db — por eso se abre aparte y se migra con MigrateCola (set "cola"), no con
-	// Migrate. NO es fatal en ningún paso: si el fichero no se puede abrir o migrar, se loguea y el daemon
-	// sigue con los listeners SIN cola (comportamiento idéntico al previo). El handle se cierra igual que el
-	// de edge.db (defer, apagado ordenado §10.I).
-	var colaDB *sql.DB
-	if opened, colaErr := db.Open(ctx, db.DialectSQLite, layout.ColaDB()); colaErr != nil {
-		log.Error("cola de entrantes: no se pudo abrir su BD; el Edge sigue SIN cola durable",
-			"error", colaErr, "path", layout.ColaDB())
-	} else {
-		defer func() { _ = opened.Close() }()
-		if err := db.MigrateCola(ctx, opened); err != nil {
-			log.Error("cola de entrantes: no se pudo migrar su BD; el Edge sigue SIN cola durable",
-				"error", err, "path", layout.ColaDB())
-		} else {
-			colaDB = opened
-		}
+	// Migrate. El handle se cierra igual que el de edge.db (defer, apagado ordenado §10.I).
+	//
+	// 🔴🔴 ES FATAL, Y ESO CAMBIÓ EL 2026-08-17 (Plan 051 O3). Hasta entonces un fallo aquí se logueaba y el
+	// daemon seguía «degradado». Era defendible mientras el listener entregaba además por su cuenta
+	// (`sink.Deliver` inline): sin cola se perdía la durabilidad y la clasificación, pero el mensaje subía.
+	// T3.0 retiró ese camino y el despachador de la cola pasó a ser EL ÚNICO por el que un entrante llega a
+	// la nube. Con eso, «seguir sin cola» dejó de ser una degradación y pasó a ser el peor modo de fallo que
+	// tiene esta pieza: el socket conectado, el teléfono del cliente acusando ✓✓, y CADA mensaje entrante
+	// evaporándose sin una sola línea de error. Nadie lo diagnostica en campo.
+	//
+	// Arrancar así sería PROMETER UN SERVICIO QUE NO EXISTE. Se prefiere que el proceso no levante: el
+	// supervisor lo reintenta, el operador ve el error en el arranque y el cliente sigue viendo sus mensajes
+	// sin entregar en WhatsApp —que es información honesta— en vez de un doble check azul mentiroso.
+	//
+	// El worker-cajero (cmd/agent/cajero.go) ya era fatal por su lado desde la Ola 2; ahora los dos procesos
+	// que abren este fichero tratan su ausencia igual.
+	colaDB, err := db.Open(ctx, db.DialectSQLite, layout.ColaDB())
+	if err != nil {
+		return fmt.Errorf("serve: abrir la BD de la cola de entrantes (%s): sin cola no hay camino de entrega, "+
+			"arrancar sería prometer un servicio que no existe (Plan 051 O3): %w", layout.ColaDB(), err)
+	}
+	defer func() { _ = colaDB.Close() }()
+	if err := db.MigrateCola(ctx, colaDB); err != nil {
+		return fmt.Errorf("serve: migrar la BD de la cola de entrantes (%s): sin cola no hay camino de entrega, "+
+			"arrancar sería prometer un servicio que no existe (Plan 051 O3): %w", layout.ColaDB(), err)
 	}
 	cola := wiring.BuildCola(ctx, cfg, colaDB, layout, custodyFor, log)
+	// Y la construcción del Store TAMBIÉN es fatal, por el mismo motivo exacto: `BuildCola` sigue devolviendo
+	// nil sin drama (su molde es el de BuildOutbox y lo comparte con el cajero, que hace su propia guarda),
+	// pero un nil aquí deja el mismo agujero negro que un fichero que no abre. La política de arranque se
+	// decide AQUÍ, en el dueño del proceso, no dentro del constructor compartido.
+	if cola == nil {
+		return fmt.Errorf("serve: la cola de entrantes no se pudo construir sobre %s (ver el error anterior); "+
+			"sin cola no hay camino de entrega (Plan 051 O3)", layout.ColaDB())
+	}
 
 	outbox := wiring.BuildOutbox(ctx, cfg, database, log)
 	intentStack := wiring.BuildIntent(cfg, database, log)
@@ -123,7 +155,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	edgeCfgSvc.Bootstrap(ctx)
 
 	healthReg := health.NewRegistry()
-	healthCollector := health.NewCollector(healthReg, outbox, intentStack.CircuitFunc(), d.version, d.startedAt)
+	// 🔴 EL CIRCUITO DEL CLASIFICADOR YA NO SE PUEDE LEER DESDE AQUÍ (Plan 051 Ola 3 · T3.0) y por eso se
+	// pasa nil EXPLÍCITO. Hasta esta ola el colector leía el breaker del decorador inline; retirado el
+	// decorador, ese breaker no existe. El circuito REAL es el del worker-cajero, que corre en OTRO PROCESO.
+	//
+	// nil ⇒ `intent_circuit` viaja VACÍO en el heartbeat y en el bundle de diagnóstico (Collector.intentCircuit
+	// ya trata el nil así, y el campo es omitempty en el contrato ADR-0023). Vacío es la respuesta honesta:
+	// «este proceso no tiene circuito». Cablear aquí un "closed" fijo —o dejar el breaker muerto— habría
+	// mandado a la nube una señal de salud inventada, que es peor que la ausencia del dato.
+	//
+	// ⚠️ DEUDA DECLARADA para la Ola 4 (telemetría): republicar `intent_circuit` desde el cajero, que sí lo
+	// conoce (internal/app/cajero · Circuito()), por el canal que ambos procesos comparten (la BD de la cola).
+	healthCollector := health.NewCollector(healthReg, outbox, nil, d.version, d.startedAt)
 	diagBuilder := diagnostics.NewBuilder(d.sink, healthCollector, cfg.DiagLogLines)
 
 	mux, authRelay := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder)
@@ -140,16 +183,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Ventana temporal de ingesta (ADR-0037): lo que llegó del buzón que WhatsApp reencola tras una
 		// caída no se ingiere. config.Load ya garantiza un margen > 0.
 		sessionmgr.WithInboundMargin(time.Duration(cfg.InboundMarginSeconds)*time.Second),
-		sessionmgr.WithInboundDecorator(intentStack.DecoratorWrap()),
+		// (aquí iba WithInboundDecorator, el decorador de intenciones inline; retirado en T3.0 junto con la
+		// opción del Manager: la clasificación ya no ocurre en el camino del listener.)
 		sessionmgr.WithKeyCustodyFactory(custodyFor),
 		// Cola durable de entrantes (Plan 051 Ola 1): cada listener anota el entrante en disco (cifrado con
-		// la DEK de SU sesión) antes de entregarlo al sink. nil (cola no disponible) ⇒ la opción no cambia
-		// nada y el cableado queda idéntico al previo.
+		// la DEK de SU sesión), y ahí acaba su trabajo. Aquí `cola` NO PUEDE SER nil: la apertura, la
+		// migración y la construcción de arriba son fatales desde el 2026-08-17.
 		sessionmgr.WithColaEntrantes(cola),
+		// Despachador de la cola (Plan 051 Ola 3, T3.3): cada sesión estrena, junto a su listener, el bucle
+		// que DRENA su cola en orden de `seq` y entrega al cable. Es el otro extremo del MISMO adaptador de
+		// la línea de arriba (no una segunda cola).
+		//
+		// 🔴 DESDE T3.0 ES EL ÚNICO CAMINO DE ENTREGA (ya no hay doble entrega: el listener solo encola), y
+		// por eso desde el 2026-08-17 el daemon no arranca sin cola. `BuildColaDespachador` sigue pudiendo
+		// devolver nil por su OTRO camino —que el adaptador no implemente el lado despachador—, que es un
+		// fallo de programación imposible con el *Store real y que él grita con un Warn.
+		sessionmgr.WithColaDespachador(wiring.BuildColaDespachador(cola, log)),
+		// Presupuesto de espera al cajero (WAPP_AGENT_INTENT_WAIT_MS, 4000 ms): el techo de latencia que la
+		// cola añade al camino de un mensaje. config.Load ya garantiza un valor > 0.
+		sessionmgr.WithPresupuestoIntent(time.Duration(cfg.Intent.WaitMS)*time.Millisecond),
 		// Interruptor del clasificador (Plan 051 Ola 2, T2.12): con la feature apagada, el entrante nace en
 		// la cola YA resuelto (marca `apagado`) en vez de que el cajero gaste una plaza del semáforo para
-		// descartarlo igual. Sale del MISMO stack que ya alimenta el decorador inline (línea de arriba), de
-		// modo que ambos caminos leen un solo interruptor mientras dure la escritura doble de la Ola 1.
+		// descartarlo igual. Tras T3.0 el stack ya no tiene decorador y este predicado lee el flag de config
+		// directamente — que es lo que `MotivoApagado` siempre significó.
 		sessionmgr.WithClasificadorActivo(intentStack.ClasificadorActivoFunc()),
 	)
 
@@ -165,12 +221,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 	srv.SetAuthorizer(authMgr)
 	srv.RegisterAuth(authMgr)
 	srv.HandleAuthorized(http.MethodGet, "/v1/logs", "edge.status.read", false, logsink.Handler(d.sink))
+	// GET /v1/intent/status — ADELGAZADO en T3.0: reporta el CONTRATO (feature, modelo y versión persistida)
+	// y señala al worker-cajero. Ya no reporta `circuit` ni `ollama_ok`: los dos vivían en el decorador
+	// inline y sostenerlos aquí sería informar de un estado que este proceso ya no tiene. Ver el doc comment
+	// de intent.statusResponse.
 	srv.HandleAuthorized(http.MethodGet, "/v1/intent/status", "edge.status.read", false, intent.StatusHandler(intent.StatusDeps{
 		Enabled:       intentStack.Enabled,
 		Model:         intentStack.Model,
-		Prober:        intentStack.Prober,
 		ConfigVersion: intentStack.ConfigVersion,
-		Circuit:       intentStack.CircuitFunc(),
 	}))
 	srv.RegisterPairing(mgr)
 	srv.RegisterUnlink(mgr)
