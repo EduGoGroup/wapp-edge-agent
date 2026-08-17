@@ -114,10 +114,15 @@ func BuildOutbox(ctx context.Context, cfg config.Config, database *sql.DB, log s
 
 // BuildCola construye la COLA DURABLE DE ENTRANTES (Plan 051 Ola 1) sobre la BD PROPIA de la cola —ya
 // abierta y migrada por el daemon con db.MigrateCola—, con los límites de config (tope de filas + TTL).
-// Sigue el molde de BuildOutbox: NO es fatal. Si la BD no está (colaDB nil porque no se pudo abrir/migrar)
-// o el Store no se puede construir, devuelve nil y los listeners se quedan SIN cola, con el comportamiento
-// byte a byte del camino de siempre (solo sink.Deliver). La durabilidad es una mejora, no un requisito de
-// arranque: nada de esto puede impedir que una sesión arranque.
+// SIGUE EL MOLDE DE BuildOutbox Y DEVUELVE nil SIN DRAMA (colaDB nil, o un Store que no se pudo construir),
+// pero eso YA NO SIGNIFICA «se sigue sin cola»: los DOS llamantes tratan ese nil como fatal por su cuenta
+// —`agent cajero` desde la Ola 2, y `agent serve` desde el 2026-08-17 (Plan 051 O3)—, porque retirado el
+// camino inline un Edge sin cola no entrega nada y arrancar sería prometer un servicio que no existe.
+//
+// LA POLÍTICA SE QUEDA EN LOS LLAMANTES, no aquí, y es deliberado: este constructor lo comparten dos
+// procesos con ciclos de vida distintos, y un `os.Exit`/error desde una factory compartida les quitaría a
+// ambos la posibilidad de decidir. Lo que sí es obligación de esta función es LOGUEAR la causa antes de
+// devolver nil, porque el error que el llamante escribe no la lleva.
 //
 // ZERO-KNOWLEDGE (ADR-0007): el CrypterFor resuelve la DEK de CADA sesión por su custodia local (la misma
 // factory que usa el session manager, un único punto de verdad) y la mantiene dentro del sobre AES; la DEK
@@ -152,6 +157,39 @@ func BuildCola(ctx context.Context, cfg config.Config, colaDB *sql.DB, layout se
 	log.Info("cola de entrantes habilitada (Plan 051): el entrante se anota en disco cifrado ANTES de entregarse",
 		"max_filas", cfg.ColaMaxRows, "ttl_horas", cfg.ColaTTLHours)
 	return store
+}
+
+// BuildColaDespachador resuelve el lado DESPACHADOR de la MISMA cola que devolvió BuildCola (Plan 051
+// Ola 3 · T3.3). No abre nada ni construye nada: el *Store de colaentrantes respalda los TRES lados del
+// puerto (encolar, reclamar, despachar) y esto sólo pregunta si el que ya tenemos en la mano sirve
+// también para drenar.
+//
+// POR QUÉ UNA ASERCIÓN DE TIPO Y NO OTRO CONSTRUCTOR: dos constructores sobre la misma BD darían dos
+// *Store, y con ellos dos cachés de sobres por sesión y dos contadores del tope — dos verdades sobre una
+// sola tabla. El puerto está partido en tres interfaces porque son tres PAPELES (y en parte tres
+// procesos), no tres objetos. Es el mismo patrón con el que sessionmgr.forgetColaCrypter llega a `Forget`.
+//
+// DEVUELVE nil en los dos casos en que no hay nada que drenar: cola no disponible —que en `agent serve` ya
+// no ocurre, porque el daemon falla antes de llegar aquí (Plan 051 O3)— o un adaptador que no implemente
+// el lado despachador, que con el *Store real es imposible y que se grita con un Warn. Ya no queda ningún
+// «camino inline» detrás: si esto devolviera nil en producción, la sesión escucharía sin entregar.
+//
+// 🔴 LA GUARDA `cola == nil` CUBRE EL nil LITERAL, que es lo que BuildCola devuelve hoy en sus dos
+// caminos de fallo. Lo que NO cubre —y hay que saberlo— es el TYPED NIL: el día que BuildCola devuelva
+// `(*colaentrantes.Store)(nil)`, la interfaz deja de ser nil, la aserción casa y aquí saldría un
+// despachador cuyo receptor es nil. La barrera contra eso es que BuildCola devuelve `nil` LITERAL, escrito
+// a mano en cada return; si alguien lo reescribe con una variable `var s *Store`, esto se rompe en
+// silencio. Mismo aviso, palabra por palabra, que el de sessionmgr.forgetColaCrypter.
+func BuildColaDespachador(cola app.ColaEntrantes, log sharedlogger.Logger) app.ColaDespachador {
+	if cola == nil {
+		return nil
+	}
+	d, ok := cola.(app.ColaDespachador)
+	if !ok {
+		log.Warn("cola de entrantes: el adaptador no implementa el lado despachador; las sesiones NO drenarán su cola")
+		return nil
+	}
+	return d
 }
 
 // dialCloudLink concentra el bloque COMÚN de BuildSink/BuildMux (H3: antes duplicado ~90 líneas): valida

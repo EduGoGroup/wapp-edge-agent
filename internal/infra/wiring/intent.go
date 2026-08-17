@@ -3,15 +3,10 @@ package wiring
 import (
 	"context"
 	"database/sql"
-	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cloudlink"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/edgeconfig"
-	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/intent"
-	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
-	"github.com/EduGoGroup/wapp-edge-intent/classifier"
-	"github.com/EduGoGroup/wapp-edge-intent/ollama"
 	"github.com/EduGoGroup/wapp-shared/intents"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -25,13 +20,21 @@ import (
 // siempre y el cajero no reclamaría ni una fila, sin un solo error en el log.
 const IntentsConfigKind = "intents"
 
-// IntentStack agrupa las piezas del CLASIFICADOR de intenciones (Plan 029) que el arranque cablea al conducto
-// CloudLink y al plano de control. Con la feature OFF, Decorator/Applier/Service/Prober son nil (cableado
-// idéntico al previo) y solo Store queda vivo (GET /v1/intent/status reporta enabled=false + config_version
-// persistida si la hubiera).
+// IntentStack agrupa lo que queda del CLASIFICADOR de intenciones (Plan 029) DENTRO del daemon tras la
+// Ola 3 del Plan 051: el CONTRATO y su conducto, nada más.
+//
+// 🔴 EL DAEMON YA NO CLASIFICA (T3.0). El decorador inline —el que envolvía el sink de cada sesión y
+// llamaba a Ollama en el hilo de whatsmeow— se retiró entero, y con él el cliente de Ollama del agente y
+// su circuit breaker. Quien clasifica hoy es el WORKER-CAJERO (`agent cajero`), que es OTRO PROCESO: lee
+// las filas de la cola durable y su propio contrato desde `edge.db`.
+//
+// LO QUE ESTE STACK SIGUE HACIENDO, y es lo único: RECIBIR el `ConfigUpdate` del kind 'intents' que llega
+// por el stream CloudLink, VALIDARLO y PERSISTIRLO en edge.db. Ese registro persistido es el ÚNICO canal
+// entre la nube y el cajero (el worker lo sondea cada 30 s, cmd/agent/cajero.go), así que romper esta
+// cadena deja al clasificador sin contrato para siempre y sin un solo error en el log.
+//
+// Con la feature OFF, Applier/Service son nil y solo Store queda vivo.
 type IntentStack struct {
-	// Decorator envuelve el sink de entrada para anotar la intención LLM (nil ⇒ off, sink sin decorar).
-	Decorator *intent.Decorator
 	// Applier persiste/valida/notifica los ConfigUpdate (edgeconfig.Service; nil ⇒ off, Ack tolerante).
 	Applier cloudlink.ConfigApplier
 	// Service es el mismo edgeconfig.Service (para Bootstrap al arrancar). nil ⇒ off.
@@ -39,20 +42,11 @@ type IntentStack struct {
 	// Store lee la config persistida. SIEMPRE presente (el status lo consulta aun con la feature off).
 	Store edgeconfig.Store
 
-	// Enabled/Model reflejan la config; Prober sondea Ollama para el status (nil ⇒ off, ollama_ok=false).
+	// Enabled/Model reflejan la config del Edge. NO describen al decorador (que ya no existe): Enabled es
+	// el interruptor de la feature `llm_intent` en esta máquina —el mismo que decide si una fila nace
+	// reclamable o con la marca `apagado`— y Model es informativo para el operador.
 	Enabled bool
 	Model   string
-	Prober  intent.HealthProber
-}
-
-// WrapSink envuelve un sink con el decorador de intenciones si la feature está ON; si no, lo devuelve tal
-// cual. Costura de cableado para el camino single-sesión (BuildSink); el multi-sesión usa Decorator.Wrap vía
-// sessionmgr.WithInboundDecorator.
-func (s *IntentStack) WrapSink(next app.InboundSink) app.InboundSink {
-	if s == nil || s.Decorator == nil {
-		return next
-	}
-	return s.Decorator.Wrap(next)
 }
 
 // applier devuelve el ConfigApplier del stack de forma nil-safe (nil si la feature está off o el stack es
@@ -64,18 +58,12 @@ func (s *IntentStack) applier() cloudlink.ConfigApplier {
 	return s.Applier
 }
 
-// DecoratorWrap devuelve la función de envoltura del sink para el camino multi-sesión
-// (sessionmgr.WithInboundDecorator), o nil si la feature está off. Devolver nil (no una identidad) mantiene
-// el cableado del Manager idéntico byte a byte al previo cuando el clasificador está deshabilitado.
-func (s *IntentStack) DecoratorWrap() func(app.InboundSink) app.InboundSink {
-	if s == nil || s.Decorator == nil {
-		return nil
-	}
-	return s.Decorator.Wrap
-}
-
 // ConfigVersion devuelve la versión de la config 'intents' vigente (persistida) o "": alimenta GET
 // /v1/intent/status con independencia de que la feature esté on/off.
+//
+// LEE DEL DISCO, no de memoria, y eso ahora importa más que antes: es EXACTAMENTE la misma fila que el
+// worker-cajero sondea para cargar su contrato, así que lo que responde aquí es lo que el cajero verá.
+// Es el dato honesto que el daemon todavía puede dar sobre la clasificación.
 func (s *IntentStack) ConfigVersion() string {
 	if s == nil || s.Store == nil {
 		return ""
@@ -87,22 +75,22 @@ func (s *IntentStack) ConfigVersion() string {
 	return rec.Version
 }
 
-// ClasificadorActivo reporta si el CLASIFICADOR de intenciones está vivo en este Edge. Se lee del
-// DECORADOR, no del flag de config: BuildIntent solo construye el decorador con la feature ON, así que
-// `Decorator != nil` es exactamente «hay a quién preguntar». Lo consume el listener (Plan 051 Ola 2, T2.12)
-// para que una fila que llega con el clasificador apagado nazca ya resuelta (`apagado`) en vez de gastar
-// una plaza del semáforo del cajero.
+// ClasificadorActivo reporta si el CLASIFICADOR de intenciones está encendido en este Edge. Lo consume el
+// listener (Plan 051 Ola 2, T2.12) para que una fila que llega con el clasificador apagado nazca ya resuelta
+// (`apagado`) en vez de gastar una plaza del semáforo del cajero.
 //
-// ⚠️ HONESTIDAD SOBRE EL ALCANCE — esto NO es `intent.Decorator.ready`, que es la condición que el camino
-// inline usa en `eligible` (sink.go:148). `ready` añade «además hay config de intenciones cargada» (por
-// push del Cloud o por Bootstrap) y es PRIVADO, sin accesor público, y añadir uno sería tocar un fichero
-// que no es de esta tarea. La diferencia es una sola ventana: feature ON pero aún sin config, donde esto
-// dice ACTIVO y `ready` diría que no. Se acepta a sabiendas porque el error cae del lado barato (el cajero
-// clasifica de más y se ve en la telemetría) y porque coincide con la semántica documentada de
-// `app.MotivoApagado`: «la feature llm_intent está apagada», que es un interruptor, no un estado de carga.
-// Si algún día hace falta la verdad exacta, la firma que la daría es `func (d *Decorator) Ready() bool`.
+// 🔄 CAMBIÓ DE FUENTE EN T3.0, y el cambio es una MEJORA, no un apaño. Antes leía `Decorator != nil`, que
+// era un proxy de la feature: BuildIntent solo construía el decorador con la feature ON. Retirado el
+// decorador, se lee el flag DIRECTO (`s.Enabled` = cfg.Intent.Enabled), que es lo que la semántica
+// documentada de `app.MotivoApagado` siempre dijo —«la feature llm_intent está apagada»— y de paso elimina
+// la salvedad que el comentario anterior arrastraba sobre `Decorator.ready`.
+//
+// ⚠️ LO QUE SIGUE SIN SABER: si el WORKER-CAJERO está realmente corriendo y con contrato cargado. Eso vive
+// en otro proceso y el daemon no puede verlo. Con la feature ON y el cajero caído, las filas nacen `nuevo`
+// y esperan en la cola hasta que el supervisor lo levante; el despachador las entrega igual al agotar su
+// presupuesto. Es el fallo del lado barato y visible, que es el que se eligió a propósito.
 func (s *IntentStack) ClasificadorActivo() bool {
-	return s != nil && s.Decorator != nil
+	return s != nil && s.Enabled
 }
 
 // ClasificadorActivoFunc devuelve el predicado que el sessionmgr cablea en cada listener
@@ -116,57 +104,43 @@ func (s *IntentStack) ClasificadorActivoFunc() func() bool {
 	return s.ClasificadorActivo
 }
 
-// CircuitFunc devuelve el lector del estado del circuito para el status (nil si la feature está off).
-func (s *IntentStack) CircuitFunc() func() string {
-	if s == nil || s.Decorator == nil {
-		return nil
-	}
-	return s.Decorator.Circuit
-}
-
-// BuildIntent construye el stack del clasificador de intenciones (Plan 029) sobre la BD única YA migrada
+// BuildIntent construye el conducto del CONTRATO de intenciones (Plan 029) sobre la BD única YA migrada
 // (la tabla edge_config la crea db.Migrate). El Store se crea SIEMPRE (lo consulta el status). Con
-// cfg.Intent.Enabled=false devuelve el stack "vacío" (sin decorador/applier): el cableado del sink queda
-// idéntico byte a byte al previo.
+// cfg.Intent.Enabled=false devuelve el stack "vacío" (sin applier/service).
 //
-// Con la feature ON: un cliente Ollama local + un clasificador (arranca sin config útil hasta el primer push
-// o el Bootstrap), el decorador compartido y el edgeconfig.Service con el kind 'intents' registrado
-// (validador = intents.ParseAndValidate; suscriptor = recarga en caliente del clasificador).
+// 🔴 LO QUE ESTA FUNCIÓN YA NO HACE (T3.0), y por qué NO hay que devolverlo: no crea cliente de Ollama, no
+// crea clasificador y no crea decorador. El daemon no habla con el LLM (REQ-051.10: «ningún otro proceso
+// que el worker habla con Ollama»); si vuelves a poner un `ollama.New` aquí, ese requisito deja de
+// cumplirse aunque el decorador no vuelva.
+//
+// 🔴 LO QUE SÍ HACE, Y ES LOAD-BEARING: registrar el kind 'intents' en el edgeconfig.Service. `Service.Apply`
+// IGNORA los kinds no registrados (registrationFor → `!known` ⇒ log + Ack sin persistir), así que este
+// RegisterKind es lo ÚNICO que hace que un ConfigUpdate de intenciones llegue a disco. Y ese disco es el
+// único canal hacia el worker-cajero, que lo sondea cada 30 s. Si lo quitas, el cajero se queda sin
+// contrato para siempre, `Listo()` devuelve false, no reclama ni una fila y NO HAY UN SOLO ERROR EN NINGÚN
+// LOG. Se registra sin suscriptores: ya no hay nada en ESTE proceso que recargar en caliente.
 func BuildIntent(cfg config.Config, database *sql.DB, log sharedlogger.Logger) *IntentStack {
 	store := edgeconfig.NewSQLStore(database)
 	st := &IntentStack{Store: store, Enabled: cfg.Intent.Enabled, Model: cfg.Intent.Model}
 	if !cfg.Intent.Enabled {
-		log.Info("clasificador de intenciones DESHABILITADO (WAPP_AGENT_INTENT_ENABLED=false): sink sin decorar")
+		log.Info("clasificador de intenciones DESHABILITADO (WAPP_AGENT_INTENT_ENABLED=false): no se acepta config 'intents' y las filas de la cola nacen con la marca `apagado`")
 		return st
 	}
 
-	client := ollama.New(cfg.Intent.OllamaURL)
-	// Arranca con una config vacía: el decorador no clasifica (ready=false) hasta que SetConfig llegue por un
-	// push del Cloud o por el Bootstrap de la config persistida.
-	cls := classifier.New(client, cfg.Intent.Model, &intents.Config{})
-	dec := intent.New(cls, time.Duration(cfg.Intent.TimeoutMS)*time.Millisecond, log)
-
 	svc := edgeconfig.NewService(store, log)
+	// Validador SÍ, suscriptores NO. El validador es lo que impide que un blob corrupto sustituya al
+	// contrato bueno en disco (last-known-good), y sigue siendo tan necesario como antes: el que se comería
+	// la basura ahora no es un decorador en memoria, es el cajero en el arranque siguiente.
 	svc.RegisterKind(IntentsConfigKind,
 		func(payload []byte) error { _, err := intents.ParseAndValidate(payload); return err },
-		func(rec edgeconfig.Record) {
-			parsed, err := intents.ParseAndValidate(rec.Payload)
-			if err != nil {
-				// El Service ya validó antes de persistir/notificar; un fallo aquí sería un blob corrupto en
-				// disco. Se loguea y se deja el clasificador con la config previa (no se recarga con basura).
-				log.Error("intent: config 'intents' ilegible al recargar (se conserva la anterior)",
-					"version", rec.Version, "error", err)
-				return
-			}
-			dec.SetConfig(parsed, rec.Version)
-		},
 	)
 
-	st.Decorator = dec
 	st.Applier = svc
 	st.Service = svc
-	st.Prober = client
-	log.Info("clasificador de intenciones HABILITADO (Plan 029, ADR-0020)",
-		"ollama_url", cfg.Intent.OllamaURL, "model", cfg.Intent.Model, "timeout_ms", cfg.Intent.TimeoutMS)
+	// `wait_ms` es el presupuesto del DESPACHADOR (lo único que este proceso controla del camino de la
+	// intención). El plazo de la inferencia y la URL de Ollama son del worker y se loguean allí: emitirlos
+	// aquí sugeriría que este proceso los usa.
+	log.Info("contrato de intenciones HABILITADO (Plan 029, ADR-0020); la clasificación la ejecuta el worker-cajero, no el daemon",
+		"model", cfg.Intent.Model, "wait_ms", cfg.Intent.WaitMS)
 	return st
 }

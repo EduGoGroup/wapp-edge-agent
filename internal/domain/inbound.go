@@ -39,11 +39,16 @@ type InboundEvent struct {
 	IsFromMe bool
 	// IsGroup indica que el chat es un grupo/lista de difusión.
 	IsGroup bool
-	// Intent es la clasificación LLM del texto (Plan 029, ADR-0020), poblada por el decorador
-	// internal/adapters/intent SOLO cuando el clasificador local resuelve una intención accionable. nil en
-	// todo lo demás (feature off, no elegible, fastlane, timeout/error/circuito abierto, o "desconocido"):
-	// el decorador JAMÁS bloquea el mensaje por culpa del clasificador. Al reenviar a la nube viaja DENTRO
-	// del sobre sellado cuando el sellado en tránsito está activo (params llevan texto literal del cliente).
+	// Intent es la clasificación LLM del texto (Plan 029, ADR-0020). SOLO se puebla cuando el clasificador
+	// local resolvió una intención accionable; nil en todo lo demás (feature off, no elegible, fastlane,
+	// timeout/error/circuito abierto, o "desconocido"). La clasificación JAMÁS bloquea ni pierde el mensaje:
+	// es un enriquecimiento best-effort. Al reenviar a la nube viaja DENTRO del sobre sellado cuando el
+	// sellado en tránsito está activo (params llevan texto literal del cliente).
+	//
+	// QUIÉN LO RELLENA cambió en el Plan 051 Ola 3 · T3.0. Antes: el decorador internal/adapters/intent, en
+	// línea, en el hilo de whatsmeow. Ahora: el WORKER-CAJERO clasifica y escribe el resultado en la columna
+	// `intent_json` de la cola durable, y el DESPACHADOR de la sesión reconstruye este campo al drenarla
+	// (internal/app/despachador · `evento`). El contrato del campo no cambió ni un byte; cambió el productor.
 	Intent *ClassifiedIntent
 }
 

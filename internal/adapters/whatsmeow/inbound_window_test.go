@@ -2,6 +2,11 @@ package whatsmeow
 
 // inbound_window_test.go — fija el criterio del ADR-0037 (ventana temporal contra el inicio de conexión),
 // el filtro de eco propio y el corte C.
+//
+// 🔄 ADAPTADO EN T3.0 (Plan 051 Ola 3): el OBSERVABLE cambió, el criterio NO. Estos tests preguntaban
+// «¿llegó al sink?»; retirado el camino inline, el listener no entrega y la única huella de un entrante
+// ADMITIDO es su fila en la cola durable. Por eso ahora todos montan un `spyCola` y preguntan «¿nació la
+// fila?». Ni un solo umbral, margen ni asimetría del ADR-0037 se ha tocado.
 
 import (
 	"context"
@@ -29,9 +34,10 @@ func msgAt(id string, ts time.Time) *events.Message {
 	}
 }
 
-// listenerSealed devuelve un listener cuyo inicio de conexión es el instante dado (sello controlado).
-func listenerSealed(sink *spySink, seal time.Time) *Listener {
-	l := NewListener(sink, quietLogger())
+// listenerSealed devuelve un listener CON COLA cuyo inicio de conexión es el instante dado (sello
+// controlado). La cola no es un detalle del test: sin ella un entrante admitido no dejaría rastro alguno.
+func listenerSealed(cola *spyCola, seal time.Time) *Listener {
+	l := listenerConCola(cola)
 	l.SetConnectSeal(func() time.Time { return seal })
 	return l
 }
@@ -40,14 +46,14 @@ func listenerSealed(sink *spySink, seal time.Time) *Listener {
 
 // TestVentana_DescartaLoAnteriorAlUmbral: un mensaje enviado mucho antes de que el socket subiera cae.
 func TestVentana_DescartaLoAnteriorAlUmbral(t *testing.T) {
-	sink := &spySink{}
+	cola := &spyCola{}
 	seal := time.Now().Add(-time.Minute) // la conexión subió hace un minuto
-	l := listenerSealed(sink, seal)
+	l := listenerSealed(cola, seal)
 
 	l.handleEvent(context.Background(), msgAt("VIEJO", seal.Add(-6*time.Hour)))
 
-	if len(sink.got) != 0 {
-		t.Fatalf("un entrante de 6 h antes de conectar NO debe subir: %+v", sink.got)
+	if len(cola.got) != 0 {
+		t.Fatalf("un entrante de 6 h antes de conectar NO debe generar fila: wa_ids=%v", colaWAIDs(cola.got))
 	}
 	if got := l.InboundStats().DroppedByWindow; got != 1 {
 		t.Fatalf("DroppedByWindow = %d, quería 1", got)
@@ -60,17 +66,17 @@ func TestVentana_DescartaLoAnteriorAlUmbral(t *testing.T) {
 // mensaje se habría descartado por nuestra propia lentitud — que es lo que midió el incidente del
 // 2026-08-06 (71 % de saturación sostenida, respiro máximo de 2,3 s).
 func TestVentana_NuestroAtascoNoCuentaComoAntiguedad(t *testing.T) {
-	sink := &spySink{}
+	cola := &spyCola{}
 	seal := time.Now().Add(-30 * time.Minute) // el socket lleva media hora arriba
-	l := listenerSealed(sink, seal)
+	l := listenerSealed(cola, seal)
 
 	// Mensaje enviado 1 s DESPUÉS de conectar, pero que llega a onMessage 30 min más tarde (pipeline
 	// atascado). Su edad contra `now` sería de ~30 min: un criterio basado en `now` lo mataría.
 	vivo := msgAt("VIVO-ATASCADO", seal.Add(time.Second))
 	l.handleEvent(context.Background(), vivo)
 
-	if len(sink.got) != 1 {
-		t.Fatalf("un mensaje posterior al inicio de conexión debe subir aunque lo procesemos tarde: %+v", sink.got)
+	if len(cola.got) != 1 {
+		t.Fatalf("un mensaje posterior al inicio de conexión debe admitirse aunque lo procesemos tarde: %d filas", len(cola.got))
 	}
 	if got := l.InboundStats().DroppedByWindow; got != 0 {
 		t.Fatalf("no debía descartarse nada: DroppedByWindow = %d", got)
@@ -81,14 +87,14 @@ func TestVentana_NuestroAtascoNoCuentaComoAntiguedad(t *testing.T) {
 // vivo. Es la ventana de rescate que el diseño anterior no tenía: una microcaída de 30 s ya no pierde el
 // «1» que el cliente tecleó justo antes.
 func TestVentana_MargenRescataLaMicrocaida(t *testing.T) {
-	sink := &spySink{}
+	cola := &spyCola{}
 	seal := time.Now()
-	l := listenerSealed(sink, seal)
+	l := listenerSealed(cola, seal)
 
 	l.handleEvent(context.Background(), msgAt("MICROCAIDA", seal.Add(-30*time.Second)))
 
-	if len(sink.got) != 1 {
-		t.Fatalf("dentro del margen el entrante debe subir (rescate de la microcaída): %+v", sink.got)
+	if len(cola.got) != 1 {
+		t.Fatalf("dentro del margen el entrante debe admitirse (rescate de la microcaída): %d filas", len(cola.got))
 	}
 }
 
@@ -97,20 +103,20 @@ func TestVentana_MargenConfigurable(t *testing.T) {
 	seal := time.Now()
 
 	// Con el default (5 min), un mensaje de 4 min antes de conectar entra.
-	sink := &spySink{}
-	l := listenerSealed(sink, seal)
+	cola := &spyCola{}
+	l := listenerSealed(cola, seal)
 	l.handleEvent(context.Background(), msgAt("4MIN", seal.Add(-4*time.Minute)))
-	if len(sink.got) != 1 {
-		t.Fatalf("con margen de 5 min, 4 min antes debe entrar: %+v", sink.got)
+	if len(cola.got) != 1 {
+		t.Fatalf("con margen de 5 min, 4 min antes debe entrar: %d filas", len(cola.got))
 	}
 
 	// Con un margen de 1 min, el mismo mensaje cae.
-	sink2 := &spySink{}
-	l2 := listenerSealed(sink2, seal)
+	cola2 := &spyCola{}
+	l2 := listenerSealed(cola2, seal)
 	l2.SetConnectMargin(time.Minute)
 	l2.handleEvent(context.Background(), msgAt("4MIN", seal.Add(-4*time.Minute)))
-	if len(sink2.got) != 0 {
-		t.Fatalf("con margen de 1 min, 4 min antes debe caer: %+v", sink2.got)
+	if len(cola2.got) != 0 {
+		t.Fatalf("con margen de 1 min, 4 min antes debe caer: wa_ids=%v", colaWAIDs(cola2.got))
 	}
 }
 
@@ -148,17 +154,17 @@ func TestResolveThreshold(t *testing.T) {
 // hora del mensaje es del servidor, así que un reloj local atrasado la deja pasar igual (ver
 // resolveThreshold). Este test fija el respaldo, no una garantía absoluta.
 func TestVentana_SinSelloUsaNow(t *testing.T) {
-	sink := &spySink{}
-	l := NewListener(sink, quietLogger()) // connectSeal nil
+	cola := &spyCola{}
+	l := listenerConCola(cola) // connectSeal nil
 	ctx := context.Background()
 
 	l.handleEvent(ctx, msgAt("VIEJO", time.Now().Add(-time.Hour)))
-	if len(sink.got) != 0 {
-		t.Fatalf("sin sello, un entrante de 1 h debe caer: %+v", sink.got)
+	if len(cola.got) != 0 {
+		t.Fatalf("sin sello, un entrante de 1 h debe caer: wa_ids=%v", colaWAIDs(cola.got))
 	}
 	l.handleEvent(ctx, msgAt("VIVO", time.Now()))
-	if len(sink.got) != 1 {
-		t.Fatalf("sin sello, un entrante recién enviado debe subir: %+v", sink.got)
+	if len(cola.got) != 1 {
+		t.Fatalf("sin sello, un entrante recién enviado debe admitirse: %d filas", len(cola.got))
 	}
 }
 
@@ -169,14 +175,14 @@ func TestVentana_SinSelloUsaNow(t *testing.T) {
 // (binary/attrs.go:116-123), así que el mensaje llega con Timestamp cero. Cero es anterior a CUALQUIER
 // umbral: dejarlo caer por la comparación lo descartaría en silencio.
 func TestVentana_SinHoraSeAdmite(t *testing.T) {
-	sink := &spySink{}
+	cola := &spyCola{}
 	seal := time.Now()
-	l := listenerSealed(sink, seal)
+	l := listenerSealed(cola, seal)
 
 	l.handleEvent(context.Background(), msgAt("SIN-HORA", time.Time{}))
 
-	if len(sink.got) != 1 || sink.got[0].MessageID != "SIN-HORA" {
-		t.Fatalf("un entrante sin hora utilizable debe ADMITIRSE, no descartarse: %+v", sink.got)
+	if len(cola.got) != 1 || cola.got[0].WAMessageID != "SIN-HORA" {
+		t.Fatalf("un entrante sin hora utilizable debe ADMITIRSE, no descartarse: wa_ids=%v", colaWAIDs(cola.got))
 	}
 	s := l.InboundStats()
 	if s.AdmittedNoTimestamp != 1 {
@@ -190,18 +196,18 @@ func TestVentana_SinHoraSeAdmite(t *testing.T) {
 // --- Eco propio ---
 
 // TestOnMessage_IsFromMe_NoSubeALaNube fija el CAMBIO DE COMPORTAMIENTO aprobado: los mensajes que
-// mandamos nosotros dejan de subir. Antes el dato solo servía para no gastar el clasificador
-// (intent/sink.go:143) y el eco viajaba igual: en una sola corrida real subieron 403.
+// mandamos nosotros dejan de subir. Antes el dato solo servía para no gastar el clasificador (lo miraba el
+// decorador inline, hoy retirado) y el eco viajaba igual: en una sola corrida real subieron 403.
 func TestOnMessage_IsFromMe_NoSubeALaNube(t *testing.T) {
-	sink := &spySink{}
-	l := listenerSealed(sink, time.Now())
+	cola := &spyCola{}
+	l := listenerSealed(cola, time.Now())
 
 	eco := msgAt("ECO-1", time.Now())
 	eco.Info.IsFromMe = true
 	l.handleEvent(context.Background(), eco)
 
-	if len(sink.got) != 0 {
-		t.Fatalf("el eco propio NO debe llegar al sink: %+v", sink.got)
+	if len(cola.got) != 0 {
+		t.Fatalf("el eco propio NO debe generar fila (y por tanto no sube): wa_ids=%v", colaWAIDs(cola.got))
 	}
 	if got := l.InboundStats().DroppedSelf; got != 1 {
 		t.Fatalf("DroppedSelf = %d, quería 1", got)
@@ -211,13 +217,13 @@ func TestOnMessage_IsFromMe_NoSubeALaNube(t *testing.T) {
 // TestOnMessage_NoPropio_SigueSubiendo: el filtro de eco propio no puede llevarse por delante el tráfico
 // ajeno, que es el que sostiene el producto.
 func TestOnMessage_NoPropio_SigueSubiendo(t *testing.T) {
-	sink := &spySink{}
-	l := listenerSealed(sink, time.Now())
+	cola := &spyCola{}
+	l := listenerSealed(cola, time.Now())
 
 	l.handleEvent(context.Background(), msgAt("AJENO", time.Now()))
 
-	if len(sink.got) != 1 {
-		t.Fatalf("el mensaje ajeno debía subir: %+v", sink.got)
+	if len(cola.got) != 1 {
+		t.Fatalf("el mensaje ajeno debía admitirse: %d filas", len(cola.got))
 	}
 	if s := l.InboundStats(); s.DroppedSelf != 0 || s.DroppedByWindow != 0 {
 		t.Fatalf("no debía descartarse nada: %+v", s)
@@ -227,27 +233,27 @@ func TestOnMessage_NoPropio_SigueSubiendo(t *testing.T) {
 // --- Corchetes: SOLO observabilidad ---
 
 // TestCorchetes_NoDecidenNada es la diferencia con el diseño anterior: con un corchete ABIERTO, un mensaje
-// vivo sigue subiendo. Los corchetes ya no son un interruptor; el criterio es la hora del mensaje.
+// vivo sigue entrando. Los corchetes ya no son un interruptor; el criterio es la hora del mensaje.
 func TestCorchetes_NoDecidenNada(t *testing.T) {
-	sink := &spySink{}
+	cola := &spyCola{}
 	seal := time.Now()
-	l := listenerSealed(sink, seal)
+	l := listenerSealed(cola, seal)
 	ctx := context.Background()
 
 	l.handleEvent(ctx, &events.OfflineSyncPreview{Total: 5, Messages: 3, Receipts: 2})
 	l.handleEvent(ctx, msgAt("VIVO-EN-CORCHETE", seal.Add(time.Second)))
 
-	if len(sink.got) != 1 {
-		t.Fatalf("un mensaje vivo debe subir aunque haya corchete abierto: %+v", sink.got)
+	if len(cola.got) != 1 {
+		t.Fatalf("un mensaje vivo debe admitirse aunque haya corchete abierto: %d filas", len(cola.got))
 	}
 }
 
 // TestCorchetes_Reconcilian: dentro del corchete se contabiliza lo que la VENTANA descartó, que es la
 // pareja anunciado-vs-descartado — la única calibración posible de un descarte silencioso.
 func TestCorchetes_Reconcilian(t *testing.T) {
-	sink := &spySink{}
+	cola := &spyCola{}
 	seal := time.Now()
-	l := listenerSealed(sink, seal)
+	l := listenerSealed(cola, seal)
 	ctx := context.Background()
 
 	l.handleEvent(ctx, &events.OfflineSyncPreview{Total: 3, Messages: 3})
@@ -295,7 +301,7 @@ func TestCorchetes_Edades(t *testing.T) {
 // del ACUSE, no el del mensaje original, así que un acuse legítimo de una entrega ocurrida durante la
 // caída es viejo por definición. Filtrarlo borraría la prueba de entrega que queremos conservar.
 func TestReceipt_NoSeFiltra(t *testing.T) {
-	l := listenerSealed(&spySink{}, time.Now())
+	l := listenerSealed(&spyCola{}, time.Now())
 	var got []domain.ReceiptEvent
 	l.onReceipt = func(r domain.ReceiptEvent) { got = append(got, r) }
 	ctx := context.Background()

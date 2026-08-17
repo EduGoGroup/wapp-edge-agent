@@ -36,12 +36,12 @@ const refrescoContrato = 30 * time.Second
 // está vivo» y de eso se encarga el supervisor (`wapp-ctl`, con Restart automático). Un socket /v1
 // aquí sería una segunda superficie que mantener para exponer seis contadores.
 //
-// ⚠️ LIMITACIÓN CONOCIDA — REQ-051.10 («ningún otro proceso habla con Ollama») AÚN NO SE CUMPLE, y no
-// se puede forzar desde aquí: mientras dure la escritura doble de la Ola 1, `agent serve` sigue
-// clasificando en línea con su decorador, así que hay DOS clientes de Ollama en la máquina. La Ola 3
-// retira el decorador y entonces el `grep` de llamadas a Ollama fuera del worker da cero. Adelantarlo
-// aquí (apagando el decorador desde el cajero) dejaría la cola sin clasificar durante la ventana en
-// que el worker todavía no está desplegado en todas las máquinas.
+// ✅ REQ-051.10 SE CUMPLE DESDE T3.0 («ningún otro proceso que el worker habla con Ollama»). Durante la
+// Ola 1 no se cumplía: `agent serve` clasificaba en línea con su decorador y había DOS clientes de Ollama
+// en la máquina. La Ola 3 retiró aquel decorador, y desde entonces el `ollama.New` de más abajo es el
+// ÚNICO del repo fuera de un test con build tag. Si alguien vuelve a instanciar un cliente de Ollama en
+// `agent serve`, el requisito se rompe otra vez aunque el decorador no vuelva: el gate es el grep, no el
+// nombre de la pieza.
 func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) error {
 	if !cfg.Intent.Enabled {
 		// Sin clasificador no hay nada que hacer, pero SALIR sería peor: el supervisor lo interpretaría
@@ -57,9 +57,15 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 	// ── La cola de entrantes ──────────────────────────────────────────────────
 	// Se abre y migra igual que en el daemon (internal/infra/daemon): es la MISMA BD propia de la cola
 	// (<data_dir>/cola_entrantes.db) y las migraciones son idempotentes, así que da igual quién de los
-	// dos procesos arranque primero. Aquí SÍ es fatal, al revés que en el daemon: sin cola, el cajero
-	// no tiene ninguna otra cosa que hacer, y fallar el arranque es más honesto que quedarse en un
-	// bucle que no reclama nada.
+	// dos procesos arranque primero.
+	//
+	// ES FATAL, y desde el 2026-08-17 (Plan 051 O3) TAMBIÉN LO ES EN EL DAEMON — este comentario decía
+	// «al revés que en el daemon» y ya no es cierto. Los dos procesos que abren este fichero tratan su
+	// ausencia igual, por razones distintas y ambas suficientes: sin cola el cajero no tiene ninguna otra
+	// cosa que hacer (se quedaría en un bucle que no reclama nada), y sin cola el daemon no tiene camino
+	// de entrega (perdería cada entrante con el socket conectado). Fallar el arranque es lo honesto en
+	// los dos casos, y que la política sea la misma evita que el operador tenga que recordar cuál de los
+	// dos hijos aguanta sin cola.
 	colaDB, err := db.Open(ctx, db.DialectSQLite, layout.ColaDB())
 	if err != nil {
 		return fmt.Errorf("cajero: abrir la BD de la cola (%s): %w", layout.ColaDB(), err)
@@ -169,11 +175,11 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 		// de fallos subiendo.
 		MaxIntentos: cfg.Worker.MaxIntentos,
 		Lease:       time.Duration(cfg.ColaLeaseSeconds) * time.Second,
-		// 🔴 EL PLAZO SALE DE cfg.Worker.InferenceTimeoutMS, NO DE cfg.Intent.TimeoutMS. Aquel es el
-		// presupuesto del camino INLINE (3 s: soltar el handler de whatsmeow cuanto antes) y usarlo aquí
-		// calibraba el worker PARA FALLAR — queda por debajo de la p95 medida por la O0 (3.736 ms), así
-		// que abortaría del orden del 20-40 % de las inferencias, abriría el breaker y dejaría la cola
-		// dando vueltas sin progresar. El worker existe justo para poder tardar. Ver el doc comment de
+		// 🔴 EL PLAZO SALE DE cfg.Worker.InferenceTimeoutMS, NO DE cfg.Intent.WaitMS. Aquel es el
+		// presupuesto del DESPACHADOR (4 s: no retener la entrega más de la cuenta) y usarlo aquí
+		// calibraba el worker PARA FALLAR — queda pegado a la p95 medida por la O0 (3.736 ms), así que
+		// abortaría una fracción grande de las inferencias, abriría el breaker y dejaría la cola dando
+		// vueltas sin progresar. El worker existe justo para poder tardar. Ver el doc comment de
 		// config.DefaultWorkerInferenceTimeoutMS y el de cajero.Deps.Timeout.
 		Timeout:       time.Duration(cfg.Worker.InferenceTimeoutMS) * time.Millisecond,
 		StatsEvery:    time.Duration(cfg.Worker.StatsEveryMS) * time.Millisecond,

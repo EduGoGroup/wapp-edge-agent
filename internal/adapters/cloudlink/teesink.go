@@ -9,12 +9,17 @@ import (
 )
 
 // TeeSink entrega cada InboundEvent a VARIOS sinks en orden (patrón tee). Permite que el conducto
-// primario (Adapter CloudLink) y un sink de diagnóstico (LogSink) reciban el mismo evento sin tocar la
-// firma de app.Listen, que sigue tomando un único InboundSink.
+// primario (Adapter CloudLink) y un sink de diagnóstico (LogSink) reciban el mismo evento allí donde solo
+// cabe un único app.InboundSink.
+//
+// ⚠️ HOY NO TIENE NINGÚN LLAMANTE (constatado en el Plan 051 Ola 3 · T3.8). Se escribió para el camino
+// inline del listener, que T3.0 retiró; el despachador de la Ola 3 recibe UN sink, el crudo de la sesión.
+// Se conserva porque el punto donde encajaría sigue existiendo (despachador.Deps.Sink), pero no confundas
+// «está aquí» con «está en uso»: si lo cableas, hazlo a sabiendas.
 //
 // Política de error: intenta TODOS los sinks aunque alguno falle (un fallo de reenvío a la nube no
-// debe impedir el log de diagnóstico) y agrega los errores con errors.Join. app.Listen registra el
-// error y sigue escuchando: una entrega fallida nunca tumba el socket.
+// debe impedir el log de diagnóstico) y agrega los errores con errors.Join. El despachador registra el
+// error y NO sella la fila: la reintenta en el poll siguiente en vez de darla por entregada.
 type TeeSink struct {
 	sinks []app.InboundSink
 }
