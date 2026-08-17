@@ -500,6 +500,39 @@ type ColaDespachador interface {
 	DespacharSinIntent(ctx context.Context, id int64, motivo MotivoOmitido) error
 }
 
+// ColaPendientes es el DESGLOSE POR ESTADO de lo que la cola tiene sin despachar. Son cardinalidades
+// puras: ni un identificador, ni un texto, ni un JID (INV-051.1).
+//
+// `Total` NO es la suma de los tres nombrados: cuenta TODAS las filas no despachadas, incluidas las de un
+// estado que este struct no contemple. La diferencia entre `Total` y la suma es, por tanto, la señal de
+// que hay filas en un estado que nadie está mirando — que es exactamente el fallo que un desglose cerrado
+// escondería.
+type ColaPendientes struct {
+	// Nuevo son las filas reclamables por el cajero.
+	Nuevo int64
+	// Tomado son las filas con un claim vivo (una inferencia en vuelo, o un lease por vencer).
+	Tomado int64
+	// Clasificado son las filas listas para que el despachador las entregue.
+	Clasificado int64
+	// Total son TODAS las filas con estado <> 'despachado'.
+	Total int64
+}
+
+// ColaContador es el CUARTO papel de la cola, y el único que no toca una sola fila: solo CUENTA. Va
+// aparte de ColaEntrantes, ColaCajero y ColaDespachador por la misma razón que aquellos tres van
+// separados entre sí —quien solo quiere una foto no debe poder encolar, reclamar ni sellar por accidente—
+// y aquí la separación compra algo más: este puerto lo consume el LATIDO DE OBSERVABILIDAD (T3.13), que
+// corre fuera de todo camino caliente y no debe poder convertirse en un escritor sin que se note.
+type ColaContador interface {
+	// Pendientes cuenta, agrupando por estado, todo lo que no está despachado.
+	//
+	// Es una lectura de solo-cuenta y NO toma el candado de escritura del adaptador: ese candado serializa
+	// las ESCRITURAS (el bloque podar→tope→insertar de Enqueue) y un COUNT no escribe. Sí compite por la
+	// única conexión SQLite del Edge, así que quien lo llame debe hacerlo con cadencia amplia y publicar
+	// cuánto tardó.
+	Pendientes(ctx context.Context) (ColaPendientes, error)
+}
+
 // ErrMotivoOmitidoDesconocido marca un DespacharSinIntent con un motivo que NO está en la lista
 // canónica (motivosOmitido), y por tanto no tiene sobre precalculado.
 //

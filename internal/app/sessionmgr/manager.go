@@ -9,6 +9,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -148,6 +149,12 @@ type Manager struct {
 	// y manda el default SEGURO del Listener (activo). Lo inyecta WithClasificadorActivo.
 	clasificadorActivo func() bool
 
+	// latencia es el CRONÓMETRO COMPARTIDO del handler de entrantes (Plan 051 Ola 3 · T3.13): el factory lo
+	// pasa al gateway de cada sesión y de ahí al Listener, que anota en él cuánto tardó cada onMessage. Es
+	// uno para todo el Edge porque INV-051.2 se juzga sobre el Edge, no sesión a sesión. nil ⇒ no se mide y
+	// nada más cambia. Lo inyecta WithLatencia.
+	latencia *latencia.Histograma
+
 	// inboundMargin es el margen de la ventana temporal de ingesta (ADR-0037) que el factory pasa al
 	// gateway de cada sesión. 0 (opción no inyectada) ⇒ NO se toca el gateway y manda el default del propio
 	// Listener; así los tests del Manager que no cablean la ventana siguen intactos.
@@ -248,6 +255,23 @@ func WithClasificadorActivo(fn func() bool) Option {
 	return func(m *Manager) {
 		if fn != nil {
 			m.clasificadorActivo = fn
+		}
+	}
+}
+
+// WithLatencia inyecta el CRONÓMETRO del handler de entrantes (Plan 051 Ola 3 · T3.13): el histograma
+// COMPARTIDO donde cada listener acumula cuánto tarda su onMessage. Es lo que hace medible el criterio de
+// cierre de la ola —«handler < 50 ms p99», INV-051.2—, que hasta esta tarea no tenía instrumento.
+//
+// Uno solo para todo el Edge, no uno por sesión: el criterio es del Edge. Un p99 por sesión con 3 mensajes
+// cada una no responde la pregunta, y fusionar histogramas después sería trabajo para nada.
+//
+// nil se IGNORA (los tests cablean Managers sin cronómetro) y los listeners quedan sin medir, que es
+// exactamente el comportamiento anterior a T3.13: la observabilidad nunca impide arrancar una sesión.
+func WithLatencia(h *latencia.Histograma) Option {
+	return func(m *Manager) {
+		if h != nil {
+			m.latencia = h
 		}
 	}
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -89,6 +90,22 @@ type ListenGateway struct {
 	// Edge), a diferencia de la cola, que se etiqueta por sesión. nil ⇒ el Listener aplica su default
 	// SEGURO (activo: clasifica de más antes que callar). Lo cablea el factory del sessionmgr.
 	clasificadorActivo func() bool
+
+	// latencia es el CRONÓMETRO COMPARTIDO del handler de entrantes (Plan 051 Ola 3 · T3.13) que serve()
+	// pasa al Listener. A diferencia de la cola —que va ligada a SU sesión porque el session_id elige la
+	// DEK—, este es uno solo para todo el Edge: el criterio INV-051.2 es del Edge, no de cada sesión.
+	// nil ⇒ el Listener no mide, y todo lo demás se comporta igual. Lo cablea el factory del sessionmgr.
+	latencia *latencia.Histograma
+}
+
+// SetLatencia liga el gateway (y su Listener) al cronómetro del handler de entrantes (Plan 051 Ola 3 ·
+// T3.13). Se llama ANTES de Listen (al construir el gateway), como el resto de setters. nil se ignora y el
+// listener queda sin medir: la observabilidad nunca puede impedir que una sesión arranque. No es PII.
+func (g *ListenGateway) SetLatencia(h *latencia.Histograma) {
+	if h == nil {
+		return
+	}
+	g.latencia = h
 }
 
 // SetClasificadorActivo liga el gateway (y su Listener) al interruptor del clasificador de intenciones
@@ -216,6 +233,10 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device) error {
 		// y pasarlo solo añadiría una opción inerte. nil se ignora en la opción (default ACTIVO).
 		listenerOpts = append(listenerOpts, WithClasificadorActivo(g.clasificadorActivo))
 	}
+	// Cronómetro del handler (T3.13). Va FUERA del bloque de la cola —al contrario que el interruptor del
+	// clasificador— porque mide el handler ENTERO, incluidos los caminos que no encolan: una sesión sin cola
+	// sigue gastando tiempo del hilo de whatsmeow y ese tiempo cuenta para INV-051.2. nil se ignora.
+	listenerOpts = append(listenerOpts, WithLatencia(g.latencia))
 	listener := NewListener(g.log, listenerOpts...)
 	// Salud por sesión (Plan 031 T6): el Listener reporta connected/connecting/dead + edad del último
 	// entrante al registro. nil ⇒ no reporta.

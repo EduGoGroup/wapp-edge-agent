@@ -50,6 +50,20 @@ const DefaultDiagLogLines = 500
 // tráfico vivo en cuanto el reloj local fuera un segundo por delante del servidor).
 const DefaultInboundMarginSeconds = 300
 
+// DefaultInboundStatsEveryMS es cada cuánto el daemon emite el bloque de LATENCIA DEL HANDLER DE ENTRANTES
+// (Plan 051 Ola 3 · T3.13): el p50/p95/p99 del tiempo que onMessage pasa en el hilo de whatsmeow, que es
+// lo que hace medible el criterio de cierre de la ola («handler < 50 ms p99», INV-051.2).
+//
+// 60 s, MÁS CORTO que los 5 min del cajero (DefaultWorkerStatsEveryMS), y no por gusto: la ventana de una
+// prueba de campo se mide en minutos, y con 5 min una sesión de PC-11 entera cabría en dos líneas de log.
+//
+// Configurable por WAPP_AGENT_INBOUND_STATS_EVERY_MS — prefijo del AGENTE, no del worker: esto corre en
+// `agent serve`, que es otro proceso con otro bloque de entorno.
+//
+// GUARDARRAÍL DISTINTO AL DE LOS DEMÁS NÚMEROS (calcado del cajero): sólo lo NEGATIVO cae a este default.
+// El 0 es un valor legítimo y significa «cállate», no un dedazo. El bloque FINAL se emite igual.
+const DefaultInboundStatsEveryMS = 60 * 1000
+
 // DefaultOutboxTTLHours es el TTL por defecto (en horas) de un evento en el outbox: 0 = DESACTIVADO
 // (durabilidad primero; el único recorte es el drop-oldest por tamaño). Un valor >0 poda los eventos más
 // viejos que ese tiempo al encolar/drenar. Configurable por WAPP_AGENT_OUTBOX_TTL_HOURS.
@@ -356,6 +370,14 @@ type Config struct {
 	// anterior a `inicioDeConexión − margen`, y eso NO sube a la nube. Default 300 (5 min). Se lee de
 	// WAPP_AGENT_INBOUND_MARGIN_SECONDS; <=0 cae al default (guardarraíl, no invariante).
 	InboundMarginSeconds int `yaml:"inbound_margin_seconds"`
+	// InboundStatsEveryMS es la cadencia del bloque de latencia del handler de entrantes en el log del
+	// daemon (Plan 051 Ola 3 · T3.13). Default DefaultInboundStatsEveryMS (60000 = 1 min). Se lee de
+	// WAPP_AGENT_INBOUND_STATS_EVERY_MS. 0 lo DESACTIVA (guardarraíl distinto: sólo lo negativo cae al
+	// default); el bloque final del apagado se emite igual.
+	//
+	// Durante una sesión de PC-11 se baja a 10000 para no depender de que el tick caiga en el momento
+	// bueno. NO se deja así: los logs del VPS van a un fichero y esa cadencia lo engorda.
+	InboundStatsEveryMS int `yaml:"inbound_stats_every_ms"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -511,6 +533,7 @@ func defaults() Config {
 		ColaLeaseSeconds:      DefaultColaLeaseSeconds,
 		DiagLogLines:          DefaultDiagLogLines,
 		InboundMarginSeconds:  DefaultInboundMarginSeconds,
+		InboundStatsEveryMS:   DefaultInboundStatsEveryMS,
 		CloudLink: CloudLinkConfig{
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
@@ -575,6 +598,7 @@ func Load(path string) (Config, error) {
 	cfg.ColaLeaseSeconds = loader.GetInt("COLA_LEASE_SECONDS", cfg.ColaLeaseSeconds)
 	cfg.DiagLogLines = loader.GetInt("DIAG_LOG_LINES", cfg.DiagLogLines)
 	cfg.InboundMarginSeconds = loader.GetInt("INBOUND_MARGIN_SECONDS", cfg.InboundMarginSeconds)
+	cfg.InboundStatsEveryMS = loader.GetInt("INBOUND_STATS_EVERY_MS", cfg.InboundStatsEveryMS)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)
@@ -659,6 +683,12 @@ func Load(path string) (Config, error) {
 	// absorbe el desfase de reloj que no podemos medir; a cero descartaría tráfico vivo.
 	if cfg.InboundMarginSeconds <= 0 {
 		cfg.InboundMarginSeconds = DefaultInboundMarginSeconds
+	}
+	// Latido de latencia del handler (T3.13): GUARDARRAÍL ASIMÉTRICO A PROPÓSITO, calcado del latido del
+	// cajero. Sólo lo NEGATIVO cae al default; el 0 es una petición legítima («no emitas el bloque
+	// periódico») y tragárselo dejaría al operador sin forma de callar un log que va a un fichero.
+	if cfg.InboundStatsEveryMS < 0 {
+		cfg.InboundStatsEveryMS = DefaultInboundStatsEveryMS
 	}
 
 	// Clasificador de intenciones (Plan 029): normaliza defaults cuando la feature está ON. Un valor

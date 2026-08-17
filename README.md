@@ -117,6 +117,7 @@ Prefijo **`WAPP_AGENT_`**. Precedencia: defaults < YAML < entorno.
 | `WAPP_AGENT_OUTBOX_MAX_EVENTS` | `10000` | Tope del outbox durable; al llenarse aplica drop-oldest. |
 | `WAPP_AGENT_OUTBOX_TTL_HOURS` | `0` | TTL de evento del outbox; 0 = desactivado (durabilidad primero). |
 | `WAPP_AGENT_INBOUND_MARGIN_SECONDS` | `300` | Margen de la **ventana de ingesta** (ADR-0037, ver ³). Se descarta todo entrante anterior a `inicio de conexión − margen`, y lo descartado **no sube a la nube**. `<=0` cae al default. Clave YAML: `inbound_margin_seconds`. |
+| `WAPP_AGENT_INBOUND_STATS_EVERY_MS` | `60000` | Cadencia del bloque de **latencia del handler de entrantes** (Plan 051 · T3.13): p50/p95/p99 del tiempo que `onMessage` pasa en el hilo de whatsmeow, más el desglose de la cola. Es lo que hace medible «handler < 50 ms p99» (INV-051.2). **`0` lo desactiva** (guardarraíl asimétrico: sólo lo negativo cae al default); el bloque final del apagado se emite igual. Se lee con `grep 'latencia del handler' <fichero de log>`. Clave YAML: `inbound_stats_every_ms`. |
 | `WAPP_AGENT_DIAG_LOG_LINES` | `500` | Líneas del ring buffer en el bundle de diagnóstico. |
 | `WAPP_AGENT_CONTROL_SOCKET_PATH` | `wapp-edge.sock` | Ruta del Unix socket del plano de control `/v1`. |
 | `WAPP_AGENT_CLOUDLINK_ENDPOINT` | (vacío²) | Endpoint gRPC del stream Connect (mTLS). Vacío = sin nube (LogSink). |

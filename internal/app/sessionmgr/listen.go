@@ -133,6 +133,11 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// cajero o ya resuelta con la marca `apagado`. nil (opción no inyectada) ⇒ no se toca el gateway
 			// y manda el default SEGURO del Listener: se considera ACTIVO y se clasifica de más.
 			gateway.SetClasificadorActivo(m.clasificadorActivo)
+			// Cronómetro del handler de entrantes (Plan 051 Ola 3 · T3.13): mismo molde que el interruptor
+			// del clasificador —COMPARTIDO por todo el Edge, no ligado a la sesión— porque el criterio
+			// INV-051.2 («handler < 50 ms p99») se juzga sobre el Edge entero. m.latencia nil (opción no
+			// inyectada) ⇒ no se toca el gateway y el listener no mide, igual que antes de T3.13.
+			gateway.SetLatencia(m.latencia)
 			// Rota el live-sender de ESTE ciclo: el mux ya tiene registrado s.sendVia; aquí solo apunta la
 			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo). Usa la variante
 			// TRACKED (Plan 013 §10.E): cada SendText puebla el Correlator (command_id ↔ MessageID) para

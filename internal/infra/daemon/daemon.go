@@ -20,6 +20,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/diagnostics"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
@@ -146,6 +147,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 			"sin cola no hay camino de entrega (Plan 051 O3)", layout.ColaDB())
 	}
 
+	// Cronómetro del handler de entrantes (Plan 051 Ola 3 · T3.13). UNO SOLO para todo el Edge: el criterio
+	// de cierre de la ola —«handler < 50 ms p99», INV-051.2— se juzga sobre el Edge, no sesión a sesión, y
+	// un p99 por sesión con tres mensajes cada una no responde la pregunta. Se arma aquí, junto a la cola,
+	// porque el bloque que lo publica cuenta las dos cosas en la misma línea.
+	//
+	// Las DOS PUNTAS (la que llena y la que publica) salen de buildLatencia y no de este cuerpo: ver ahí el
+	// porqué, que es el único motivo por el que este paquete tiene tests.
+	lat := buildLatencia(cfg, cola, log)
+
 	outbox := wiring.BuildOutbox(ctx, cfg, database, log)
 	intentStack := wiring.BuildIntent(cfg, database, log)
 
@@ -207,6 +217,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// descartarlo igual. Tras T3.0 el stack ya no tiene decorador y este predicado lee el flag de config
 		// directamente — que es lo que `MotivoApagado` siempre significó.
 		sessionmgr.WithClasificadorActivo(intentStack.ClasificadorActivoFunc()),
+		// Cronómetro del handler de entrantes (Plan 051 Ola 3 · T3.13): cada listener anota en él cuánto
+		// tardó su onMessage. Es lo único que hace MEDIBLE el criterio de cierre de la ola; sin esta línea
+		// el histograma existe y nadie lo llena.
+		//
+		// La opción viene ARMADA de buildLatencia —en vez de un `sessionmgr.WithLatencia(algo)` escrito
+		// aquí— para que en este cuerpo no quede ninguna expresión capaz de nombrar OTRO histograma que el
+		// que se publica. Es la mitad de la reparación del agujero que describe buildLatencia.
+		lat.opt,
 	)
 
 	if err := mgr.Restore(ctx); err != nil {
@@ -242,8 +260,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(ln) }()
 
+	// LATIDO DE LATENCIA DEL HANDLER (Plan 051 Ola 3 · T3.13). El histograma sin emisor es un instrumento
+	// con la aguja tapada: sus contadores solo se leerían al morir el proceso, que es cuando ya no sirven.
+	//
+	// Contexto PROPIO y espera EXPLÍCITA al final. Con el `ctx` del daemon a secas, el bloque FINAL —el que
+	// resume la sesión de medida entera— competiría con el `return` de esta función y se perdería la mitad
+	// de las veces. Así el cierre es determinista: se cancela, se espera y solo entonces se retorna.
+	latidoCtx, pararLatido := context.WithCancel(context.Background())
+	latidoFin := make(chan struct{})
+	go func() {
+		defer close(latidoFin)
+		latencia.Latido(latidoCtx, lat.deps)
+	}()
+
 	log.Info("agent serve: daemon multi-sesión + plano de control /v1 en un solo proceso",
-		"socket", cfg.ControlSocketPath, "version", d.version, "data_dir", cfg.DataDir, "max_sesiones", cfg.MaxSessions)
+		"socket", cfg.ControlSocketPath, "version", d.version, "data_dir", cfg.DataDir, "max_sesiones", cfg.MaxSessions,
+		"latencia_stats_cada_ms", cfg.InboundStatsEveryMS)
 
 	select {
 	case <-ctx.Done():
@@ -261,6 +293,77 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	mgr.Stop()
 
+	// El bloque FINAL de latencia se emite DESPUÉS de parar los listeners: así cubre hasta el último
+	// entrante atendido, y su COUNT de la cola es la foto real de lo que queda sin despachar al apagar.
+	// Se espera a que retorne (el latido hace su COUNT sobre un contexto desligado con plazo propio).
+	pararLatido()
+	<-latidoFin
+
 	log.Info("agent serve: detenido limpiamente (socket /v1 cerrado, listeners apagados)")
 	return nil
+}
+
+// cableadoLatencia son las DOS PUNTAS del cronómetro del handler (Plan 051 Ola 3 · T3.13) atadas en un
+// solo valor: la que lo LLENA (la opción que el Manager reparte a cada listener) y la que lo PUBLICA (lo
+// que consume el latido). Van juntas porque un cronómetro con las puntas en instrumentos distintos no
+// falla: mide y publica, cada uno lo suyo, y el resultado es un bloque «sin dato» para siempre.
+type cableadoLatencia struct {
+	// hist es el instrumento. `Run` no lo toca —le bastan las dos puntas—: está aquí para que el test
+	// pueda AFIRMAR la identidad, que es exactamente lo que nadie podía comprobar.
+	hist *latencia.Histograma
+	// opt es la punta que lo LLENA: cada listener anota en él cuánto tardó su onMessage.
+	opt sessionmgr.Option
+	// deps es la punta que lo PUBLICA: la cadencia, el logger y el contador de la cola del bloque.
+	deps latencia.Deps
+}
+
+// buildLatencia arma el cronómetro del handler de entrantes y sus dos puntas.
+//
+// 🔴 POR QUÉ ES UNA FUNCIÓN Y NO TRES LÍNEAS DENTRO DE `Run`. Este paquete no tenía un solo `_test.go` y
+// sus únicos importadores son `cmd/agent`, cuyos tests no ejercitan `Run`: TODO el cableado de T3.13 era
+// invisible para los tres gates. Se comprobó ejecutándolo, no suponiéndolo — poner un `latencia.Nuevo()`
+// recién construido en el `Hist:` del latido dejaba `go build`, `go vet` y `go test ./... -p 1` en verde.
+//
+// Y el modo de fallo que eso compra es de los caros: en campo el bloque saldría con `n=0` y sin
+// percentiles PARA SIEMPRE, con el Edge funcionando de maravilla. El síntoma —«el latido sale pero el p99
+// no aparece»— no apunta a su causa: quien lo vea buscará en el histograma, en los listeners o en la
+// cadencia, y el fallo está en una línea de wiring que ningún test miraba.
+//
+// Extraerlo es lo que lo hace comprobable: aquí dentro el histograma se nombra UNA sola vez y las dos
+// puntas cuelgan de esa misma variable, y el test afirma esa identidad (ver latencia_cableado_test.go).
+// La regla que lo sostiene es que `Run` USE esto: una función paralela que `Run` no llama probaría un
+// cableado que no corre en producción, que es justo el error que esto viene a cerrar.
+func buildLatencia(cfg config.Config, cola app.ColaEntrantes, log sharedlogger.Logger) cableadoLatencia {
+	h := latencia.Nuevo()
+	return cableadoLatencia{
+		hist: h,
+		opt:  sessionmgr.WithLatencia(h),
+		deps: latencia.Deps{
+			Hist: h,
+			Cada: time.Duration(cfg.InboundStatsEveryMS) * time.Millisecond,
+			Log:  log,
+			// El MISMO adaptador de la cola, en su papel de solo-contar (app.ColaContador). Se comprueba la
+			// aserción de tipo en vez de darla por hecha: `BuildCola` devuelve el puerto de encolado, y un
+			// pánico aquí por una implementación que no respalde el lado contador sería tumbar el daemon por
+			// una línea de observabilidad. nil ⇒ el bloque sale sin los campos de cola, que es correcto.
+			Cola: colaContador(cola, log),
+		},
+	}
+}
+
+// colaContador devuelve el lado SOLO-CONTAR de la cola, o nil si el adaptador no lo respalda.
+//
+// La aserción de tipo se comprueba en vez de darse por hecha, por el mismo criterio que
+// `wiring.BuildColaDespachador`: con el *Store real siempre se cumple, así que un fallo aquí es un error
+// de programación, no un estado degradado — pero tumbar el daemon con un pánico por una línea de
+// observabilidad sería peor que la ausencia del dato. Se avisa y se sigue: el bloque de latencia saldrá
+// sin los campos de cola, que es lo honesto.
+func colaContador(cola app.ColaEntrantes, log sharedlogger.Logger) app.ColaContador {
+	c, ok := cola.(app.ColaContador)
+	if !ok {
+		log.Warn("agent serve: la cola de entrantes no respalda el lado CONTADOR (app.ColaContador); el bloque " +
+			"de latencia del handler saldrá sin `cola_pendientes`. Es un fallo de cableado, no un modo de operación")
+		return nil
+	}
+	return c
 }

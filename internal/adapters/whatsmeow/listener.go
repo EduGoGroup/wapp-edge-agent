@@ -31,6 +31,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-intent/classifier"
 	"github.com/EduGoGroup/wapp-shared/logger"
@@ -132,6 +133,23 @@ type Listener struct {
 	// clasificado con X» — por eso el IntentJSON que se persiste es una marca de omisión, no un intent.
 	fastLane func(string) bool
 
+	// latencia es el CRONÓMETRO del handler de entrantes (Plan 051 Ola 3 · T3.13). Es lo único que hace
+	// MEDIBLE el criterio de cierre de la ola —«handler < 50 ms p99», INV-051.2—, que hasta esta tarea
+	// existía sobre el papel y no tenía instrumento.
+	//
+	// nil ⇒ NO SE MIDE Y NADA MÁS CAMBIA. Todos los métodos del histograma son nil-safe a propósito: sin
+	// WithLatencia el comportamiento del listener es idéntico byte a byte al de antes de T3.13, porque un
+	// instrumento de medida no puede alterar lo que mide ni, mucho menos, tumbar la escucha.
+	//
+	// 🔴 ES UN PUNTERO A TIPO CONCRETO, NO UNA INTERFAZ, Y ESO ES DELIBERADO. Una interfaz colgando aquí
+	// sería la puerta por la que mañana alguien engancha un exportador REMOTO en el camino caliente —
+	// exactamente lo que INV-051.2 prohíbe y lo que vigila el barrido de listener_camino_caliente_test.go
+	// (que este campo pasa por construcción: no cumple app.InboundSink, no expone Classify y no es un func
+	// que reciba domain.InboundEvent). Un *latencia.Histograma no puede hablar por la red.
+	//
+	// 🔴 INV-051.1: aquí no entra nada del contenido. El histograma solo ve duraciones.
+	latencia *latencia.Histograma
+
 	// clasificadorActivo dice si el CLASIFICADOR de intenciones está encendido en este Edge (Plan 051 Ola 2,
 	// T2.12). Se lee FRESCO en cada mensaje —no se cachea un bool al construir— porque la feature puede
 	// apagarse/encenderse en caliente y una copia congelada mentiría el resto de la vida del proceso.
@@ -191,6 +209,22 @@ func WithClasificadorActivo(fn func() bool) ListenerOption {
 	return func(l *Listener) {
 		if fn != nil {
 			l.clasificadorActivo = fn
+		}
+	}
+}
+
+// WithLatencia cablea el CRONÓMETRO del handler de entrantes (Plan 051 Ola 3 · T3.13): el histograma
+// COMPARTIDO por todas las sesiones del Edge donde se acumula cuánto tarda onMessage, que es lo que hace
+// medible «handler < 50 ms p99» (INV-051.2).
+//
+// Es compartido —no uno por sesión— porque el criterio es del EDGE: un p99 por sesión con 3 mensajes cada
+// una no responde la pregunta, y sumarlos después exigiría fusionar histogramas para nada.
+//
+// nil se IGNORA y el listener queda sin medir, que es el comportamiento anterior a T3.13 exactamente.
+func WithLatencia(h *latencia.Histograma) ListenerOption {
+	return func(l *Listener) {
+		if h != nil {
+			l.latencia = h
 		}
 	}
 }
@@ -333,17 +367,35 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 // El descarte es SILENCIOSO hacia el cliente final y CONTADO hacia nosotros: un descarte invisible es
 // indistinguible de un bug. Se cuenta, no se transcribe (ADR-0034 nivel 3): ni texto ni teléfono al log.
 func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
+	// ⏱️ CRONÓMETRO (T3.13). Envuelve la función ENTERA —no solo el Enqueue— porque lo que INV-051.2 acota
+	// es cuánto tiempo del hilo de whatsmeow consume este handler, y eso incluye los filtros de la puerta.
+	//
+	// `camino` decide en qué SERIE cae la medida y se reasigna en cada salida temprana; el `defer` es lo que
+	// garantiza que se anota pase lo que pase, incluido el recover de enqueueCola. Sale por `Encolado` por
+	// defecto porque los caminos que encolan son tres (normal, fastlane y el del entrante sin hora) y los
+	// que descartan son dos: el default cubre el caso mayoritario y cada descarte lo dice explícitamente.
+	//
+	// COSTE: una sola llamada extra al reloj (MarkInbound reusa `inicio`), más una búsqueda de 16
+	// comparaciones y un atomic.Add. Ver el análisis en la cabecera de internal/app/latencia.
+	inicio := time.Now()
+	camino := latencia.Encolado
+	defer func() { l.latencia.Observar(camino, time.Since(inicio)) }()
+
 	// Prueba de vida (Plan 031 T6): sella el instante del último entrante. Se marca ANTES de filtrar y para
 	// TODO mensaje —incluidos los descartados— porque es prueba de vida del SOCKET, no señal de negocio:
 	// una ráfaga descartada sigue demostrando que el socket recibe. Comportamiento idéntico al previo.
+	//
+	// Reusa `inicio` en vez de pedir la hora otra vez: es el mismo instante con una resolución que a esta
+	// escala no distingue nada, y ahorra la única llamada al reloj que el cronómetro habría añadido.
 	if l.reporter != nil {
-		l.reporter.MarkInbound(time.Now())
+		l.reporter.MarkInbound(inicio)
 	}
 
 	// 1 · Eco propio. Antes de la Ola 1 este dato solo servía para no gastar el clasificador (lo miraba
 	// `intent.Decorator.eligible`, hoy retirado); el evento subía igual a la nube. Descartarlo aquí es un
 	// CAMBIO DE COMPORTAMIENTO deliberado y aprobado.
 	if e.Info.IsFromMe {
+		camino = latencia.Descartado // (T3.13) sale sin fila: su tiempo no es tiempo de encolar
 		l.brackets.countSelfDrop()
 		return
 	}
@@ -381,6 +433,10 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 	now := time.Now()
 	threshold := resolveThreshold(seal, l.margin, now)
 	if e.Info.Timestamp.Before(threshold) {
+		// (T3.13) La ráfaga del ADR-0037 son miles de eventos que SÍ atan el hilo del socket, así que se
+		// miden; pero en su propia serie, porque cuestan microsegundos y mezclarlos con los encolados
+		// diluiría el p99 justo cuando hay ráfaga — es decir, mejoraría el número cuando el Edge va peor.
+		camino = latencia.Descartado
 		age := now.Sub(e.Info.Timestamp)
 		if age < 0 {
 			age = 0

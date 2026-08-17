@@ -945,3 +945,70 @@ func TestLoad_Worker_DesdeYAML(t *testing.T) {
 		t.Fatalf("las claves ausentes del YAML deben conservar su default: %+v", cfg.Worker)
 	}
 }
+
+// TestLoad_InboundStatsEveryMS_ElCeroDesactiva: el latido de latencia del handler (T3.13) es el segundo
+// número del proyecto cuyo cero es un valor legítimo («cállate»), y por el mismo motivo que el del cajero:
+// los logs del VPS van a un FICHERO, así que un operador tiene que poder callar un bloque que se emite
+// cada minuto sin tener que apagar el daemon.
+//
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO: escribir el guardarraíl como `<= 0` (que es como están TODOS los demás
+// números del agente, y por eso es el error natural) ⇒ el 0 explícito cae al default y el bloque sigue
+// saliendo. La otra mitad —que un negativo SÍ caiga— la cubre el segundo subtest.
+func TestLoad_InboundStatsEveryMS_ElCeroDesactiva(t *testing.T) {
+	t.Run("default cuando no se toca", func(t *testing.T) {
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.InboundStatsEveryMS != DefaultInboundStatsEveryMS {
+			t.Fatalf("sin variable, la cadencia es el default (%d ms): got %d",
+				DefaultInboundStatsEveryMS, cfg.InboundStatsEveryMS)
+		}
+	})
+	t.Run("cero desactiva", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"INBOUND_STATS_EVERY_MS", "0")
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.InboundStatsEveryMS != 0 {
+			t.Fatalf("un 0 explícito DESACTIVA el latido periódico, no cae al default: got %d", cfg.InboundStatsEveryMS)
+		}
+	})
+	t.Run("negativo cae al default", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"INBOUND_STATS_EVERY_MS", "-1")
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.InboundStatsEveryMS != DefaultInboundStatsEveryMS {
+			t.Fatalf("un negativo no significa nada y cae al default: got %d", cfg.InboundStatsEveryMS)
+		}
+	})
+	t.Run("un valor de sesion de campo se respeta", func(t *testing.T) {
+		// 10 s es lo que se pone durante PC-11 para no depender de que el tick caiga en el momento bueno.
+		t.Setenv(EnvPrefix+"INBOUND_STATS_EVERY_MS", "10000")
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.InboundStatsEveryMS != 10000 {
+			t.Fatalf("la cadencia de la sesión de campo se respeta tal cual: got %d", cfg.InboundStatsEveryMS)
+		}
+	})
+}
+
+// TestLoad_InboundStatsEveryMS_EsDelAGENTE_NoDelWorker: el prefijo importa porque son DOS PROCESOS con dos
+// bloques de entorno. El cronómetro del handler vive en `agent serve`; el latido de contadores del cajero,
+// en `agent cajero`. Cruzar los prefijos dejaría una de las dos telemetrías muda en campo, y el síntoma
+// —«no sale el bloque»— no apunta a su causa.
+func TestLoad_InboundStatsEveryMS_EsDelAgenteNoDelWorker(t *testing.T) {
+	t.Setenv(WorkerEnvPrefix+"INBOUND_STATS_EVERY_MS", "1234")
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.InboundStatsEveryMS != DefaultInboundStatsEveryMS {
+		t.Fatalf("WAPP_WORKER_* no debe gobernar la cadencia del AGENTE: got %d", cfg.InboundStatsEveryMS)
+	}
+}
