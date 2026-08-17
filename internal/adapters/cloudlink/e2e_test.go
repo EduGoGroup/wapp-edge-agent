@@ -87,6 +87,25 @@ func recvKind(t *testing.T, ctx context.Context, srv *serverDouble, what string,
 	}
 }
 
+// awaitAdapterReady espera el LATIDO INICIAL que el Adapter emite por cada sesión registrada nada más
+// establecer el stream (runOnce → heartbeatAll). Es la ÚNICA señal real de que el Adapter ya publicó su
+// cliente y de que un Deliver posterior encontrará stream vivo.
+//
+// Por qué hace falta: srv.streamCh se dispara en el SERVIDOR, dentro de Connect, en cuanto llega la llamada;
+// eso ocurre ANTES de que el cliente vuelva de client.New y ejecute setClient(cl). Los tests que hacían
+// Deliver justo tras ese handshake corrían una carrera: al perderla, forward() ve currentClient()==nil y —sin
+// outbox— DESCARTA el evento con un warn, así que el IncomingMessage no llega jamás y el test agota su
+// contexto a los 10 s ("timeout esperando IncomingMessage del Edge"). En macOS la carrera se ganaba siempre;
+// en el CI dentro de Docker (Linux, -race, todos los paquetes a la vez) TestDeliver_Intent_ClearMirror_WhenNoSeal
+// se puso rojo. El latido se envía DESPUÉS de setClient y en la misma goroutine, así que recibirlo ordena
+// ambos hechos sin mirar el reloj (nada de sleeps ni de subir el timeout).
+func awaitAdapterReady(t *testing.T, ctx context.Context, srv *serverDouble) {
+	t.Helper()
+	recvKind(t, ctx, srv, "latido inicial (stream establecido)", func(m *cloudlinkv1.EdgeToCloud) bool {
+		return m.GetHeartbeat() != nil
+	})
+}
+
 // --- arnés --------------------------------------------------------------------------------------
 
 const e2eSessionID = "sess-t6"
@@ -149,12 +168,17 @@ func newE2EHarness(t *testing.T, ctx context.Context, newValidator ValidatorFact
 
 	go func() { _ = adapter.Run(ctx) }()
 
-	// Handshake: esperamos el stream (el Adapter conectó). Los heartbeats iniciales por sesión los filtra
+	// Handshake: esperamos el stream (el Adapter conectó). Los heartbeats iniciales que sobren los filtra
 	// recvKind (busca por tipo), así que no hace falta drenarlos explícitamente.
 	select {
 	case h.stream = <-srv.streamCh:
 	case <-ctx.Done():
 		t.Fatalf("timeout esperando que el Adapter abra el stream: %v", ctx.Err())
+	}
+	// …y esperamos el primer latido: el stream en el servidor NO implica que el Adapter ya tenga su cliente
+	// publicado, y un Deliver adelantado se descartaría en silencio (ver awaitAdapterReady).
+	if len(sessionIDs) > 0 {
+		awaitAdapterReady(t, ctx, srv)
 	}
 	return h
 }

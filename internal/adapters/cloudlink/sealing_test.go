@@ -64,6 +64,10 @@ func newSealHarness(t *testing.T, ctx context.Context, opts ...Option) *e2eHarne
 	case <-ctx.Done():
 		t.Fatalf("timeout esperando el stream del Adapter: %v", ctx.Err())
 	}
+	// El stream visto por el servidor no basta: hay que esperar el latido inicial de la sesión, que el
+	// Adapter emite ya con su cliente publicado. Sin esto, el Deliver del test podía adelantarse y morir
+	// descartado (ver awaitAdapterReady en e2e_test.go).
+	awaitAdapterReady(t, ctx, srv)
 	return h
 }
 
