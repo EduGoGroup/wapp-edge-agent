@@ -885,27 +885,35 @@ func (c *Cajero) registrarReparto(lec lecturaAfinidad) {
 }
 
 // avisarHilosSobresuscritos avisa cuando se le piden a Ollama más hilos de inferencia que CPUs tiene
-// este proceso disponibles. No es el hallazgo de la medición, es su efecto secundario: el `num_thread`
-// se calibró en la O0 contra una máquina SIN confinar, así que en cuanto alguien reparte las 6 vCPU en
-// 4/2 el número queda sobresuscrito y nadie se entera — no falla nada, sólo se pelean los hilos.
+// OLLAMA disponibles. No es el hallazgo de la medición, es su efecto secundario: el `num_thread` se
+// calibró en la O0 contra una máquina SIN confinar, así que en cuanto alguien reparte las 6 vCPU el
+// número puede quedar sobresuscrito y nadie se entera — no falla nada, sólo se pelean los hilos.
+//
+// 🔴 SE COMPARA CONTRA LAS CPUs DE OLLAMA, NO CONTRA LAS DEL CAJERO, y la distinción no es sutil:
+// `num_thread` es una opción que este proceso PASA en la petición HTTP, pero los hilos los crea y los
+// ejecuta el proceso de Ollama. El cajero, mientras tanto, está bloqueado esperando la respuesta y no
+// usa CPU. Compararlo contra la afinidad propia daba las dos respuestas equivocadas a la vez: en el
+// reparto real de campo —Ollama en 0-4 con sus 5 hilos, el Edge confinado a la vCPU 5— habría emitido
+// un Warn PERMANENTE Y FALSO en cada arranque, y en cambio se habría callado en el caso que de verdad
+// importa (Ollama estrangulado a menos CPUs que hilos), que es el que asfixia la inferencia.
 //
 // No se toca el número, sólo se dice: DefaultNumThread vive en el módulo del clasificador (otro repo) y
-// está cerrado por la O0. Y si la afinidad propia no se pudo leer, esto no hace nada: sin saber a
-// cuántas CPUs está confinado el proceso, no hay comparación que hacer.
+// está cerrado por la O0. Y si la afinidad de Ollama no se pudo leer, esto no hace nada: sin saber a
+// cuántas CPUs está confinado, no hay comparación que hacer.
 func (c *Cajero) avisarHilosSobresuscritos(lec lecturaAfinidad) {
-	if lec.ErrCajero != nil {
+	if lec.ErrOllama != nil {
 		return
 	}
-	cpus, err := parsearListaCPUs(lec.Cajero)
+	cpus, err := parsearListaCPUs(lec.Ollama)
 	if err != nil || len(cpus) == 0 {
 		return
 	}
 	if c.numThread <= len(cpus) {
 		return
 	}
-	c.log.Warn("cajero: se le piden a Ollama MÁS hilos de inferencia que CPUs tiene el cajero (T2.8); "+
-		"baja WAPP_WORKER_NUM_THREAD o amplía el `taskset` de este proceso",
-		"num_thread", c.numThread, "cpus_cajero", cpus.String(), "cpus_cajero_total", len(cpus))
+	c.log.Warn("cajero: se le piden a Ollama MÁS hilos de inferencia que CPUs tiene OLLAMA (T2.8); "+
+		"baja WAPP_WORKER_NUM_THREAD o amplía el `taskset` de Ollama",
+		"num_thread", c.numThread, "cpus_ollama", cpus.String(), "cpus_ollama_total", len(cpus))
 }
 
 // concatenar une los textos del lote EN EL ORDEN EN QUE VIENEN, que el adaptador garantiza que es el

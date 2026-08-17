@@ -383,8 +383,14 @@ func TestRegistrarReparto_NuncaEsFatal_ConLecturaAMedias(t *testing.T) {
 	}
 }
 
-// TestAvisarHilosSobresuscritos: pedirle a Ollama más hilos que CPUs tiene el cajero confinado es el
-// efecto colateral de repartir la máquina (el número se calibró SIN confinar). Se avisa, no se cambia.
+// TestAvisarHilosSobresuscritos: pedirle a Ollama más hilos que CPUs tiene OLLAMA es el efecto colateral
+// de repartir la máquina (el número se calibró SIN confinar). Se avisa, no se cambia.
+//
+// 🔴 LA COMPARACIÓN ES CONTRA LAS CPUs DE OLLAMA, NO CONTRA LAS DEL CAJERO, y estos casos lo fijan
+// porque la primera versión lo hacía al revés. `num_thread` lo manda este proceso en la petición, pero
+// los hilos los ejecuta Ollama; el cajero está bloqueado esperando la respuesta y no usa CPU. El caso
+// «el reparto REAL de campo» de abajo es el que lo demuestra: con el Edge confinado a una sola vCPU y
+// Ollama con cinco, la versión vieja emitía un Warn permanente y falso en cada arranque.
 func TestAvisarHilosSobresuscritos(t *testing.T) {
 	casos := []struct {
 		nombre    string
@@ -392,12 +398,17 @@ func TestAvisarHilosSobresuscritos(t *testing.T) {
 		numThread int
 		avisa     bool
 	}{
-		{"5 hilos en 4 CPUs (el reparto 4/2)", lecturaAfinidad{Ollama: "4-5", Cajero: "0-3", Presentes: "0-5"}, 5, true},
-		{"5 hilos en 5 CPUs: justo, no sobra", lecturaAfinidad{Ollama: "5", Cajero: "0-4", Presentes: "0-5"}, 5, false},
-		{"5 hilos en 6 CPUs", lecturaAfinidad{Ollama: "6-7", Cajero: "0-5", Presentes: "0-7"}, 5, false},
-		{"sin afinidad propia legible no hay comparación", lecturaAfinidad{
-			Ollama: "4-5", ErrCajero: errors.New("no se pudo")}, 99, false},
-		{"afinidad propia ilegible: tampoco", lecturaAfinidad{Ollama: "4-5", Cajero: ""}, 99, false},
+		{"el reparto REAL de campo: Ollama 0-4, Edge en la 5 — NO se avisa", lecturaAfinidad{
+			Ollama: "0-4", Cajero: "5", Presentes: "0-5"}, 5, false},
+		{"Ollama estrangulado a 1 CPU con 5 hilos: ESTO sí se avisa", lecturaAfinidad{
+			Ollama: "5", Cajero: "0-4", Presentes: "0-5"}, 5, true},
+		{"5 hilos en 4 CPUs de Ollama (reparto 4/2)", lecturaAfinidad{
+			Ollama: "0-3", Cajero: "4-5", Presentes: "0-5"}, 5, true},
+		{"5 hilos en 6 CPUs de Ollama", lecturaAfinidad{
+			Ollama: "0-5", Cajero: "0-5", Presentes: "0-5"}, 5, false},
+		{"sin afinidad de Ollama legible no hay comparación", lecturaAfinidad{
+			Cajero: "0-3", ErrOllama: errors.New("no se pudo")}, 99, false},
+		{"afinidad de Ollama ilegible: tampoco", lecturaAfinidad{Ollama: "", Cajero: "0-3"}, 99, false},
 	}
 
 	for _, c := range casos {
