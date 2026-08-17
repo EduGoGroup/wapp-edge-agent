@@ -7,8 +7,13 @@ import (
 )
 
 // ports.go — Puertos (interfaces) de la capa de aplicación que no pertenecen a un caso de uso concreto.
-// Los puertos ESPECÍFICOS de un caso de uso (Connector, QRSink, ListenGateway, InboundSink, etc.)
-// siguen definidos junto al caso de uso que los consume.
+// Los puertos ESPECÍFICOS de un caso de uso (Connector, QRSink, ListenGateway, etc.) siguen definidos
+// junto al caso de uso que los consume.
+//
+// EXCEPCIÓN ANOTADA (Plan 051 Ola 3 · T3.8): InboundSink sigue declarado en listen.go y su consumidor ya
+// NO es app.Listen —es el despachador (app/despachador), que lo recibe inyectado—. Se queda ahí por ser
+// su domicilio histórico y porque `app` es el único paquete que importan a la vez el despachador, el
+// sessionmgr y el adaptador de cloudlink; la regla de arriba no aplica a ese puerto.
 
 // SessionStore es el puerto de PERSISTENCIA de los metadatos de negocio de las sesiones (tabla
 // `sessions`). La implementación real (internal/adapters/sessionstore) lee/escribe SQLite EN CLARO;

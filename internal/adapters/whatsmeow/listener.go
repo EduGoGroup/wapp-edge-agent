@@ -2,7 +2,10 @@
 // EduGo, que deshabilitó la escucha): se construye desde cero sobre client.AddEventHandler.
 //
 // El Listener registra UN handler en el cliente y ENRUTA por tipo de evento:
-//   - *events.Message      -> construye un domain.InboundEvent y lo entrega al InboundSink.
+//   - *events.Message      -> ANOTA el entrante en la COLA DURABLE y retorna. NO entrega a nadie: quien
+//     entrega al cable es el DESPACHADOR de la sesión (internal/app/despachador), que corre en su propia
+//     goroutine (Plan 051 Ola 3 · T3.0, INV-051.2). El hilo de whatsmeow queda libre en cuanto el INSERT
+//     cifrado termina.
 //   - *events.Connected    -> marca estado conectado y RESETEA el backoff.
 //   - *events.Disconnected -> marca estado desconectado y AVANZA el backoff (whatsmeow auto-reconecta).
 //   - *events.LoggedOut    -> marca la sesión CAÍDA (no se re-empareja automáticamente).
@@ -28,6 +31,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-intent/classifier"
 	"github.com/EduGoGroup/wapp-shared/logger"
@@ -45,11 +49,15 @@ const (
 	StateLoggedOut
 )
 
-// Listener enruta los eventos de whatsmeow hacia el dominio/sink y lleva el estado de conexión y la
-// política de backoff. Es seguro para uso concurrente (whatsmeow invoca el handler desde sus
-// goroutines): el estado se protege con mu.
+// Listener enruta los eventos de whatsmeow hacia la COLA DURABLE (entrantes) y hacia los hooks de
+// conexión/acuse, y lleva el estado de conexión y la política de backoff. Es seguro para uso concurrente
+// (whatsmeow invoca el handler desde sus goroutines): el estado se protege con mu.
+//
+// 🔴 EL LISTENER YA NO TIENE SINK (Plan 051 Ola 3 · T3.0). Hasta esta ola guardaba un app.InboundSink y
+// entregaba cada entrante en línea, en el hilo de whatsmeow. Ese campo se retiró ENTERO —no se dejó nil—
+// porque un puntero al cable colgando de esta estructura es una invitación a volver a entregar desde
+// aquí, y eso es exactamente lo que INV-051.2 prohíbe: la entrega es del despachador.
 type Listener struct {
-	sink    app.InboundSink
 	log     logger.Logger
 	backoff *Backoff
 
@@ -98,10 +106,17 @@ type Listener struct {
 	// Default defaultConnectMargin; configurable por Edge (WAPP_AGENT_INBOUND_MARGIN_SECONDS).
 	margin time.Duration
 
-	// cola es la COLA DURABLE de entrantes (Plan 051 Ola 1): el mesonero anota el mensaje en disco
-	// (cifrado con la DEK de la sesión) ANTES de entregarlo al sink, para que el acuse de WhatsApp salga
-	// con el mensaje ya durable. nil ⇒ COMPORTAMIENTO IDÉNTICO AL PREVIO (solo sink.Deliver): así el
-	// cableado del adaptador puede hacerse en otra tarea sin romper nada de lo que hoy funciona.
+	// cola es la COLA DURABLE de entrantes (Plan 051 Ola 1) y, desde T3.0, el ÚNICO destino del entrante:
+	// el mesonero anota el mensaje en disco (cifrado con la DEK de la sesión) y retorna; el despachador de
+	// la sesión lo lee y lo entrega al cable.
+	//
+	// 🔴 nil ⇒ LOS ENTRANTES DE ESTA SESIÓN SE PIERDEN. Hasta la Ola 3 el nil era una degradación benigna
+	// (quedaba el `sink.Deliver` inline); retirado ese camino, un nil aquí es un agujero negro. Por eso
+	// NewListener lo GRITA al construir en vez de arrancar callado.
+	//
+	// EN PRODUCCIÓN NO PUEDE SER nil desde el 2026-08-17: el daemon no arranca si `cola_entrantes.db` no se
+	// puede abrir, migrar o construir (internal/infra/daemon). Lo que queda aquí es la red para los
+	// cableados que no vienen del daemon. Ver el bloque de «SIN COLA» de NewListener.
 	cola app.ColaEntrantes
 
 	// sessionID etiqueta las filas de la cola. Va EN CLARO en disco a propósito (app/cola.go): es la
@@ -117,6 +132,23 @@ type Listener struct {
 	// concreto del clasificador. OJO SEMÁNTICO: true significa «entrega SIN intención», no «ya
 	// clasificado con X» — por eso el IntentJSON que se persiste es una marca de omisión, no un intent.
 	fastLane func(string) bool
+
+	// latencia es el CRONÓMETRO del handler de entrantes (Plan 051 Ola 3 · T3.13). Es lo único que hace
+	// MEDIBLE el criterio de cierre de la ola —«handler < 50 ms p99», INV-051.2—, que hasta esta tarea
+	// existía sobre el papel y no tenía instrumento.
+	//
+	// nil ⇒ NO SE MIDE Y NADA MÁS CAMBIA. Todos los métodos del histograma son nil-safe a propósito: sin
+	// WithLatencia el comportamiento del listener es idéntico byte a byte al de antes de T3.13, porque un
+	// instrumento de medida no puede alterar lo que mide ni, mucho menos, tumbar la escucha.
+	//
+	// 🔴 ES UN PUNTERO A TIPO CONCRETO, NO UNA INTERFAZ, Y ESO ES DELIBERADO. Una interfaz colgando aquí
+	// sería la puerta por la que mañana alguien engancha un exportador REMOTO en el camino caliente —
+	// exactamente lo que INV-051.2 prohíbe y lo que vigila el barrido de listener_camino_caliente_test.go
+	// (que este campo pasa por construcción: no cumple app.InboundSink, no expone Classify y no es un func
+	// que reciba domain.InboundEvent). Un *latencia.Histograma no puede hablar por la red.
+	//
+	// 🔴 INV-051.1: aquí no entra nada del contenido. El histograma solo ve duraciones.
+	latencia *latencia.Histograma
 
 	// clasificadorActivo dice si el CLASIFICADOR de intenciones está encendido en este Edge (Plan 051 Ola 2,
 	// T2.12). Se lee FRESCO en cada mensaje —no se cachea un bool al construir— porque la feature puede
@@ -134,8 +166,10 @@ type Listener struct {
 // app.ListenOption hace con el caso de uso Listen. Sin opciones, los defaults son los de siempre.
 type ListenerOption func(*Listener)
 
-// WithCola cablea la cola durable de entrantes (Plan 051 Ola 1). nil se IGNORA: el listener se queda
-// con el camino de siempre (solo sink.Deliver), que es el fallback explícito de esta ola.
+// WithCola cablea la cola durable de entrantes (Plan 051 Ola 1). nil se IGNORA, pero eso NO es un
+// fallback: sin cola el listener no tiene dónde dejar el entrante y la sesión queda sorda (NewListener lo
+// grita, y desde el Plan 051 O3 el daemon ni siquiera arranca en esa situación). La opción viaja SIEMPRE
+// con WithSessionID.
 func WithCola(c app.ColaEntrantes) ListenerOption {
 	return func(l *Listener) {
 		if c != nil {
@@ -179,16 +213,33 @@ func WithClasificadorActivo(fn func() bool) ListenerOption {
 	}
 }
 
+// WithLatencia cablea el CRONÓMETRO del handler de entrantes (Plan 051 Ola 3 · T3.13): el histograma
+// COMPARTIDO por todas las sesiones del Edge donde se acumula cuánto tarda onMessage, que es lo que hace
+// medible «handler < 50 ms p99» (INV-051.2).
+//
+// Es compartido —no uno por sesión— porque el criterio es del EDGE: un p99 por sesión con 3 mensajes cada
+// una no responde la pregunta, y sumarlos después exigiría fusionar histogramas para nada.
+//
+// nil se IGNORA y el listener queda sin medir, que es el comportamiento anterior a T3.13 exactamente.
+func WithLatencia(h *latencia.Histograma) ListenerOption {
+	return func(l *Listener) {
+		if h != nil {
+			l.latencia = h
+		}
+	}
+}
+
 // SetHealthReporter liga el listener al registro de salud de SU sesión (Plan 031 T6). Se llama ANTES de
 // Register (al construir el ciclo de escucha). nil ⇒ no se reporta salud. No es secreto ni PII.
 func (l *Listener) SetHealthReporter(r health.SessionReporter) { l.reporter = r }
 
-// NewListener construye el listener con el sink y el logger dados, el backoff por defecto del spike y el
-// observador de corchetes. El margen de la ventana arranca en su default; SetConnectMargin lo ajusta.
-// Sin opts el comportamiento es el histórico: SIN cola durable, solo entrega al sink.
-func NewListener(sink app.InboundSink, log logger.Logger, opts ...ListenerOption) *Listener {
+// NewListener construye el listener con el logger dado, el backoff por defecto del spike y el observador
+// de corchetes. El margen de la ventana arranca en su default; SetConnectMargin lo ajusta.
+//
+// YA NO RECIBE SINK (Plan 051 Ola 3 · T3.0): el listener no entrega. Sin WithCola no tiene a dónde dejar
+// el entrante, y eso ES un fallo de cableado, no un modo de operación — ver el grito de abajo.
+func NewListener(log logger.Logger, opts ...ListenerOption) *Listener {
 	l := &Listener{
-		sink:     sink,
 		log:      log,
 		backoff:  DefaultBackoff(),
 		state:    StateDisconnected,
@@ -203,12 +254,30 @@ func NewListener(sink app.InboundSink, log logger.Logger, opts ...ListenerOption
 	// session_id="" y el adaptador pediría la DEK de la cadena vacía: o falla en cada mensaje, o —peor—
 	// mezcla el material de todas las sesiones bajo una llave que no es de nadie. Ninguna de las dos se
 	// puede descubrir en producción por casualidad, así que NO se falla en silencio: se GRITA en el log y
-	// se DEGRADA al camino de siempre (cola nil ⇒ solo sink.Deliver), que es exactamente el
-	// comportamiento previo al Plan 051. Tumbar el proceso tampoco es opción: un error de cableado no
-	// puede dejar sin escucha a las sesiones que sí están bien.
+	// se desactiva la cola. Tumbar el proceso tampoco es opción: un error de cableado no puede dejar sin
+	// escucha a las sesiones que sí están bien.
 	if l.cola != nil && l.sessionID == "" {
-		l.log.Error("listener: cableado incompleto — WithCola sin WithSessionID; la cola durable queda DESACTIVADA para esta sesión (se entrega solo al sink). Corrige el arranque: ambas opciones van juntas")
+		l.log.Error("listener: cableado incompleto — WithCola sin WithSessionID; la cola durable queda DESACTIVADA para esta sesión. Corrige el arranque: ambas opciones van juntas")
 		l.cola = nil
+	}
+	// SIN COLA ⇒ SESIÓN SORDA, Y HAY QUE DECIRLO. Un listener sin cola no anota, no entrega y no falla:
+	// cada mensaje que llegue se evapora con el socket conectado y sin un solo error. El síntoma en campo
+	// —«el cliente escribe y no pasa nada»— no apunta a su causa por ninguna parte; esta línea es lo único
+	// que la delata.
+	//
+	// 🔴 YA NO ES ALCANZABLE DESDE PRODUCCIÓN (Plan 051 O3, 2026-08-17). Esta comprobación nació como
+	// PALIATIVO de un agujero real: T3.0 retiró el `sink.Deliver` inline y la apertura de
+	// `cola_entrantes.db` en el daemon seguía sin ser fatal, así que un fichero que no abría dejaba
+	// listeners sordos de verdad. Ese agujero se cerró en el sitio correcto: el daemon NO ARRANCA si la
+	// cola no se puede abrir, migrar o construir. Un daemon vivo tiene cola por construcción.
+	//
+	// SE CONSERVA IGUAL, y no por inercia: `NewListener` es público y lo llaman los tests y cualquier
+	// cableado que no venga del daemon. Si esta línea aparece en un log de campo, el diagnóstico ya no es
+	// «revisa el fichero de la cola» sino «alguien construyó un listener por fuera del arranque»: es un bug
+	// de cableado, no un estado degradado. Se grita y se SIGUE, porque tumbar el proceso desde un
+	// constructor dejaría sin escucha a las sesiones que sí están bien.
+	if l.cola == nil {
+		l.log.Error("listener: sesión SIN cola durable de entrantes; sus mensajes NO se anotan ni se despachan. El daemon no arranca sin cola desde el Plan 051 O3, así que esto es un cableado hecho por fuera de `agent serve`")
 	}
 	return l
 }
@@ -240,7 +309,7 @@ func (l *Listener) State() ConnState {
 }
 
 // Register cablea handleEvent al AddEventHandler REAL del cliente whatsmeow. El ctx (vida de la
-// sesión Listen) se propaga a cada entrega al sink. NO se cubre en tests (requiere un client real).
+// sesión Listen) se propaga a cada anotación en la cola. NO se cubre en tests (requiere un client real).
 func (l *Listener) Register(ctx context.Context, client *wm.Client) uint32 {
 	// Sello de la ventana temporal (ADR-0037): Client.LastSuccessfulConnect leído FRESCO en cada
 	// evaluación, nunca cacheado. Se lee desde el handler de mensaje, que es exactamente donde la cadena
@@ -277,8 +346,13 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 	}
 }
 
-// onMessage decide si el entrante se ADMITE y, si lo hace, lo mapea a domain.InboundEvent y lo entrega al
-// sink. Un fallo de entrega se registra pero NO tumba la escucha (el socket sigue vivo).
+// onMessage decide si el entrante se ADMITE y, si lo hace, lo ANOTA EN LA COLA DURABLE y RETORNA. No
+// entrega a nadie y no espera a nadie: quien entrega al cable es el despachador de la sesión.
+//
+// 🔴 INV-051.2 — ESTA FUNCIÓN CORRE EN EL HILO DE WHATSMEOW Y DEBE SALIR RÁPIDO. Lo único que hace con el
+// mensaje es un INSERT cifrado local. NO hay aquí ninguna llamada al LLM, ninguna espera sobre el cajero y
+// ninguna entrega al cable: cada una de esas tres cosas ataría el bucle de eventos de whatsmeow a la
+// latencia de un tercero (Ollama, el worker, la nube), que es justo lo que la Ola 3 vino a romper.
 //
 // Los filtros de la puerta, en este orden:
 //  1. ECO PROPIO (IsFromMe): lo mandamos nosotros; no es una conversación entrante y no tiene por qué subir.
@@ -286,24 +360,42 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 //  3. VENTANA TEMPORAL (ADR-0037, criterio único): anterior a `inicioDeConexión − margen` ⇒ se descarta.
 //
 // Lo ADMITIDO sigue el orden del Plan 051: ventana → PUERTA DE ELEGIBILIDAD (sin texto / grupo / feature
-// apagada / fastlane, ver el switch de enqueueCola) → INSERT cifrado en la cola durable → sink.Deliver. El
-// INSERT va antes de la entrega para que el acuse salga con el mensaje ya en disco; la entrega al sink SE
-// MANTIENE (escritura doble) hasta que exista el despachador de la Ola 3. La puerta de elegibilidad NO
+// apagada / fastlane, ver el switch de enqueueCola) → INSERT cifrado en la cola durable → fin. El INSERT es
+// lo que hace durable el mensaje ANTES de que WhatsApp reciba el acuse. La puerta de elegibilidad NO
 // descarta nada: decide si la fila nace reclamable por el cajero o ya resuelta con su marca de omisión.
 //
 // El descarte es SILENCIOSO hacia el cliente final y CONTADO hacia nosotros: un descarte invisible es
 // indistinguible de un bug. Se cuenta, no se transcribe (ADR-0034 nivel 3): ni texto ni teléfono al log.
 func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
+	// ⏱️ CRONÓMETRO (T3.13). Envuelve la función ENTERA —no solo el Enqueue— porque lo que INV-051.2 acota
+	// es cuánto tiempo del hilo de whatsmeow consume este handler, y eso incluye los filtros de la puerta.
+	//
+	// `camino` decide en qué SERIE cae la medida y se reasigna en cada salida temprana; el `defer` es lo que
+	// garantiza que se anota pase lo que pase, incluido el recover de enqueueCola. Sale por `Encolado` por
+	// defecto porque los caminos que encolan son tres (normal, fastlane y el del entrante sin hora) y los
+	// que descartan son dos: el default cubre el caso mayoritario y cada descarte lo dice explícitamente.
+	//
+	// COSTE: una sola llamada extra al reloj (MarkInbound reusa `inicio`), más una búsqueda de 16
+	// comparaciones y un atomic.Add. Ver el análisis en la cabecera de internal/app/latencia.
+	inicio := time.Now()
+	camino := latencia.Encolado
+	defer func() { l.latencia.Observar(camino, time.Since(inicio)) }()
+
 	// Prueba de vida (Plan 031 T6): sella el instante del último entrante. Se marca ANTES de filtrar y para
 	// TODO mensaje —incluidos los descartados— porque es prueba de vida del SOCKET, no señal de negocio:
 	// una ráfaga descartada sigue demostrando que el socket recibe. Comportamiento idéntico al previo.
+	//
+	// Reusa `inicio` en vez de pedir la hora otra vez: es el mismo instante con una resolución que a esta
+	// escala no distingue nada, y ahorra la única llamada al reloj que el cronómetro habría añadido.
 	if l.reporter != nil {
-		l.reporter.MarkInbound(time.Now())
+		l.reporter.MarkInbound(inicio)
 	}
 
-	// 1 · Eco propio. Hoy este dato solo se usaba para no gastar el clasificador (intent/sink.go:143); el
-	// evento subía igual a la nube. Descartarlo aquí es un CAMBIO DE COMPORTAMIENTO deliberado y aprobado.
+	// 1 · Eco propio. Antes de la Ola 1 este dato solo servía para no gastar el clasificador (lo miraba
+	// `intent.Decorator.eligible`, hoy retirado); el evento subía igual a la nube. Descartarlo aquí es un
+	// CAMBIO DE COMPORTAMIENTO deliberado y aprobado.
 	if e.Info.IsFromMe {
+		camino = latencia.Descartado // (T3.13) sale sin fila: su tiempo no es tiempo de encolar
 		l.brackets.countSelfDrop()
 		return
 	}
@@ -317,15 +409,17 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 	if e.Info.Timestamp.IsZero() {
 		l.brackets.countNoTimestamp()
 		l.log.Warn("listener: entrante SIN hora utilizable; se admite por precaución (la ventana no puede juzgarlo)")
-		// Cola durable ANTES del sink, igual que en el camino normal (ver el comentario largo de abajo).
+		// Este camino ENCOLA Y RETORNA, exactamente igual que el normal de abajo. Antes de T3.0 tenía además
+		// su propio `sink.Deliver`; se retiró con el otro (decisión del 2026-08-17): los dos caminos encolan
+		// desde T1.7, y el despachador drena la cola entera sin distinguir por qué entró cada fila. Dejar la
+		// entrega SOLO aquí habría sido peor que dejarla en los dos: un duplicado intermitente, disparado por
+		// una condición rarísima (`t="0"`), imposible de reproducir a voluntad.
+		//
 		// SELLO: aquí Info.Timestamp es CERO y NO se puede persistir tal cual — un 0 en la columna es epoch
 		// 1970, y la poda por TTL de la cola se llevaría la fila en el primer barrido, o sea perder justo el
 		// mensaje que acabamos de admitir por precaución. Se sella con la hora LOCAL de recepción, que es lo
 		// único cierto que tenemos de él: no es su hora real, pero sitúa la fila en la ventana de retención.
 		l.enqueueCola(ctx, e, time.Now().Unix())
-		if err := l.sink.Deliver(ctx, toInboundEvent(e)); err != nil {
-			l.log.Error("listener: no se pudo entregar el evento entrante al sink", "error", err)
-		}
 		return
 	}
 
@@ -339,6 +433,10 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 	now := time.Now()
 	threshold := resolveThreshold(seal, l.margin, now)
 	if e.Info.Timestamp.Before(threshold) {
+		// (T3.13) La ráfaga del ADR-0037 son miles de eventos que SÍ atan el hilo del socket, así que se
+		// miden; pero en su propia serie, porque cuestan microsegundos y mezclarlos con los encolados
+		// diluiría el p99 justo cuando hay ráfaga — es decir, mejoraría el número cuando el Edge va peor.
+		camino = latencia.Descartado
 		age := now.Sub(e.Info.Timestamp)
 		if age < 0 {
 			age = 0
@@ -349,33 +447,41 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 		return
 	}
 
-	// 4 · COLA DURABLE (Plan 051 Ola 1), y va ANTES del sink a propósito.
+	// 4 · COLA DURABLE (Plan 051 Ola 1) — y AQUÍ SE ACABA EL TRABAJO DEL LISTENER (Ola 3 · T3.0).
 	//
-	// ⚠️ NO "LIMPIES" EL sink.Deliver DE ABAJO. En la Ola 1 esto es ESCRITURA DOBLE deliberada: primero
-	// durabilidad (el INSERT cifrado), después la entrega de siempre. El gate «mensaje durable antes del
-	// acuse» se cumple con que el INSERT ocurra ANTES del Deliver, no con quitar el Deliver. Quien sustituye
-	// al camino inline es el DESPACHADOR de la Ola 3; hasta que exista y esté cableado, borrar esta entrega
-	// deja los mensajes sin llegar a la nube — regresión de campo, no simplificación.
+	// 🔴 AQUÍ NO SE ENTREGA, Y REINTRODUCIR UNA ENTREGA VIOLA INV-051.2. Quien entrega este mensaje al cable
+	// es el DESPACHADOR de esta sesión (internal/app/despachador, cableado en sessionmgr/despacho.go): lee la
+	// cola en orden de `seq`, espera —con presupuesto acotado— a que el cajero le ponga la intención, y hace
+	// el `Deliver` desde SU goroutine. Hasta el 2026-08-17 aquí abajo había un `l.sink.Deliver` en escritura
+	// doble con este mismo INSERT; era el camino INLINE, y era transitorio por diseño.
+	//
+	// Por qué no puede volver, aunque parezca un atajo inofensivo:
+	//   - ATA EL HILO DE WHATSMEOW A UN TERCERO. Este código corre en el bucle de eventos del socket. Cada
+	//     milisegundo que se pasa aquí es un milisegundo que la sesión no procesa el siguiente evento.
+	//   - DUPLICA. El despachador entrega igual, y la deduplicación por `wa_message_id` del cable es una red
+	//     de seguridad, no una licencia para mandar dos veces.
+	//   - ROMPE EL ORDEN. La cola entrega FIFO por `seq`; una entrega paralela desde aquí adelanta mensajes.
+	//   - Y NO AÑADE DURABILIDAD: la promesa «mensaje durable antes del acuse» la cumple el INSERT, no la
+	//     entrega.
 	//
 	// Un descartado por la ventana (paso 3) ya ha vuelto: no genera fila (REQ-051.5).
 	l.enqueueCola(ctx, e, e.Info.Timestamp.Unix())
-
-	inbound := toInboundEvent(e)
-	if err := l.sink.Deliver(ctx, inbound); err != nil {
-		l.log.Error("listener: no se pudo entregar el evento entrante al sink",
-			"error", err, "message_id", inbound.MessageID)
-	}
 }
 
 // enqueueCola anota el entrante en la cola durable. tsWhatsApp va en epoch-SEGUNDOS (no milis): es el
 // sello con el que la cola ordena y poda.
 //
-// REQ-051.8 — un fallo del Enqueue se REGISTRA y ya: no tumba el socket, no aborta el handler y no
-// impide la entrega al sink. La cola es una mejora de durabilidad; que falle no puede ser peor que no
-// tenerla. INV-051.1 — el texto del mensaje NUNCA sale por el log, ni entero ni truncado: solo
-// identificadores y el error.
+// REQ-051.8 — un fallo del Enqueue se REGISTRA y ya: no tumba el socket y no aborta el handler. INV-051.1 —
+// el texto del mensaje NUNCA sale por el log, ni entero ni truncado: solo identificadores y el error.
 //
-// cola == nil ⇒ no-op (fallback documentado: comportamiento idéntico al previo al Plan 051).
+// ⚠️ LO QUE SIGNIFICA UN FALLO CAMBIÓ EN T3.0. Mientras existió el camino inline, un Enqueue fallido solo
+// costaba la intención: el mensaje llegaba igual por el `sink.Deliver`. Retirado el inline, un Enqueue
+// fallido es un MENSAJE PERDIDO. La política no cambia (no se tumba la escucha por un fallo de disco: eso
+// dejaría sordas también a las sesiones sanas), pero el contador `cola_enqueue_error` de InboundStats deja
+// de ser una métrica de calidad y pasa a ser una métrica de PÉRDIDA — quien la publique en la Ola 4 debe
+// tratarla como tal.
+//
+// cola == nil ⇒ no-op, y el mensaje se pierde (NewListener ya gritó al construir; ver allí).
 func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsApp int64) {
 	if l.cola == nil {
 		return
@@ -436,13 +542,11 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 	// Los cinco caminos (los cuatro de arriba más el `nuevo` del resto) terminan con el mensaje entregado
 	// SIN intención; lo único que cambia entre ellos es QUÉ SE APRENDE al mirarlos, y de eso va INV-051.3.
 	//
-	// ⚠️ DUPLICACIÓN TRANSITORIA, DECLARADA — NO LA "LIMPIES". Los filtros de grupo y de feature-apagada
-	// existen HOY en dos sitios: aquí y en intent.Decorator.eligible (adapters/intent/sink.go:142), que
-	// gobierna el camino INLINE del decorador. No es un parche olvidado: mientras dure la escritura doble
-	// de la Ola 1 (en onMessage, este enqueueCola SEGUIDO del sink.Deliver), los dos caminos coexisten y
-	// cada uno necesita su propia puerta. Quien retira ESTA duplicación es la OLA 3, al sacar el IntentSink del
-	// camino caliente y sustituirlo por el despachador: ese día desaparece `eligible`, no esta rama. Si
-	// borras una de las dos antes, el camino que quede sin puerta manda tráfico de grupo a Ollama.
+	// ✅ LA DUPLICACIÓN YA NO EXISTE (T3.0, 2026-08-17). Estos filtros vivieron un tiempo en DOS sitios:
+	// aquí y en `intent.Decorator.eligible`, la puerta del camino inline. Aquella copia murió con el
+	// decorador, tal como este comentario anunciaba: ESTA rama es ahora la ÚNICA puerta de elegibilidad del
+	// Edge, y lo que decide es en qué estado NACE la fila. Si alguien vuelve a necesitar el criterio en otro
+	// punto, que lo lea de aquí; una segunda copia volvería a divergir en silencio.
 	//
 	// EL VOCABULARIO YA NO VIVE AQUÍ (2026-08-16, Plan 051 Ola 2): los literales JSON que este fichero
 	// declaraba a mano se sustituyeron por el enum canónico `app.MotivoOmitido` (internal/app/cola.go),
@@ -455,8 +559,8 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 		item.Estado = app.EstadoClasificado
 		item.IntentJSON = app.SobreOmitido(app.MotivoSinTexto)
 	case e.Info.IsGroup:
-		// Propiedad del MENSAJE: un grupo nunca fue elegible para el clasificador (es el mismo criterio
-		// que intent.Decorator.eligible aplica al camino inline). Hasta T2.12 este tráfico nacía `nuevo`
+		// Propiedad del MENSAJE: un grupo nunca fue elegible para el clasificador (era el mismo criterio
+		// que aplicaba intent.Decorator.eligible, retirado con el inline). Hasta T2.12 este tráfico nacía `nuevo`
 		// y el cajero lo mandaba a Ollama — carga que el Edge NUNCA ha clasificado, colándose por la
 		// puerta nueva de la cola.
 		item.Estado = app.EstadoClasificado
@@ -481,11 +585,11 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 		// gritó, y aquí únicamente se baja el nivel. Sin esto, una sesión con la DEK ausente escribía un
 		// Error por mensaje entrante, a ritmo de socket.
 		if errors.Is(err, app.ErrColaFalloRepetido) {
-			l.log.Debug("listener: la cola durable sigue rechazando los entrantes de esta sesión (fallo ya reportado); el evento se entrega igualmente al sink",
+			l.log.Debug("listener: la cola durable sigue rechazando los entrantes de esta sesión (fallo ya reportado); este mensaje SE PIERDE",
 				"message_id", e.Info.ID)
 			return
 		}
-		l.log.Error("listener: no se pudo anotar el entrante en la cola durable; la escucha sigue y el evento se entrega igualmente al sink (REQ-051.8)",
+		l.log.Error("listener: no se pudo anotar el entrante en la cola durable; el mensaje SE PIERDE (ya no hay camino inline que lo rescate) y la escucha sigue (REQ-051.8)",
 			"error", err, "message_id", e.Info.ID)
 	}
 }
@@ -639,6 +743,14 @@ func (l *Listener) onLoggedOut(e *events.LoggedOut) {
 
 // toInboundEvent extrae de un *events.Message los campos útiles de dominio. El cuerpo de texto sale
 // de Conversation o, si viene envuelto, de ExtendedTextMessage. No toca material cifrado.
+//
+// ⚠️ YA NO LA LLAMA EL CAMINO CALIENTE (T3.0): el listener no construye el evento de dominio, porque no
+// entrega. SE CONSERVA —y no se borra— porque sigue siendo la ESPECIFICACIÓN EJECUTABLE del mapeo
+// *events.Message → domain.InboundEvent: el despachador reconstruye ese mismo evento desde las columnas y
+// el `meta` de la cola (despachador.go, «la traducción inversa exacta de toInboundEvent + colaMeta»), y los
+// tests de esta capa la usan como referencia de qué campos hay que preservar. Borrarla dejaría al
+// despachador sin contra-parte contra la que contrastarse. Si algún día el despachador deja de imitarla,
+// muere con ella.
 func toInboundEvent(e *events.Message) domain.InboundEvent {
 	return domain.InboundEvent{
 		MessageID: e.Info.ID,

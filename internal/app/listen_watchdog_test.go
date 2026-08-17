@@ -35,7 +35,7 @@ func (c *blockingCustody) Load() ([]byte, error) {
 func TestListen_DEKLoadTimeout(t *testing.T) {
 	dek := bytes.Repeat([]byte{0xAB}, DEKSize)
 	cust := newBlockingCustody(dek)
-	gw := &fakeListenGateway{emit: 1}
+	gw := newFakeListenGateway()
 
 	var mu sync.Mutex
 	var reported []time.Duration
@@ -45,7 +45,7 @@ func TestListen_DEKLoadTimeout(t *testing.T) {
 		mu.Unlock()
 	}
 
-	l := NewListen(cust, gw, &spySink{}, nil,
+	l := NewListen(cust, gw, nil,
 		WithDEKLoadTimeout(20*time.Millisecond),
 		WithDEKDurationReporter(report))
 
@@ -97,14 +97,14 @@ func TestListen_DEKLoadTimeout(t *testing.T) {
 func TestListen_DEKLoadReportsDurationOnSuccess(t *testing.T) {
 	dek := bytes.Repeat([]byte{0x11}, DEKSize)
 	cust := custodyWith(dek)
-	// emit:1 → el gateway entrega un evento al sink (mutex-safe): sincroniza sin leer gw.gotDEK en carrera.
-	gw := &fakeListenGateway{emit: 1}
-	sink := &spySink{}
+	// El gateway avisa al ENTRAR en Listen: sincroniza sin leer gw.gotDEK en carrera. Hasta T3.8 la señal
+	// era el conteo de un spySink que el propio fake alimentaba; ese sink murió con el parámetro del puerto.
+	gw := newFakeListenGateway()
 
 	var mu sync.Mutex
 	var got time.Duration
 	var called bool
-	l := NewListen(cust, gw, sink, nil,
+	l := NewListen(cust, gw, nil,
 		WithDEKDurationReporter(func(d time.Duration) {
 			mu.Lock()
 			got, called = d, true
@@ -115,7 +115,7 @@ func TestListen_DEKLoadReportsDurationOnSuccess(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- l.Run(ctx) }()
 
-	waitFor(t, func() bool { return sink.count() == 1 }) // la DEK llegó al gateway y emitió
+	gw.esperaEntrada(t) // la DEK se cargó y llegó al gateway
 	cancel()
 	<-done
 

@@ -3,13 +3,20 @@ package app
 // Listen es el caso de uso de ESCUCHA 24/7 (always-on) del Edge (RF-5/RF-6, design §5).
 //
 // A diferencia de Send (ciclo efímero connect-send-disconnect), Listen mantiene el socket de
-// WhatsApp VIVO de forma continua: arranca la conexión, registra el listener que enruta los mensajes
-// entrantes hacia el sink y BLOQUEA hasta que el ctx se cancele (Ctrl-C / SIGINT en el daemon).
+// WhatsApp VIVO de forma continua: arranca la conexión, registra el listener que ANOTA los mensajes
+// entrantes en la cola durable y BLOQUEA hasta que el ctx se cancele (Ctrl-C / SIGINT en el daemon).
 //
 // Orquesta el flujo DESACOPLADO por interfaces para ser testeable sin teléfono ni red:
 //   - recupera la DEK del puerto KeyCustody (la misma sellada en el pairing, zero-knowledge);
 //   - delega la conexión+escucha al puerto ListenGateway, que en producción descifra el store con la
 //     DEK, carga el device pareado, conecta el cliente whatsmeow always-on y registra el listener.
+//
+// 🔴 ESTE CASO DE USO YA NO ENTREGA NADA (Plan 051 Ola 3 · T3.0, retirada del sink en T3.8). Hasta la
+// Ola 3 arrastraba un InboundSink que le pasaba al gateway para que el listener entregase cada entrante
+// al cable desde el propio hilo de whatsmeow. Ese camino murió: hoy el listener solo ENCOLA y quien
+// entrega es el DESPACHADOR de la sesión (app/despachador, cableado en sessionmgr/despacho.go), que
+// toma su sink por su cuenta de mux.SinkFor(session_id). Lo que queda aquí es exactamente lo que este
+// caso de uso sigue haciendo: cargar la DEK y sostener el socket vivo hasta la cancelación.
 //
 // Invariante de seguridad (ADR-0007): la DEK en claro vive SOLO en RAM y, en modo always-on,
 // MIENTRAS el socket viva. ListenGateway.Listen bloquea hasta cancelación, así que la DEK permanece
@@ -42,28 +49,39 @@ const defaultDEKLoadTimeout = 10 * time.Second
 var ErrDEKLoadTimeout = errors.New("listen: la carga de la DEK excedió el plazo (posible diálogo de permiso del Keychain pendiente)")
 
 // InboundSink es el puerto de SALIDA de los mensajes entrantes ya descifrados (domain.InboundEvent).
-// En la Fase 1 lo implementa el cliente CloudLink (reenvío a la nube por gRPC bidi-stream); en el
-// spike lo implementa un adaptador de LOG (CloudLink stub, design §8). Abstrae el destino para que
-// ni el caso de uso ni el listener conozcan a dónde va el evento.
+// Lo implementa el cliente CloudLink (reenvío a la nube por gRPC bidi-stream, etiquetado por sesión con
+// mux.SinkFor(session_id)); en diagnóstico lo implementa un adaptador de LOG (LogMux, design §8).
+//
+// ⚠️ SU CONSUMIDOR YA NO ES ESTE CASO DE USO (Plan 051 Ola 3 · T3.8): lo consume el DESPACHADOR
+// (app/despachador), que drena la cola durable y entrega en orden de `seq`. Sigue declarado en este
+// fichero por ser su domicilio histórico y porque `app` es el único paquete que pueden importar a la vez
+// el despachador, el sessionmgr y el adaptador de cloudlink; NO porque Listen lo use — no lo usa.
 type InboundSink interface {
 	// Deliver entrega un evento entrante al destino. Devuelve error si no pudo entregarlo (el
-	// listener lo registra y sigue escuchando: una entrega fallida no debe tumbar el socket).
+	// despachador lo registra y reintenta la misma cabeza: una entrega fallida no avanza la cola,
+	// pero tampoco tumba el socket ni pierde la fila, que sigue en disco sin sellar).
 	Deliver(ctx context.Context, evt domain.InboundEvent) error
 }
 
 // ListenGateway ABSTRAE la conexión always-on + escucha sobre whatsmeow para el caso de uso. La
 // implementación real (internal/adapters/whatsmeow) construye el store CIFRADO con la DEK, carga el
-// device pareado, conecta el cliente, registra el listener que enruta los *events.Message hacia el
-// sink y mantiene el socket VIVO hasta que el ctx se cancele. Un fake en los tests emite eventos al
-// sink y respeta la cancelación sin red.
+// device pareado, conecta el cliente, registra el listener que ANOTA los *events.Message en la cola
+// durable de la sesión y mantiene el socket VIVO hasta que el ctx se cancele. Un fake en los tests
+// registra la DEK que recibió y respeta la cancelación sin red.
+//
+// 🔴 SIN `sink` DESDE T3.8, y esto no es cosmética. El parámetro existía para que el gateway entregara
+// los entrantes en línea; desde T3.0 el adaptador real lo recibía y lo IGNORABA, de modo que el puerto
+// prometía una entrega que ninguna implementación hacía — y el test que la afirmaba corría contra el
+// fake, no contra producción, así que ninguna mutación del código real podía ponerlo en rojo. La entrega
+// vive hoy en el despachador (INV-051.2: nada se entrega desde el hilo de whatsmeow). NO lo reintroduzcas.
 //
 // Contrato de seguridad: la DEK (32 bytes) entra SOLO para descifrar el store y NUNCA se persiste ni
 // se loguea.
 type ListenGateway interface {
-	// Listen conecta, registra el listener (eventos -> sink) y BLOQUEA manteniendo el socket vivo
-	// hasta que ctx se cancele. Devuelve nil al cancelarse limpio, o error si la conexión inicial
+	// Listen conecta, registra el listener (eventos -> cola durable) y BLOQUEA manteniendo el socket
+	// vivo hasta que ctx se cancele. Devuelve nil al cancelarse limpio, o error si la conexión inicial
 	// (o la carga del device) falla.
-	Listen(ctx context.Context, dek []byte, sink InboundSink) error
+	Listen(ctx context.Context, dek []byte) error
 }
 
 // LiveSender es el puerto de ENVÍO sobre el cliente VIVO de la escucha always-on: reutiliza la MISMA
@@ -90,7 +108,6 @@ type LiveSender interface {
 type Listen struct {
 	custody KeyCustody
 	gateway ListenGateway
-	sink    InboundSink
 	log     logger.Logger
 
 	// dekLoadTimeout es el plazo del watchdog de la carga de la DEK (Plan 031 T6); 0 ⇒ defaultDEKLoadTimeout.
@@ -127,11 +144,15 @@ func WithDEKDurationReporter(fn func(time.Duration)) ListenOption {
 // NewListen construye el caso de uso con los puertos dados. log traza la carga de la DEK (el llamador
 // multi-sesión pasa su logger con session_id; ver sessionmgr); nil ⇒ se descarta (tests). opts inyectan el
 // watchdog/reporte de salud (Plan 031 T6); sin opts, defaults seguros (plazo default, sin reporte).
-func NewListen(custody KeyCustody, gateway ListenGateway, sink InboundSink, log logger.Logger, opts ...ListenOption) *Listen {
+//
+// Sin parámetro `sink` desde T3.8: ver la nota del puerto ListenGateway. El llamante de producción
+// (sessionmgr.WithWhatsmeowListen) dejó con ello de pedir un `mux.SinkFor(session_id)` que no usaba nadie
+// —era la SEGUNDA llamada por sesión, junto a la del despachador, que sí es la de verdad.
+func NewListen(custody KeyCustody, gateway ListenGateway, log logger.Logger, opts ...ListenOption) *Listen {
 	if log == nil {
 		log = logger.New(logger.WithWriter(io.Discard))
 	}
-	l := &Listen{custody: custody, gateway: gateway, sink: sink, log: log, dekLoadTimeout: defaultDEKLoadTimeout}
+	l := &Listen{custody: custody, gateway: gateway, log: log, dekLoadTimeout: defaultDEKLoadTimeout}
 	for _, o := range opts {
 		o(l)
 	}
@@ -180,7 +201,7 @@ func (l *Listen) Run(ctx context.Context) error {
 	l.reportDEKDuration(res.Elapsed)
 	l.log.Info("custodia: DEK cargada", "duracion", res.Elapsed.String())
 
-	if err := l.gateway.Listen(ctx, dek, l.sink); err != nil {
+	if err := l.gateway.Listen(ctx, dek); err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
 	return nil

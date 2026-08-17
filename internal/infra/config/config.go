@@ -50,6 +50,20 @@ const DefaultDiagLogLines = 500
 // tráfico vivo en cuanto el reloj local fuera un segundo por delante del servidor).
 const DefaultInboundMarginSeconds = 300
 
+// DefaultInboundStatsEveryMS es cada cuánto el daemon emite el bloque de LATENCIA DEL HANDLER DE ENTRANTES
+// (Plan 051 Ola 3 · T3.13): el p50/p95/p99 del tiempo que onMessage pasa en el hilo de whatsmeow, que es
+// lo que hace medible el criterio de cierre de la ola («handler < 50 ms p99», INV-051.2).
+//
+// 60 s, MÁS CORTO que los 5 min del cajero (DefaultWorkerStatsEveryMS), y no por gusto: la ventana de una
+// prueba de campo se mide en minutos, y con 5 min una sesión de PC-11 entera cabría en dos líneas de log.
+//
+// Configurable por WAPP_AGENT_INBOUND_STATS_EVERY_MS — prefijo del AGENTE, no del worker: esto corre en
+// `agent serve`, que es otro proceso con otro bloque de entorno.
+//
+// GUARDARRAÍL DISTINTO AL DE LOS DEMÁS NÚMEROS (calcado del cajero): sólo lo NEGATIVO cae a este default.
+// El 0 es un valor legítimo y significa «cállate», no un dedazo. El bloque FINAL se emite igual.
+const DefaultInboundStatsEveryMS = 60 * 1000
+
 // DefaultOutboxTTLHours es el TTL por defecto (en horas) de un evento en el outbox: 0 = DESACTIVADO
 // (durabilidad primero; el único recorte es el drop-oldest por tamaño). Un valor >0 poda los eventos más
 // viejos que ese tiempo al encolar/drenar. Configurable por WAPP_AGENT_OUTBOX_TTL_HOURS.
@@ -120,13 +134,13 @@ const DefaultWorkerPollMS = 500
 
 // DefaultWorkerInferenceTimeoutMS es el plazo de UNA inferencia del worker-cajero.
 //
-// 🔴 ES UN NÚMERO DISTINTO DE DefaultIntentTimeoutMS (3000 ms) Y TIENE QUE SERLO. Aquel es el
-// presupuesto del camino INLINE —el decorador que clasifica dentro del handler de whatsmeow— y es
-// corto porque su trabajo es SOLTAR EL HANDLER: pasado el plazo, el mensaje se entrega sin intent y la
-// sesión sigue viva. El worker existe justo para lo contrario: se sacó la inferencia a otro proceso
-// PARA PODER TARDAR sin comerse el proceso que mantiene los sockets.
+// 🔴 ES UN NÚMERO DISTINTO DE DefaultIntentWaitMS (4000 ms) Y TIENE QUE SERLO. Aquel es el
+// presupuesto del DESPACHADOR —cuánto espera a que aparezca el intent antes de entregar el mensaje sin
+// él— y es corto porque su trabajo es NO RETENER la entrega: pasado el plazo, el mensaje sale sin
+// intent y la sesión sigue viva. El worker existe justo para lo contrario: se sacó la inferencia a otro
+// proceso PARA PODER TARDAR sin comerse el proceso que mantiene los sockets.
 //
-// Heredar aquí los 3 s lo calibraba PARA FALLAR. La O0 midió p50 = 2.613 ms y p95 = 3.736 ms sobre el
+// Heredar aquí los 4 s del despachador lo calibraba PARA FALLAR. La O0 midió p50 = 2.613 ms y p95 = 3.736 ms sobre el
 // VPS real (docs/plans/051-worker-cajero-edge/O0-resultados-2026-08-09.md), o sea que 3 s queda POR
 // DEBAJO de la p95: ~20-40 % de las inferencias abortarían, cada aborto es un fallo, 5 seguidos abren
 // el breaker 60 s, las filas se quedan en `tomado`, el barrido las devuelve a `nuevo`, se re-reclaman
@@ -185,8 +199,9 @@ const DefaultWorkerStatsEveryMS = 5 * 60 * 1000
 // DefaultWorkerMaxRunes es el TECHO de runas del texto que se manda a clasificar (T2.5): sin techo,
 // pegar ~65 KB en un chat basta para que la inferencia tarde lo bastante como para contar fallos y
 // ABRIR EL BREAKER COMPARTIDO, apagando la clasificación de todas las sesiones. Es la vía más barata
-// que existe hoy para denegar el servicio del clasificador desde fuera. El porqué del 4000, en
-// classifier.DefaultMaxRunes. Configurable por WAPP_WORKER_MAX_RUNES; <=0 cae al default.
+// que existe hoy para denegar el servicio del clasificador desde fuera. El porqué del número —hoy
+// 1000 runas, bajado desde 4000 con medición contra Ollama real— vive en classifier.DefaultMaxRunes:
+// NO se repite aquí precisamente para que no vuelva a envejecer, que ya pasó una vez. Configurable por WAPP_WORKER_MAX_RUNES; <=0 cae al default.
 const DefaultWorkerMaxRunes = cajero.DefaultMaxRunes
 
 // DefaultWorkerNumThread son los hilos de inferencia que se le piden a Ollama. Lo fijó la medición de
@@ -214,7 +229,8 @@ type WorkerConfig struct {
 	MaxConcurrent int `yaml:"max_concurrent"`
 	// PollMS es el intervalo del poll cuando la cola está vacía (T2.7, primera opción). Default 500.
 	PollMS int `yaml:"poll_ms"`
-	// MaxRunes es el techo de runas de la entrada a clasificar (T2.5). Default 4000.
+	// MaxRunes es el techo de runas de la entrada a clasificar (T2.5). El default lo fija
+	// classifier.DefaultMaxRunes (hoy 1000), no un literal de este fichero.
 	MaxRunes int `yaml:"max_runes"`
 	// NumThread son los hilos que se le piden a Ollama por inferencia (T2.5). Default 5.
 	NumThread int `yaml:"num_thread"`
@@ -226,7 +242,7 @@ type WorkerConfig struct {
 	// Default DefaultWorkerMaxIntentos (3). Es el freno del lote venenoso: ver la constante.
 	MaxIntentos int `yaml:"max_intentos"`
 	// InferenceTimeoutMS acota UNA inferencia del worker. Default DefaultWorkerInferenceTimeoutMS
-	// (15000). NO es Intent.TimeoutMS: ver el doc comment de la constante, el porqué está ahí entero.
+	// (15000). NO es Intent.WaitMS: ver el doc comment de la constante, el porqué está ahí entero.
 	InferenceTimeoutMS int `yaml:"inference_timeout_ms"`
 	// StatsEveryMS es la cadencia del latido de contadores en el log del cajero. Default
 	// DefaultWorkerStatsEveryMS (300000 = 5 min). 0 lo DESACTIVA (guardarraíl distinto: sólo lo
@@ -354,6 +370,14 @@ type Config struct {
 	// anterior a `inicioDeConexión − margen`, y eso NO sube a la nube. Default 300 (5 min). Se lee de
 	// WAPP_AGENT_INBOUND_MARGIN_SECONDS; <=0 cae al default (guardarraíl, no invariante).
 	InboundMarginSeconds int `yaml:"inbound_margin_seconds"`
+	// InboundStatsEveryMS es la cadencia del bloque de latencia del handler de entrantes en el log del
+	// daemon (Plan 051 Ola 3 · T3.13). Default DefaultInboundStatsEveryMS (60000 = 1 min). Se lee de
+	// WAPP_AGENT_INBOUND_STATS_EVERY_MS. 0 lo DESACTIVA (guardarraíl distinto: sólo lo negativo cae al
+	// default); el bloque final del apagado se emite igual.
+	//
+	// Durante una sesión de PC-11 se baja a 10000 para no depender de que el tick caiga en el momento
+	// bueno. NO se deja así: los logs del VPS van a un fichero y esa cadencia lo engorda.
+	InboundStatsEveryMS int `yaml:"inbound_stats_every_ms"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -384,9 +408,16 @@ const DefaultIntentOllamaURL = "http://127.0.0.1:11434"
 // Configurable por WAPP_AGENT_INTENT_MODEL.
 const DefaultIntentModel = "qwen3:1.7b"
 
-// DefaultIntentTimeoutMS es el timeout por defecto (ms) de una clasificación: pasado ese tanto el decorador
-// degrada (entrega el mensaje SIN intención) sin bloquear. Configurable por WAPP_AGENT_INTENT_TIMEOUT_MS.
-const DefaultIntentTimeoutMS = 3000
+// DefaultIntentWaitMS es el PRESUPUESTO DE ESPERA por defecto (ms) del DESPACHADOR (Plan 051 Ola 3):
+// cuánto aguanta la entrega de un mensaje esperando a que el worker-cajero deje su intent en la cola
+// antes de despacharlo SIN intención. Configurable por WAPP_AGENT_INTENT_WAIT_MS.
+//
+// 🔴 NO ES EL TIMEOUT DE INFERENCIA, y son dos números que NO se colapsan. El de inferencia es
+// WAPP_WORKER_INFERENCE_TIMEOUT_MS (15000, ver DefaultWorkerInferenceTimeoutMS) y mide «cuánto aguanto a Ollama»;
+// éste mide «cuánto retengo la entrega». Que el segundo sea MENOR que el primero es lo normal y no es
+// una incoherencia: el despachador se rinde antes de que la inferencia termine, entrega sin intent, y
+// la clasificación tardía sigue su curso en la cola sin retener a nadie.
+const DefaultIntentWaitMS = 4000
 
 // IntentConfig agrupa los parámetros del clasificador de intenciones (Plan 029). Todo OFF por defecto.
 type IntentConfig struct {
@@ -396,8 +427,16 @@ type IntentConfig struct {
 	OllamaURL string `yaml:"ollama_url"`
 	// Model es el modelo de clasificación (default qwen3:1.7b).
 	Model string `yaml:"model"`
-	// TimeoutMS es el timeout por clasificación en milisegundos (default 3000). <=0 cae al default.
-	TimeoutMS int `yaml:"timeout_ms"`
+	// WaitMS es el PRESUPUESTO DE ESPERA DEL DESPACHADOR en milisegundos (default 4000): cuánto retiene
+	// la entrega de un mensaje aguardando a que aparezca su intent, antes de despacharlo sin él.
+	// <=0 cae al default.
+	//
+	// 🔴 NO ES EL TIMEOUT DE INFERENCIA. El timeout de inferencia es WAPP_WORKER_INFERENCE_TIMEOUT_MS
+	// (15000), que vive en Worker.InferenceTimeoutMS. SON DOS NÚMEROS DISTINTOS Y NO SE COLAPSAN: éste
+	// acota lo que espera el que ENTREGA; aquél acota lo que tarda el que CLASIFICA.
+	//
+	// Sustituye a la retirada WAPP_AGENT_INTENT_TIMEOUT_MS (Plan 051 Ola 3, T3.1): ver VariablesRetiradas.
+	WaitMS int `yaml:"wait_ms"`
 }
 
 // CloudLinkConfig agrupa los parámetros del conducto CloudLink. Todos OPCIONALES: con Endpoint vacío
@@ -494,6 +533,7 @@ func defaults() Config {
 		ColaLeaseSeconds:      DefaultColaLeaseSeconds,
 		DiagLogLines:          DefaultDiagLogLines,
 		InboundMarginSeconds:  DefaultInboundMarginSeconds,
+		InboundStatsEveryMS:   DefaultInboundStatsEveryMS,
 		CloudLink: CloudLinkConfig{
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
@@ -502,7 +542,7 @@ func defaults() Config {
 			Enabled:   false,
 			OllamaURL: DefaultIntentOllamaURL,
 			Model:     DefaultIntentModel,
-			TimeoutMS: DefaultIntentTimeoutMS,
+			WaitMS:    DefaultIntentWaitMS,
 		},
 		Worker: WorkerConfig{
 			MaxConcurrent:      DefaultWorkerMaxConcurrent,
@@ -558,6 +598,7 @@ func Load(path string) (Config, error) {
 	cfg.ColaLeaseSeconds = loader.GetInt("COLA_LEASE_SECONDS", cfg.ColaLeaseSeconds)
 	cfg.DiagLogLines = loader.GetInt("DIAG_LOG_LINES", cfg.DiagLogLines)
 	cfg.InboundMarginSeconds = loader.GetInt("INBOUND_MARGIN_SECONDS", cfg.InboundMarginSeconds)
+	cfg.InboundStatsEveryMS = loader.GetInt("INBOUND_STATS_EVERY_MS", cfg.InboundStatsEveryMS)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)
@@ -575,7 +616,7 @@ func Load(path string) (Config, error) {
 	cfg.Intent.Enabled = loader.GetBool("INTENT_ENABLED", cfg.Intent.Enabled)
 	cfg.Intent.OllamaURL = loader.GetString("INTENT_OLLAMA_URL", cfg.Intent.OllamaURL)
 	cfg.Intent.Model = loader.GetString("INTENT_MODEL", cfg.Intent.Model)
-	cfg.Intent.TimeoutMS = loader.GetInt("INTENT_TIMEOUT_MS", cfg.Intent.TimeoutMS)
+	cfg.Intent.WaitMS = loader.GetInt("INTENT_WAIT_MS", cfg.Intent.WaitMS)
 	cfg.EnableAlphaTestAccounts = loader.GetBool("ALPHA_TEST_ACCOUNTS", loader.GetBool("ENABLE_ALPHA_LOGIN", cfg.EnableAlphaTestAccounts))
 	cfg.PlatformAPIBaseURL = loader.GetString("PLATFORM_API_BASE_URL", cfg.PlatformAPIBaseURL)
 
@@ -643,9 +684,15 @@ func Load(path string) (Config, error) {
 	if cfg.InboundMarginSeconds <= 0 {
 		cfg.InboundMarginSeconds = DefaultInboundMarginSeconds
 	}
+	// Latido de latencia del handler (T3.13): GUARDARRAÍL ASIMÉTRICO A PROPÓSITO, calcado del latido del
+	// cajero. Sólo lo NEGATIVO cae al default; el 0 es una petición legítima («no emitas el bloque
+	// periódico») y tragárselo dejaría al operador sin forma de callar un log que va a un fichero.
+	if cfg.InboundStatsEveryMS < 0 {
+		cfg.InboundStatsEveryMS = DefaultInboundStatsEveryMS
+	}
 
 	// Clasificador de intenciones (Plan 029): normaliza defaults cuando la feature está ON. Un valor
-	// vacío/tecleado mal (YAML/env) cae al default en vez de dejar el clasificador sin URL/modelo/timeout.
+	// vacío/tecleado mal (YAML/env) cae al default en vez de dejar el clasificador sin URL/modelo/espera.
 	// Con Enabled=false no se toca nada relevante (el decorador no se cablea).
 	if cfg.Intent.OllamaURL == "" {
 		cfg.Intent.OllamaURL = DefaultIntentOllamaURL
@@ -653,8 +700,11 @@ func Load(path string) (Config, error) {
 	if cfg.Intent.Model == "" {
 		cfg.Intent.Model = DefaultIntentModel
 	}
-	if cfg.Intent.TimeoutMS <= 0 {
-		cfg.Intent.TimeoutMS = DefaultIntentTimeoutMS
+	// Presupuesto de espera del despachador (Plan 051 Ola 3): un 0 significaría no esperar NUNCA —el
+	// mensaje saldría siempre sin intent y el worker-cajero clasificaría para nadie—, y un negativo no
+	// significa nada. Los dos caen al default.
+	if cfg.Intent.WaitMS <= 0 {
+		cfg.Intent.WaitMS = DefaultIntentWaitMS
 	}
 
 	// Worker-cajero (Plan 051 Ola 2): TODOS sus números caen al default si son <=0. Ninguno es un
@@ -748,6 +798,66 @@ func Load(path string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VARIABLES RETIRADAS — el aviso que evita el fallo silencioso
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// AvisoRetirada describe UNA variable de entorno que ya no se lee y qué debe usarse en su lugar.
+//
+// Existe porque retirar una variable de entorno FALLA EN SILENCIO por definición: el operador la deja
+// puesta en su unidad de systemd/LaunchAgent, el proceso arranca sin una queja, y el número que él cree
+// haber fijado no gobierna nada. No hay error, no hay log, no hay forma de notarlo salvo midiendo el
+// comportamiento. Un Warn en el arranque cuesta tres líneas y cierra ese agujero.
+type AvisoRetirada struct {
+	// Variable es el NOMBRE COMPLETO de la variable retirada (con prefijo), tal y como el operador la
+	// tiene escrita en su entorno. Se nombra literal para que un grep en sus ficheros la encuentre.
+	Variable string
+	// Sustituta es el nombre completo de la variable VIGENTE que hace su trabajo (o "" si no hay
+	// sustituta y la función simplemente desapareció).
+	Sustituta string
+	// Motivo explica en una frase por qué se retiró, para que el aviso sea accionable sin abrir el plan.
+	Motivo string
+}
+
+// VariablesRetiradas devuelve el aviso a emitir por cada variable de entorno RETIRADA que siga presente
+// en el entorno del proceso. Devuelve nil si no hay ninguna (el caso normal).
+//
+// Es una función PURA sobre el entorno —sólo os.LookupEnv, sin YAML, sin disco— y por eso NO vive dentro
+// de Load: config no tiene logger y no debe tenerlo (Load se llama antes de construirlo). El que sí lo
+// tiene es el arranque, que llama aquí y emite un Warn por cada elemento. Así el aviso es testeable con
+// t.Setenv sin levantar nada.
+//
+// SE MIRA LA PRESENCIA, NO EL VALOR: una variable puesta a vacío también se avisa, porque el operador la
+// escribió con una intención y esa intención ya no se cumple.
+func VariablesRetiradas() []AvisoRetirada {
+	var avisos []AvisoRetirada
+
+	// WAPP_AGENT_INTENT_TIMEOUT_MS (Plan 051 Ola 3, T3.1): era el plazo del camino INLINE —el decorador
+	// que clasificaba dentro del handler de whatsmeow— y ese camino se retira con la ola. Se nombran las
+	// DOS variables vivas porque la confusión clásica es colapsarlas en una: la que acota lo que ESPERA
+	// el despachador (WAPP_AGENT_INTENT_WAIT_MS) y la que acota lo que TARDA la inferencia del
+	// worker-cajero (WAPP_WORKER_INFERENCE_TIMEOUT_MS). Quien tenía puesta la retirada casi siempre
+	// quería la segunda, así que es la que se le señala como sustituta.
+	//
+	// ⚠️ LA SUSTITUTA SE NOMBRA COMO ESTÁ EN EL CÓDIGO, NO COMO ESTÁ EN LOS DOCS. El plan y el ADR-0038
+	// la llaman `WAPP_WORKER_TIMEOUT_MS`, pero lo que Load lee de verdad es
+	// `WAPP_WORKER_INFERENCE_TIMEOUT_MS` (ver el overlay del workerLoader). Mandar al operador a la
+	// variable de los docs sería reproducir el mismo fallo silencioso que este aviso existe para evitar:
+	// la escribiría, no gobernaría nada y nadie se enteraría.
+	if _, presente := os.LookupEnv(EnvPrefix + "INTENT_TIMEOUT_MS"); presente {
+		avisos = append(avisos, AvisoRetirada{
+			Variable:  EnvPrefix + "INTENT_TIMEOUT_MS",
+			Sustituta: WorkerEnvPrefix + "INFERENCE_TIMEOUT_MS",
+			Motivo: "el camino inline de clasificación se retiró (Plan 051 Ola 3): el timeout de INFERENCIA " +
+				"es ahora " + WorkerEnvPrefix + "INFERENCE_TIMEOUT_MS y el presupuesto de ESPERA del " +
+				"despachador es " + EnvPrefix + "INTENT_WAIT_MS; son dos números distintos y esta variable " +
+				"ya no gobierna ninguno",
+		})
+	}
+
+	return avisos
 }
 
 // DefaultConfigPath devuelve la ruta ESTABLE del config.yaml del Edge dentro del data_dir sagrado

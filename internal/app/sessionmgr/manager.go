@@ -9,6 +9,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -95,11 +96,10 @@ type Manager struct {
 	// directamente (sin mux): startListener/Unlink omiten el registro de forma segura.
 	cloudMux CloudLinkMux
 
-	// inboundDecorator envuelve el sink de SALIDA de cada listener (mux.SinkFor(sid)) antes de entregárselo
-	// a app.Listen (Plan 029 · T11): con el clasificador de intenciones ON, decora la entrega para anotar la
-	// intención LLM antes del reenvío a la nube. nil (feature off) ⇒ el sink va tal cual (cableado idéntico
-	// al previo). Lo inyecta WithInboundDecorator. Es COMPARTIDO por todas las sesiones (un solo clasificador).
-	inboundDecorator func(app.InboundSink) app.InboundSink
+	// (aquí vivió `inboundDecorator`, el envoltorio del sink de cada listener que anotaba la intención LLM
+	// en línea, Plan 029 · T11. Se retiró en el Plan 051 Ola 3 · T3.0 junto con su opción
+	// WithInboundDecorator: el listener ya no entrega, así que no hay entrega que decorar. La intención la
+	// resuelve el worker-cajero y la escribe en la cola; el despachador la lee de ahí.)
 
 	// backoffBase/backoffMax acotan la política de reintento de un listener caído (aislamiento §10.H):
 	// retroceso exponencial Base·2^n saturado en Max. Defaults 1s/60s; los tests inyectan valores
@@ -114,20 +114,46 @@ type Manager struct {
 	health *health.Registry
 
 	// cola es la COLA DURABLE DE ENTRANTES del Edge (Plan 051 Ola 1): el factory la pasa al gateway de cada
-	// sesión JUNTO CON su session_id, para que el listener anote el mensaje en disco (sellado con la DEK de
-	// ESA sesión) antes de entregarlo al sink. Es COMPARTIDA por todas las sesiones (una sola BD, un `seq`
-	// global). nil (opción no inyectada, o cola que no se pudo abrir) ⇒ NO se toca el gateway y el listener
-	// se queda con el camino de siempre: es el fallback explícito de la ola, y jamás impide arrancar una
-	// sesión. Lo inyecta WithColaEntrantes.
+	// sesión JUNTO CON su session_id, para que el listener anote ahí el mensaje (sellado con la DEK de ESA
+	// sesión). Es COMPARTIDA por todas las sesiones (una sola BD, un `seq` global). Lo inyecta
+	// WithColaEntrantes.
+	//
+	// 🔴 nil ⇒ LA SESIÓN QUEDA SORDA (cambió en T3.0). Mientras existió el camino inline, un nil aquí era un
+	// fallback benigno: el listener seguía entregando al sink. Retirado el inline, un nil significa que el
+	// entrante no se anota en ningún sitio y nadie lo despacha.
+	//
+	// EN PRODUCCIÓN YA NO ES ALCANZABLE (2026-08-17): el daemon no arranca sin cola. Este campo sigue
+	// pudiendo ser nil para los tests, y el Manager sigue sin impedir ARRANCAR la sesión por ello —el
+	// socket, los acuses y el estado de conexión valen por sí solos, y una sesión rota no puede tumbar a
+	// las sanas—, pero ya no describe ningún modo de operación real: el listener lo grita al construirse.
 	cola app.ColaEntrantes
+
+	// colaDespachador es el lado DESPACHADOR de esa MISMA cola (Plan 051 Ola 3, T3.3): con él, cada sesión
+	// arranca junto a su listener el bucle que DRENA su cola —en orden de `seq`— y entrega al cable. Es el
+	// mismo adaptador que `cola` visto por el otro extremo del puerto (leer la cabeza y sellarla), no una
+	// segunda cola. nil (opción no inyectada, es decir: tests) ⇒ la sesión escucha pero no drena, y desde
+	// T3.0 eso significa que no entrega NADA. En producción no puede ser nil: el daemon falla antes de
+	// llegar a cablear el Manager. Lo inyecta WithColaDespachador.
+	colaDespachador app.ColaDespachador
+
+	// presupuestoIntent es cuánto retiene el despachador la cabeza de una sesión esperando a que el cajero
+	// la clasifique, antes de entregarla sin intención (WAPP_AGENT_INTENT_WAIT_MS). 0 (opción no inyectada)
+	// ⇒ manda el default del propio despachador. Lo inyecta WithPresupuestoIntent.
+	presupuestoIntent time.Duration
 
 	// clasificadorActivo es el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
 	// T2.12) que el factory pasa al gateway de cada sesión: con él, un entrante que llega con la feature
 	// apagada nace en la cola YA resuelto (marca `apagado`) en vez de ocupar una plaza del semáforo del
-	// cajero para acabar descartado. Es COMPARTIDO (un solo clasificador por Edge), como inboundDecorator y
-	// a diferencia de la cola, que se etiqueta por sesión. nil (opción no inyectada) ⇒ NO se toca el gateway
+	// cajero para acabar descartado. Es COMPARTIDO (un solo clasificador por Edge), a diferencia de la cola,
+	// que se etiqueta por sesión. nil (opción no inyectada) ⇒ NO se toca el gateway
 	// y manda el default SEGURO del Listener (activo). Lo inyecta WithClasificadorActivo.
 	clasificadorActivo func() bool
+
+	// latencia es el CRONÓMETRO COMPARTIDO del handler de entrantes (Plan 051 Ola 3 · T3.13): el factory lo
+	// pasa al gateway de cada sesión y de ahí al Listener, que anota en él cuánto tardó cada onMessage. Es
+	// uno para todo el Edge porque INV-051.2 se juzga sobre el Edge, no sesión a sesión. nil ⇒ no se mide y
+	// nada más cambia. Lo inyecta WithLatencia.
+	latencia *latencia.Histograma
 
 	// inboundMargin es el margen de la ventana temporal de ingesta (ADR-0037) que el factory pasa al
 	// gateway de cada sesión. 0 (opción no inyectada) ⇒ NO se toca el gateway y manda el default del propio
@@ -187,18 +213,10 @@ func WithListenerBackoff(base, max time.Duration) Option {
 	}
 }
 
-// WithInboundDecorator inyecta el decorador del sink de entrada (Plan 029 · T11): con el clasificador de
-// intenciones ON, cada listener envuelve su mux.SinkFor(sid) con este wrap para anotar la intención LLM
-// antes del reenvío a la nube. En producción lo cablea cmd/agent desde el stack de intent (compartido por
-// todas las sesiones); con la feature off no se pasa la opción y el sink va tal cual (cableado idéntico).
-// nil se ignora.
-func WithInboundDecorator(wrap func(app.InboundSink) app.InboundSink) Option {
-	return func(m *Manager) {
-		if wrap != nil {
-			m.inboundDecorator = wrap
-		}
-	}
-}
+// (aquí vivió `WithInboundDecorator`. Retirada en el Plan 051 Ola 3 · T3.0: era la costura por la que el
+// decorador de intenciones se metía en el camino del listener, y ese camino ya no entrega nada. NO la
+// resucites para "enriquecer" entregas: lo que haya que añadir a un entrante se añade en la cola, que es
+// donde el cajero y el despachador se encuentran, no en el hilo de whatsmeow — INV-051.2.)
 
 // WithInboundMargin fija el MARGEN de la ventana temporal de ingesta (ADR-0037) para todas las sesiones:
 // se descarta en la puerta lo anterior a `inicioDeConexión − margen`, y eso no sube a la nube. En
@@ -214,9 +232,10 @@ func WithInboundMargin(d time.Duration) Option {
 
 // WithColaEntrantes inyecta la COLA DURABLE DE ENTRANTES compartida (Plan 051 Ola 1): cada listener anota
 // el entrante en disco —cifrado con la DEK de SU sesión— ANTES de entregarlo al sink, de modo que el acuse
-// de WhatsApp salga con el mensaje ya durable. En producción la cablea el daemon desde wiring.BuildCola;
-// los tests que no la pasan quedan con el comportamiento previo intacto. nil se IGNORA (fallback explícito
-// de la ola: sin cola, camino de siempre; nunca se impide arrancar una sesión).
+// de WhatsApp salga con el mensaje ya durable. En producción la cablea el daemon desde wiring.BuildCola, y
+// desde el 2026-08-17 ese daemon NO ARRANCA si no puede construirla, así que en campo esta opción llega
+// siempre con valor. nil se IGNORA (los tests cablean Managers sin cola): el Manager nunca impide arrancar
+// una sesión por esto, porque la política de arranque del proceso no es suya.
 func WithColaEntrantes(c app.ColaEntrantes) Option {
 	return func(m *Manager) {
 		if c != nil {
@@ -236,6 +255,23 @@ func WithClasificadorActivo(fn func() bool) Option {
 	return func(m *Manager) {
 		if fn != nil {
 			m.clasificadorActivo = fn
+		}
+	}
+}
+
+// WithLatencia inyecta el CRONÓMETRO del handler de entrantes (Plan 051 Ola 3 · T3.13): el histograma
+// COMPARTIDO donde cada listener acumula cuánto tarda su onMessage. Es lo que hace medible el criterio de
+// cierre de la ola —«handler < 50 ms p99», INV-051.2—, que hasta esta tarea no tenía instrumento.
+//
+// Uno solo para todo el Edge, no uno por sesión: el criterio es del Edge. Un p99 por sesión con 3 mensajes
+// cada una no responde la pregunta, y fusionar histogramas después sería trabajo para nada.
+//
+// nil se IGNORA (los tests cablean Managers sin cronómetro) y los listeners quedan sin medir, que es
+// exactamente el comportamiento anterior a T3.13: la observabilidad nunca impide arrancar una sesión.
+func WithLatencia(h *latencia.Histograma) Option {
+	return func(m *Manager) {
+		if h != nil {
+			m.latencia = h
 		}
 	}
 }

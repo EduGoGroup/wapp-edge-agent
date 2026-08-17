@@ -139,6 +139,24 @@ type Store struct {
 	// corresponder a 20 filas rescatadas, y cada inferencia tirada es un coste de LLM que sí se pagó.
 	cierresDescartadosPorFence atomic.Int64
 
+	// despachosSinIntentNoAplicados acumula las veces que DespacharSinIntent NO tocó nada: el
+	// despachador agotó el presupuesto y fue a escribir el sobre de omisión, pero la fila ya había dejado
+	// de estar `nuevo`/`tomado` — el cajero la cerró justo antes. El mensaje sale igual, y sale MEJOR (con
+	// su intent real), así que esto NO es una degradación: es la carrera resolviéndose del lado bueno.
+	//
+	// SE CUENTA AQUÍ PORQUE NADIE MÁS PUEDE. DespacharSinIntent devuelve solo `error`, y el no-op no es
+	// un error, así que desde fuera «escribí la omisión» y «llegué tarde» son indistinguibles.
+	// El despachador (T3.4) contará sus DECISIONES por motivo; este número es el complemento exacto —
+	// «de esas decisiones, cuántas no llegaron a disco»— y con los dos se deriva el tercero. Por eso no
+	// se añade aquí un `DespachadasSinIntent` (sellos que sí aterrizaron): sería `decididas - este`,
+	// duplicando una serie que la Ola 4 ya va a publicar.
+	//
+	// ⚠️ Y NO ES UN NÚMERO RARO, es el borde de la calibración: el presupuesto son 4000 ms y la p95
+	// MEDIDA de una inferencia es de 3.736 ms. Los dos números están pegados a propósito, así que esta
+	// carrera se corre en cada mensaje lento. Un valor que sube dice que el presupuesto está justo — que
+	// se está pagando la espera entera para acabar recibiendo el intent igualmente.
+	despachosSinIntentNoAplicados atomic.Int64
+
 	// seq es la secuencia monotónica del orden de la cola, sembrada de MAX(seq) en New. Atómica: el Edge
 	// encola desde varios listeners (uno por sesión) en paralelo.
 	seq atomic.Int64

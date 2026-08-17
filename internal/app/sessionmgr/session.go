@@ -77,6 +77,18 @@ type liveSession struct {
 	// sin tocar a las demás (design §7)— sin usar el WaitGroup GLOBAL del Manager (que une a todas). nil
 	// si no se arrancó listener (sesión registrada sin escucha): waitDone es entonces un no-op.
 	done chan struct{}
+	// despachadores cuenta la(s) goroutine(s) del DESPACHADOR de la cola de esta sesión (Plan 051 Ola 3,
+	// T3.3). Es el gemelo POR SESIÓN de `done`, para el segundo hilo que la sesión estrena en esa ola: el
+	// que drena su cola durable y entrega al cable.
+	//
+	// POR QUÉ UN WaitGroup Y NO OTRO `chan struct{}`: `done` es de un solo cierre porque la goroutine del
+	// listener es exactamente una y vive todo el ciclo; aquí el WaitGroup no obliga a decidir de antemano
+	// si el despachador arranca (con la cola no cableada NO arranca, y entonces esperarlo es un no-op
+	// inmediato en vez de un canal nil que hay que comprobar). Lo usa stopLive para no borrar la DEK de una
+	// sesión cuyo despachador aún esté abriendo filas. No lo protege `mu`: un WaitGroup ya es seguro entre
+	// goroutines, y su Add ocurre ANTES del `go` (happens-before), igual que el de `m.wg`.
+	despachadores sync.WaitGroup
+
 	// health es la salud de runtime observada por la goroutine listener (starting→listening→degraded→stopped).
 	health SessionHealth
 	// lastErr es la última causa de caída del listener (para diagnóstico/plano de control); nil si sano.

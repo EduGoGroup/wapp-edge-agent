@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+
+	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 )
 
 // Nombres del layout en disco bajo <data_dir> (ADR-0016 §4).
@@ -96,9 +98,22 @@ func (l Layout) StoreDB(id string) (string, error) {
 // `session_id` en claro y su contenido sellado con la DEK DE ESA sesión (INV-051.1), de modo que la BD
 // compartida no mezcla llaves.
 //
-// Al no haber id que validar no hay ruta que pueda escaparse de data_dir, así que devuelve solo string
+// Al no haber id que validar no hay ruta que pueda escaparse de data_dir, así que no devuelve error
 // (mismo criterio que DataDir/SessionsRoot).
-func (l Layout) ColaDB() string { return filepath.Join(l.dataDir, colaDBName) }
+//
+// DEVUELVE db.ColaDBPath Y NO string (Plan 051 · T3.16): ese tipo es lo único que acepta db.OpenCola, y
+// no encaja en el `dsn string` de db.Open. Así el compilador —y no un comentario— impide que uno de los
+// dos procesos que escriben la cola la abra por el constructor equivocado y se quede sin el perfil de
+// escritura que necesita (los pragmas son POR-CONEXIÓN: el porqué completo, en el doc de db.ColaDBPath).
+// Este método es el ÚNICO productor del tipo, que es lo que cierra el círculo: la ruta nace aquí ya
+// tipada y no hay otra forma legítima de fabricarla.
+//
+// Es también el motivo de que este paquete —que es `app`— importe `infra/db`: el import existe solo por
+// ese tipo, no por comportamiento. La alternativa (declarar el tipo aquí y que db lo importase) crea un
+// ciclo en cuanto los tests de sessionmgr importan db, cosa que ya hacen.
+func (l Layout) ColaDB() db.ColaDBPath {
+	return db.ColaDBPath(filepath.Join(l.dataDir, colaDBName))
+}
 
 // DEKPath devuelve <data_dir>/keys/<session_id>.key (DEK de la sesión, custodiada por FileCustody).
 //

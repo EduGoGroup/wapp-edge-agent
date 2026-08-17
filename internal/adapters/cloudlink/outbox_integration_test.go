@@ -181,6 +181,11 @@ func TestOutbox_LiveSendDoesNotEnqueue(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("timeout esperando el stream: %v", ctx.Err())
 	}
+	// …y el latido inicial, que es cuando el Adapter ya tiene su cliente publicado. Aquí no basta con que el
+	// test "no falle": si el Deliver se adelanta, forward() encola en el outbox y el drenaje lo entrega igual,
+	// de modo que la aserción de abajo pasaría SIN haber probado el camino en vivo que este test dice cubrir
+	// (ver awaitAdapterReady en e2e_test.go).
+	awaitAdapterReady(t, ctx, srv)
 
 	if err := a.SinkFor("A").Deliver(ctx, incomingEvt("m1", "en vivo")); err != nil {
 		t.Fatalf("Deliver: %v", err)

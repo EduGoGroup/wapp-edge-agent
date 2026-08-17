@@ -12,10 +12,14 @@ package sessionmgr
 //   - participa del APAGADO ORDENADO (§10.I): Stop cancela su context, el runner retorna, el *sql.DB
 //     se cierra vía defer y el WaitGroup hace el join.
 //
-// REUSO (no duplicación): app.Listen YA opera por-sesión (recibe custodia+gateway+sink por inyección);
+// REUSO (no duplicación): app.Listen YA opera por-sesión (recibe custodia+gateway por inyección);
 // "generalizarlo a N" es construir UNA instancia por sesión con SU custodia y SU gateway (sobre el
 // *sql.DB de su store), no reescribir la conexión. El factory listenFactory es la única costura de
 // producción (WithWhatsmeowListen) vs. tests (fake), igual que pairFactory en el emparejamiento.
+//
+// El SEGUNDO hilo de cada sesión —el despachador que drena su cola y entrega al cable— nace en el mismo
+// startListener pero se cablea aparte (despacho.go): desde la Ola 3, la escucha ANOTA y el despachador
+// ENTREGA, y este fichero solo se ocupa del primero.
 
 import (
 	"context"
@@ -80,7 +84,8 @@ type CloudLinkMux interface {
 // WithWhatsmeowListen habilita Restore/startListener con la escucha REAL sobre whatsmeow Y la cablea al
 // multiplexor CloudLink (T7): por cada sesión monta un ListenGateway per-device sobre la BD ÚNICA
 // COMPARTIDA (m.db) que carga el device CONCRETO de la sesión por SU JID (s.meta.JID) con SU DEK, y un
-// app.Listen que mantiene el socket vivo reenviando los entrantes al sink ETIQUETADO (mux.SinkFor(id)).
+// app.Listen que mantiene el socket vivo mientras el listener ANOTA los entrantes en la cola durable
+// (Plan 051 Ola 3: la salida al cable es del despachador, no de este camino).
 // Ya NO abre un store.db por sesión (Plan 022 §10.A): N devices comparten una sola *sql.DB. El io.Closer
 // del apagado ordenado es nil porque la BD compartida la posee el daemon (NO se cierra por-listener, §10.I).
 //
@@ -128,6 +133,11 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// cajero o ya resuelta con la marca `apagado`. nil (opción no inyectada) ⇒ no se toca el gateway
 			// y manda el default SEGURO del Listener: se considera ACTIVO y se clasifica de más.
 			gateway.SetClasificadorActivo(m.clasificadorActivo)
+			// Cronómetro del handler de entrantes (Plan 051 Ola 3 · T3.13): mismo molde que el interruptor
+			// del clasificador —COMPARTIDO por todo el Edge, no ligado a la sesión— porque el criterio
+			// INV-051.2 («handler < 50 ms p99») se juzga sobre el Edge entero. m.latencia nil (opción no
+			// inyectada) ⇒ no se toca el gateway y el listener no mide, igual que antes de T3.13.
+			gateway.SetLatencia(m.latencia)
 			// Rota el live-sender de ESTE ciclo: el mux ya tiene registrado s.sendVia; aquí solo apunta la
 			// indirección al cliente vivo recién creado (una reconexión = gateway nuevo). Usa la variante
 			// TRACKED (Plan 013 §10.E): cada SendText puebla el Correlator (command_id ↔ MessageID) para
@@ -160,19 +170,19 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			gateway.SetLoggedOutHandler(func() {
 				m.onLoggedOut(s)
 			})
-			// Sink de SALIDA etiquetado por session_id; con el clasificador de intenciones ON (Plan 029 · T11)
-			// se envuelve con el decorador COMPARTIDO para anotar la intención LLM antes del reenvío. Feature
-			// off ⇒ inboundDecorator nil ⇒ sink tal cual (cableado idéntico al previo).
-			outSink := mux.SinkFor(sid)
-			if m.inboundDecorator != nil {
-				outSink = m.inboundDecorator(outSink)
-			}
+			// AQUÍ YA NO SE PIDE SINK (Plan 051 Ola 3 · T3.8). Hasta esta tarea vivía un
+			// `outSink := mux.SinkFor(sid)` que solo existía para alimentar el parámetro muerto de
+			// app.NewListen: el listener dejó de entregar en T3.0 y el adaptador real lo ignoraba, así que
+			// era la SEGUNDA llamada a SinkFor por sesión. La ÚNICA que queda —la que sí entrega— es la del
+			// despachador, en startDespachador (despacho.go). Si vuelves a necesitar un sink en este factory,
+			// pregúntate antes quién lo consumiría: hoy nadie por este camino.
+			//
 			// s.log arrastra session_id/jid: la traza de la carga de la DEK sale etiquetada por sesión.
 			// Watchdog+reporte de la carga de DEK (Plan 031 T6): al vencer el plazo, Run devuelve
 			// ErrDEKLoadTimeout ⇒ runListener degrada con motivo dek_load_timeout; la duración (éxito o
 			// retorno tardío) alimenta dek_load_duration_ms en el registro de salud.
 			rep := m.health.For(s.meta.SessionID)
-			runner := app.NewListen(s.custody, gateway, outSink, s.log,
+			runner := app.NewListen(s.custody, gateway, s.log,
 				app.WithDEKDurationReporter(rep.SetDEKLoadDuration))
 			return runner, nil, nil
 		}
@@ -254,6 +264,12 @@ func (m *Manager) startListener(s *liveSession) {
 	m.health.SetSocketState(s.meta.SessionID, health.SocketConnecting, "")
 	m.wg.Add(1)
 	go m.runListener(ctx, s)
+	// Segundo hilo de la sesión (Plan 051 Ola 3, T3.3): el DESPACHADOR que drena su cola durable y entrega
+	// al cable en orden de `seq`. Comparte el MISMO ctx cancelable y el MISMO WaitGroup que el listener —
+	// son la misma vida—, y NO arranca si la cola despachadora no está cableada (ver startDespachador). Va
+	// DESPUÉS del `go` del listener y no antes por una razón de arranque: así una sesión cuya cola trae
+	// atraso empieza a drenarla mientras el socket todavía está cargando la DEK, en vez de después.
+	m.startDespachador(ctx, s)
 }
 
 // runListener es la goroutine de escucha de UNA sesión: corre el listener y, si cae (error o pánico),

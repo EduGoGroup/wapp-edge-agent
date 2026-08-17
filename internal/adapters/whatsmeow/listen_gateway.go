@@ -14,6 +14,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -26,8 +27,8 @@ const presenceTimeout = 10 * time.Second
 // ListenGateway implementa app.ListenGateway sobre whatsmeow ALWAYS-ON (RF-5/RF-6, design §5).
 //
 // A diferencia del Sender (cliente efímero por envío), aquí el cliente se mantiene CONECTADO de forma
-// continua: carga el device pareado (store cifrado con la DEK), registra el Listener (eventos ->
-// sink) y BLOQUEA hasta que el ctx se cancele, momento en que desconecta limpio. whatsmeow gestiona
+// continua: carga el device pareado (store cifrado con la DEK), registra el Listener (eventos -> cola
+// durable) y BLOQUEA hasta que el ctx se cancele, momento en que desconecta limpio. whatsmeow gestiona
 // el auto-reconnect del socket (EnableAutoReconnect, por defecto activo); el Listener observa los
 // eventos de conexión y traza la política de backoff (ver backoff.go).
 //
@@ -78,8 +79,8 @@ type ListenGateway struct {
 
 	// cola es la COLA DURABLE DE ENTRANTES compartida (Plan 051 Ola 1) y sessionID la sesión con la que se
 	// etiquetan (y sellan) sus filas. serve() los pasa al Listener SIEMPRE JUNTOS: la cola sin session_id
-	// dejaría filas que el adaptador no sabría con qué DEK cifrar. Ambos vacíos/nil ⇒ el Listener queda
-	// SIN cola, con el camino de siempre (solo sink.Deliver). Lo cablea el factory del sessionmgr (SetCola).
+	// dejaría filas que el adaptador no sabría con qué DEK cifrar. Ambos vacíos/nil ⇒ el Listener queda SIN
+	// cola y, desde T3.0, SIN destino ninguno para el entrante. Lo cablea el factory del sessionmgr (SetCola).
 	cola      app.ColaEntrantes
 	sessionID string
 
@@ -89,6 +90,22 @@ type ListenGateway struct {
 	// Edge), a diferencia de la cola, que se etiqueta por sesión. nil ⇒ el Listener aplica su default
 	// SEGURO (activo: clasifica de más antes que callar). Lo cablea el factory del sessionmgr.
 	clasificadorActivo func() bool
+
+	// latencia es el CRONÓMETRO COMPARTIDO del handler de entrantes (Plan 051 Ola 3 · T3.13) que serve()
+	// pasa al Listener. A diferencia de la cola —que va ligada a SU sesión porque el session_id elige la
+	// DEK—, este es uno solo para todo el Edge: el criterio INV-051.2 es del Edge, no de cada sesión.
+	// nil ⇒ el Listener no mide, y todo lo demás se comporta igual. Lo cablea el factory del sessionmgr.
+	latencia *latencia.Histograma
+}
+
+// SetLatencia liga el gateway (y su Listener) al cronómetro del handler de entrantes (Plan 051 Ola 3 ·
+// T3.13). Se llama ANTES de Listen (al construir el gateway), como el resto de setters. nil se ignora y el
+// listener queda sin medir: la observabilidad nunca puede impedir que una sesión arranque. No es PII.
+func (g *ListenGateway) SetLatencia(h *latencia.Histograma) {
+	if h == nil {
+		return
+	}
+	g.latencia = h
 }
 
 // SetClasificadorActivo liga el gateway (y su Listener) al interruptor del clasificador de intenciones
@@ -170,22 +187,30 @@ func (g *ListenGateway) SetLoggedOutHandler(fn func()) { g.onLoggedOut = fn }
 // trae). No es secreto ni PII; no se loguea.
 func (g *ListenGateway) SetPushName(name string) { g.pushName = name }
 
-// Listen carga el device pareado, conecta el cliente always-on, registra el Listener (eventos ->
-// sink) y BLOQUEA manteniendo el socket vivo hasta que ctx se cancele. Devuelve nil al cancelarse
+// Listen carga el device pareado, conecta el cliente always-on, registra el Listener (eventos -> cola
+// durable) y BLOQUEA manteniendo el socket vivo hasta que ctx se cancele. Devuelve nil al cancelarse
 // limpio, o error si la carga del device o la conexión inicial fallan. La DEK solo se usa para
 // descifrar el store; no se loguea.
-func (g *ListenGateway) Listen(ctx context.Context, dek []byte, sink app.InboundSink) error {
+//
+// 🔴 SIN PARÁMETRO `sink` DESDE T3.8 (la limpieza que T3.0 dejó anotada). T3.0 retiró el camino inline y
+// este método pasó a recibir un `_ app.InboundSink` que ignoraba: el puerto seguía prometiendo una entrega
+// que ninguna implementación hacía. Quien entrega los entrantes al cable es el despachador de la sesión
+// (sessionmgr/despacho.go), que toma su propio sink de `mux.SinkFor(session_id)` sin pasar por aquí.
+//
+// NO vuelvas a cablear un sink al Listener: reintroducir la entrega en el hilo de whatsmeow viola
+// INV-051.2 (y listener_camino_caliente_test.go lo caza por reflexión sobre los campos del Listener).
+func (g *ListenGateway) Listen(ctx context.Context, dek []byte) error {
 	device, err := g.loadDevice(ctx, dek)
 	if err != nil {
 		return err
 	}
-	return g.serve(ctx, device, sink)
+	return g.serve(ctx, device)
 }
 
 // serve cablea el Listener al cliente real y mantiene el socket vivo hasta la cancelación del ctx.
 // whatsmeow loguea por el puente waLog→slog (walog.go): un fallo/caída del websocket YA queda trazado
 // en el log del agente (antes waLog.Noop lo silenciaba); el nivel lo gobierna el logger del agente.
-func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink app.InboundSink) error {
+func (g *ListenGateway) serve(ctx context.Context, device *store.Device) error {
 	client := wm.NewClient(device, newWALog(g.log))
 	client.EnableAutoReconnect = true // whatsmeow reintenta el socket; el Listener traza el backoff.
 	disableHistorySync(client)
@@ -196,17 +221,23 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 
 	// Cola durable de entrantes (Plan 051 Ola 1): las dos opciones viajan JUNTAS o no viaja ninguna, de modo
 	// que nunca se llega a WithCola sin WithSessionID (ese caso degrada con un log de Error en el Listener).
-	// Sin cola cableada, NewListener recibe cero opciones: el comportamiento es byte a byte el de hoy.
+	//
+	// ⚠️ SIN COLA CABLEADA LA SESIÓN QUEDA SORDA (T3.0): el listener ya no entrega por su cuenta, así que
+	// «cero opciones» dejó de ser el comportamiento histórico y pasó a ser un fallo de arranque. NewListener
+	// lo grita; aquí no se aborta porque este método no decide la política de arranque del daemon.
 	var listenerOpts []ListenerOption
 	if g.cola != nil && g.sessionID != "" {
 		listenerOpts = append(listenerOpts, WithCola(g.cola), WithSessionID(g.sessionID))
 		// El interruptor del clasificador viaja DENTRO de este bloque a propósito (T2.12): lo único que
 		// gobierna es el ESTADO EN QUE NACE una fila de la cola, así que sin cola no tiene nada que decidir
-		// y pasarlo solo añadiría una opción inerte. Así se mantiene la promesa de arriba: sin cola
-		// cableada, NewListener sigue recibiendo cero opciones. nil se ignora en la opción (default ACTIVO).
+		// y pasarlo solo añadiría una opción inerte. nil se ignora en la opción (default ACTIVO).
 		listenerOpts = append(listenerOpts, WithClasificadorActivo(g.clasificadorActivo))
 	}
-	listener := NewListener(sink, g.log, listenerOpts...)
+	// Cronómetro del handler (T3.13). Va FUERA del bloque de la cola —al contrario que el interruptor del
+	// clasificador— porque mide el handler ENTERO, incluidos los caminos que no encolan: una sesión sin cola
+	// sigue gastando tiempo del hilo de whatsmeow y ese tiempo cuenta para INV-051.2. nil se ignora.
+	listenerOpts = append(listenerOpts, WithLatencia(g.latencia))
+	listener := NewListener(g.log, listenerOpts...)
 	// Salud por sesión (Plan 031 T6): el Listener reporta connected/connecting/dead + edad del último
 	// entrante al registro. nil ⇒ no reporta.
 	listener.SetHealthReporter(g.reporter)

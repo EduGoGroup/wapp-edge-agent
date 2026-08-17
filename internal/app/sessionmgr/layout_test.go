@@ -49,8 +49,10 @@ func TestLayout_Paths(t *testing.T) {
 	}
 
 	// La cola de entrantes es GLOBAL a todas las sesiones (Plan 051): cuelga de data_dir, NO de
-	// sessions/<id>/, y por eso ColaDB no recibe id ni puede fallar.
-	if got, want := l.ColaDB(), filepath.Join(base, "cola_entrantes.db"); got != want {
+	// sessions/<id>/, y por eso ColaDB no recibe id ni puede fallar. Devuelve db.ColaDBPath y no string
+	// (T3.16, la barrera que impide abrirla con el constructor equivocado), así que la comparación con la
+	// ruta esperada convierte: lo que se afirma aquí es el VALOR, el tipo lo afirma el compilador.
+	if got, want := string(l.ColaDB()), filepath.Join(base, "cola_entrantes.db"); got != want {
 		t.Fatalf("ColaDB: got %q, want %q", got, want)
 	}
 }

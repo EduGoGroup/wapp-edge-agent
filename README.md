@@ -24,20 +24,34 @@ Hexagonal: `internal/domain` (entidades), `internal/app` (casos de uso + puertos
 `internal/adapters` (implementaciones) e `internal/infra` (config, db, wiring, logger,
 enroll, watchdog, migración).
 
-- **Núcleo (daemon) + plano de control** (ADR-0014/0015). El núcleo (`cmd/agent`) expone
+- **Núcleo (daemon) + plano de control** (ADR-0014/0015). El núcleo (`agent serve`) expone
   un contrato **HTTP `/v1` sobre un Unix domain socket** co-ubicado (sin puerto de red):
   `/v1/sessions/pair`, `/v1/sessions/{id}/pair`, `/v1/enroll`, `/v1/logs`,
   `/v1/intent/status`. **No hay systray.**
+  > **`/v1/intent/status` informa del CONTRATO de intenciones, no del clasificador**
+  > (Plan 051 O3 · T3.0): `{enabled, model, config_version, clasifica_en, worker_status_url}`.
+  > `circuit` y `ollama_ok` **se retiraron** —vivían en el decorador inline, que ya no existe—;
+  > el estado del clasificador se pregunta en **`GET /v1/cajero/status`**.
+- **Worker-cajero (`agent cajero`)** — segundo modo del mismo binario y **2.º hijo supervisado**
+  por `wapp-ctl` (Plan 051, ADR-0038). Es **el único proceso que habla con Ollama**: reclama
+  filas de `cola_entrantes.db`, clasifica y deja el sobre ahí. El núcleo solo encola y despacha.
 - **`wapp-ctl`** (`cmd/wapp-ctl`) es el segundo binario: un **supervisor loopback**
-  (`127.0.0.1:8105` por defecto) que arranca/para el núcleo, hace **reverse-proxy** al
-  socket `/v1` y sirve la **web de onboarding** (`internal/webui`, QR local sincrónico,
-  sin relay SSE). El QR se genera y se escanea en el propio equipo.
+  (`127.0.0.1:8105` por defecto) que arranca/para el núcleo **y el cajero**, hace
+  **reverse-proxy** al socket `/v1` y sirve la **web de onboarding** (`internal/webui`, QR local
+  sincrónico, sin relay SSE). Sirve por su cuenta (sin proxyar) `/v1/daemon/*` y `/v1/cajero/*`.
+  El QR se genera y se escanea en el propio equipo.
+
+> 🔴 **`<data_dir>/cola_entrantes.db` es condición de arranque** desde el 2026-08-17 (Plan 051
+> O3): si no abre o no migra, **ni el núcleo ni el cajero levantan**. Retirado el camino inline,
+> la cola es el único camino de entrega; arrancar sin ella sería acusar ✓✓ al cliente y perder
+> cada entrante en silencio. En campo eso se traduce en permisos y espacio del `data_dir`.
 - **Adapters** (`internal/adapters`): `whatsmeow` (socket, QR, envío, handlers de
   eventos), `cloudlink` (cliente gRPC bidi-stream saliente con mTLS), `cryptostore`
   (SQLite cifrado campo a campo AES-256-GCM con la DEK), `keycustody` (keystore del SO),
-  `outbox` (cola durable SQLite, ADR-0003), `sessionstore`, `supervisor`, `control`
-  (plano de control), `edgeconfig` (config empujada por la nube) e `intent` (clasificador
-  LLM local).
+  `outbox` (cola durable SQLite, ADR-0003), `colaentrantes` (cola durable de **entrada**,
+  BD propia), `sessionstore`, `supervisor`, `control` (plano de control), `edgeconfig`
+  (config empujada por la nube) e `intent` (hoy **solo** el endpoint de estado del contrato:
+  el decorador que clasificaba inline se retiró en el Plan 051 O3).
 - **Salud y diagnóstico**: watchdogs de salud por sesión y un ring buffer de logs que
   alimenta el bundle de diagnóstico bajo demanda.
 
@@ -103,6 +117,7 @@ Prefijo **`WAPP_AGENT_`**. Precedencia: defaults < YAML < entorno.
 | `WAPP_AGENT_OUTBOX_MAX_EVENTS` | `10000` | Tope del outbox durable; al llenarse aplica drop-oldest. |
 | `WAPP_AGENT_OUTBOX_TTL_HOURS` | `0` | TTL de evento del outbox; 0 = desactivado (durabilidad primero). |
 | `WAPP_AGENT_INBOUND_MARGIN_SECONDS` | `300` | Margen de la **ventana de ingesta** (ADR-0037, ver ³). Se descarta todo entrante anterior a `inicio de conexión − margen`, y lo descartado **no sube a la nube**. `<=0` cae al default. Clave YAML: `inbound_margin_seconds`. |
+| `WAPP_AGENT_INBOUND_STATS_EVERY_MS` | `60000` | Cadencia del bloque de **latencia del handler de entrantes** (Plan 051 · T3.13): p50/p95/p99 del tiempo que `onMessage` pasa en el hilo de whatsmeow, más el desglose de la cola. Es lo que hace medible «handler < 50 ms p99» (INV-051.2). **`0` lo desactiva** (guardarraíl asimétrico: sólo lo negativo cae al default); el bloque final del apagado se emite igual. Se lee con `grep 'latencia del handler' <fichero de log>`. Clave YAML: `inbound_stats_every_ms`. |
 | `WAPP_AGENT_DIAG_LOG_LINES` | `500` | Líneas del ring buffer en el bundle de diagnóstico. |
 | `WAPP_AGENT_CONTROL_SOCKET_PATH` | `wapp-edge.sock` | Ruta del Unix socket del plano de control `/v1`. |
 | `WAPP_AGENT_CLOUDLINK_ENDPOINT` | (vacío²) | Endpoint gRPC del stream Connect (mTLS). Vacío = sin nube (LogSink). |
@@ -113,7 +128,8 @@ Prefijo **`WAPP_AGENT_`**. Precedencia: defaults < YAML < entorno.
 | `WAPP_AGENT_INTENT_ENABLED` | `false` | Activa el clasificador LLM local de intenciones. |
 | `WAPP_AGENT_INTENT_OLLAMA_URL` | `http://127.0.0.1:11434` | URL del Ollama local (loopback). |
 | `WAPP_AGENT_INTENT_MODEL` | `qwen3:1.7b` | Modelo del clasificador. |
-| `WAPP_AGENT_INTENT_TIMEOUT_MS` | `3000` | Timeout por clasificación; al excederse degrada sin bloquear. |
+| `WAPP_AGENT_INTENT_WAIT_MS` | `4000` | **Presupuesto de espera del DESPACHADOR**: cuánto retiene la entrega de un mensaje aguardando a que el worker-cajero deje su intent, antes de despacharlo sin él. **NO es el timeout de inferencia** — ése es `WAPP_WORKER_INFERENCE_TIMEOUT_MS` (`15000`). Son dos números distintos y no se colapsan. El `4000` lo fijó la medición de la O0 (ADR-0038 Enmienda 1 §(d)): con `3000` y `num_thread=4`, el **55 %** del tráfico se despachaba sin intent y en silencio. |
+| ~~`WAPP_AGENT_INTENT_TIMEOUT_MS`~~ | — | **RETIRADA** (Plan 051 Ola 3, T3.1). Era el plazo del camino inline de clasificación. Si sigue puesta en el entorno, el arranque del daemon emite un `Warn` y la ignora. Usa `WAPP_AGENT_INTENT_WAIT_MS` (espera del despachador) o `WAPP_WORKER_INFERENCE_TIMEOUT_MS` (timeout de inferencia), según lo que quisieras ajustar. |
 | `WAPP_AGENT_PLATFORM_API_BASE_URL` | `http://localhost:8103` | URL base de la API pública HTTP de la plataforma cloud (`/api/v1/...`) que usa `wapp-ctl` para el signup del Edge (C-03/T3.5) — llamada DIRECTA por red, no relayada por el socket local. **A diferencia de `CLOUDLINK_ENDPOINT`, NO se deriva del enrolamiento**: en cualquier instalación fuera de la máquina de desarrollo hay que fijarla a mano, o el botón "solicitar acceso" llamará al propio `localhost` del Edge y nunca funcionará (queda constancia en el log de arranque mientras siga en el default, ver ⁴). `http://` solo se admite contra loopback (`localhost`/`127.0.0.1`/`::1`); con cualquier otro host el signup se rehúsa (nunca manda la contraseña en claro por la red) — usa `https://`. |
 | `WAPP_LOG_FILE` | (vacío) | Redirige el log a archivo (útil bajo LaunchAgent/systemd). |
 

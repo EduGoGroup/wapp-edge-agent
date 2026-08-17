@@ -166,22 +166,44 @@ func (m *Manager) stopLive(id string) (jid string, live bool) {
 		delete(m.live, id)
 	}
 	m.mu.Unlock()
-	m.forgetColaCrypter(id)
 	if !ok {
+		// La sesión no estaba viva: no hay ninguna goroutine que pueda re-poblar el caché de sobres, así
+		// que se olvida aquí mismo. Un Unlink de una sesión ya parada tiene que olvidarla igual (el caché
+		// no sabe nada de si el listener corría).
+		m.forgetColaCrypter(id)
 		m.health.Remove(id)
 		return "", false
 	}
 	s.stop()
 	s.waitDone()
+	// Plan 051 Ola 3 (T3.3): el `stop()` de arriba cancela el ctx COMPARTIDO por listener y despachador, así
+	// que el despachador ya está saliendo; aquí se le espera. Va ANTES de que el llamante borre la DEK y los
+	// metadatos: un despachador todavía vivo seguiría pidiendo la cabeza de una sesión que ya no existe y
+	// escribiendo un Error por poll al no poder abrir sus filas. No-op si nunca arrancó.
+	s.waitDespachadores()
+	// 🔴 EL OLVIDO DEL CACHÉ DE SOBRES VA DESPUÉS DEL JOIN, Y ESO SE CORRIGIÓ EN LA REVISIÓN DE LA OLA 3.
+	// Estaba arriba, antes del `stop()`, y así era INERTE para una sesión viva: entre el `Forget` y la
+	// parada efectiva de las goroutines quedaba una ventana en la que cualquier `Enqueue` del listener o
+	// —desde esta ola— cualquier `CabezaDeSesion` del despachador (que consulta el sobre en CADA poll)
+	// volvía a llamar a CrypterFor y RE-CACHEABA la DEK, que se quedaba en el mapa hasta reiniciar el
+	// proceso. Hoy es una fuga de ~60 B; el día que se rote la DEK conservando el `session_id`, una entrada
+	// resucitada sella con la llave vieja y eso es pérdida silenciosa (ver el doc de Store.Forget).
+	// Después del join no queda nadie que pueda repoblarlo.
+	m.forgetColaCrypter(id)
 	// Salud (Plan 031 T6): saca la entrada del registro de salud DESPUÉS de que la goroutine haya parado
 	// por completo, evitando carreras donde el teardown recien-conectado intente un SetSocketState.
 	m.health.Remove(id)
 	return s.meta.JID, true
 }
 
-// forgetColaCrypter saca a la sesión del CACHÉ DE SOBRES de la cola de entrantes (Plan 051 T2.9). Va en
-// stopLive, ANTES del early-return de "no estaba viva", porque un Unlink de una sesión ya parada tiene que
-// olvidarla igual: el caché no sabe nada de si el listener corría.
+// forgetColaCrypter saca a la sesión del CACHÉ DE SOBRES de la cola de entrantes (Plan 051 T2.9).
+//
+// 🔴 CUÁNDO SE LLAMA ES PARTE DEL CONTRATO (revisión de la Ola 3, 2026-08-17): en stopLive, DESPUÉS del
+// join de las goroutines de la sesión (waitDone + waitDespachadores) y, en el camino de la sesión que ya
+// no estaba viva, en su early-return —un Unlink de una sesión parada tiene que olvidarla igual: el caché
+// no sabe nada de si el listener corría—. Llamarlo antes del join lo dejaba inerte: el listener (Enqueue)
+// y el despachador (CabezaDeSesion, una vez por poll) resuelven el sobre por la misma puerta y lo
+// re-cachean, así que el olvido se deshacía solo.
 //
 // Type assertion y NO un método del puerto: m.cola es app.ColaEntrantes (internal/app/cola.go), que es el
 // contrato del ENCOLADO —lo que el listener necesita— y no tiene por qué crecer con un detalle de gestión

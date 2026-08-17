@@ -21,9 +21,9 @@ func testLogger() sharedlogger.Logger {
 	return sharedlogger.New(sharedlogger.WithWriter(&bytes.Buffer{}), sharedlogger.WithJSON(true))
 }
 
-// openDB abre una BD de cola temporal POR EL MISMO CAMINO QUE PRODUCCIÓN (db.Open, el que usa el daemon
-// en daemon.go para <data_dir>/cola_entrantes.db) y le aplica la MIGRACIÓN REAL (db.MigrateCola), no una
-// copia a mano del DDL. Es deliberado por partida doble:
+// openDB abre una BD de cola temporal POR EL MISMO CAMINO QUE PRODUCCIÓN (db.OpenCola, el que usan el
+// daemon en daemon.go y el cajero en cmd/agent/cajero.go para <data_dir>/cola_entrantes.db) y le aplica la
+// MIGRACIÓN REAL (db.MigrateCola), no una copia a mano del DDL. Es deliberado por partida doble:
 //
 //   - El esquema: un DDL replicado en el test se desincroniza del de producción sin que nadie se entere
 //     —así fue como el índice único ux_cola_session_wamid faltó en los tests y la idempotencia del
@@ -32,8 +32,10 @@ func testLogger() sharedlogger.Logger {
 //     ROLLBACK y sin busy_timeout mientras producción va en WAL con 5 s de espera (db.go, openSQLite).
 //     Eso es el MODO DE CONCURRENCIA del motor, no un detalle cosmético: ningún test de esta cola estaba
 //     ejercitando el modo real, y justo aquí (drop-oldest, claim, barrido) es donde la concurrencia
-//     decide si algo es correcto. Llamando a db.Open no se replican los pragmas: se HEREDAN, y el día
-//     que producción cambie uno los tests lo cambian con ella.
+//     decide si algo es correcto. Llamando al constructor de producción no se replican los pragmas: se
+//     HEREDAN, y el día que producción cambie uno los tests lo cambian con ella. Eso ya pasó: T3.15 le
+//     dio a la cola un perfil de escritura PROPIO (synchronous=NORMAL + WAL ancho) que db.Open NO aplica,
+//     y este helper lo heredó sin tocar una línea con solo cambiar Open por OpenCola.
 //
 // Sigue siendo autocontenido: SQLite sobre un fichero en t.TempDir(), sin servidores, sin Docker y sin
 // variables de entorno. Aquí no hay ciclo de imports: internal/infra/db no importa ningún paquete
@@ -41,10 +43,10 @@ func testLogger() sharedlogger.Logger {
 // necesita el blank import).
 func openDB(t *testing.T) *sql.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "cola_entrantes.db")
-	database, err := infradb.Open(context.Background(), infradb.DialectSQLite, path)
+	path := infradb.ColaDBPath(filepath.Join(t.TempDir(), "cola_entrantes.db"))
+	database, err := infradb.OpenCola(context.Background(), path)
 	if err != nil {
-		t.Fatalf("db.Open: %v", err)
+		t.Fatalf("db.OpenCola: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	if err := infradb.MigrateCola(context.Background(), database); err != nil {
