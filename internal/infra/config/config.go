@@ -185,8 +185,9 @@ const DefaultWorkerStatsEveryMS = 5 * 60 * 1000
 // DefaultWorkerMaxRunes es el TECHO de runas del texto que se manda a clasificar (T2.5): sin techo,
 // pegar ~65 KB en un chat basta para que la inferencia tarde lo bastante como para contar fallos y
 // ABRIR EL BREAKER COMPARTIDO, apagando la clasificación de todas las sesiones. Es la vía más barata
-// que existe hoy para denegar el servicio del clasificador desde fuera. El porqué del 4000, en
-// classifier.DefaultMaxRunes. Configurable por WAPP_WORKER_MAX_RUNES; <=0 cae al default.
+// que existe hoy para denegar el servicio del clasificador desde fuera. El porqué del número —hoy
+// 1000 runas, bajado desde 4000 con medición contra Ollama real— vive en classifier.DefaultMaxRunes:
+// NO se repite aquí precisamente para que no vuelva a envejecer, que ya pasó una vez. Configurable por WAPP_WORKER_MAX_RUNES; <=0 cae al default.
 const DefaultWorkerMaxRunes = cajero.DefaultMaxRunes
 
 // DefaultWorkerNumThread son los hilos de inferencia que se le piden a Ollama. Lo fijó la medición de
@@ -214,7 +215,8 @@ type WorkerConfig struct {
 	MaxConcurrent int `yaml:"max_concurrent"`
 	// PollMS es el intervalo del poll cuando la cola está vacía (T2.7, primera opción). Default 500.
 	PollMS int `yaml:"poll_ms"`
-	// MaxRunes es el techo de runas de la entrada a clasificar (T2.5). Default 4000.
+	// MaxRunes es el techo de runas de la entrada a clasificar (T2.5). El default lo fija
+	// classifier.DefaultMaxRunes (hoy 1000), no un literal de este fichero.
 	MaxRunes int `yaml:"max_runes"`
 	// NumThread son los hilos que se le piden a Ollama por inferencia (T2.5). Default 5.
 	NumThread int `yaml:"num_thread"`
