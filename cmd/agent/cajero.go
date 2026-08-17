@@ -180,6 +180,9 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 		Listo:         contrato.Listo,
 		ConfigVersion: contrato.Version,
 		OllamaURL:     cfg.Intent.OllamaURL,
+		// T2.8 · el mismo número que se le manda al clasificador arriba (WithLLMOptions), aquí sólo para
+		// que el aviso de sobresuscripción compare lo que DE VERDAD se está pidiendo y no el default.
+		NumThread: cfg.Worker.NumThread,
 	})
 	if err != nil {
 		return err

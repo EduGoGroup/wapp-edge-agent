@@ -971,6 +971,10 @@ func TestCierreTimeout_PorDebajoDelSigkillDelSupervisor(t *testing.T) {
 
 // TestAfinidadOllama_NuncaEsFatal: la comprobación de T2.8 puede fallar, y cuando falla el cajero
 // arranca igual dejando el hecho en Warn.
+//
+// Este pasa por el camino REAL (Run → registrarAfinidad → leerAfinidades, la que toca /proc). El
+// contenido de cada veredicto se prueba aparte, en afinidad_test.go, contra lecturas sintéticas: aquí lo
+// que se defiende es que la comprobación no puede impedir un arranque.
 func TestAfinidadOllama_NuncaEsFatal(t *testing.T) {
 	log := &logCaptura{}
 	cola := &colaFake{}
@@ -982,7 +986,7 @@ func TestAfinidadOllama_NuncaEsFatal(t *testing.T) {
 
 	// Una URL remota no es observable en Linux, y en macOS no lo es ninguna: en ambos casos el
 	// resultado esperado es el MISMO — un aviso, no un fallo de arranque.
-	if _, ok := log.buscar("afinidad de CPU"); !ok {
+	if _, ok := log.buscar("(T2.8)"); !ok {
 		t.Error("el arranque debe dejar constancia de la comprobación de afinidad (T2.8)")
 	}
 	if _, ok := log.buscar("arrancando"); !ok {

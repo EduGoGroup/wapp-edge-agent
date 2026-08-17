@@ -209,6 +209,12 @@ type Deps struct {
 	// OllamaURL es la URL del Ollama al que se apunta. Sólo se usa para la comprobación de afinidad de
 	// CPU del arranque (T2.8): el cajero NO habla con Ollama por su cuenta, eso es del Clasificador.
 	OllamaURL string
+	// NumThread son los hilos de inferencia que el Clasificador le pide a Ollama (WAPP_WORKER_NUM_THREAD).
+	// El cajero NO lo usa para inferir —no habla con Ollama—, sólo para el AVISO de T2.8: pedir más hilos
+	// que CPUs tiene el proceso confinado es sobresuscripción, y con el `taskset` puesto es fácil que
+	// pase sin que nadie lo note (el número se calibró en la O0 contra una máquina SIN confinar).
+	// <=0 ⇒ DefaultNumThread, que es lo que el clasificador manda si nadie toca la variable.
+	NumThread int
 }
 
 // Cajero es el bucle. Construir con New; el cero-valor no sirve.
@@ -227,6 +233,7 @@ type Cajero struct {
 	listo         func() bool
 	configVersion func() string
 	ollamaURL     string
+	numThread     int
 
 	// sem es el SEMÁFORO de inferencias (T2.3): un canal con buffer de N plazas. Se toma ANTES de
 	// reclamar y se suelta al cerrar el lote, así que acota a la vez las inferencias en vuelo y los
@@ -326,6 +333,10 @@ func New(deps Deps) (*Cajero, error) {
 	if lease <= 0 {
 		lease = app.DefaultColaLeaseSegundos * time.Second
 	}
+	numThread := deps.NumThread
+	if numThread <= 0 {
+		numThread = DefaultNumThread
+	}
 
 	return &Cajero{
 		cola:          deps.Cola,
@@ -342,6 +353,7 @@ func New(deps Deps) (*Cajero, error) {
 		listo:         deps.Listo,
 		configVersion: deps.ConfigVersion,
 		ollamaURL:     deps.OllamaURL,
+		numThread:     numThread,
 		sem:           make(chan struct{}, plazas),
 	}, nil
 }
@@ -815,21 +827,85 @@ func (c *Cajero) sobre(res classifier.Classification) (string, error) {
 	return string(b), nil
 }
 
-// registrarAfinidad es T2.8: comprueba en el arranque la afinidad de CPU del Ollama al que se apunta y
-// la deja EN EL LOG LOCAL. La publicación al heartbeat es de la Ola 4 y aquí no se hace.
+// registrarAfinidad es T2.8: comprueba en el arranque el REPARTO de CPUs entre el Ollama al que se
+// apunta y este mismo proceso, y lo deja EN EL LOG LOCAL. La publicación al heartbeat es de la Ola 4 y
+// aquí no se hace.
 //
-// 🔴 NUNCA ES FATAL. La O0 midió que el aislamiento por CPU es la palanca de rendimiento (con el modelo
-// grande al lado y sin `taskset`, el p50 se va a 21,8 s con picos de 80 s), pero un worker que se niega
-// a arrancar porque no pudo leer /proc es un worker que no clasifica nada. Se avisa y se sigue.
+// MIRA A LOS DOS LADOS, y no es un extra: la medición contra el Ollama real del VPS demostró que
+// confinar sólo al vecino deja el 17,2 % de las clasificaciones por encima del timeout, mientras que dos
+// conjuntos DISJUNTOS lo dejan en 0 % — con las mismas 2 vCPU para el vecino en ambos casos. Un chequeo
+// que sólo mirase a Ollama daría por buena esa configuración. La tabla completa y el porqué están en el
+// encabezado de afinidad.go.
+//
+// 🔴 NUNCA ES FATAL. Olvidar el `taskset` cuesta el 100 % de las clasificaciones (p50 47.991 ms contra
+// un timeout de 15 s) y en silencio, pero un worker que se niega a arrancar porque no pudo leer /proc es
+// un worker que no clasifica NADA. Se avisa y se sigue, y eso vale también cuando sólo se pudo leer una
+// de las dos afinidades.
 func (c *Cajero) registrarAfinidad(ctx context.Context) {
-	cpus, err := afinidadOllama(ctx, c.ollamaURL)
-	if err != nil {
-		c.log.Warn("cajero: no se pudo comprobar la afinidad de CPU de Ollama (T2.8); el cajero arranca IGUAL",
-			"error", err, "ollama_url", c.ollamaURL)
+	c.registrarReparto(leerAfinidades(ctx, c.ollamaURL))
+}
+
+// registrarReparto es la MITAD DECIDIBLE de registrarAfinidad: recibe la lectura ya hecha y elige qué
+// se loguea y con qué nivel. Está separada de la lectura porque leerAfinidades sólo funciona en Linux y
+// los gates se corren en macOS: así los tres veredictos —y el hecho de que dos de ellos sean Warn y uno
+// Info— quedan cubiertos por tests en cualquier plataforma.
+func (c *Cajero) registrarReparto(lec lecturaAfinidad) {
+	// El aviso de hilos va PRIMERO y por su cuenta: depende sólo de la afinidad propia —la que siempre se
+	// puede leer— así que sigue sirviendo en el caso más común de fallo, el de no poder ver a Ollama.
+	c.avisarHilosSobresuscritos(lec)
+
+	if lec.ErrOllama != nil || lec.ErrCajero != nil {
+		c.log.Warn("cajero: no se pudo comprobar el reparto de CPUs entre Ollama y el cajero (T2.8); el cajero arranca IGUAL",
+			"error_ollama", lec.ErrOllama, "error_cajero", lec.ErrCajero,
+			"cpus_ollama", lec.Ollama, "cpus_cajero", lec.Cajero, "ollama_url", c.ollamaURL)
 		return
 	}
-	c.log.Info("cajero: afinidad de CPU de Ollama comprobada (T2.8)",
-		"cpus_permitidas", cpus, "ollama_url", c.ollamaURL)
+
+	reparto, err := clasificarReparto(lec.Ollama, lec.Cajero, lec.Presentes)
+	if err != nil {
+		c.log.Warn("cajero: la afinidad de CPU se leyó pero no se pudo interpretar (T2.8); el cajero arranca IGUAL",
+			"error", err, "cpus_ollama", lec.Ollama, "cpus_cajero", lec.Cajero, "ollama_url", c.ollamaURL)
+		return
+	}
+
+	switch reparto.Veredicto {
+	case afinidadDisjunta:
+		c.log.Info("cajero: reparto de CPUs DISJUNTO entre Ollama y el cajero (T2.8) — es la configuración medida como buena",
+			"cpus_ollama", reparto.Ollama.String(), "cpus_cajero", reparto.Cajero.String(), "ollama_url", c.ollamaURL)
+	case afinidadCajeroSinConfinar:
+		c.log.Warn("cajero: el cajero NO está confinado a ninguna CPU (T2.8) — puede subirse a todas, incluidas las de Ollama; "+
+			recetaSolapamiento,
+			"cpus_ollama", reparto.Ollama.String(), "cpus_cajero", reparto.Cajero.String(),
+			"cpus_compartidas", reparto.Comunes.String(), "ollama_url", c.ollamaURL)
+	default: // afinidadSolapada
+		c.log.Warn("cajero: Ollama y el cajero SE PISAN en al menos una CPU (T2.8) — "+recetaSolapamiento,
+			"cpus_ollama", reparto.Ollama.String(), "cpus_cajero", reparto.Cajero.String(),
+			"cpus_compartidas", reparto.Comunes.String(), "ollama_url", c.ollamaURL)
+	}
+}
+
+// avisarHilosSobresuscritos avisa cuando se le piden a Ollama más hilos de inferencia que CPUs tiene
+// este proceso disponibles. No es el hallazgo de la medición, es su efecto secundario: el `num_thread`
+// se calibró en la O0 contra una máquina SIN confinar, así que en cuanto alguien reparte las 6 vCPU en
+// 4/2 el número queda sobresuscrito y nadie se entera — no falla nada, sólo se pelean los hilos.
+//
+// No se toca el número, sólo se dice: DefaultNumThread vive en el módulo del clasificador (otro repo) y
+// está cerrado por la O0. Y si la afinidad propia no se pudo leer, esto no hace nada: sin saber a
+// cuántas CPUs está confinado el proceso, no hay comparación que hacer.
+func (c *Cajero) avisarHilosSobresuscritos(lec lecturaAfinidad) {
+	if lec.ErrCajero != nil {
+		return
+	}
+	cpus, err := parsearListaCPUs(lec.Cajero)
+	if err != nil || len(cpus) == 0 {
+		return
+	}
+	if c.numThread <= len(cpus) {
+		return
+	}
+	c.log.Warn("cajero: se le piden a Ollama MÁS hilos de inferencia que CPUs tiene el cajero (T2.8); "+
+		"baja WAPP_WORKER_NUM_THREAD o amplía el `taskset` de este proceso",
+		"num_thread", c.numThread, "cpus_cajero", cpus.String(), "cpus_cajero_total", len(cpus))
 }
 
 // concatenar une los textos del lote EN EL ORDEN EN QUE VIENEN, que el adaptador garantiza que es el

@@ -14,14 +14,31 @@ import (
 	"strings"
 )
 
-// afinidadOllama devuelve la lista de CPUs a las que el proceso de Ollama tiene permitido subirse
-// (T2.8, REQ-051.16), en el formato de `Cpus_allowed_list` del kernel: "0-3", "2,4", "0-1,6"…
+// leerAfinidades averigua LAS DOS afinidades de CPU que T2.8 (REQ-051.16) necesita comparar —la del
+// proceso de Ollama y la de ESTE proceso— más el censo de CPUs de la máquina. Los valores vienen en el
+// formato `Cpus_allowed_list` del kernel: "0-3", "2,4", "0-1,6"… Quién decide qué significan es
+// clasificarReparto (afinidad.go); aquí sólo se leen.
 //
-// POR QUÉ ESTA COMPROBACIÓN EXISTE: la O0 midió que el aislamiento por CPU es LA palanca de
-// rendimiento de esta pieza. Con una sola instancia de Ollama y el modelo grande al lado, el p50 se va
-// a 21,8 s (6,3×, picos de 80 s); con dos instancias aisladas por `taskset` la degradación desaparece.
+// POR QUÉ ESTA COMPROBACIÓN EXISTE, y por qué mira a los dos lados. El aislamiento por CPU es LA palanca
+// de rendimiento de esta pieza, y la medición contra el Ollama real del VPS (6 vCPU, LOTES reales,
+// num_thread=5) puso número a las dos mitades del asunto:
+//
+//   - CUÁNTO CUESTA OLVIDAR EL `taskset`: con una sola instancia compartida, el p50 se va a 47.991 ms
+//     —11,2× de degradación— y el 100 % de las clasificaciones pasa del timeout de 15 s. El 100 %, y en
+//     SILENCIO: el clasificador que se rinde devuelve «desconocido» y el flujo sigue por el camino de
+//     siempre (ADR-0020 §3), así que no hay error, ni alarma, ni una sola línea roja. Simplemente deja
+//     de haber clasificación. La cifra vieja de este comentario (6,3× y p50 21,8 s) es de la O0 y se
+//     midió con MENSAJES SUELTOS; con lotes reales duele el doble.
+//   - AISLAR SÓLO A OLLAMA NO BASTA: dándole al vecino las mismas 2 vCPU, dejar al cajero suelto en las 6
+//     deja el 17,2 % de los lotes por encima del timeout, mientras que confinarlo a CPUs disjuntas lo
+//     deja en 0 %. La tabla completa está en el encabezado de afinidad.go.
+//
 // El problema operativo es que un reinicio manual o una unidad systemd editada destruyen ese
 // aislamiento SIN QUE NADA AVISE. Esto es el aviso.
+//
+// LA AFINIDAD DEL PROPIO CAJERO es la barata de las dos: /proc/self/status siempre es legible por su
+// dueño, así que este lado no falla nunca en la práctica. La cara es la de Ollama, y de ahí el rodeo que
+// sigue.
 //
 // CÓMO SE IDENTIFICA EL PID DE OLLAMA, y qué falla si no se encuentra. No hay API de Ollama que lo
 // diga, así que se deduce del sistema de ficheros, sin cgo y sin ejecutar binarios externos:
@@ -40,15 +57,26 @@ import (
 //     (justo el escenario de las dos instancias aisladas por `taskset`), devuelve la de menor PID y no
 //     hay forma de saber cuál atiende nuestra URL. Por eso es el fallback y no el camino principal.
 //
-// SI NINGUNO DE LOS DOS ENCUENTRA EL PROCESO se devuelve error y el llamante lo registra como Warn: el
-// cajero arranca IGUAL. Los casos en que eso pasa son (a) Ollama no está corriendo todavía —el worker
-// puede arrancar antes que él—, (b) Ollama es remoto o vive en otro namespace de red/PID (contenedor),
-// y (c) /proc está restringido (hidepid=2). En ninguno de los tres tiene sentido impedir el arranque:
-// lo que se pierde es una comprobación de rendimiento, no la corrección.
-func afinidadOllama(ctx context.Context, urlOllama string) (string, error) {
+// SI NINGUNO DE LOS DOS ENCUENTRA EL PROCESO se devuelve error EN ErrOllama y el llamante lo registra
+// como Warn: el cajero arranca IGUAL. Los casos en que eso pasa son (a) Ollama no está corriendo todavía
+// —el worker puede arrancar antes que él—, (b) Ollama es remoto o vive en otro namespace de red/PID
+// (contenedor), y (c) /proc está restringido (hidepid=2). En ninguno de los tres tiene sentido impedir
+// el arranque: lo que se pierde es una comprobación de rendimiento, no la corrección.
+func leerAfinidades(ctx context.Context, urlOllama string) lecturaAfinidad {
+	var lec lecturaAfinidad
 	if err := ctx.Err(); err != nil {
-		return "", err
+		lec.ErrOllama, lec.ErrCajero = err, err
+		return lec
 	}
+
+	lec.Cajero, lec.ErrCajero = cpusPermitidasEn(rutaStatusPropio)
+	lec.Presentes = cpusPresentes()
+	lec.Ollama, lec.ErrOllama = afinidadOllama(urlOllama)
+	return lec
+}
+
+// afinidadOllama es el rodeo del doc comment de arriba: puerto → inodo → PID → Cpus_allowed_list.
+func afinidadOllama(urlOllama string) (string, error) {
 	puerto, err := puertoDe(urlOllama)
 	if err != nil {
 		return "", err
@@ -64,6 +92,28 @@ func afinidadOllama(ctx context.Context, urlOllama string) (string, error) {
 	}
 
 	return cpusPermitidas(pid)
+}
+
+// rutaStatusPropio es el /proc/<pid>/status de ESTE proceso. Se usa la vista mágica `self` en vez de
+// os.Getpid() a propósito: `self` la resuelve el kernel por el hilo que lee, así que no hay ventana en la
+// que el PID que se compone aquí deje de ser el nuestro.
+const rutaStatusPropio = "/proc/self/status"
+
+// rutaCPUsPresentes es el censo de CPUs de la MÁQUINA, en el mismo formato de lista que
+// Cpus_allowed_list. Es el único modo de distinguir «el cajero está confinado a un trozo que resulta ser
+// todo» de «al cajero no le pusieron taskset»: runtime.NumCPU() NO sirve para esto, porque Go lo calcula
+// respetando la afinidad del proceso y por tanto devuelve 4 en un proceso confinado a 4 de 6 vCPU —
+// justo el dato que aquí haría falta que no estuviera ya filtrado.
+const rutaCPUsPresentes = "/sys/devices/system/cpu/present"
+
+// cpusPresentes lee el censo de CPUs de la máquina. Devuelve "" si no se puede: es un dato ACCESORIO
+// (afina el mensaje, no la detección) y no merece un error que el llamante tenga que gestionar.
+func cpusPresentes() string {
+	b, err := os.ReadFile(rutaCPUsPresentes)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // puertoDe extrae el puerto de la URL de Ollama y comprueba que apunta a esta misma máquina: si el
@@ -226,12 +276,20 @@ func pidPorNombre(nombre string) (int, error) {
 	return mejor, nil
 }
 
-// cpusPermitidas lee la línea `Cpus_allowed_list` de /proc/<pid>/status, que es la proyección legible
-// de sched_getaffinity(2) — el mismo dato que consulta `taskset -pc <pid>`, sin cgo y sin ejecutar
-// nada. /proc/<pid>/status es legible por cualquier usuario, así que este paso funciona aunque Ollama
-// corra con otro uid.
+// cpusPermitidas lee la afinidad del PID dado. Ver cpusPermitidasEn para el porqué del formato.
 func cpusPermitidas(pid int) (string, error) {
-	ruta := filepath.Join("/proc", strconv.Itoa(pid), "status")
+	return cpusPermitidasEn(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+}
+
+// cpusPermitidasEn lee la línea `Cpus_allowed_list` de un /proc/<pid>/status, que es la proyección
+// legible de sched_getaffinity(2) — el mismo dato que consulta `taskset -pc <pid>`, sin cgo y sin
+// ejecutar nada. /proc/<pid>/status es legible por cualquier usuario, así que este paso funciona aunque
+// Ollama corra con otro uid.
+//
+// TOMA LA RUTA Y NO EL PID para que el propio proceso se lea por /proc/self/status con ESTE MISMO
+// parser: el campo es idéntico en los dos casos y tener dos lectores del mismo formato es la forma de
+// que uno de ellos se quede atrás.
+func cpusPermitidasEn(ruta string) (string, error) {
 	f, err := os.Open(ruta)
 	if err != nil {
 		return "", fmt.Errorf("no se pudo leer %s: %w", ruta, err)
