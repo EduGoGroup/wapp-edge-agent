@@ -64,7 +64,9 @@ const (
 	EstadoNuevo = "nuevo"
 	// EstadoTomado: reclamada por el cajero (lease vivo). Si el lease vence, vuelve a EstadoNuevo.
 	EstadoTomado = "tomado"
-	// EstadoClasificado: con intent resuelto (por el cajero o por el fastlane), lista para el despachador.
+	// EstadoClasificado: con intent RESUELTO —por el cajero, por el fastlane del listener, o por el
+	// PRESUPUESTO VENCIDO del despachador (que escribe un sobre de omisión, no un intent)— y por tanto
+	// lista para entregarse. Es el único estado desde el que se sella `despachado`.
 	EstadoClasificado = "clasificado"
 	// EstadoDespachado: ya entregada al despachador (cloudlink/outbox); solo espera la poda por TTL.
 	EstadoDespachado = "despachado"
@@ -109,8 +111,10 @@ const (
 	// bug de ese corte o por un descifrado que devolvió cadena vacía; el motivo es el mismo porque el
 	// hecho es el mismo (no había qué clasificar), y así el contador de la Ola 4 no se parte en dos.
 	MotivoSinTexto MotivoOmitido = "sin_texto"
-	// MotivoNoElegible: el mensaje no cumple las condiciones de elegibilidad del clasificador
-	// (ver intent.Decorator.eligible). No se intentó clasificar.
+	// MotivoNoElegible: el mensaje no cumple las condiciones de elegibilidad del clasificador — hoy, venir
+	// de un GRUPO. El criterio lo aplica el LISTENER, en el switch de `enqueueCola`, y desde el Plan 051
+	// Ola 3 · T3.0 ese es el ÚNICO sitio donde vive: la copia que tenía el decorador inline
+	// (`intent.Decorator.eligible`) murió con él. No se intentó clasificar.
 	MotivoNoElegible MotivoOmitido = "no_elegible"
 	// MotivoPresupuesto: el despachador agotó su presupuesto de espera (WAPP_AGENT_INTENT_WAIT_MS,
 	// 4000 ms) sin que el cajero llegara a clasificar. Lo escribe el DESPACHADOR (Ola 3).
@@ -404,6 +408,110 @@ type ColaCajero interface {
 	// qué el margen es amplio a propósito y por qué acortarlo empeora las cosas.
 	BarrerLeasesVencidos(ctx context.Context, lease time.Duration) (int64, error)
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// El lado DESPACHADOR del puerto (Plan 051 Ola 3 · T3.2 · REQ-051.18/19/20)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ColaCabeza es la fila CABEZA de una sesión tal como la ve el despachador: la fila NO despachada de
+// `seq` más bajo, con el texto y la meta YA DESCIFRADOS en memoria.
+//
+// INV-051.1 SIGUE INTACTO: en DISCO la fila sigue cifrada campo a campo con la DEK de su sesión; lo
+// que este struct materializa es la copia en memoria que el despachador necesita para construir el
+// evento. Igual que app.ColaMensaje, NUNCA se imprime con `%+v` ni se loguea: lleva contenido.
+//
+// POR QUÉ ES UN TIPO PROPIO Y NO SE REUSA ColaMensaje: son dos preguntas distintas. ColaMensaje es una
+// fila de un LOTE ya reclamado (la unidad del cajero, que no necesita saber en qué estado está: acaba
+// de ponerla `tomado` él mismo). La cabeza es una fila SUELTA cuyo dato más importante es justo el que
+// a ColaMensaje le sobra: `Estado` —si está `clasificado` sale ya, y si sigue `nuevo`/`tomado` es que
+// el cajero aún no ha llegado y hay que correrle el presupuesto (T3.4)—. Meterle esos campos a
+// ColaMensaje ensuciaría el contrato del cajero con dos campos que él nunca mira.
+type ColaCabeza struct {
+	// ID es la clave primaria: lo que se pasa a MarcarDespachada / DespacharSinIntent.
+	ID int64
+	// Seq es el número de orden global. Es el criterio FIFO del despachador (REQ-051.18): la fila N+1
+	// no sale antes que la N aunque la N+1 esté lista y la N esté esperando al cajero.
+	Seq int64
+	// SessionID y ChatJID son el metadato de enrutado, EN CLARO en disco (ver ColaItem).
+	SessionID string
+	ChatJID   string
+	// WAMessageID y TSWhatsApp son los identificadores de trazabilidad del mensaje de WhatsApp.
+	WAMessageID string
+	TSWhatsApp  int64
+	// Estado es el estado literal de la fila: EstadoNuevo, EstadoTomado o EstadoClasificado. Nunca
+	// EstadoDespachado (esas filas no son cabeza de nada: la consulta las excluye).
+	Estado string
+	// IntentJSON es el sobre persistido, o "" si la columna era NULL.
+	IntentJSON string
+	// TieneIntent distingue "" de NULL, que NO son lo mismo (INV-051.3): NULL significa «esta fila aún
+	// no pasó por el cajero», nunca «se clasificó y no tenía intención». Es la diferencia entre esperar
+	// al worker y despachar sin intent.
+	TieneIntent bool
+	// Texto es el cuerpo del mensaje YA DESCIFRADO con la DEK de SessionID.
+	Texto string
+	// Meta son los metadatos de negocio YA DESCIFRADOS; nil si la columna era NULL (y nil se distingue
+	// de una meta vacía: la columna NULL no se abre siquiera).
+	Meta []byte
+}
+
+// ColaDespachador es el lado LECTOR/SELLADOR de la cola que consume el despachador (Ola 3). Va aparte
+// de ColaEntrantes y de ColaCajero por la misma razón que aquellas dos van separadas entre sí: son
+// papeles distintos —el listener anota, el cajero clasifica, el despachador entrega y sella— y ninguno
+// debe poder llamar por accidente a los métodos de otro. Aquí, además, los papeles viven en PROCESOS
+// distintos: el listener y el despachador en `agent serve`, el cajero es el segundo hijo de `wapp-ctl`.
+type ColaDespachador interface {
+	// CabezaDeSesion devuelve la fila NO despachada de `seq` más bajo de la sesión, ya descifrada, o
+	// (nil, nil) si la sesión no tiene nada pendiente.
+	//
+	// (nil, nil) y NO un error: una sesión al día es el estado NORMAL de un despachador que va sobrado,
+	// y es lo que va a devolver la inmensa mayoría de los polls. Devolver error obligaría al bucle a
+	// distinguir «no hay nada» de «algo se rompió» leyendo el texto del error, que es exactamente el
+	// mismo criterio que ya sigue ColaCajero.Reclamar.
+	CabezaDeSesion(ctx context.Context, sessionID string) (*ColaCabeza, error)
+
+	// MarcarDespachada sella `estado='despachado'` + `despachado_en` sobre una fila que sigue
+	// `clasificado` (REQ-051.20). Es lo que des-inertiza el TTL de REQ-051.7: la poda solo borra filas
+	// `despachado` CON sello, y hasta esta ola nadie escribía ninguna de las dos cosas.
+	//
+	// Si la fila ya NO está `clasificado`, la operación es no-op y NO es error: el despachador la
+	// releerá en el poll siguiente y decidirá otra vez con lo que haya en disco.
+	MarcarDespachada(ctx context.Context, id int64) error
+
+	// DespacharSinIntent escribe, en UNA sola sentencia, el sobre de omisión y pasa a `clasificado` una
+	// fila que sigue `nuevo` o `tomado`, soltando su claim (`tomado_en`/`claim_token` a NULL): es el
+	// camino del presupuesto vencido (T3.4), el que garantiza que un cajero atascado nunca detenga la
+	// entrega de un mensaje.
+	//
+	// 🔴 NO SELLA `despachado` NI `despachado_en` — el nombre engaña. Deja la fila LISTA PARA ENTREGARSE
+	// SIN INTENCIÓN, y quien la entrega y la sella es el despachador por su camino normal (la relee como
+	// `clasificado`, `EsOmitido` la reconoce, `evt.Intent` queda nil y `MarcarDespachada` cierra). Hasta
+	// el 2026-08-17 sellaba `despachado` aquí, y eso PERDÍA el mensaje: `CabezaDeSesion` excluye ese
+	// estado, así que la fila desaparecía del alcance del despachador antes de haber salido al cable.
+	// El orden correcto es el mismo que rige en MarcarDespachada: ENTREGA ANTES DE SELLO. Esto ENMIENDA
+	// la letra de REQ-051.19 (que decía `estado='despachado'`) conservando su intención.
+	//
+	// Si el cajero la cerró justo antes (la fila pasó a `clasificado` mientras corría el presupuesto),
+	// la operación es NO-OP SILENCIOSA y tampoco es error: el despachador la relee como `clasificado` y
+	// la entrega CON su intent, que es el desenlace bueno de esa carrera.
+	//
+	// motivo debe pertenecer a la lista canónica (ver MotivosOmitido): un motivo sin sobre se rechaza
+	// con error en vez de persistir un `intent_json` NULL, que en disco significaría lo contrario de lo
+	// que pasó («esta fila no pasó por el cajero»).
+	DespacharSinIntent(ctx context.Context, id int64, motivo MotivoOmitido) error
+}
+
+// ErrMotivoOmitidoDesconocido marca un DespacharSinIntent con un motivo que NO está en la lista
+// canónica (motivosOmitido), y por tanto no tiene sobre precalculado.
+//
+// 🔴 POR QUÉ ES UN ERROR Y NO UN «SE ESCRIBE NULL Y YA»: `intent_json` NULL tiene un significado
+// asignado y es el CONTRARIO del hecho que se está registrando —«esta fila aún no pasó por el cajero»
+// (INV-051.3)—. Persistirlo dejaría en disco una fila `clasificado` SIN sobre, que es exactamente la
+// forma de un FRAGMENTO INTERMEDIO DE LOTE: el despachador la entregaría contándola en
+// `fragmentos_de_lote` (tráfico sano) en vez de en su motivo de omisión, y el porqué real se perdería
+// sin rastro en la única serie que el operador mira para decidir. Sólo es alcanzable añadiendo
+// una constante MotivoOmitido y olvidando meterla en `motivosOmitido`, que es un bug de programación
+// que debe ser ruidoso en el test, no silencioso en el campo.
+var ErrMotivoOmitidoDesconocido = errors.New("cola de entrantes: motivo de omisión fuera de la lista canónica (sin sobre que persistir)")
 
 // ErrColaFalloRepetido marca un error de Enqueue que la implementación YA REPORTÓ en su log por esta
 // misma causa y esta misma sesión, dentro de una ventana de enfriamiento. El error SIGUE siendo un
