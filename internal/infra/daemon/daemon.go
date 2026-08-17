@@ -127,7 +127,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 	//
 	// El worker-cajero (cmd/agent/cajero.go) ya era fatal por su lado desde la Ola 2; ahora los dos procesos
 	// que abren este fichero tratan su ausencia igual.
-	colaDB, err := db.Open(ctx, db.DialectSQLite, layout.ColaDB())
+	//
+	// Se abre con db.OpenCola y NO con db.Open: la cola lleva su propio perfil de escritura SQLite
+	// (synchronous=NORMAL + un WAL 4× más ancho, Plan 051 · T3.15) porque es la única BD del Edge con dos
+	// procesos escribiéndola a la vez. Esos pragmas son POR-CONEXIÓN, así que el cajero tiene que abrirla
+	// exactamente igual —y lo hace, por el mismo constructor—; si uno de los dos se quedara en el perfil
+	// conservador, sus checkpoints seguirían bloqueando al otro.
+	colaDB, err := db.OpenCola(ctx, layout.ColaDB())
 	if err != nil {
 		return fmt.Errorf("serve: abrir la BD de la cola de entrantes (%s): sin cola no hay camino de entrega, "+
 			"arrancar sería prometer un servicio que no existe (Plan 051 O3): %w", layout.ColaDB(), err)

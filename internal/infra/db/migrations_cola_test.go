@@ -44,13 +44,14 @@ CREATE INDEX IF NOT EXISTS ix_cola_estado_seq ON cola_entrantes(estado, seq);
 CREATE INDEX IF NOT EXISTS ix_cola_conv ON cola_entrantes(session_id, chat_jid, estado);
 `
 
-// openColaDB abre una BD de cola vacía en t.TempDir() por el camino de producción (Open), SIN migrar.
+// openColaDB abre una BD de cola vacía en t.TempDir() por el camino de producción (OpenCola, que es el
+// constructor de ESTA BD desde T3.15 — no Open), SIN migrar.
 func openColaDB(t *testing.T) *sql.DB {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "cola_entrantes.db")
-	database, err := Open(context.Background(), DialectSQLite, path)
+	path := ColaDBPath(filepath.Join(t.TempDir(), "cola_entrantes.db"))
+	database, err := OpenCola(context.Background(), path)
 	if err != nil {
-		t.Fatalf("Open(cola): %v", err)
+		t.Fatalf("OpenCola: %v", err)
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	return database

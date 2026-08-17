@@ -7,8 +7,9 @@
 //     metadatos de NEGOCIO en claro de las sesiones (número/JID/estado/rol/timestamps).
 //
 // Desde el Plan 051 hay además un TERCER set, "cola" (migrations/cola → tabla cola_entrantes), que NO
-// va a edge.db sino a un fichero APARTE (<data_dir>/cola_entrantes.db): se aplica solo con MigrateCola,
-// nunca desde Migrate. Ver el comentario de MigrateCola para el porqué de la separación.
+// va a edge.db sino a un fichero APARTE (<data_dir>/cola_entrantes.db): se abre con OpenCola (perfil de
+// escritura propio, T3.15) y se aplica solo con MigrateCola, nunca desde Migrate. Ver los comentarios de
+// esas dos funciones para el porqué de la separación.
 //
 // MODELO BD ÚNICA (ADR-0018, Plan 022): el Edge usa UNA sola *sql.DB (<data_dir>/edge.db en SQLite,
 // o la cadena Postgres) que aloja AMBOS sets — metadatos (accounts/devices), el Container whatsmeow
@@ -19,7 +20,8 @@
 // El driver por defecto es modernc.org/sqlite (CGO_ENABLED=0, sin SQLCipher): el fichero .db NO se
 // cifra a nivel de página; el cryptostore (internal/adapters/cryptostore) cifra CADA campo sensible con
 // la DEK antes de escribirlo. Por eso aquí solo nos ocupamos de: abrir la BD con permisos 0600 (SQLite),
-// fijar los pragmas (WAL, foreign_keys, busy_timeout) y aplicar el set de migración que corresponda.
+// fijar los pragmas (WAL, foreign_keys, busy_timeout + el perfil de escritura, ver sqliteTuning) y aplicar
+// el set de migración que corresponda.
 //
 // Helpers legacy single-sesión (OpenAndMigrate = ambos sets a una db; OpenSessionStore = solo el set
 // store; OpenAndMigrateMeta/MigrateMeta/MigrateStore = un set) se CONSERVAN como COSTURA DE TESTS:
@@ -75,7 +77,8 @@ const (
 // CONMUTABLE por config (WAPP_AGENT_DB_DIALECT + WAPP_AGENT_DB_DSN):
 //
 //   - DialectSQLite (default, "" también): abre/crea el fichero SQLite en dsn con permisos 0600 y deja
-//     la conexión lista (journal_mode=WAL, foreign_keys=ON, busy_timeout=5s) con UN único escritor
+//     la conexión lista (journal_mode=WAL, foreign_keys=ON, busy_timeout=5s, más el perfil de escritura
+//     CONSERVADOR defaultTuning: synchronous=FULL, wal_autocheckpoint=1000) con UN único escritor
 //     (SetMaxOpenConns(1)). Driver modernc.org/sqlite (CGO-free, pure-Go): el .db NO se cifra a nivel
 //     de página; el cryptostore cifra cada campo sensible con la DEK.
 //   - DialectPostgres: abre la conexión con el driver enlazado SOLO bajo el build-tag `postgres`
@@ -84,10 +87,15 @@ const (
 //
 // WAL/PRAGMA y el escritor único son EXCLUSIVOS de SQLite (no existen en Postgres); Open los aplica
 // solo en la rama SQLite.
+//
+// ⚠️ LA COLA DE ENTRANTES NO SE ABRE CON Open: usa OpenCola, que aplica un perfil de escritura DISTINTO
+// (Plan 051 · T3.15). Y desde T3.16 esto ya NO es solo una advertencia en un comentario: la ruta de la
+// cola tiene tipo propio (ColaDBPath), así que `Open(ctx, dialect, layout.ColaDB())` NO COMPILA. Ver
+// ColaDBPath para el porqué de esa barrera.
 func Open(ctx context.Context, dialect, dsn string) (*sql.DB, error) {
 	switch dialect {
 	case DialectSQLite, "":
-		return openSQLite(ctx, dsn)
+		return openSQLite(ctx, dsn, defaultTuning)
 	case DialectPostgres:
 		return openPostgres(ctx, dsn)
 	default:
@@ -95,11 +103,133 @@ func Open(ctx context.Context, dialect, dsn string) (*sql.DB, error) {
 	}
 }
 
-// openSQLite implementa Open para el motor SQLite embebido (pure-Go). Fija SetMaxOpenConns(1): PRAGMA
-// foreign_keys es por-conexión en SQLite, así que limitar el pool a una conexión garantiza que el
-// pragma aplicado aquí rige TODAS las operaciones (evita que database/sql abra conexiones nuevas sin el
-// pragma) y serializa la escritura del store cifrado (suficiente para el daemon del Edge).
-func openSQLite(ctx context.Context, path string) (*sql.DB, error) {
+// ColaDBPath es la ruta del fichero de la COLA DE ENTRANTES (<data_dir>/cola_entrantes.db). Es un TIPO
+// PROPIO y no un `string` a propósito, y esa es toda su razón de ser: hace que el error no se pueda
+// ESCRIBIR (Plan 051 · T3.16).
+//
+// EL FALLO QUE ESTE TIPO EXISTE PARA IMPEDIR. El perfil de escritura de la cola (colaTuning:
+// synchronous=NORMAL + WAL 4× más ancho) lo aplica OpenCola AL ABRIR, y `synchronous`/`wal_autocheckpoint`
+// son PRAGMAs POR-CONEXIÓN. La cola la abren DOS PROCESOS DISTINTOS —`agent serve`
+// (internal/infra/daemon), que hace el Enqueue del handler, y `agent cajero` (cmd/agent/cajero.go), que
+// hace los UPDATE de lote— y el perfil solo sirve si lo aplican LOS DOS: si uno se quedara en Open(),
+// seguiría haciendo fsync en cada commit y disparando checkpoints cada 4 MiB en mitad del tráfico del
+// otro, que es EXACTAMENTE el mecanismo medido detrás de los picos de 250-471 ms en el p99 del handler
+// (PC-11). Media palanca no arregla nada.
+//
+// Y ese error era invisible: con la ruta siendo un `string` pelado, revertir una de las dos líneas a
+// `db.Open(ctx, dialecto, layout.ColaDB())` COMPILA, pasa todos los tests —los que hay miran los pragmas
+// EFECTIVOS de una conexión abierta con OpenCola, no quién la abre en producción— y el pragma
+// simplemente no se aplica en campo. Un guardarraíl de test podía cazarlo; un tipo lo hace imposible de
+// teclear, que es la línea que ya se siguió en T3.13 con buildLatencia.
+//
+// CÓMO FUNCIONA LA BARRERA: Go no convierte implícitamente entre un tipo nombrado y su subyacente, así
+// que ColaDBPath no encaja en el `dsn string` de Open ni en ningún otro constructor de este paquete —solo
+// en OpenCola—. La ruta se construye en UN solo sitio (sessionmgr.Layout.ColaDB, la fuente de verdad del
+// layout en disco) y llega tipada hasta aquí. Sí sigue siendo formateable sin ceremonia (`%s` en un
+// fmt.Errorf, valor de un par clave/valor del logger): el tipo estorba justo donde tiene que estorbar y
+// en ningún otro sitio.
+//
+// LO QUE EL COMPILADOR NO PUEDE IMPEDIR es que alguien escriba la conversión explícita
+// `db.Open(ctx, d, string(layout.ColaDB()))`. Eso ya no es un descuido —es una frase que hay que querer
+// escribir—, y de ella se ocupa el guardarraíl de cableado (cola_cableado_ast_test.go), que además vigila
+// que las dos aperturas de producción sigan existiendo.
+type ColaDBPath string
+
+// OpenCola abre la BD PROPIA de la cola de entrantes (<data_dir>/cola_entrantes.db, Layout.ColaDB())
+// —SQLite siempre, como MigrateCola— con el PERFIL DE ESCRITURA de la cola (colaTuning) en vez del
+// perfil conservador del resto de bases del Edge. Es la ÚNICA vía por la que se puede abrir ese fichero:
+// su parámetro es ColaDBPath, el tipo que solo produce Layout.ColaDB(), así que la exclusividad ya no
+// depende de que el llamante lea este comentario. El porqué —los pragmas por-conexión y los dos procesos
+// escritores— está en el doc de ColaDBPath.
+//
+// NO migra: el llamante sigue haciendo MigrateCola con su propio *sql.DB (ver el doc de MigrateCola para
+// por qué la cola no se migra desde Migrate). Abrir y migrar siguen separados porque hay tres llamantes y
+// no todos migran en el mismo punto del arranque.
+func OpenCola(ctx context.Context, path ColaDBPath) (*sql.DB, error) {
+	return openSQLite(ctx, string(path), colaTuning)
+}
+
+// sqliteTuning es el PERFIL DE DURABILIDAD Y CHECKPOINTING de una BD SQLite del Edge: los dos pragmas
+// que openSQLite NO puede fijar igual para todas sus bases porque la respuesta correcta depende de qué
+// guarda cada fichero y de cuántos procesos escriben en él. El resto de pragmas (WAL, foreign_keys,
+// busy_timeout) sí son universales y viven fuera de aquí.
+//
+// Los DOS son PRAGMAs por-conexión, igual que foreign_keys: es el mismo motivo por el que openSQLite fija
+// SetMaxOpenConns(1) (una sola conexión ⇒ el pragma aplicado al abrir rige TODAS las operaciones, sin que
+// database/sql pueda abrir por detrás conexiones sin él). Cambiar ese pool obligaría a fijar también
+// estos dos en cada conexión nueva.
+type sqliteTuning struct {
+	// synchronous es el valor de PRAGMA synchronous ("FULL" o "NORMAL"): cuándo se hace fsync.
+	synchronous string
+	// walAutocheckpoint es el umbral de PRAGMA wal_autocheckpoint EN PÁGINAS (page_size = 4096 B en este
+	// driver, verificado): a partir de cuántas páginas de WAL un commit arrastra además un checkpoint.
+	walAutocheckpoint int
+}
+
+// colaWALAutocheckpointPages es el umbral de checkpoint automático de la cola de entrantes, EN PÁGINAS.
+// Con el page_size de 4096 B del driver son 16 MiB de WAL, cuatro veces el default de SQLite (1000
+// páginas = 4 MiB).
+//
+// EL CRITERIO, que sale de una medición y no de un número redondo: en el VPS, con la cola drenando ~1500
+// filas de backlog, el WAL se midió en 4.136.512 B contra un umbral de 4.096.000 B. Es decir, el WAL vivía
+// PEGADO al techo: cada commit del drenaje disparaba un checkpoint, y un checkpoint BLOQUEA A LOS
+// ESCRITORES —los dos, el que encola y el que cierra lotes, que son procesos distintos sobre el mismo
+// fichero—. Ese es el mecanismo que metía las esperas de 250-471 ms en el p99 del handler (PC-11).
+//
+// El trabajo que hay que dejar entrar ENTERO en el WAL, sin checkpoint por el medio, es un backlog
+// completo drenando: ~4 MiB medidos. 16 MiB da margen para una ráfaga cuatro veces mayor y hace que el
+// checkpoint caiga DESPUÉS, cuando el cajero ya no está escribiendo y a nadie le duele esperar.
+//
+// EL COSTE, que es real y por eso el valor no es «enorme»: (a) el fichero `cola_entrantes.db-wal` puede
+// ocupar hasta ~16 MiB de disco —efímero, el checkpoint lo trunca—; (b) cuando el checkpoint llega mueve
+// hasta 16 MiB de una vez en lugar de 4, o sea es 4× más caro… pero ocurre 4× menos y ya no en mitad de
+// la ráfaga, que es justo el cambio que se busca; (c) mientras el WAL está lleno las LECTURAS cuestan algo
+// más, porque una lectura busca primero la página en el WAL a través del wal-index, y ese índice crece
+// con él. Por (a) y (c) NO se desactiva el autocheckpoint (PRAGMA wal_autocheckpoint=0) ni se pone en un
+// valor gigante: en un proceso 24/7 el WAL crecería sin techo y la degradación de lectura sería
+// permanente. El objetivo es MOVER el checkpoint fuera de la ráfaga, no suprimirlo.
+const colaWALAutocheckpointPages = 4000
+
+var (
+	// defaultTuning es el perfil CONSERVADOR: los propios defaults de SQLite, fijados explícitamente para
+	// que sean visibles y verificables aquí en vez de heredados en silencio del driver. Rige edge.db —el
+	// store cifrado de whatsmeow (device, prekeys, sesiones Signal) y los metadatos de negocio— y todos
+	// los helpers legacy. Ahí no se toca nada: no hay ningún problema medido de latencia en esa BD (su
+	// tráfico es de órdenes de magnitud menos), así que relajar su durabilidad sería pagar un riesgo sin
+	// comprar nada. Ver OpenCola para la única base que sí se aparta de este perfil, y el informe de la
+	// decisión de alcance.
+	defaultTuning = sqliteTuning{synchronous: "FULL", walAutocheckpoint: 1000}
+
+	// colaTuning es el perfil de la COLA DE ENTRANTES (Plan 051 · T3.15): la única BD del Edge con dos
+	// procesos escribiéndola a la vez y con un criterio de latencia colgando de ella (INV-051.2, handler
+	// < 50 ms p99).
+	//
+	// synchronous=NORMAL Y POR QUÉ ES ACEPTABLE (decisión de Jhoan, 2026-08-17): en modo WAL, NORMAL no
+	// significa «escribir más tarde». El commit escribe el dato en el WAL igual que con FULL —la escritura
+	// ya salió del proceso y está en el page cache del SO ANTES de que se acuse la transacción—; lo que se
+	// omite es el fsync que fuerza esa escritura al plato en CADA commit (se hace en el checkpoint). Por
+	// eso un crash del proceso, un pánico o un `kill -9` NO pierden nada: el SO conserva la escritura
+	// aunque el proceso muera. Solo un corte de energía o un pánico del KERNEL pueden perder las últimas
+	// transacciones no sincronizadas.
+	//
+	// Y NO PUEDE CORROMPER LA BASE: en WAL mode, SQLite garantiza la integridad con synchronous=NORMAL —el
+	// WAL nunca deja la base a medias, un commit que no llegó simplemente no existe—. Lo que se debilita
+	// es la DURABILIDAD de las últimas transacciones, no la consistencia. En términos de la cola, el peor
+	// caso concreto es: un cierre de lote perdido (la fila vuelve a ser reclamable por TTL de lease y el
+	// cajero la rehace; el UNIQUE (session_id, wa_message_id) impide duplicar) o un Enqueue recién acusado
+	// perdido (un entrante menos) — el mismo mensaje que se habría perdido si el corte de luz llega un
+	// milisegundo antes, mientras el paquete aún viajaba. Ese riesgo ya existía y es mucho mayor por otras
+	// vías; el que se añade aquí es marginal frente a lo que compra.
+	colaTuning = sqliteTuning{synchronous: "NORMAL", walAutocheckpoint: colaWALAutocheckpointPages}
+)
+
+// openSQLite implementa Open para el motor SQLite embebido (pure-Go), con el perfil de escritura `tuning`
+// (ver sqliteTuning: defaultTuning para el resto del Edge, colaTuning para la cola de entrantes). Fija
+// SetMaxOpenConns(1): PRAGMA foreign_keys —y también synchronous y wal_autocheckpoint— es por-conexión en
+// SQLite, así que limitar el pool a una conexión garantiza que los pragmas aplicados aquí rigen TODAS las
+// operaciones (evita que database/sql abra conexiones nuevas sin ellos) y serializa la escritura del store
+// cifrado (suficiente para el daemon del Edge).
+func openSQLite(ctx context.Context, path string, tuning sqliteTuning) (*sql.DB, error) {
 	// Garantiza el fichero con 0600 ANTES de que SQLite lo cree con permisos del umask.
 	f, err := os.OpenFile(path, os.O_CREATE, 0o600)
 	if err != nil {
@@ -116,10 +246,19 @@ func openSQLite(ctx context.Context, path string) (*sql.DB, error) {
 	}
 	database.SetMaxOpenConns(1)
 
+	// journal_mode=WAL va PRIMERO a propósito: synchronous=NORMAL solo es seguro (no-corrupción) en modo
+	// WAL, y wal_autocheckpoint no tiene sentido fuera de él. Fijarlos antes sería fijarlos sobre un
+	// journal que aún es `delete`.
 	for _, pragma := range []string{
 		"PRAGMA journal_mode=WAL",
 		"PRAGMA foreign_keys=ON",
 		"PRAGMA busy_timeout=5000",
+		// Los dos del perfil se emiten SIEMPRE, también cuando coinciden con el default de SQLite: así el
+		// valor efectivo lo decide este código y no la versión del driver, y un test puede leerlos.
+		// Interpolación segura: los valores salen de constantes de este fichero, nunca de entrada externa,
+		// y SQLite no admite placeholders en un PRAGMA.
+		fmt.Sprintf("PRAGMA synchronous=%s", tuning.synchronous),
+		fmt.Sprintf("PRAGMA wal_autocheckpoint=%d", tuning.walAutocheckpoint),
 	} {
 		if _, err := database.ExecContext(ctx, pragma); err != nil {
 			_ = database.Close()

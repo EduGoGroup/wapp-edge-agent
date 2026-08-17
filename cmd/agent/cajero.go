@@ -66,7 +66,12 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 	// de entrega (perdería cada entrante con el socket conectado). Fallar el arranque es lo honesto en
 	// los dos casos, y que la política sea la misma evita que el operador tenga que recordar cuál de los
 	// dos hijos aguanta sin cola.
-	colaDB, err := db.Open(ctx, db.DialectSQLite, layout.ColaDB())
+	//
+	// db.OpenCola, no db.Open, y AQUÍ importa más que en ningún sitio: este proceso es el que escribe los
+	// UPDATE de lote, o sea el que provocaba los checkpoints que frenaban al handler del daemon (T3.15).
+	// `synchronous` y `wal_autocheckpoint` son pragmas por-conexión: si el cajero abriera con el perfil
+	// conservador, el perfil del daemon no le afectaría y el problema seguiría exactamente igual.
+	colaDB, err := db.OpenCola(ctx, layout.ColaDB())
 	if err != nil {
 		return fmt.Errorf("cajero: abrir la BD de la cola (%s): %w", layout.ColaDB(), err)
 	}

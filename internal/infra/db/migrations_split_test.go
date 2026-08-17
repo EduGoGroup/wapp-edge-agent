@@ -199,10 +199,11 @@ func TestColaMigrationLandsInItsOwnFile(t *testing.T) {
 		t.Fatalf("Migrate(edge.db): %v", err)
 	}
 
-	// --- Arranque real, paso 2: la COLA, en su PROPIO fichero y con su PROPIO runner.
-	colaDB, err := Open(ctx, DialectSQLite, filepath.Join(dataDir, colaDBFileName))
+	// --- Arranque real, paso 2: la COLA, en su PROPIO fichero, con su PROPIO constructor (OpenCola, que le
+	// da el perfil de escritura de T3.15) y su PROPIO runner.
+	colaDB, err := OpenCola(ctx, ColaDBPath(filepath.Join(dataDir, colaDBFileName)))
 	if err != nil {
-		t.Fatalf("Open(cola_entrantes.db): %v", err)
+		t.Fatalf("OpenCola(cola_entrantes.db): %v", err)
 	}
 	defer func() { _ = colaDB.Close() }()
 	if err := MigrateCola(ctx, colaDB); err != nil {
