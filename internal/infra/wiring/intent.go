@@ -16,8 +16,14 @@ import (
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
-// intentsConfigKind es el kind de config empujada que gobierna el clasificador (Plan 029, ADR-0021).
-const intentsConfigKind = "intents"
+// IntentsConfigKind es el kind de config empujada que gobierna el clasificador (Plan 029, ADR-0021).
+//
+// ESTÁ EXPORTADA porque el worker-cajero (`agent cajero`, Plan 051 Ola 2) es OTRO PROCESO y lee ese
+// mismo registro de edge.db por su cuenta (sondea, porque el ConfigUpdate del Cloud llega por el
+// stream CloudLink que vive en `agent serve`). Tenerlo duplicado en un literal de cmd/agent fallaba en
+// silencio: con el kind desalineado el `Get` no encontraría nada, `Listo()` devolvería false para
+// siempre y el cajero no reclamaría ni una fila, sin un solo error en el log.
+const IntentsConfigKind = "intents"
 
 // IntentStack agrupa las piezas del CLASIFICADOR de intenciones (Plan 029) que el arranque cablea al conducto
 // CloudLink y al plano de control. Con la feature OFF, Decorator/Applier/Service/Prober son nil (cableado
@@ -74,11 +80,40 @@ func (s *IntentStack) ConfigVersion() string {
 	if s == nil || s.Store == nil {
 		return ""
 	}
-	rec, ok, err := s.Store.Get(context.Background(), intentsConfigKind)
+	rec, ok, err := s.Store.Get(context.Background(), IntentsConfigKind)
 	if err != nil || !ok {
 		return ""
 	}
 	return rec.Version
+}
+
+// ClasificadorActivo reporta si el CLASIFICADOR de intenciones está vivo en este Edge. Se lee del
+// DECORADOR, no del flag de config: BuildIntent solo construye el decorador con la feature ON, así que
+// `Decorator != nil` es exactamente «hay a quién preguntar». Lo consume el listener (Plan 051 Ola 2, T2.12)
+// para que una fila que llega con el clasificador apagado nazca ya resuelta (`apagado`) en vez de gastar
+// una plaza del semáforo del cajero.
+//
+// ⚠️ HONESTIDAD SOBRE EL ALCANCE — esto NO es `intent.Decorator.ready`, que es la condición que el camino
+// inline usa en `eligible` (sink.go:148). `ready` añade «además hay config de intenciones cargada» (por
+// push del Cloud o por Bootstrap) y es PRIVADO, sin accesor público, y añadir uno sería tocar un fichero
+// que no es de esta tarea. La diferencia es una sola ventana: feature ON pero aún sin config, donde esto
+// dice ACTIVO y `ready` diría que no. Se acepta a sabiendas porque el error cae del lado barato (el cajero
+// clasifica de más y se ve en la telemetría) y porque coincide con la semántica documentada de
+// `app.MotivoApagado`: «la feature llm_intent está apagada», que es un interruptor, no un estado de carga.
+// Si algún día hace falta la verdad exacta, la firma que la daría es `func (d *Decorator) Ready() bool`.
+func (s *IntentStack) ClasificadorActivo() bool {
+	return s != nil && s.Decorator != nil
+}
+
+// ClasificadorActivoFunc devuelve el predicado que el sessionmgr cablea en cada listener
+// (sessionmgr.WithClasificadorActivo). Devuelve un MÉTODO y no un bool ya evaluado para no congelar la foto
+// del arranque: quien lo llame lee el estado del stack en el momento del mensaje. Con el stack nil devuelve
+// nil, y el Listener cae a su default SEGURO (activo).
+func (s *IntentStack) ClasificadorActivoFunc() func() bool {
+	if s == nil {
+		return nil
+	}
+	return s.ClasificadorActivo
 }
 
 // CircuitFunc devuelve el lector del estado del circuito para el status (nil si la feature está off).
@@ -112,7 +147,7 @@ func BuildIntent(cfg config.Config, database *sql.DB, log sharedlogger.Logger) *
 	dec := intent.New(cls, time.Duration(cfg.Intent.TimeoutMS)*time.Millisecond, log)
 
 	svc := edgeconfig.NewService(store, log)
-	svc.RegisterKind(intentsConfigKind,
+	svc.RegisterKind(IntentsConfigKind,
 		func(payload []byte) error { _, err := intents.ParseAndValidate(payload); return err },
 		func(rec edgeconfig.Record) {
 			parsed, err := intents.ParseAndValidate(rec.Payload)

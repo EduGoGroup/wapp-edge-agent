@@ -1,11 +1,15 @@
 // Command agent es el daemon del Edge Agent de wApp.
 //
-// DOS subcomandos, y no hay mas:
+// TRES subcomandos, y no hay mas:
 //
 //   - `enroll`: enrola el Edge contra la nube (mTLS por codigo de enrolamiento).
 //   - `serve`:  el daemon 24/7 — restaura las sesiones activas, mantiene un listener
 //     por sesion sobre el socket VIVO de whatsmeow, drena el outbox contra CloudLink
 //     y expone el plano de control /v1 sobre el Unix socket co-ubicado.
+//   - `cajero`: el worker-cajero de la cola de entrantes (Plan 051 Ola 2 · T2.2) — reclama
+//     lotes por conversacion, clasifica contra el Ollama local y escribe el intent de
+//     vuelta. MISMO BINARIO, papel distinto: es el tercer hijo de `wapp-ctl`, sin plano
+//     de control propio (su readiness es «el proceso esta vivo»).
 //
 // Emparejar es `POST /v1/sessions/pair` contra ese plano de control (por terminal
 // ASCII o por la web local de wapp-ctl); enviar y escuchar los gobierna `serve`.
@@ -79,17 +83,32 @@ func main() {
 			"error", err, "data_dir", cfg.DataDir)
 	}
 
+	// subcomando es el verbo con el que se invocó el binario ("", "enroll", "serve", "cajero"). Se
+	// calcula ANTES de las migraciones porque una de ellas depende de él (ver justo debajo).
+	subcomando := ""
+	if len(os.Args) > 1 {
+		subcomando = os.Args[1]
+	}
+
 	// Migración clean-slate hacia la BD ÚNICA (Plan 022 T1, ADR-0018 §8, fase 1): archiva el layout
 	// multi-sesión POR-DIRECTORIO (sessions/<id>/) bajo <data_dir>/_archived-pre-022/ y deja sessions/
 	// vacío. NO borra el árbol viejo (T6.5 lo lee para restaurar las sesiones ACTIVAS sin re-escanear).
 	// Idempotente (no-op si ya migró) y NO fatal: un fallo de E/S no impide arrancar (se loguea y sigue).
-	if err := edgemigrate.ArchiveLegacyPerSessionLayout(cfg.DataDir, log); err != nil {
-		log.Error("migración clean-slate a BD única de arranque falló (continuo de todas formas)",
-			"error", err, "data_dir", cfg.DataDir)
+	//
+	// 🔴 EL CAJERO NO LA CORRE. Desde el Plan 051 Ola 2 hay DOS procesos de este binario vivos a la vez
+	// (`agent serve` y `agent cajero`, ambos hijos de wapp-ctl) y el supervisor puede arrancarlos casi
+	// en paralelo: dos procesos MOVIENDO el mismo árbol `sessions/` sin coordinación no tiene por qué
+	// romper nada (es idempotente y no fatal), pero tampoco tiene por qué pasar. El dueño del layout es
+	// el daemon; el cajero sólo LEE de edge.db y de la BD de la cola, y no necesita nada de esto.
+	if subcomando != "cajero" {
+		if err := edgemigrate.ArchiveLegacyPerSessionLayout(cfg.DataDir, log); err != nil {
+			log.Error("migración clean-slate a BD única de arranque falló (continuo de todas formas)",
+				"error", err, "data_dir", cfg.DataDir)
+		}
 	}
 
 	// Despacho de subcomandos. Sin argumento o `serve`: daemon multi-sesión.
-	if len(os.Args) > 1 && os.Args[1] == "enroll" {
+	if subcomando == "enroll" {
 		if err := runEnroll(context.Background(), cfg, log); err != nil {
 			log.Error("enrolamiento fallido", "error", err)
 			os.Exit(1)
@@ -97,13 +116,26 @@ func main() {
 		return
 	}
 
-	if len(os.Args) > 1 && os.Args[1] == "serve" {
+	if subcomando == "serve" {
 		sink := logsink.New(0)
 		serveLog := logger.NewWithSink(cfg, sink)
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 		if err := runServe(ctx, cfg, serveLog, sink); err != nil {
 			serveLog.Error("daemon multi-sesión fallido", "error", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Worker-cajero (Plan 051 Ola 2 · T2.2). Mismo molde que `serve` —misma config, mismo logger, mismo
+	// Layout— y el mismo ctx atado a SIGINT/SIGTERM para que el supervisor lo pueda parar limpio. NO
+	// usa logsink: no expone plano de control, así que no hay quien lea el ring buffer de logs.
+	if subcomando == "cajero" {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		if err := runCajero(ctx, cfg, log); err != nil {
+			log.Error("worker-cajero fallido", "error", err)
 			os.Exit(1)
 		}
 		return

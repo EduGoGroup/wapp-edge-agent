@@ -24,18 +24,11 @@ import (
 	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/breaker"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	"github.com/EduGoGroup/wapp-edge-intent/classifier"
 	"github.com/EduGoGroup/wapp-shared/intents"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
-)
-
-// Parámetros del circuit breaker (ADR-0020): cbThreshold fallos CONSECUTIVOS abren el circuito por
-// cbOpenFor; pasado ese tiempo entra en medio-abierto y deja pasar UN sondeo (éxito ⇒ cierra, fallo ⇒
-// reabre). Un resultado "desconocido"/confianza baja NO es fallo (el clasificador respondió bien).
-const (
-	cbThreshold = 5
-	cbOpenFor   = 60 * time.Second
 )
 
 // classifierPort es la dependencia del decorador hacia el clasificador. La cumple *classifier.Classifier;
@@ -53,14 +46,19 @@ type Decorator struct {
 	log        sharedlogger.Logger
 	now        func() time.Time
 
+	// cb es el CIRCUIT BREAKER, hoy en internal/app/breaker (Plan 051 Ola 2 · T2.4). Antes vivía aquí
+	// dentro, en tres campos (failures/openUntil/probing) y tres métodos privados; se extrajo SIN tocar
+	// un solo umbral porque el worker-cajero necesita exactamente la misma pieza y duplicarla habría
+	// dejado dos calibraciones que divergen en silencio. El decorador conserva su `now` sustituible y se
+	// lo PRESTA al breaker (WithClock) para que ambos lean el mismo reloj aunque el test lo cambie
+	// después de construir.
+	cb *breaker.Breaker
+
 	mu sync.Mutex
 	// ready indica que hay config de intenciones cargada (por push o por Bootstrap): sin ella el decorador
 	// no clasifica (entrega tal cual) — el clasificador arranca sin prompt/schema útiles.
 	ready     bool
 	configVer string
-	failures  int       // fallos consecutivos del clasificador (Ollama caído/timeout/pánico)
-	openUntil time.Time // instante hasta el que el circuito está abierto
-	probing   bool      // hay un sondeo de medio-abierto en curso (deja pasar solo uno)
 }
 
 // New construye el decorador sobre un clasificador ya creado. Arranca SIN config (ready=false) hasta que
@@ -72,7 +70,13 @@ func New(cls classifierPort, timeout time.Duration, log sharedlogger.Logger) *De
 	if timeout <= 0 {
 		timeout = 3 * time.Second
 	}
-	return &Decorator{classifier: cls, timeout: timeout, log: log, now: time.Now}
+	d := &Decorator{classifier: cls, timeout: timeout, log: log, now: time.Now}
+	// El reloj se pasa como CLOSURE sobre el campo, no como valor: los tests sustituyen d.now DESPUÉS
+	// de New, y si el breaker se quedara con la foto de time.Now el medio-abierto dejaría de poder
+	// observarse sin esperar 60 s reales.
+	d.cb = breaker.New(breaker.DefaultThreshold, breaker.DefaultOpenFor,
+		breaker.WithClock(func() time.Time { return d.now() }))
+	return d
 }
 
 // SetConfig recarga el clasificador en caliente con una config nueva y marca el decorador listo (ready).
@@ -103,17 +107,9 @@ func (d *Decorator) ConfigVersion() string {
 }
 
 // Circuit devuelve el estado del circuito ("closed"/"open"/"half-open"). Para GET /v1/intent/status.
-func (d *Decorator) Circuit() string {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.failures < cbThreshold {
-		return "closed"
-	}
-	if d.now().Before(d.openUntil) {
-		return "open"
-	}
-	return "half-open"
-}
+// Las tres etiquetas son las MISMAS de siempre: viven ahora en breaker.State* y son contrato publicado
+// (`intent_circuit`, ADR-0023), no detalle interno.
+func (d *Decorator) Circuit() string { return d.cb.State() }
 
 // sink es el app.InboundSink por sesión: clasifica (si procede) y delega en next. Comparte d con las demás
 // sesiones.
@@ -152,16 +148,16 @@ func (d *Decorator) eligible(evt domain.InboundEvent) bool {
 // accionable o nil (cualquier no-éxito: circuito abierto, timeout, error, pánico, "desconocido" o confianza
 // baja). Solo error/timeout/pánico castigan el circuito; un "desconocido" es un éxito sin intención.
 func (d *Decorator) classify(ctx context.Context, text string) *domain.ClassifiedIntent {
-	if !d.beginAttempt() {
+	if !d.cb.BeginAttempt() {
 		return nil // circuito abierto o sondeo de medio-abierto ya en curso
 	}
 	res, err := d.runClassify(ctx, text)
 	if err != nil {
-		d.recordFailure()
+		d.cb.RecordFailure()
 		d.log.Warn("intent: clasificación falló; se entrega el mensaje SIN intención", "error", err)
 		return nil
 	}
-	d.recordSuccess()
+	d.cb.RecordSuccess()
 	if res.Intent == "" || res.Intent == intents.ReservedUnknown {
 		return nil // el clasificador respondió, pero sin intención accionable
 	}
@@ -184,44 +180,4 @@ func (d *Decorator) runClassify(ctx context.Context, text string) (cls classifie
 	cctx, cancel := context.WithTimeout(ctx, d.timeout)
 	defer cancel()
 	return d.classifier.Classify(cctx, text)
-}
-
-// beginAttempt decide si se permite un intento de clasificación según el circuito: cerrado ⇒ sí; abierto y
-// dentro de la ventana ⇒ no; ventana vencida ⇒ medio-abierto, deja pasar UN sondeo (marca probing para que
-// las llamadas concurrentes no sondeen todas a la vez).
-func (d *Decorator) beginAttempt() bool {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.failures < cbThreshold {
-		return true // cerrado
-	}
-	if d.now().Before(d.openUntil) {
-		return false // abierto
-	}
-	if d.probing {
-		return false // medio-abierto, sondeo ya en curso
-	}
-	d.probing = true
-	return true
-}
-
-// recordSuccess cierra el circuito (reinicia el contador de fallos y el sondeo).
-func (d *Decorator) recordSuccess() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.failures = 0
-	d.probing = false
-	d.openUntil = time.Time{}
-}
-
-// recordFailure suma un fallo consecutivo; al llegar al umbral abre el circuito por cbOpenFor. Un fallo del
-// sondeo de medio-abierto (probing) reabre igual (failures ya >= umbral).
-func (d *Decorator) recordFailure() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	d.failures++
-	d.probing = false
-	if d.failures >= cbThreshold {
-		d.openUntil = d.now().Add(cbOpenFor)
-	}
 }

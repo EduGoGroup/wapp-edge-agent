@@ -8,6 +8,8 @@ github.com/EduGoGroup/wapp-cloudlink v0.12.0 h1:u22f/DpUBCGy3Qbn3nLD5dzbYe7LlLbq
 github.com/EduGoGroup/wapp-cloudlink v0.12.0/go.mod h1:/VyLjFHHIMILLtwtoDknslpxtstwRkmA9WSvwmeIrU0=
 github.com/EduGoGroup/wapp-edge-intent v0.1.0 h1:BlH2bpIoHKnFLFEHkr7LrOZ2+DV8ZXZIUfZtNF0+ubo=
 github.com/EduGoGroup/wapp-edge-intent v0.1.0/go.mod h1:3nkv/BwsT76asjfKx6Fhww6RDTdyI77IrJ5wL71/j7s=
+github.com/EduGoGroup/wapp-edge-intent v0.2.0 h1:w9CfW/GXrJlkxl791Ko0IpdxJ9sasSQve+NsPSojEIg=
+github.com/EduGoGroup/wapp-edge-intent v0.2.0/go.mod h1:c+gFHrESoSCl7724EwEeJMIF3tCVy777tZvmYLHcams=
 github.com/EduGoGroup/wapp-shared/auth v0.4.1 h1:MHEJ6I4n1abHiVVJZhKToYyH+ajswygQhegk2zIetFA=
 github.com/EduGoGroup/wapp-shared/auth v0.4.1/go.mod h1:DcoZTsKO30A2B0Fgh8Mqzvg8du4qd0CB0eMCIP6Dm9Y=
 github.com/EduGoGroup/wapp-shared/config v0.3.0 h1:wDV0+aieMC5ByiWDzwkNdUUe28Yc3LJBF2nO+CS7n/k=

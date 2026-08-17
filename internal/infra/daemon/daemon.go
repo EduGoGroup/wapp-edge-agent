@@ -29,8 +29,16 @@ import (
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
-// singleDBFileName es el nombre de la BD ÚNICA del Edge (Plan 022 T3) bajo data_dir.
-const singleDBFileName = "edge.db"
+// SingleDBFileName es el nombre de la BD ÚNICA del Edge (Plan 022 T3) bajo data_dir.
+//
+// ESTÁ EXPORTADA porque el daemon ya NO es el único proceso que abre ese fichero: el worker-cajero
+// (`agent cajero`, Plan 051 Ola 2) lee de ahí el contrato de intenciones. Tenía el nombre duplicado en
+// un literal de cmd/agent y ese duplicado fallaba EN SILENCIO: si el nombre cambiara aquí, el cajero
+// abriría un `edge.db` vacío, `Listo()` devolvería false para siempre y el worker no reclamaría nada,
+// sin un solo error. Un símbolo compartido cuesta menos que ese modo de fallo.
+//
+// Sigue siendo el daemon el DUEÑO del fichero: es quien lo migra. El cajero sólo lo abre para leer.
+const SingleDBFileName = "edge.db"
 
 // Daemon encapsula el ciclo de vida y la orquestación de componentes del Edge Agent multi-sesión.
 type Daemon struct {
@@ -62,7 +70,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	dbDSN := cfg.DBDSN
 	if cfg.DBDialect == db.DialectSQLite && dbDSN == "" {
-		dbDSN = filepath.Join(cfg.DataDir, singleDBFileName)
+		dbDSN = filepath.Join(cfg.DataDir, SingleDBFileName)
 	}
 	database, err := db.Open(ctx, cfg.DBDialect, dbDSN)
 	if err != nil {
@@ -138,6 +146,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// la DEK de SU sesión) antes de entregarlo al sink. nil (cola no disponible) ⇒ la opción no cambia
 		// nada y el cableado queda idéntico al previo.
 		sessionmgr.WithColaEntrantes(cola),
+		// Interruptor del clasificador (Plan 051 Ola 2, T2.12): con la feature apagada, el entrante nace en
+		// la cola YA resuelto (marca `apagado`) en vez de que el cajero gaste una plaza del semáforo para
+		// descartarlo igual. Sale del MISMO stack que ya alimenta el decorador inline (línea de arriba), de
+		// modo que ambos caminos leen un solo interruptor mientras dure la escritura doble de la Ola 1.
+		sessionmgr.WithClasificadorActivo(intentStack.ClasificadorActivoFunc()),
 	)
 
 	if err := mgr.Restore(ctx); err != nil {

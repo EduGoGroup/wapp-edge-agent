@@ -25,8 +25,10 @@
 -- de enrutado, no contenido de negocio.
 --
 -- IDEMPOTENCIA LOCAL: unicidad por (session_id, wa_message_id) — el mismo mensaje de WhatsApp anotado
--- dos veces (reintento del handler, reconexión que re-emite el evento) no duplica fila; el encolado es
--- INSERT OR IGNORE por esa clave. Este índice único es la ÚNICA adición sobre el DDL literal del design
+-- dos veces (reintento del handler, reconexión que re-emite el evento) no duplica fila; el encolado
+-- hace un INSERT normal y TRAGA el choque contra este índice reconociéndolo por su código de error
+-- (T2.11; antes era un `INSERT OR IGNORE`, que ignoraba de más — ver la nota de portabilidad abajo).
+-- Este índice único es la ÚNICA adición sobre el DDL literal del design
 -- §2 (que no declara unicidad): sin él, el contrato "Enqueue idempotente" del puerto app.ColaEntrantes
 -- exigiría un SELECT previo, que en dos procesos concurrentes tiene carrera. Es aditivo y no cambia
 -- ninguna columna del design. El ORDEN lo da `seq`, secuencia monotónica GLOBAL generada por el Edge
@@ -38,13 +40,55 @@
 -- que el TTL. El crecimiento de lo pendiente lo contiene el TOPE DE FILAS del Store (drop-oldest), que
 -- descarta bajo presión real y lo deja anotado en el log.
 --
+-- FENCING DEL CLAIM POR `claim_token`, NO POR `tomado_en` (Plan 051 Ola 2): el cierre del lote
+-- (MarcarClasificado) solo escribe sobre las filas que siguen `tomado` CON EL MISMO `claim_token` que
+-- devolvió el claim. Es lo único que demuestra que el lote sigue siendo de ESTE cajero y no de otro que lo
+-- relevó tras vencer el lease — contar filas afectadas no caza nada, porque las filas siguen ahí: lo que
+-- ha cambiado es de quién son.
+--
+-- ⚠️ POR QUÉ NO SIRVE `tomado_en`, que es lo que había antes y parece bastar: es el reloj de PARED
+-- (`s.now().Unix()`, epoch-SEGUNDOS). El argumento de que dos claims de la misma fila no pueden compartir
+-- segundo se apoya en que entre uno y otro han de pasar ≥60 s de lease, y ESO ASUME QUE EL RELOJ AVANZA.
+-- La plataforma objetivo es un portátil: un salto de NTP hacia atrás tras suspender la máquina hace que el
+-- sello del relevo repita el del claim original, y entonces un cierre tardío pisa el intent del cajero que
+-- lo relevó — en silencio, con todos los contadores cuadrando. Un token aleatorio (16 bytes de CSPRNG en
+-- hex) no depende del reloj en absoluto.
+--
+-- `tomado_en` SE QUEDA, con su otro papel: es el instante que mide BarrerLeasesVencidos para saber si el
+-- lease caducó. Son dos preguntas distintas —«¿cuándo se tomó?» y «¿quién lo tiene?»— y ahora cada una
+-- tiene su columna. Ambas se ponen a NULL a la vez: al cerrar el lote y al rescatarlo el barrido.
+--
+-- 🔴 `claim_token` NO ESTÁ EN EL `CREATE TABLE` DE ABAJO, Y ES A PROPÓSITO (T2.18). Nació editando ESTE
+-- fichero, apoyándose en que «la cola no ha corrido todavía en ningún entorno». Esa premisa CADUCA SOLA:
+-- el commit que introdujo esta migración ya está en `dev` y el daemon la aplica al arrancar, así que
+-- cualquier binario compilado desde `dev` ya creó `<data_dir>/cola_entrantes.db` sin que nadie «usara la
+-- cola» (hay equipos de prueba delegados). Sobre una BD así, editar el `CREATE TABLE ... IF NOT EXISTS`
+-- es un NO-OP SILENCIOSO: la columna nunca se añade, el arranque no falla, `Enqueue` sigue insertando
+-- (su INSERT no la nombra) y el PRIMER `Reclamar` muere con `no such column: claim_token` — una cola que
+-- acepta mensajes que ningún cajero podrá vaciar jamás, hasta que el tope empiece a descartarlos.
+-- Por eso la columna la añade GO, de forma guardada: `ensureColaClaimToken` (db.go) lee
+-- `PRAGMA table_info(cola_entrantes)` y emite el `ALTER TABLE ... ADD COLUMN claim_token TEXT` solo si
+-- falta, igual que `ensureDeviceMetadataColumns` hace con `msg_enc_device`. Un `ALTER` pelado AQUÍ no
+-- vale: este runner no lleva tabla de versión y re-ejecuta el fichero entero en cada arranque, y modernc
+-- SQLite (sin CGO) no soporta `ADD COLUMN IF NOT EXISTS`.
+--
+-- ⚠️ REGLA, no anécdota: NINGUNA columna nueva se añade editando este `CREATE TABLE`. El permiso que
+-- justificaba hacerlo («todavía no hay bases desplegadas») no se puede volver a comprobar una vez el
+-- fichero está en `dev`. Columna nueva ⇒ `ensure…` en Go, al lado de la de arriba.
+--
 -- PORTABLE SQLite/Postgres (ADR-0002 §Migración): solo TEXT/INTEGER/BLOB (BYTEA->BLOB), sin PRAGMAs, sin
 -- AUTOINCREMENT, índices y unicidad con sintaxis común. IDEMPOTENTE de arriba abajo (CREATE TABLE/INDEX
 -- IF NOT EXISTS): el runner applyMigrations (db.go) NO lleva tabla de versión y RE-EJECUTA el fichero
 -- entero en CADA arranque, así que ninguna sentencia aquí puede fallar la segunda vez.
--- ⚠️ La portabilidad es la del DDL, NO la del código que lo usa: el ENCOLADO (Store.Enqueue) resuelve la
--- idempotencia con `INSERT OR IGNORE`, que es sintaxis ESPECÍFICA DE SQLite. Un puerto a Postgres tendría
--- que reescribir esa sentencia como `INSERT ... ON CONFLICT (session_id, wa_message_id) DO NOTHING`.
+-- ⚠️ La portabilidad es la del DDL, NO la del código que lo usa. Desde T2.11 la SENTENCIA del encolado
+-- (Store.Enqueue) ya es un `INSERT` estándar —portable tal cual—, pero la idempotencia se resolvió
+-- moviendo el problema al MANEJO DEL ERROR: se inserta siempre y se TRAGA el choque contra
+-- ux_cola_session_wamid inspeccionando el código de error EXTENDIDO **2067** (`SQLITE_CONSTRAINT_UNIQUE`)
+-- que devuelve el driver `modernc.org/sqlite`; cualquier otra violación de restricción sí sube como error
+-- (con `INSERT OR IGNORE` se tragaban TODAS, en silencio). Ese 2067 es lo específico de driver que un
+-- puerto a Postgres tendría que reescribir —allí el equivalente es el SQLSTATE `23505` de `*pq.Error`/
+-- `*pgconn.PgError`—, no la sentencia. El cambio, por tanto, no elimina la deuda de portabilidad: la
+-- mueve del SQL al Go, donde al menos el compilador y los tests la ven.
 --
 -- EXCEPCIÓN DOCUMENTADA a la convención de nombres: la convención dura del repo es sufijo `_unix` para
 -- los timestamps epoch-segundos (ver created_unix/updated_unix en 0005_outbox.sql), pero `tomado_en` y
@@ -66,6 +110,7 @@ CREATE TABLE IF NOT EXISTS cola_entrantes (
     estado        TEXT    NOT NULL DEFAULT 'nuevo',  -- 'nuevo' | 'tomado' | 'clasificado' | 'despachado'
     tomado_en     INTEGER,                           -- epoch-segundos del claim (lease): el barrido devuelve a 'nuevo' si venció
     despachado_en INTEGER                            -- epoch-segundos del despacho: ÚNICA base de la poda por TTL (ver arriba)
+    -- claim_token TEXT — NO va aquí: la añade ensureColaClaimToken (db.go) con un ALTER guardado. Ver arriba.
 );
 
 -- Idempotencia local del encolado: el MISMO mensaje de WhatsApp, en la MISMA sesión, una sola fila.

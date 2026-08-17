@@ -166,6 +166,7 @@ func (m *Manager) stopLive(id string) (jid string, live bool) {
 		delete(m.live, id)
 	}
 	m.mu.Unlock()
+	m.forgetColaCrypter(id)
 	if !ok {
 		m.health.Remove(id)
 		return "", false
@@ -176,6 +177,42 @@ func (m *Manager) stopLive(id string) (jid string, live bool) {
 	// por completo, evitando carreras donde el teardown recien-conectado intente un SetSocketState.
 	m.health.Remove(id)
 	return s.meta.JID, true
+}
+
+// forgetColaCrypter saca a la sesión del CACHÉ DE SOBRES de la cola de entrantes (Plan 051 T2.9). Va en
+// stopLive, ANTES del early-return de "no estaba viva", porque un Unlink de una sesión ya parada tiene que
+// olvidarla igual: el caché no sabe nada de si el listener corría.
+//
+// Type assertion y NO un método del puerto: m.cola es app.ColaEntrantes (internal/app/cola.go), que es el
+// contrato del ENCOLADO —lo que el listener necesita— y no tiene por qué crecer con un detalle de gestión
+// de caché del adaptador. Es el mismo patrón que clearDEK usa unas líneas más abajo con
+// `custody.(interface{ Clear() error })`. Un m.cola nil (opción no inyectada, o cola que no se pudo abrir)
+// hace fallar la aserción y esto es no-op, igual que el resto del cableado opcional de la ola.
+//
+// Sin valor de retorno a propósito: olvidar una entrada de caché no puede fallar, y un teardown no debería
+// poder quedarse a medias por esto.
+//
+// 🔴 EL PELIGRO ES EL TYPED NIL, y las dos guardas que lo rodean NO hacen lo mismo — conviene no
+// confundirlas, porque la que parece suficiente no lo es:
+//
+//   - `m.cola == nil` (aquí abajo) cubre el nil LITERAL, que es lo que BuildCola devuelve HOY cuando la
+//     cola no se puede abrir. Hoy la aserción de tipo ya lo cubría por su cuenta (sobre una interfaz nil
+//     nunca casa), así que este `if` no arregla un bug vivo: hace EXPLÍCITO que la cola es opcional, en vez
+//     de dejar que lo sostenga un detalle de la semántica de las aserciones.
+//   - Lo que de verdad puede reventar es el TYPED NIL: el día que BuildCola devuelva
+//     `(*colaentrantes.Store)(nil)` —lo que sale de `var s *Store; … ; return s`, la forma natural de
+//     escribir esas funciones—, la interfaz deja de ser nil, `m.cola == nil` NO muerde, la aserción CASA y
+//     se invoca Forget sobre un receptor nil. Eso NO se cierra aquí: lo cierra el `if s == nil` del propio
+//     Forget (internal/adapters/colaentrantes), y por eso está puesto también allí.
+//
+// Van las dos porque un teardown que entra en pánico se lleva por delante el Unlink entero.
+func (m *Manager) forgetColaCrypter(id string) {
+	if m.cola == nil {
+		return
+	}
+	if f, ok := m.cola.(interface{ Forget(string) }); ok {
+		f.Forget(id)
+	}
 }
 
 // clearDEK limpia la DEK custodiada del device id (best-effort). Clear abstrae el backend de custodia (el

@@ -82,6 +82,24 @@ type ListenGateway struct {
 	// SIN cola, con el camino de siempre (solo sink.Deliver). Lo cablea el factory del sessionmgr (SetCola).
 	cola      app.ColaEntrantes
 	sessionID string
+
+	// clasificadorActivo es el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
+	// T2.12) que serve() pasa al Listener. Gobierna si una fila de la cola nace reclamable por el cajero o
+	// ya resuelta con la marca `apagado`. Es COMPARTIDO por todas las sesiones (un solo clasificador en el
+	// Edge), a diferencia de la cola, que se etiqueta por sesión. nil ⇒ el Listener aplica su default
+	// SEGURO (activo: clasifica de más antes que callar). Lo cablea el factory del sessionmgr.
+	clasificadorActivo func() bool
+}
+
+// SetClasificadorActivo liga el gateway (y su Listener) al interruptor del clasificador de intenciones
+// (Plan 051 Ola 2, T2.12). Se llama ANTES de Listen (al construir el gateway), como el resto de setters.
+// nil se ignora y manda el default del Listener (ACTIVO): un cableado a medias debe clasificar de más, no
+// dejar de clasificar en silencio. No es secreto ni PII.
+func (g *ListenGateway) SetClasificadorActivo(fn func() bool) {
+	if fn == nil {
+		return
+	}
+	g.clasificadorActivo = fn
 }
 
 // SetCola liga el gateway (y su Listener) a la cola durable de entrantes de ESTA sesión (Plan 051 Ola 1).
@@ -182,6 +200,11 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device, sink ap
 	var listenerOpts []ListenerOption
 	if g.cola != nil && g.sessionID != "" {
 		listenerOpts = append(listenerOpts, WithCola(g.cola), WithSessionID(g.sessionID))
+		// El interruptor del clasificador viaja DENTRO de este bloque a propósito (T2.12): lo único que
+		// gobierna es el ESTADO EN QUE NACE una fila de la cola, así que sin cola no tiene nada que decidir
+		// y pasarlo solo añadiría una opción inerte. Así se mantiene la promesa de arriba: sin cola
+		// cableada, NewListener sigue recibiendo cero opciones. nil se ignora en la opción (default ACTIVO).
+		listenerOpts = append(listenerOpts, WithClasificadorActivo(g.clasificadorActivo))
 	}
 	listener := NewListener(sink, g.log, listenerOpts...)
 	// Salud por sesión (Plan 031 T6): el Listener reporta connected/connecting/dead + edad del último

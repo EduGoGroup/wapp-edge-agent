@@ -121,6 +121,14 @@ type Manager struct {
 	// sesión. Lo inyecta WithColaEntrantes.
 	cola app.ColaEntrantes
 
+	// clasificadorActivo es el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
+	// T2.12) que el factory pasa al gateway de cada sesión: con él, un entrante que llega con la feature
+	// apagada nace en la cola YA resuelto (marca `apagado`) en vez de ocupar una plaza del semáforo del
+	// cajero para acabar descartado. Es COMPARTIDO (un solo clasificador por Edge), como inboundDecorator y
+	// a diferencia de la cola, que se etiqueta por sesión. nil (opción no inyectada) ⇒ NO se toca el gateway
+	// y manda el default SEGURO del Listener (activo). Lo inyecta WithClasificadorActivo.
+	clasificadorActivo func() bool
+
 	// inboundMargin es el margen de la ventana temporal de ingesta (ADR-0037) que el factory pasa al
 	// gateway de cada sesión. 0 (opción no inyectada) ⇒ NO se toca el gateway y manda el default del propio
 	// Listener; así los tests del Manager que no cablean la ventana siguen intactos.
@@ -213,6 +221,21 @@ func WithColaEntrantes(c app.ColaEntrantes) Option {
 	return func(m *Manager) {
 		if c != nil {
 			m.cola = c
+		}
+	}
+}
+
+// WithClasificadorActivo inyecta el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
+// T2.12): cada listener lo consulta al encolar para que un entrante que llega con la feature apagada nazca
+// ya resuelto (`apagado`) en vez de gastar una plaza del semáforo del cajero y acabar descartado igual. En
+// producción lo cablea el daemon desde el stack de intent (wiring.IntentStack); los tests que no lo pasan
+// quedan con el default del Listener. Se pide un `func() bool` y no un bool para que la feature pueda
+// apagarse en caliente sin que el Manager quede con la foto del arranque. nil se IGNORA (default ACTIVO:
+// clasificar de más es barato y visible; dejar de clasificar en silencio, no).
+func WithClasificadorActivo(fn func() bool) Option {
+	return func(m *Manager) {
+		if fn != nil {
+			m.clasificadorActivo = fn
 		}
 	}
 }

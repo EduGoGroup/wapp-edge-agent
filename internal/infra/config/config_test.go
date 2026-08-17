@@ -527,6 +527,87 @@ func TestLoad_ColaLimits(t *testing.T) {
 	}
 }
 
+// TestLoad_ColaClaimMaxFilas cubre el TOPE DE FILAS POR CLAIM del worker-cajero (Plan 051 Ola 2, T2.1):
+// default 20, override por WAPP_AGENT_COLA_CLAIM_MAX_FILAS, y el guardarraíl de que un valor no positivo
+// cae al default.
+//
+// Por qué existe este test y no bastaba con el comentario del código: `ColaClaimMaxFilas` aún NO se cablea
+// (lo consumirá el worker de otra tanda), así que el gate de config es HOY el único sitio donde este
+// parámetro se puede romper sin que nada más se entere. Un 0 colándose hasta el claim significa un cajero
+// que reclama cero filas: la cola deja de drenar EN SILENCIO, sin error y sin log.
+func TestLoad_ColaClaimMaxFilas(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaClaimMaxFilas != DefaultColaClaimMaxFilas {
+		t.Fatalf("default del claim: got %d, want %d", cfg.ColaClaimMaxFilas, DefaultColaClaimMaxFilas)
+	}
+
+	t.Setenv(EnvPrefix+"COLA_CLAIM_MAX_FILAS", "7")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaClaimMaxFilas != 7 {
+		t.Fatalf("override del claim: got %d, want 7", cfg.ColaClaimMaxFilas)
+	}
+
+	// Guardarraíl: 0 (y cualquier valor <=0) NO significa «sin tope» ni «cero filas»; cae al default.
+	for _, crudo := range []string{"0", "-5"} {
+		t.Run("no_positivo="+crudo, func(t *testing.T) {
+			t.Setenv(EnvPrefix+"COLA_CLAIM_MAX_FILAS", crudo)
+			cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+			if err != nil {
+				t.Fatalf("Load(%s): %v", crudo, err)
+			}
+			if cfg.ColaClaimMaxFilas != DefaultColaClaimMaxFilas {
+				t.Fatalf("guardarraíl del claim con %s: got %d, want %d",
+					crudo, cfg.ColaClaimMaxFilas, DefaultColaClaimMaxFilas)
+			}
+		})
+	}
+}
+
+// TestLoad_ColaLeaseSeconds cubre el LEASE del claim (Plan 051 Ola 2, T2.7): default 60 s, override por
+// WAPP_AGENT_COLA_LEASE_SECONDS, y el guardarraíl de que un valor no positivo cae al default.
+//
+// El caso que de verdad importa aquí es el <=0: un lease de 0 s vencería INSTANTÁNEAMENTE y el barrido
+// devolvería a `nuevo` lotes que un cajero vivo aún está clasificando — se pagaría una segunda inferencia
+// por el mismo texto, en bucle. El guardarraíl es lo único que separa esa configuración del disco.
+func TestLoad_ColaLeaseSeconds(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaLeaseSeconds != DefaultColaLeaseSeconds {
+		t.Fatalf("default del lease: got %d, want %d", cfg.ColaLeaseSeconds, DefaultColaLeaseSeconds)
+	}
+
+	t.Setenv(EnvPrefix+"COLA_LEASE_SECONDS", "15")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.ColaLeaseSeconds != 15 {
+		t.Fatalf("override del lease: got %d, want 15", cfg.ColaLeaseSeconds)
+	}
+
+	for _, crudo := range []string{"0", "-1"} {
+		t.Run("no_positivo="+crudo, func(t *testing.T) {
+			t.Setenv(EnvPrefix+"COLA_LEASE_SECONDS", crudo)
+			cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+			if err != nil {
+				t.Fatalf("Load(%s): %v", crudo, err)
+			}
+			if cfg.ColaLeaseSeconds != DefaultColaLeaseSeconds {
+				t.Fatalf("guardarraíl del lease con %s: got %d, want %d",
+					crudo, cfg.ColaLeaseSeconds, DefaultColaLeaseSeconds)
+			}
+		})
+	}
+}
+
 // TestLoad_RuntimeEndpointStateFallback verifica que `serve` (config.Load) RELEE el endpoint de runtime
 // persistido por el enroll en <data_dir>/cloudlink-endpoint cuando no viene por YAML/env (Plan 026 T3,
 // cierra follow-up 023): así el stream se levanta sin edición manual del config.yaml.
@@ -573,5 +654,188 @@ func TestLoad_ExplicitEndpointWinsOverState(t *testing.T) {
 	}
 	if cfg.CloudLink.Endpoint != "desde-env:7001" {
 		t.Fatalf("endpoint env debe ganar al estado: got %q", cfg.CloudLink.Endpoint)
+	}
+}
+
+// TestLoad_Worker_DefaultsYPrefijoPropio cubre el bloque del WORKER-CAJERO (Plan 051 Ola 2).
+//
+// Lo que de verdad vigila este test es EL PREFIJO: las variables del worker son WAPP_WORKER_*, NO
+// WAPP_AGENT_*, porque el cajero es otro proceso con su propio bloque de entorno (design §4, T2.3).
+// Un refactor que las meta bajo el loader general del Edge las renombraría en silencio: el operador
+// exportaría WAPP_WORKER_MAX_CONCURRENT, nadie lo leería, y el semáforo se quedaría en el default sin
+// que nada fallara. Por eso se comprueban las DOS direcciones (la buena aplica, la mala no).
+func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.Worker.MaxConcurrent != DefaultWorkerMaxConcurrent || DefaultWorkerMaxConcurrent != 1 {
+		t.Fatalf("el semáforo por defecto es 1 (cerrado por la medición de la O0): got %d", cfg.Worker.MaxConcurrent)
+	}
+	if cfg.Worker.PollMS != DefaultWorkerPollMS {
+		t.Fatalf("poll por defecto: got %d, want %d", cfg.Worker.PollMS, DefaultWorkerPollMS)
+	}
+	if cfg.Worker.MaxRunes != DefaultWorkerMaxRunes {
+		t.Fatalf("techo de runas por defecto: got %d, want %d", cfg.Worker.MaxRunes, DefaultWorkerMaxRunes)
+	}
+	if cfg.Worker.NumThread != DefaultWorkerNumThread || cfg.Worker.NumPredict != DefaultWorkerNumPredict ||
+		cfg.Worker.NumCtx != DefaultWorkerNumCtx {
+		t.Fatalf("opciones de modelo por defecto: %+v", cfg.Worker)
+	}
+
+	if cfg.Worker.MaxIntentos != DefaultWorkerMaxIntentos || DefaultWorkerMaxIntentos != 3 {
+		t.Fatalf("intentos por defecto: got %d, want 3 (dos reintentos gratis y a la tercera se abandona)",
+			cfg.Worker.MaxIntentos)
+	}
+	if cfg.Worker.InferenceTimeoutMS != DefaultWorkerInferenceTimeoutMS {
+		t.Fatalf("plazo de inferencia por defecto: got %d, want %d",
+			cfg.Worker.InferenceTimeoutMS, DefaultWorkerInferenceTimeoutMS)
+	}
+	if cfg.Worker.StatsEveryMS != DefaultWorkerStatsEveryMS {
+		t.Fatalf("latido de contadores por defecto: got %d, want %d",
+			cfg.Worker.StatsEveryMS, DefaultWorkerStatsEveryMS)
+	}
+
+	// El prefijo BUENO aplica.
+	t.Setenv(WorkerEnvPrefix+"MAX_CONCURRENT", "2")
+	t.Setenv(WorkerEnvPrefix+"POLL_MS", "250")
+	t.Setenv(WorkerEnvPrefix+"MAX_RUNES", "1500")
+	t.Setenv(WorkerEnvPrefix+"NUM_THREAD", "3")
+	t.Setenv(WorkerEnvPrefix+"NUM_PREDICT", "64")
+	t.Setenv(WorkerEnvPrefix+"NUM_CTX", "2048")
+	t.Setenv(WorkerEnvPrefix+"MAX_INTENTOS", "5")
+	t.Setenv(WorkerEnvPrefix+"INFERENCE_TIMEOUT_MS", "9000")
+	t.Setenv(WorkerEnvPrefix+"STATS_EVERY_MS", "60000")
+	cfg, err = Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	esperado := WorkerConfig{
+		MaxConcurrent: 2, PollMS: 250, MaxRunes: 1500, NumThread: 3, NumPredict: 64, NumCtx: 2048,
+		MaxIntentos: 5, InferenceTimeoutMS: 9000, StatsEveryMS: 60000,
+	}
+	if cfg.Worker != esperado {
+		t.Fatalf("override con el prefijo propio: got %+v, want %+v", cfg.Worker, esperado)
+	}
+}
+
+// TestLoad_InferenceTimeout_NoEsElDelDecorador es el arreglo de la calibración del worker, aseverado.
+//
+// El plazo de UNA inferencia del cajero (WAPP_WORKER_INFERENCE_TIMEOUT_MS, 15 s) y el del camino
+// INLINE (WAPP_AGENT_INTENT_TIMEOUT_MS, 3 s) son dos presupuestos de dos caminos distintos, y el
+// segundo NO puede gobernar al primero: la O0 midió p95 = 3.736 ms, así que un plazo de 3 s aborta
+// cerca de la mitad de las inferencias del worker, abre el breaker y deja la cola dando vueltas sin
+// progresar. Este test vigila las TRES mitades del contrato: el default, que son números distintos, y
+// que mover el del decorador no mueve el del worker.
+func TestLoad_InferenceTimeout_NoEsElDelDecorador(t *testing.T) {
+	if DefaultWorkerInferenceTimeoutMS == DefaultIntentTimeoutMS {
+		t.Fatal("el plazo del worker y el del decorador inline NO pueden ser el mismo número")
+	}
+	if DefaultWorkerInferenceTimeoutMS != 15000 {
+		t.Fatalf("el default del worker es 15000 ms (≈4× la p95 de la O0): got %d", DefaultWorkerInferenceTimeoutMS)
+	}
+
+	// Mover el del decorador no debe arrastrar al del worker.
+	t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "1500")
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.Intent.TimeoutMS != 1500 {
+		t.Fatalf("el plazo del decorador debe seguir siendo configurable: got %d", cfg.Intent.TimeoutMS)
+	}
+	if cfg.Worker.InferenceTimeoutMS != DefaultWorkerInferenceTimeoutMS {
+		t.Fatalf("WAPP_AGENT_INTENT_TIMEOUT_MS NO gobierna al worker: got %d, want %d",
+			cfg.Worker.InferenceTimeoutMS, DefaultWorkerInferenceTimeoutMS)
+	}
+}
+
+// TestLoad_StatsEveryMS_ElCeroDesactiva: el latido de contadores es el ÚNICO número del worker cuyo
+// cero es un valor legítimo («cállate»), no un dedazo. Sólo lo negativo cae al default.
+func TestLoad_StatsEveryMS_ElCeroDesactiva(t *testing.T) {
+	t.Run("cero desactiva", func(t *testing.T) {
+		t.Setenv(WorkerEnvPrefix+"STATS_EVERY_MS", "0")
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Worker.StatsEveryMS != 0 {
+			t.Fatalf("un 0 explícito DESACTIVA el latido, no cae al default: got %d", cfg.Worker.StatsEveryMS)
+		}
+	})
+	t.Run("negativo cae al default", func(t *testing.T) {
+		t.Setenv(WorkerEnvPrefix+"STATS_EVERY_MS", "-1")
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Worker.StatsEveryMS != DefaultWorkerStatsEveryMS {
+			t.Fatalf("un negativo no significa nada y cae al default: got %d", cfg.Worker.StatsEveryMS)
+		}
+	})
+}
+
+// TestLoad_Worker_PrefijoDelAgenteNoAplica es la otra mitad del contrato del prefijo: WAPP_AGENT_ NO
+// gobierna al worker. Si algún día alguien "unifica" los prefijos, este test lo caza.
+func TestLoad_Worker_PrefijoDelAgenteNoAplica(t *testing.T) {
+	t.Setenv(EnvPrefix+"MAX_CONCURRENT", "9")
+	t.Setenv(EnvPrefix+"POLL_MS", "9999")
+	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.Worker.MaxConcurrent != DefaultWorkerMaxConcurrent || cfg.Worker.PollMS != DefaultWorkerPollMS {
+		t.Fatalf("WAPP_AGENT_* no debe gobernar al worker: got %+v", cfg.Worker)
+	}
+}
+
+// TestLoad_Worker_GuardarrailNoPositivo: cada cero tiene su forma propia de romper el worker (semáforo
+// sin plazas ⇒ bucle bloqueado; poll 0 ⇒ espera activa que quema un core; runas 0 ⇒ la DoS de T2.5 de
+// vuelta), así que ninguno se traga: todos caen al default.
+func TestLoad_Worker_GuardarrailNoPositivo(t *testing.T) {
+	claves := []struct {
+		env  string
+		leer func(Config) int
+		def  int
+	}{
+		{"MAX_CONCURRENT", func(c Config) int { return c.Worker.MaxConcurrent }, DefaultWorkerMaxConcurrent},
+		{"POLL_MS", func(c Config) int { return c.Worker.PollMS }, DefaultWorkerPollMS},
+		{"MAX_RUNES", func(c Config) int { return c.Worker.MaxRunes }, DefaultWorkerMaxRunes},
+		{"NUM_THREAD", func(c Config) int { return c.Worker.NumThread }, DefaultWorkerNumThread},
+		{"NUM_PREDICT", func(c Config) int { return c.Worker.NumPredict }, DefaultWorkerNumPredict},
+		{"NUM_CTX", func(c Config) int { return c.Worker.NumCtx }, DefaultWorkerNumCtx},
+		{"INFERENCE_TIMEOUT_MS", func(c Config) int { return c.Worker.InferenceTimeoutMS }, DefaultWorkerInferenceTimeoutMS},
+		// STATS_EVERY_MS NO va en esta lista: su cero es válido (desactiva) y tiene su propio test.
+	}
+	for _, k := range claves {
+		for _, crudo := range []string{"0", "-1"} {
+			t.Run(k.env+"="+crudo, func(t *testing.T) {
+				t.Setenv(WorkerEnvPrefix+k.env, crudo)
+				cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+				if err != nil {
+					t.Fatalf("Load(%s=%s): %v", k.env, crudo, err)
+				}
+				if got := k.leer(cfg); got != k.def {
+					t.Fatalf("guardarraíl de %s con %s: got %d, want %d", k.env, crudo, got, k.def)
+				}
+			})
+		}
+	}
+}
+
+// TestLoad_Worker_DesdeYAML: el bloque `worker:` va en el MISMO config.yaml (el fichero es compartido
+// entre `agent serve` y `agent cajero`), aunque las variables de entorno tengan prefijos distintos.
+func TestLoad_Worker_DesdeYAML(t *testing.T) {
+	yamlPath := writeTempYAML(t, "worker:\n  max_concurrent: 2\n  poll_ms: 750\n  max_runes: 2500\n")
+	cfg, err := Load(yamlPath)
+	if err != nil {
+		t.Fatalf("Load devolvió error inesperado: %v", err)
+	}
+	if cfg.Worker.MaxConcurrent != 2 || cfg.Worker.PollMS != 750 || cfg.Worker.MaxRunes != 2500 {
+		t.Fatalf("el bloque worker del YAML no se aplicó: %+v", cfg.Worker)
+	}
+	// Lo que el YAML no nombra conserva su default (no se pone a cero por unmarshal parcial).
+	if cfg.Worker.NumThread != DefaultWorkerNumThread || cfg.Worker.NumCtx != DefaultWorkerNumCtx {
+		t.Fatalf("las claves ausentes del YAML deben conservar su default: %+v", cfg.Worker)
 	}
 }

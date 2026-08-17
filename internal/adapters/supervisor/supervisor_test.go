@@ -31,10 +31,21 @@ func TestMain(m *testing.M) {
 //   - "" (normal): escucha y responde 200 a /v1/health; SIGTERM ⇒ shutdown limpio.
 //   - "noready":   escucha pero /v1/health responde 503 ⇒ el supervisor nunca lo ve ready.
 //   - "crash":     sale de inmediato (no llega a escuchar) ⇒ readiness falla por muerte temprana.
+//   - "diesoon":   NO escucha (hijo sin plano HTTP, como el cajero del Plan 051): vive
+//     SUPERVISOR_FAKE_LIFETIME_MS (default 300 ms) y se muere SOLO ⇒ ejercita el relanzado automático.
 func fakeAgentMain() {
 	switch os.Getenv("SUPERVISOR_FAKE_MODE") {
 	case "crash":
 		os.Exit(1)
+	case "diesoon":
+		vida := 300 * time.Millisecond
+		if raw := os.Getenv("SUPERVISOR_FAKE_LIFETIME_MS"); raw != "" {
+			if ms, err := strconv.Atoi(raw); err == nil {
+				vida = time.Duration(ms) * time.Millisecond
+			}
+		}
+		time.Sleep(vida)
+		os.Exit(3)
 	}
 
 	sock := os.Getenv("WAPP_AGENT_CONTROL_SOCKET_PATH")
@@ -78,7 +89,28 @@ func fakeAgentMain() {
 func fakeCfg(t *testing.T, mode string) Config {
 	t.Helper()
 	dir := t.TempDir()
-	sock := filepath.Join(dir, "edge.sock")
+	// 🔴 EL SOCKET NO PUEDE VIVIR EN t.TempDir(), Y ESTO NO ES MANÍA: `sun_path` de un socket Unix son
+	// 104 bytes en macOS (108 en Linux), y `t.TempDir()` mete el NOMBRE DEL TEST en la ruta. En macOS la
+	// base ya es larga (`/var/folders/xx/…/T/`), así que un test con nombre largo se pasa del límite,
+	// `net.Listen("unix", …)` falla en el hijo y el fake sale con `os.Exit(2)` ANTES de escuchar.
+	//
+	// Lo caro no es que falle: es que el test SEGUÍA EN VERDE. Los tests de readiness sólo comprueban que
+	// `Start` devuelva error, y «el hijo murió a los 10 ms» es un error tan válido como el que buscaban —
+	// así que pasaban sin ejercer NADA de lo que dicen fijar. Y como en Linux la ruta sí cabe, el mismo
+	// test sí corría de verdad en `make ci-docker`: el verde de `go test` en macOS y el del CI NO
+	// significaban lo mismo. Se descubrió porque el CI cazó un test que en local pasaba siempre.
+	//
+	// El directorio del socket va aparte y con nombre CORTO; el resto (PID file) se queda en t.TempDir(),
+	// que no tiene este límite y sí da limpieza automática.
+	sockDir, err := os.MkdirTemp("", "wsup")
+	if err != nil {
+		t.Fatalf("crear el directorio del socket: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(sockDir) })
+	sock := filepath.Join(sockDir, "e.sock")
+	if len(sock) > 100 {
+		t.Fatalf("la ruta del socket mide %d bytes y sun_path son 104 en macOS: %s", len(sock), sock)
+	}
 	env := append(os.Environ(),
 		"SUPERVISOR_FAKE_AGENT=1",
 		"WAPP_AGENT_CONTROL_SOCKET_PATH="+sock,
