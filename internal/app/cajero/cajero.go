@@ -1194,6 +1194,20 @@ func (c *Cajero) sobre(res classifier.Classification) (string, error) {
 // un timeout de 15 s) y en silencio, pero un worker que se niega a arrancar porque no pudo leer /proc es
 // un worker que no clasifica NADA. Se avisa y se sigue, y eso vale también cuando sólo se pudo leer una
 // de las dos afinidades.
+//
+// 🔴 LÍMITE DECLARADO (T4.6, decisión del 2026-08-17): esto corre UNA SOLA VEZ, desde Run, y el veredicto
+// que guarda se republica en el parte del worker cada 30 s SIN VOLVER A MIRAR. Un `taskset -pc` en
+// caliente NO se refleja: se comprobó en campo (PC-12) cambiando la afinidad a `0-5` con el cajero vivo,
+// y tanto el parte como la consola siguieron diciendo `disjunta`. La regla de rancidez NO puede cazarlo,
+// porque el parte sí se refresca — el valor es OBSOLETO, no rancio, que es la única familia de avería
+// que las defensas de la Ola 4 no cubren.
+//
+// Se eligió declararlo en vez de arreglarlo, y la declaración vive donde alguien la lee: el tooltip de
+// los tres chips de CPU de la consola (`dashboard.html`), custodiado por
+// `TestDashboardAvisaQueElRepartoDeCPUEsDelArranque`. Si algún día se arregla, la forma es llamar a esto
+// desde la publicación del parte en vez de desde Run —es una lectura de /proc, no cuesta nada— y
+// entonces hay que RETIRAR ese aviso de la consola: un tooltip que avisa de un límite que ya no existe
+// es la misma avería al revés.
 func (c *Cajero) registrarAfinidad(ctx context.Context) {
 	c.registrarReparto(leerAfinidades(ctx, c.ollamaURL))
 }
