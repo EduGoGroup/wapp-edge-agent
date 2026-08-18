@@ -248,6 +248,33 @@ type WorkerConfig struct {
 	// DefaultWorkerStatsEveryMS (300000 = 5 min). 0 lo DESACTIVA (guardarraíl distinto: sólo lo
 	// negativo cae al default).
 	StatsEveryMS int `yaml:"stats_every_ms"`
+	// DataDirs es la LISTA de data_dir's que el cajero atiende en ROUND-ROBIN (Plan 051 Ola 4 · T4.1).
+	// Cada entrada es UNA INSTALACIÓN del Edge en la misma máquina, y por tanto UNA cola
+	// (<data_dir>/cola_entrantes.db): la unidad de trabajo del round-robin es el FICHERO de cola, no la
+	// sesión (ver el doc comment de sessionmgr.Layout.ColaDB).
+	//
+	// 🔴 NO ES `Config.DataDir` EN PLURAL, Y NO DEBE SERLO. `Config.DataDir` es el data_dir del DAEMON
+	// —de él cuelgan el layout multi-sesión, la BD única, el socket de control y media docena de
+	// consumidores más—, y convertirlo en lista rompería a todos ellos para servir a un solo proceso.
+	// Esta lista es EXCLUSIVA del worker-cajero, que sí es el único que atiende N instalaciones a la vez.
+	//
+	// Formato en el entorno: WAPP_WORKER_DATA_DIRS es una lista SEPARADA POR COMAS
+	// ("/srv/wapp/a,/srv/wapp/b"). En YAML es una lista de verdad (`worker: { data_dirs: [...] }`). Al
+	// cargar se TRIMEA cada entrada, se descartan las vacías, se ABSOLUTIZA cada una (después de anclar
+	// Config.DataDir, para que las relativas queden ancladas igual) y se RECHAZAN los duplicados con
+	// error: dos entradas que resuelven al mismo fichero SQLite serían un round-robin que se reclama a sí
+	// mismo, contando el doble un trabajo que es uno.
+	//
+	// Vacía (lo normal: una sola instalación) ⇒ el default es exactamente `[]string{Config.DataDir}`, o
+	// sea el comportamiento previo a T4.1 sin ninguna diferencia observable.
+	//
+	// ⚠️ LÍMITE DEL FORMATO POR COMAS: una ruta que CONTENGA una coma no es representable en la variable
+	// de entorno, y no hay forma de detectarlo desde aquí —cuando la lista llega, la información de dónde
+	// estaba cada frontera ya se perdió—. `/srv/wapp/a,b` se lee como dos entradas, `b` se absolutiza
+	// contra el CWD del supervisor y el cajero abriría una cola en un directorio que nadie escribió. Si
+	// alguna vez hace falta soportarlo, la salida es el YAML (`worker: { data_dirs: [...] }`), que sí es
+	// una lista de verdad y no parte nada. Un data_dir con comas es raro pero legal en POSIX.
+	DataDirs []string `yaml:"data_dirs"`
 }
 
 // DefaultPlatformAPIBaseURL es la URL base por defecto de la API PÚBLICA HTTP de la plataforma cloud
@@ -634,6 +661,14 @@ func Load(path string) (Config, error) {
 	cfg.Worker.MaxIntentos = workerLoader.GetInt("MAX_INTENTOS", cfg.Worker.MaxIntentos)
 	cfg.Worker.InferenceTimeoutMS = workerLoader.GetInt("INFERENCE_TIMEOUT_MS", cfg.Worker.InferenceTimeoutMS)
 	cfg.Worker.StatsEveryMS = workerLoader.GetInt("STATS_EVERY_MS", cfg.Worker.StatsEveryMS)
+	// WAPP_WORKER_DATA_DIRS es LISTA POR COMAS y por eso no hay `GetStringSlice` que valga: el Loader
+	// compartido no tiene ese método (sólo GetString/GetInt/GetBool/GetDuration) y aquí no se le añade uno
+	// —el formato de lista es de ESTA variable, no del loader—. El overlay es TODO-O-NADA: si la variable
+	// está puesta y no está vacía, SUSTITUYE a la lista del YAML (no se fusionan; fusionar dos fuentes de
+	// una lista deja al operador sin forma de QUITAR una entrada del YAML desde el entorno).
+	if crudo := workerLoader.GetString("DATA_DIRS", ""); strings.TrimSpace(crudo) != "" {
+		cfg.Worker.DataDirs = strings.Split(crudo, ",")
+	}
 
 	// Puerto de runtime CloudLink por defecto (Plan 026 T3): si nadie lo fijó (YAML/env), "8101"
 	// (topología de prod, design §1). Con él el enroll deriva y persiste el Endpoint de runtime.
@@ -773,6 +808,17 @@ func Load(path string) (Config, error) {
 	}
 	cfg.DataDir = absDataDir
 
+	// Lista de colas del WORKER-CAJERO (Plan 051 Ola 4 · T4.1). VA DESPUÉS DEL filepath.Abs DE ARRIBA, Y
+	// EL ORDEN ES LOAD-BEARING: si se normalizara antes, una entrada relativa de la lista se anclaría
+	// contra el CWD mientras Config.DataDir ya está anclado a su ruta sagrada, y el cajero abriría la cola
+	// de un directorio distinto del que el operador cree haber escrito — sin error y sin síntoma, sólo una
+	// cola que nunca tiene trabajo.
+	dataDirs, err := normalizarDataDirs(cfg.Worker.DataDirs, cfg.DataDir)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.Worker.DataDirs = dataDirs
+
 	// Endpoint de runtime PERSISTIDO por el enroll (Plan 026 T3, cierra follow-up 023): si nadie fijó el
 	// Endpoint por YAML/env (lo normal en el kit: viene comentado), se lee del archivo de estado
 	// <data_dir>/cloudlink-endpoint que el enroll escribió al derivarlo del enrollment_endpoint. Así
@@ -798,6 +844,56 @@ func Load(path string) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizarDataDirs convierte la lista CRUDA de WAPP_WORKER_DATA_DIRS / `worker.data_dirs` en la lista
+// definitiva de data_dir's que el cajero atiende en round-robin (Plan 051 Ola 4 · T4.1).
+//
+// Las cuatro reglas, y el porqué de cada una:
+//
+//   - TRIM por elemento y descarte de los vacíos. "a, b" y "a,b," son la misma lista: una lista por comas
+//     tecleada a mano en una unidad de systemd lleva espacios y comas colgando, y fallar por eso sería
+//     castigar al operador por un espacio. (Es el mismo criterio de trim+validación por elemento que ya
+//     usa cajero.parsearListaCPUs, aunque aquel rechace el elemento vacío: allí el vacío significa que la
+//     lectura de /proc salió mal, aquí sólo que alguien puso una coma de más.)
+//   - LISTA ENTERA VACÍA ⇒ el default, que es `[]string{base}`, o sea el data_dir único de siempre. Una
+//     lista vacía no puede significar «ninguna cola»: el cajero se quedaría vivo sin reclamar nada.
+//   - ABSOLUTIZACIÓN de cada entrada, por el mismo motivo por el que Config.DataDir se ancla: el proceso
+//     lo lanza un supervisor y su CWD no es el del operador que escribió la config.
+//   - DUPLICADOS ⇒ ERROR EXPLÍCITO, no deduplicación silenciosa. Dos entradas que resuelven al mismo
+//     directorio son el mismo fichero cola_entrantes.db dos veces: el round-robin se turnaría consigo
+//     mismo, el semáforo se repartiría entre dos punteros a la misma cola y el operador vería la mitad de
+//     su lista trabajando sin entender por qué. Tragárselo callando dejaría una config MENTIROSA viva; el
+//     error nombra las dos formas —lo que se tecleó y a dónde resuelve— porque el caso típico es una ruta
+//     relativa y una absoluta que apuntan al mismo sitio, y sin ver la resolución nadie ve el duplicado.
+func normalizarDataDirs(crudas []string, base string) ([]string, error) {
+	limpias := make([]string, 0, len(crudas))
+	for _, cruda := range crudas {
+		if entrada := strings.TrimSpace(cruda); entrada != "" {
+			limpias = append(limpias, entrada)
+		}
+	}
+	if len(limpias) == 0 {
+		return []string{base}, nil
+	}
+
+	dirs := make([]string, 0, len(limpias))
+	vistos := make(map[string]string, len(limpias)) // ruta resuelta → la entrada CRUDA que la produjo
+	for _, entrada := range limpias {
+		abs, err := filepath.Abs(entrada)
+		if err != nil {
+			return nil, fmt.Errorf("config: worker.data_dirs: no se pudo resolver %q a ruta absoluta: %w", entrada, err)
+		}
+		if antes, repetida := vistos[abs]; repetida {
+			return nil, fmt.Errorf(
+				"config: worker.data_dirs: %q y %q apuntan al mismo directorio (%s); dos colas sobre el mismo "+
+					"cola_entrantes.db harían que el round-robin del cajero se turnase consigo mismo",
+				antes, entrada, abs)
+		}
+		vistos[abs] = entrada
+		dirs = append(dirs, abs)
+	}
+	return dirs, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

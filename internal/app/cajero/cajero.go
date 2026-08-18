@@ -140,11 +140,54 @@ type Interruptor interface {
 	State() string
 }
 
+// ColaNombrada es UNA cola del cajero con la etiqueta con la que aparece en el log (Plan 051 Ola 4 ·
+// T4.1). El nombre es, en el cableado real, el DATA_DIR de esa instalación.
+//
+// EL NOMBRE NO ES COSMÉTICO. Desde T4.1 el cajero atiende N instalaciones de la misma máquina y todos
+// sus mensajes de log —el barrido que rescata filas, el claim que falla, el lote que se abandona— hablan
+// de UNA de ellas. Sin la etiqueta, un operador con cinco instalaciones lee «el barrido de leases falló»
+// y no tiene forma de saber cuál de los cinco ficheros SQLite está roto.
+//
+// 🔴 INV-051.1: el nombre viaja al log, así que es una RUTA DE DIRECTORIO y nunca nada derivado del
+// contenido de un mensaje ni de un chat_jid.
+type ColaNombrada struct {
+	// Nombre es la etiqueta de la cola en el log (el data_dir). Vacío ⇒ se usa el índice.
+	Nombre string
+	// Cola es el puerto del lado cajero de ESA instalación. Obligatorio.
+	Cola app.ColaCajero
+	// Parte es el buzón por el que ESTA instalación recibe el parte de salud del cajero (Plan 051 Ola 4 ·
+	// T4.5). nil ⇒ esta cola no recibe parte, y el daemon de esa instalación publicará `intent_circuit`
+	// vacío. NO es obligatorio a propósito: el parte es TELEMETRÍA y su ausencia no puede impedir que se
+	// clasifique (ver publicarParte).
+	//
+	// VIAJA PEGADO A LA COLA, y no en una lista paralela de Deps, porque el escritor y la cola son LA
+	// MISMA BD (<data_dir>/cola_entrantes.db, tabla parte_worker): dos listas indexadas por posición se
+	// desalinean el día que alguien reordene una, y el síntoma sería un parte escrito en el fichero de la
+	// instalación vecina — donde su daemon lo leería como propio.
+	Parte app.ParteWorkerEscritor
+}
+
 // Deps son las dependencias del cajero. Todo son INTERFACES o funciones: el paquete no conoce SQLite,
 // ni HTTP, ni el layout de ficheros — el cableado real vive en cmd/agent.
 type Deps struct {
-	// Cola es el puerto del lado cajero (Reclamar/MarcarClasificado/BarrerLeasesVencidos). Obligatoria.
+	// Cola es el puerto del lado cajero (Reclamar/MarcarClasificado/BarrerLeasesVencidos) cuando hay UNA
+	// SOLA cola. Es el atajo mono-cola y sigue siendo el caso normal (una instalación por máquina).
+	//
+	// Obligatoria SALVO que se pase Colas. Si se pasan las dos, MANDA Colas y ésta se ignora: elegir la
+	// más rica evita la fusión silenciosa (una cola duplicada entre las dos vías sería exactamente el
+	// round-robin que se reclama a sí mismo que el T4.1 prohíbe).
 	Cola app.ColaCajero
+	// Colas es la LISTA de colas que el cajero atiende en ROUND-ROBIN ESTRICTO (Plan 051 Ola 4 · T4.1),
+	// una por instalación (un data_dir ⇒ un cola_entrantes.db). Tiene precedencia sobre Cola.
+	//
+	// 🔴 EL SEMÁFORO Y EL BREAKER SIGUEN SIENDO UNO POR PROCESO, no uno por cola, y eso NO es un descuido
+	// de esta lista: los dos protegen a OLLAMA, que es uno por máquina. Un semáforo por cola con N=1 y
+	// cinco instalaciones daría cinco inferencias simultáneas contra la misma instancia de Ollama —justo
+	// el solapamiento que la O0 midió como la causa de que la latencia p50 se dispare—, y un breaker por
+	// cola dejaría a cuatro colas martilleando un Ollama que la quinta ya sabe caído. Lo que rota es EL
+	// CLAIM; el resto del bucle es de la máquina. Si alguna vez hace falta acotar por cola, el sitio es un
+	// número nuevo, no partir estos dos.
+	Colas []ColaNombrada
 	// Clasificador es el LLM local. Obligatorio.
 	Clasificador Clasificador
 	// Breaker es el circuito compartido. nil ⇒ se construye uno con la calibración por defecto.
@@ -218,9 +261,34 @@ type Deps struct {
 	NumThread int
 }
 
+// colaMontada es una cola YA VALIDADA con su etiqueta y su contador propio de rescates. Es el elemento
+// sobre el que gira el round-robin de T4.1.
+//
+// ES UN PUNTERO EN LA SLICE (`[]*colaMontada`) Y TIENE QUE SERLO: lleva dentro un atomic.Int64, y una
+// slice de valores obligaría a indexar para sumar sin copiar jamás el elemento — una restricción que no
+// se puede declarar y que el primer `for _, c := range colas` rompería en silencio (sumaría sobre la
+// copia). Con punteros el rango es seguro por construcción.
+type colaMontada struct {
+	cola   app.ColaCajero
+	nombre string
+	// parte es el buzón del parte de salud de ESTA instalación (T4.5). Puede ser nil: el parte es
+	// telemetría y una cola sin buzón sigue clasificando igual (ver ColaNombrada.Parte).
+	parte app.ParteWorkerEscritor
+	// rescatados son las filas que el barrido devolvió de `tomado` a `nuevo` EN ESTA cola. El agregado del
+	// proceso sigue existiendo (Cajero.rescatados); éste es el desglose que dice CUÁL instalación es la
+	// que tiene un cajero muriéndose a mitad.
+	rescatados atomic.Int64
+}
+
 // Cajero es el bucle. Construir con New; el cero-valor no sirve.
 type Cajero struct {
-	cola          app.ColaCajero
+	// colas son las N colas del round-robin (Plan 051 Ola 4 · T4.1). Con una sola instalación tiene
+	// exactamente un elemento y el bucle se comporta igual que antes de T4.1.
+	colas []*colaMontada
+	// cursor es la POSICIÓN del round-robin. Sólo lo toca bucle(), que es una única goroutine, así que no
+	// necesita candado: las goroutines de procesar() no lo leen (cada una recibe SU cola por parámetro) y
+	// el barrido las recorre todas sin cursor.
+	cursor        int
 	clasificador  Clasificador
 	breaker       Interruptor
 	despertador   Despertador
@@ -251,6 +319,20 @@ type Cajero struct {
 	// no excluye a nadie más que al cajero, y BeginAttempt/RecordSuccess se llamaban sin él—, así que
 	// con MAX_CONCURRENT>1 el contador de aperturas podía sumar de más o de menos. Si vuelves a
 	// necesitar un lock aquí, es señal de que la decisión debería vivir dentro del breaker.
+
+	// veredictoTaskset es el resultado de la comprobación de afinidad de CPU del arranque (T2.8), RETENIDO
+	// para que pueda viajar en el parte (T4.5). Hasta la Ola 4 se calculaba una vez, se logueaba y se
+	// tiraba.
+	//
+	// ES UN atomic.Value Y NO UN string PELADO porque lo ESCRIBE Run (antes del bucle) y lo LEEN el
+	// publicador del parte y los tests, potencialmente desde otra goroutine. Un string sin protección es
+	// una carrera que `-race` caza. Cargarlo vacío —el cero del Value es nil, y el type assert falla
+	// devolviendo ""— es exactamente la semántica que hace falta: vacío = «no se sabe» (ver Taskset).
+	veredictoTaskset atomic.Value // string
+
+	// inferencia es el histograma de latencia de la inferencia (T4.5), del que sale el p50 del parte. Va
+	// por VALOR y no por puntero: es un array de atómicos, no necesita construcción, y el cero funciona.
+	inferencia histogramaInferencia
 
 	clasificados     atomic.Int64
 	omitidos         atomic.Int64
@@ -291,12 +373,52 @@ func chatJIDHash(jid string) string {
 	return hex.EncodeToString(sum[:])[:chatJIDHashLen]
 }
 
+// montarColas resuelve las DOS formas de pasar colas (Deps.Colas y el atajo Deps.Cola) en la lista única
+// sobre la que gira el round-robin.
+//
+// FALLA ANTES DE ARRANCAR ante una cola nil DENTRO de la lista, y ese es el punto de esta función. El
+// caso real que cubre: el cableado abre N data_dir's en un bucle y uno de ellos no pudo construir su
+// Store. Sin esta comprobación el cajero arrancaría tan campante y la primera vez que el cursor cayera en
+// esa posición —minutos después, en producción, con el arranque ya dado por bueno— el claim entraría en
+// un puntero nil. Un pánico diferido es peor que un error de arranque, porque el error de arranque lo ve
+// el operador que acaba de tocar la config.
+func montarColas(deps Deps) ([]*colaMontada, error) {
+	crudas := deps.Colas
+	if len(crudas) == 0 {
+		if deps.Cola == nil {
+			return nil, errors.New("cajero: falta la cola (app.ColaCajero): pasa Deps.Cola o Deps.Colas")
+		}
+		crudas = []ColaNombrada{{Cola: deps.Cola}}
+	}
+
+	colas := make([]*colaMontada, 0, len(crudas))
+	for i, cn := range crudas {
+		if cn.Cola == nil {
+			return nil, fmt.Errorf("cajero: la cola %d (%s) es nil: no se puede reclamar de ella",
+				i, nombreDeCola(cn.Nombre, i))
+		}
+		colas = append(colas, &colaMontada{cola: cn.Cola, nombre: nombreDeCola(cn.Nombre, i), parte: cn.Parte})
+	}
+	return colas, nil
+}
+
+// nombreDeCola da a una cola sin etiqueta un nombre que al menos la distinga de sus hermanas. Un nombre
+// vacío en el log sería peor que un número: dejaría dos líneas idénticas hablando de instalaciones
+// distintas.
+func nombreDeCola(nombre string, i int) string {
+	if strings.TrimSpace(nombre) != "" {
+		return nombre
+	}
+	return fmt.Sprintf("cola-%d", i)
+}
+
 // New valida las dependencias y aplica los defaults. Devuelve error sólo si falta algo sin lo que el
 // bucle no puede existir (la cola y el clasificador): todo lo demás tiene un default seguro, porque un
 // worker que se niega a arrancar es un worker que no clasifica nada.
 func New(deps Deps) (*Cajero, error) {
-	if deps.Cola == nil {
-		return nil, errors.New("cajero: falta la cola (app.ColaCajero)")
+	colas, err := montarColas(deps)
+	if err != nil {
+		return nil, err
 	}
 	if deps.Clasificador == nil {
 		return nil, errors.New("cajero: falta el clasificador")
@@ -340,7 +462,7 @@ func New(deps Deps) (*Cajero, error) {
 	}
 
 	return &Cajero{
-		cola:          deps.Cola,
+		colas:         colas,
 		clasificador:  deps.Clasificador,
 		breaker:       br,
 		despertador:   desp,
@@ -372,6 +494,11 @@ func New(deps Deps) (*Cajero, error) {
 func (c *Cajero) Run(ctx context.Context) error {
 	c.registrarAfinidad(ctx)
 	c.log.Info("cajero: arrancando",
+		// Las colas y el semáforo van JUNTOS en la misma línea a propósito: son los dos números que un
+		// operador confunde. `colas` es cuántas instalaciones se turnan; `max_concurrent` sigue siendo
+		// cuántas inferencias caben A LA VEZ EN LA MÁQUINA, no por cola (ver Deps.Colas).
+		"colas", len(c.colas),
+		"colas_nombres", strings.Join(c.nombresDeColas(), ","),
 		"max_concurrent", cap(c.sem),
 		"max_filas_claim", c.maxFilas,
 		"max_intentos", c.maxIntentos,
@@ -379,6 +506,15 @@ func (c *Cajero) Run(ctx context.Context) error {
 		"inferencia_timeout_ms", c.timeout.Milliseconds(),
 		"stats_cada_ms", c.statsEvery.Milliseconds(),
 	)
+
+	// T4.5 · EL PRIMER PARTE VA AQUÍ, ANTES DEL BUCLE, y no se deja para el primer tick. Sin esto habría
+	// un agujero de ParteCada (30 s) en cada arranque en el que el daemon leería «sin parte» con el cajero
+	// perfectamente vivo — y en una máquina que se reinicia a menudo (la plataforma objetivo es un
+	// portátil), ese hueco es una fracción nada despreciable del tiempo total.
+	//
+	// DESPUÉS de registrarAfinidad, para que el veredicto del taskset ya esté retenido y el primer parte
+	// lo lleve. Al revés se publicaría un taskset vacío que sólo se corregiría 30 s más tarde.
+	c.publicarParte(ctx)
 
 	var barrido sync.WaitGroup
 	barrido.Add(1)
@@ -413,10 +549,52 @@ func (c *Cajero) contadores() []any {
 		"rescatados", c.Rescatados(),
 		"aperturas_breaker", c.AperturasBreaker(),
 		"circuito", c.Circuito(),
+		// Las tres señales del parte se emiten TAMBIÉN en el log local (T4.5). No es duplicar por
+		// duplicar: el parte sólo se puede leer desde la nube, y el diagnóstico de campo —el bundle, el
+		// `journalctl` de un operador— se hace sobre este fichero. Si algún día el tubo del parte se rompe,
+		// estas tres claves son lo único que queda.
+		"taskset", c.Taskset(),
+		"p50_inferencia_ms", c.P50InferenciaMS(),
+		"colas", len(c.colas),
 	}
 }
 
+// nombresDeColas devuelve las etiquetas de las colas en el orden del round-robin. Sólo para el log.
+func (c *Cajero) nombresDeColas() []string {
+	nombres := make([]string, 0, len(c.colas))
+	for _, cm := range c.colas {
+		nombres = append(nombres, cm.nombre)
+	}
+	return nombres
+}
+
 // bucle es el ciclo de trabajo. Sale cuando ctx se cancela.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// ROUND-ROBIN ESTRICTO ENTRE N COLAS (Plan 051 Ola 4 · T4.1)
+// ─────────────────────────────────────────────────────────────────────────────
+// Lo que rota es EL CLAIM y sólo el claim: el cursor avanza una posición por claim INTENTADO —tenga
+// lote o no— y el bucle sólo duerme cuando ha encadenado TANTOS CLAIMS VACÍOS CONSECUTIVOS COMO COLAS
+// HAY. Las dos mitades de esa frase son necesarias y por motivos opuestos:
+//
+//   - Si el cursor avanzara sólo cuando hay trabajo, la cola PARLANCHINA se llevaría todas las vueltas
+//     y la callada no volvería a ser atendida hasta que aquélla se vaciara. Eso es inanición, y es lo
+//     que el criterio de equidad de T4.1 mide (tras M rondas, ninguna cola espera más de N claims).
+//   - Si se durmiera al primer vacío, el poll se pagaría N veces por vuelta y la última instalación de
+//     la lista esperaría N·poll aun teniendo trabajo desde el principio.
+//
+// ⚠️ «N VACÍOS CONSECUTIVOS» NO ES LO MISMO QUE «LA VUELTA ENTERA EN BLANCO», y el comentario decía lo
+// segundo mientras el código hacía lo primero. `vaciasSeguidas` es GLOBAL, no por vuelta: un claim con lote
+// lo reinicia, así que la ventana de N vacíos puede quedar a caballo de dos vueltas. La conducta resultante
+// es JUSTA igualmente —el cursor rota SIEMPRE, con lote o sin él, así que ninguna cola pasa hambre— y no
+// hay espera activa: para no dormir hace falta un claim CON lote cada N intentos, es decir, trabajo real.
+// Se deja como está a propósito: lo que estaba mal era la promesa escrita, no lo implementado.
+//
+// Con UNA sola cola —el caso normal, una instalación por máquina— el umbral es 1 y el bucle se comporta
+// EXACTAMENTE igual que antes de T4.1: es la no-regresión que el plan exige.
+//
+// 🔴 EL SEMÁFORO Y EL BREAKER NO ROTAN: son UNO POR PROCESO porque protegen a Ollama, que es uno por
+// máquina. El argumento completo está en Deps.Colas, y no se re-abre aquí.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // QUIÉN ESCRIBE app.MotivoBreaker — el hueco del diseño, resuelto y documentado
@@ -476,19 +654,49 @@ func (c *Cajero) bucle(ctx context.Context) {
 		latido = t.C
 	}
 
+	// Latido del PARTE (T4.5 · el tubo cajero→daemon). Va en el MISMO sitio que el de contadores —al
+	// principio de la vuelta, en un select no bloqueante— pero con SU PROPIO ticker, y esa separación es
+	// deliberada: `statsEvery` es un mando de LOG que el operador puede poner a 0 para callar la
+	// telemetría local, y colgar de él la frescura del parte significaría que bajar la verbosidad del log
+	// apaga `intent_circuit` en la nube. El argumento completo, con el cálculo del 3×, en app.ParteCada.
+	tParte := time.NewTicker(app.ParteCada)
+	defer tParte.Stop()
+
+	// vaciasSeguidas cuenta CLAIMS VACÍOS CONSECUTIVOS —no «colas de esta vuelta»: el contador es global y
+	// un claim con lote lo reinicia, así que la ventana puede quedar a caballo de dos vueltas—. Es lo que
+	// decide cuándo dormir: sólo tras N vacíos seguidos, siendo N el número de colas. Dormir en cuanto una
+	// cola está vacía —el comportamiento de antes de T4.1, trasladado sin pensar— pondría un poll de 500 ms
+	// entre cola y cola: con cinco instalaciones, la quinta esperaría 2,5 s por vuelta aunque tuviera
+	// trabajo desde el primer instante. Con UNA sola cola el umbral es 1 y el comportamiento es el de
+	// siempre. Ver el bloque de arriba para por qué «consecutivos» basta y no se toca.
+	vaciasSeguidas := 0
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 
+		// Dos latidos y un `default`: el select sigue siendo NO BLOQUEANTE. Si los dos canales estuvieran
+		// listos a la vez, Go elige uno al azar y el tick del otro QUEDA PENDIENTE en su ticker, así que se
+		// atiende en la vuelta siguiente —que llega, como mucho, un poll después—. No se pierde ninguno.
+		//
+		// 🔴 VA ANTES DE LA COMPROBACIÓN DEL BREAKER, y eso no es casualidad: con el circuito ABIERTO el
+		// bucle no reclama y se va a dormir con un `continue`, pero vuelve por aquí arriba. Publicar
+		// después habría dejado el parte congelado EXACTAMENTE en el escenario que el parte existe para
+		// contar (Ollama caído ⇒ breaker abierto), y a los 90 s el daemon lo habría tirado por rancio: el
+		// operador vería un hueco donde debía leer "open".
 		select {
 		case <-latido:
 			c.log.Info("cajero: contadores", c.contadores()...)
+		case <-tParte.C:
+			c.publicarParte(ctx)
 		default:
 		}
 
-		// (1) Circuito abierto ⇒ no se reclama en absoluto (T2.4).
+		// (1) Circuito abierto ⇒ no se reclama en absoluto (T2.4). Vale para TODAS las colas: el breaker es
+		// uno por proceso porque protege a Ollama, que es uno por máquina (ver Deps.Colas).
 		if c.breaker.State() == breaker.StateOpen {
+			vaciasSeguidas = 0 // la vuelta se interrumpió sin terminar; la siguiente empieza limpia
 			if c.despertador.Esperar(ctx) != nil {
 				return
 			}
@@ -498,6 +706,7 @@ func (c *Cajero) bucle(ctx context.Context) {
 		// (2) Sin contrato de intenciones cargado tampoco se reclama: reclamar sería marcar el lote
 		// `tomado` para acabar clasificándolo con un prompt vacío. Espejo del `ready` del decorador.
 		if c.listo != nil && !c.listo() {
+			vaciasSeguidas = 0
 			if c.despertador.Esperar(ctx) != nil {
 				return
 			}
@@ -512,14 +721,32 @@ func (c *Cajero) bucle(ctx context.Context) {
 			return
 		}
 
-		lote, err := c.cola.Reclamar(ctx, c.maxFilas)
+		// (4) EL CLAIM ROTA — ROUND-ROBIN ESTRICTO (T4.1). El cursor avanza UNA POSICIÓN POR CLAIM
+		// INTENTADO, haya lote o no, y ese «o no» es la mitad importante de la regla: si el cursor sólo
+		// avanzara cuando hay trabajo, una cola PARLANCHINA (siempre con cola pendiente) se llevaría todas
+		// las vueltas y la cola callada de al lado no volvería a ser atendida hasta que la primera se
+		// vaciara. Eso es inanición, y es justo lo que el criterio de equidad de T4.1 mide.
+		//
+		// El cursor se lee y se avanza AQUÍ, en la única goroutine que lo toca. La cola elegida viaja por
+		// PARÁMETRO al resto del camino (procesar → cerrar), y no en un campo del Cajero, porque el cierre
+		// tiene que ir contra LA MISMA cola de la que se reclamó: cerrar un lote contra la cola del vecino
+		// no encontraría sus filas, devolvería ErrLoteRelevado y el trabajo pagado se perdería en silencio.
+		cm := c.colas[c.cursor]
+		c.cursor = (c.cursor + 1) % len(c.colas)
+
+		lote, err := cm.cola.Reclamar(ctx, c.maxFilas)
 		if err != nil {
 			<-c.sem
 			if ctx.Err() != nil {
 				return // el error es la cancelación, no un fallo de la BD
 			}
 			c.fallos.Add(1)
-			c.log.Error("cajero: no se pudo reclamar un lote de la cola", "error", err)
+			// `cola` nombra la instalación: con N data_dir's, «no se pudo reclamar» sin decir de cuál deja
+			// al operador con cinco ficheros que revisar y ninguna pista.
+			c.log.Error("cajero: no se pudo reclamar un lote de la cola", "error", err, "cola", cm.nombre)
+			// Se DUERME aunque no se haya completado la vuelta, y el contador se reinicia: un claim que
+			// falla no es una cola vacía, y encadenar vueltas contra una BD rota sería un bucle caliente.
+			vaciasSeguidas = 0
 			if c.despertador.Esperar(ctx) != nil {
 				return
 			}
@@ -528,25 +755,37 @@ func (c *Cajero) bucle(ctx context.Context) {
 		if lote == nil || len(lote.Mensajes) == 0 {
 			// Cola vacía: es el estado NORMAL de un worker al día, no un error.
 			<-c.sem
+			vaciasSeguidas++
+			if vaciasSeguidas < len(c.colas) {
+				// Aún no se han encadenado N vacíos: quedan colas por probar antes de concluir que no hay
+				// trabajo en ninguna parte, así que se sigue SIN dormir.
+				continue
+			}
+			vaciasSeguidas = 0
 			if c.despertador.Esperar(ctx) != nil {
 				return
 			}
 			continue
 		}
+		vaciasSeguidas = 0
 
 		c.enVuelo.Add(1)
-		go func(l *app.ColaLote) {
+		go func(cm *colaMontada, l *app.ColaLote) {
 			defer func() {
 				<-c.sem
 				c.enVuelo.Done()
 			}()
-			c.procesar(ctx, l)
-		}(lote)
+			c.procesar(ctx, cm, l)
+		}(cm, lote)
 	}
 }
 
 // procesar clasifica UN lote y lo cierra. Se ejecuta con una plaza del semáforo tomada.
-func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
+//
+// `cm` es LA COLA DE LA QUE SE RECLAMÓ, y viaja por parámetro hasta cerrar() porque el cierre lleva
+// fencing por ClaimToken: contra otra cola no encontraría las filas, devolvería ErrLoteRelevado y una
+// inferencia ya pagada se perdería con un log que diría «carrera del lease» sin que hubiera ninguna.
+func (c *Cajero) procesar(ctx context.Context, cm *colaMontada, lote *app.ColaLote) {
 	texto := concatenar(lote)
 	runas := utf8.RuneCountInString(texto)
 
@@ -566,7 +805,7 @@ func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
 		c.log.Warn("cajero: lote SIN TEXTO reclamado; se cierra como `sin_texto` sin llamar a Ollama "+
 			"(el listener debió marcarlo al nacer la fila, T1.8: revisa aguas arriba)",
 			"session_id", lote.SessionID, "mensajes", len(lote.Mensajes))
-		if c.cerrar(ctx, lote, app.SobreOmitido(app.MotivoSinTexto)) {
+		if c.cerrar(ctx, cm, lote, app.SobreOmitido(app.MotivoSinTexto)) {
 			c.omitidos.Add(1)
 		}
 		return
@@ -576,7 +815,7 @@ func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
 		// Ver el bloque «QUIÉN ESCRIBE app.MotivoBreaker» en el doc comment de bucle(): éste es el
 		// único punto que lo escribe, y es exactamente la semántica del enum («el breaker está
 		// abierto; ni siquiera se llamó a Ollama»).
-		if c.cerrar(ctx, lote, app.SobreOmitido(app.MotivoBreaker)) {
+		if c.cerrar(ctx, cm, lote, app.SobreOmitido(app.MotivoBreaker)) {
 			c.omitidos.Add(1)
 		}
 		return
@@ -584,6 +823,15 @@ func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
 
 	inicio := c.ahora()
 	res, err := c.clasificar(ctx, texto)
+	// T4.5 · la latencia se mide UNA vez, con el reloj del CAJERO, y sirve a los dos caminos.
+	//
+	// 🔴 EL RELOJ DEL CAJERO Y NO `res.Metrics.TotalMs`, que es lo que el log de éxito ya publicaba. Son
+	// dos números distintos: aquél es lo que Ollama dice que tardó por dentro, y éste es lo que el cajero
+	// ESPERÓ de verdad (incluye el viaje HTTP, la serialización y la cola del propio Ollama). El segundo es
+	// el que gobierna la plaza del semáforo y, por tanto, el que explica que la cola avance o no. Además es
+	// el ÚNICO que existe en el camino de fallo —un timeout no trae Metrics—, así que medir con res.Metrics
+	// obligaría a mezclar dos relojes en la misma serie.
+	transcurrido := c.ahora().Sub(inicio)
 	if err != nil {
 		// 🔴 EL APAGADO SE COMPRUEBA ANTES DE REGISTRAR NADA, y el orden es el arreglo, no un detalle
 		// de estilo. Al revés —registrar el fallo y luego decir en el log «no es un fallo del
@@ -608,6 +856,11 @@ func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
 				"session_id", lote.SessionID, "mensajes", len(lote.Mensajes))
 			return
 		}
+		// 🔴 LOS FALLOS SÍ ENTRAN EN EL HISTOGRAMA, y va aquí —después del corte del apagado y antes de
+		// todo lo demás— para que el único tiempo que NO se mide sea el que cortó el SIGTERM. Un timeout de
+		// 15 s es latencia que el cajero pagó: ocupó la plaza del semáforo y toda la cola esperó detrás. El
+		// argumento largo, en histogramaInferencia.observar.
+		c.inferencia.observar(transcurrido)
 		c.registrarFallo()
 
 		// 🔴 EL FRENO DEL LOTE VENENOSO (T2.19). El reintento gratis de abajo —dejar el lote en `tomado`
@@ -641,8 +894,9 @@ func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
 				"mensajes", len(lote.Mensajes),
 				"runas", runas,
 				"circuito", c.breaker.State(),
+				"cola", cm.nombre,
 			)
-			if c.cerrar(ctx, lote, app.SobreOmitido(app.MotivoFalloRepetido)) {
+			if c.cerrar(ctx, cm, lote, app.SobreOmitido(app.MotivoFalloRepetido)) {
 				c.omitidos.Add(1)
 				c.abandonados.Add(1)
 			}
@@ -656,11 +910,13 @@ func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
 			"runas", runas,
 			"intentos", lote.Intentos,
 			"max_intentos", c.maxIntentos,
-			"latencia_ms", c.ahora().Sub(inicio).Milliseconds(),
+			"latencia_ms", transcurrido.Milliseconds(),
 			"circuito", c.breaker.State(),
+			"cola", cm.nombre,
 		)
 		return
 	}
+	c.inferencia.observar(transcurrido) // el camino de éxito, con el MISMO reloj que el de fallo
 	c.breaker.RecordSuccess()
 
 	// T2.6 · el log de métricas. 🔴 INV-051.1: aquí NO va el texto clasificado ni ningún valor de
@@ -681,7 +937,7 @@ func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
 	// «desconocido» (o intent vacío) NO es un fallo —el modelo respondió bien, sin intención
 	// accionable— y por eso ya se registró como éxito en el breaker. Lo que cambia es el sobre.
 	if res.Intent == "" || res.Intent == intents.ReservedUnknown {
-		if c.cerrar(ctx, lote, app.SobreOmitido(app.MotivoDesconocido)) {
+		if c.cerrar(ctx, cm, lote, app.SobreOmitido(app.MotivoDesconocido)) {
 			c.omitidos.Add(1)
 		}
 		return
@@ -693,12 +949,12 @@ func (c *Cajero) procesar(ctx context.Context, lote *app.ColaLote) {
 		// confianza). Se degrada a «desconocido» en vez de dejar el lote colgado: el mensaje sale sin
 		// intent, que es el fallo seguro.
 		c.log.Error("cajero: no se pudo serializar el sobre; el lote se cierra como `desconocido`", "error", err)
-		if c.cerrar(ctx, lote, app.SobreOmitido(app.MotivoDesconocido)) {
+		if c.cerrar(ctx, cm, lote, app.SobreOmitido(app.MotivoDesconocido)) {
 			c.omitidos.Add(1)
 		}
 		return
 	}
-	if c.cerrar(ctx, lote, sobre) {
+	if c.cerrar(ctx, cm, lote, sobre) {
 		c.clasificados.Add(1)
 	}
 }
@@ -727,11 +983,12 @@ func (c *Cajero) clasificar(ctx context.Context, texto string) (cls classifier.C
 // inferencia YA PAGADA y dejaría el lote en `tomado` esperando 60 s al barrido. El trabajo ya está
 // hecho; escribirlo cuesta un UPDATE. El plazo propio (cierreTimeout) impide que ese desligue se
 // convierta en un cierre que nunca termina.
-func (c *Cajero) cerrar(ctx context.Context, lote *app.ColaLote, intentJSON string) bool {
+func (c *Cajero) cerrar(ctx context.Context, cm *colaMontada, lote *app.ColaLote, intentJSON string) bool {
 	cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cierreTimeout)
 	defer cancel()
 
-	err := c.cola.MarcarClasificado(cctx, lote, intentJSON)
+	// SIEMPRE contra `cm`, la cola de la que se reclamó: ver el doc comment de procesar().
+	err := cm.cola.MarcarClasificado(cctx, lote, intentJSON)
 	switch {
 	case err == nil:
 		return true
@@ -743,11 +1000,13 @@ func (c *Cajero) cerrar(ctx context.Context, lote *app.ColaLote, intentJSON stri
 		// las inferencias están tardando más que WAPP_AGENT_COLA_LEASE_SECONDS.
 		c.relevados.Add(1)
 		c.log.Info("cajero: el lote fue relevado (lease vencido); el cierre tardío se descarta",
-			"session_id", lote.SessionID, "mensajes", len(lote.Mensajes), "relevados", c.relevados.Load())
+			"session_id", lote.SessionID, "mensajes", len(lote.Mensajes), "relevados", c.relevados.Load(),
+			"cola", cm.nombre)
 		return false
 	default:
 		c.fallos.Add(1)
-		c.log.Error("cajero: no se pudo cerrar el lote", "error", err, "session_id", lote.SessionID)
+		c.log.Error("cajero: no se pudo cerrar el lote", "error", err, "session_id", lote.SessionID,
+			"cola", cm.nombre)
 		return false
 	}
 }
@@ -771,9 +1030,91 @@ func (c *Cajero) registrarFallo() {
 	}
 }
 
+// parteTimeout es el plazo de UNA publicación del parte. Es corto a propósito y no es cosmético: el
+// parte se publica DESDE EL BUCLE, en la goroutine que reclama, así que un UPSERT que se quedara
+// esperando un fichero bloqueado dejaría de reclamar lotes en TODAS las colas mientras tanto. Dos
+// segundos es un orden de magnitud más de lo que cuesta escribir cinco columnas en un SQLite local, y
+// un orden de magnitud menos que el poll con el que el bucle ya vive.
+//
+// A DIFERENCIA DE cierreTimeout, ESTE CONTEXTO NO SE DESLIGA del ctx del proceso: el cierre de un lote
+// salva una inferencia YA PAGADA y merece terminar aunque llegue el SIGTERM; un parte a medio escribir
+// durante el apagado no vale nada —el proceso se está yendo, y el siguiente parte lo escribirá el
+// cajero que arranque—. Colgarlo del ctx es además lo que garantiza que Run no se demora en la parada.
+const parteTimeout = 2 * time.Second
+
+// publicarParte deja el parte de salud del cajero escrito en TODAS sus colas (Plan 051 Ola 4 · T4.5).
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// POR QUÉ EN TODAS LAS COLAS Y NO EN UNA
+// ─────────────────────────────────────────────────────────────────────────────
+// Las tres señales del parte —circuito, taskset y p50— son POR PROCESO, no por cola: describen a
+// OLLAMA y a ESTA máquina, que son uno solo aunque el cajero atienda cinco instalaciones (es el mismo
+// argumento por el que el semáforo y el breaker no rotan, ver Deps.Colas). Pero el LECTOR no es uno:
+// cada instalación tiene su propio `agent serve`, que construye su heartbeat leyendo SU
+// <data_dir>/cola_entrantes.db y no sabe nada de las otras. Publicar en una sola cola dejaría a las N-1
+// instalaciones restantes con `intent_circuit` vacío para siempre, sin ningún síntoma.
+//
+// Sí: el mismo valor se escribe N veces. Son N UPSERT de cinco columnas cada 30 s —con cinco
+// instalaciones, una escritura cada seis segundos repartida entre cinco ficheros—, y el precio de la
+// alternativa (un fichero compartido fuera de la cola, o un IPC nuevo) es una pieza que mantener.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// UN FALLO AQUÍ NO PUEDE FRENAR NI TUMBAR EL BUCLE
+// ─────────────────────────────────────────────────────────────────────────────
+// El parte es TELEMETRÍA; la cola es EL TRABAJO. Un error se avisa en Warn —nunca Error, y nunca con un
+// return que corte el recorrido— y se sigue con la cola siguiente: que el fichero de una instalación
+// esté bloqueado no puede dejar sin parte a las otras cuatro, igual que no las deja sin barrido (ver
+// barrerLeases). El modo de fallo resultante es el bueno: el daemon deja de ver partes frescos, los
+// declara rancios a los 90 s (app.ParteRancio) y publica `intent_circuit` VACÍO — la ausencia honesta
+// del dato, nunca un valor inventado.
+func (c *Cajero) publicarParte(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	p := app.ParteWorker{
+		TS:       c.ahora(),
+		Circuito: c.Circuito(),
+		Taskset:  c.Taskset(),
+		P50ms:    c.inferencia.p50MS(),
+	}
+	for _, cm := range c.colas {
+		if cm.parte == nil {
+			continue // esta instalación no tiene buzón de parte: ver ColaNombrada.Parte
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		pctx, cancel := context.WithTimeout(ctx, parteTimeout)
+		err := cm.parte.PublicarParte(pctx, p)
+		cancel()
+		if err != nil {
+			if ctx.Err() != nil {
+				return // el error es la parada, no un fallo de la BD
+			}
+			// 🔴 INV-051.1: aquí sólo va el nombre de la cola (una ruta de directorio) y el error. El parte
+			// no contiene nada de negocio, así que ni siquiera hay un campo del que haya que cuidarse.
+			c.log.Warn("cajero: no se pudo publicar el parte de salud; el daemon de esa instalación "+
+				"publicará `intent_circuit` VACÍO hasta el próximo parte (la clasificación NO se ve afectada)",
+				"error", err, "cola", cm.nombre)
+		}
+	}
+}
+
 // barrerLeases devuelve a `nuevo` las filas que un cajero muerto dejó bloqueadas en `tomado`. Corre en
 // su propia goroutine con periodo = lease: barrer más a menudo no rescata antes (una fila sólo es
 // rescatable cuando su lease ya venció) y barrer más despacio alarga la espera sin ganar nada.
+//
+// 🔴 CON N COLAS SE BARREN TODAS DENTRO DEL MISMO TICK, y NO se lanza una goroutine por cola (T4.1). Una
+// goroutine por cola significaría N tickers en vez de uno —N veces el trabajo de despertar al proceso, y
+// N cadencias que pueden desfasarse— y, sobre todo, rompería la lectura del contador agregado: los N
+// barridos escribirían en `c.rescatados` en instantes distintos y el número dejaría de corresponder a
+// «lo rescatado en la última pasada». El barrido es un UPDATE contra un SQLite local; hacerlos en fila es
+// milisegundos, no un problema de latencia que haya que paralelizar.
+//
+// EL BUCLE NO SE CORTA ANTE UN FALLO: si la cola 2 de 5 no se puede barrer, las otras cuatro se barren
+// igual. Un `return`/`break` ahí dejaría a las instalaciones siguientes sin rescate por culpa de un
+// vecino, y el barrido es justo lo que impide que las filas `tomado` de un worker muerto se queden
+// bloqueadas para siempre.
 func (c *Cajero) barrerLeases(ctx context.Context) {
 	t := time.NewTicker(c.lease)
 	defer t.Stop()
@@ -782,20 +1123,31 @@ func (c *Cajero) barrerLeases(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			n, err := c.cola.BarrerLeasesVencidos(ctx, c.lease)
-			if err != nil {
+			for _, cm := range c.colas {
 				if ctx.Err() != nil {
 					return
 				}
-				c.log.Error("cajero: el barrido de leases falló", "error", err)
-				continue
-			}
-			if n > 0 {
-				// Warn y no Info: rescatar filas significa que ALGUIEN murió a mitad (este worker en su
-				// vida anterior, o el otro cajero de una máquina multi-empresa). No es normal.
-				total := c.rescatados.Add(n)
-				c.log.Warn("cajero: leases vencidos rescatados (vuelven a `nuevo`)",
-					"filas", n, "lease_s", int(c.lease.Seconds()), "rescatados_total", total)
+				n, err := cm.cola.BarrerLeasesVencidos(ctx, c.lease)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					c.log.Error("cajero: el barrido de leases falló", "error", err, "cola", cm.nombre)
+					continue
+				}
+				if n > 0 {
+					// Warn y no Info: rescatar filas significa que ALGUIEN murió a mitad (este worker en su
+					// vida anterior, o el otro cajero de una máquina multi-empresa). No es normal.
+					//
+					// Se emite el desglose de ESTA cola y el agregado del proceso: el primero dice QUÉ
+					// instalación tiene el problema, el segundo sigue siendo el número que se compara con el
+					// resto de contadores del bloque periódico.
+					deLaCola := cm.rescatados.Add(n)
+					total := c.rescatados.Add(n)
+					c.log.Warn("cajero: leases vencidos rescatados (vuelven a `nuevo`)",
+						"filas", n, "lease_s", int(c.lease.Seconds()), "rescatados_total", total,
+						"cola", cm.nombre, "rescatados_cola", deLaCola)
+				}
 			}
 		}
 	}
@@ -868,6 +1220,17 @@ func (c *Cajero) registrarReparto(lec lecturaAfinidad) {
 			"error", err, "cpus_ollama", lec.Ollama, "cpus_cajero", lec.Cajero, "ollama_url", c.ollamaURL)
 		return
 	}
+
+	// T4.5 · EL VEREDICTO SE RETIENE, no sólo se loguea. Hasta la Ola 4 este valor moría en el switch de
+	// abajo, y con él la única pista que el operador tiene de por qué su clasificador va lento (la
+	// medición: mismo vecino con 2 vCPU, 17,2 % de lotes por encima del timeout con los conjuntos
+	// solapados contra 0 % con los disjuntos). Ahora viaja en el parte hasta el heartbeat.
+	//
+	// SE GUARDA AQUÍ Y NO EN LOS CAMINOS DE ERROR DE ARRIBA, a propósito: si la lectura falló (no-Linux,
+	// /proc ilegible, Ollama de otro usuario) el veredicto se queda VACÍO, que es «no se sabe». Cualquier
+	// otra cosa —un "disjunta" optimista por defecto— sería inventarse la señal que este chequeo existe
+	// para no dar por buena (ver el encabezado de afinidad.go).
+	c.veredictoTaskset.Store(string(reparto.Veredicto))
 
 	switch reparto.Veredicto {
 	case afinidadDisjunta:
@@ -979,8 +1342,25 @@ func (c *Cajero) Relevados() int64 { return c.relevados.Load() }
 // Fallos son los errores reales: claim fallido, inferencia fallida y cierre fallido.
 func (c *Cajero) Fallos() int64 { return c.fallos.Load() }
 
-// Rescatados son las filas que el barrido devolvió de `tomado` a `nuevo`.
+// Rescatados son las filas que el barrido devolvió de `tomado` a `nuevo`, SUMADAS SOBRE TODAS LAS COLAS.
+// El desglose por instalación está en RescatadosPorCola.
 func (c *Cajero) Rescatados() int64 { return c.rescatados.Load() }
+
+// Colas es cuántas colas (instalaciones) atiende este cajero en round-robin (T4.1). Con el default es 1.
+func (c *Cajero) Colas() int { return len(c.colas) }
+
+// RescatadosPorCola es el desglose de Rescatados por instalación, indexado por el nombre de la cola (el
+// data_dir en el cableado real).
+//
+// VA APARTE DEL AGREGADO, no en su lugar: el agregado responde «¿está muriéndose algún cajero?» y esto
+// responde «¿cuál?». Con una sola cola el mapa tiene una entrada y su valor es igual al agregado.
+func (c *Cajero) RescatadosPorCola() map[string]int64 {
+	m := make(map[string]int64, len(c.colas))
+	for _, cm := range c.colas {
+		m[cm.nombre] = cm.rescatados.Load()
+	}
+	return m
+}
 
 // AperturasBreaker son las veces que el circuito pasó de no-abierto a ABIERTO. Es el contador que hay
 // que mirar para saber si Ollama se está cayendo — no el de omisiones por `breaker`, que con el
@@ -989,3 +1369,21 @@ func (c *Cajero) AperturasBreaker() int64 { return c.aperturasBreaker.Load() }
 
 // Circuito devuelve el estado del circuito, con las mismas etiquetas que `GET /v1/intent/status`.
 func (c *Cajero) Circuito() string { return c.breaker.State() }
+
+// Taskset devuelve el veredicto del reparto de CPUs entre Ollama y el cajero (T2.8): "disjunta",
+// "solapada" o "cajero_sin_confinar".
+//
+// 🔴 VACÍO SIGNIFICA «NO SE SABE», Y NUNCA SE SUSTITUYE POR UN DEFAULT. Se queda vacío en tres casos
+// reales: fuera de Linux (taskset_other.go no puede leer la afinidad y devuelve error), cuando Ollama
+// corre con otro usuario y su /proc no es legible, y cuando la lista de CPUs del kernel no se pudo
+// interpretar. En los tres, lo cierto es que el reparto se desconoce — y un "disjunta" por defecto
+// diría justo lo contrario de lo que la medición avisa (con los conjuntos solapados, el 17,2 % de las
+// clasificaciones se pasó del timeout; ver el encabezado de afinidad.go).
+func (c *Cajero) Taskset() string {
+	v, _ := c.veredictoTaskset.Load().(string) // nil (nunca escrito) ⇒ "" ⇒ «no se sabe»
+	return v
+}
+
+// P50InferenciaMS es el p50 de la latencia de inferencia en ms, o 0 si aún no hay muestras. Es una COTA
+// SUPERIOR (el borde del bucket), y acumulado desde que arrancó el proceso: ver histogramaInferencia.
+func (c *Cajero) P50InferenciaMS() int64 { return c.inferencia.p50MS() }

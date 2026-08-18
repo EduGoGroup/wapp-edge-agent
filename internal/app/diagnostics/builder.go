@@ -138,6 +138,49 @@ type sessionHealthDoc struct {
 	IntentCircuit     string `json:"intent_circuit,omitempty"`
 	OutboxDepth       int64  `json:"outbox_depth"`
 	BinaryVersion     string `json:"binary_version"`
+
+	// ─── Plan 051 Ola 4 · lo que ya viaja en el heartbeat y en GET /v1/health, y aquí faltaba ───
+	//
+	// 🔴 EL BUNDLE ES EL CANAL DE CAMPO CUANDO EL EDGE ESTÁ DESCONECTADO, que es EXACTAMENTE la situación en
+	// la que alguien mira estos números: un Edge que no entrega suele ser un Edge que no habla con la nube.
+	// Que el heartbeat los llevara y el bundle no dejaba al soporte con la mitad del cuadro justo en el peor
+	// momento. No dependen de ningún release de proto (aquí se serializa JSON propio, no `SessionHealth`),
+	// así que no había nada que esperar para cablearlos.
+	//
+	// Los dos del PARTE son omitempty por la misma razón que en el plano de control: su ausencia ES
+	// información («el parte del worker-cajero no está o está rancio»), y un `intent_p50_ms: 0` impreso se
+	// leería como «inferencia instantánea», que es lo contrario de la verdad.
+	WorkerTaskset string `json:"worker_taskset,omitempty"`
+	IntentP50Ms   int64  `json:"intent_p50_ms,omitempty"`
+
+	// 🔴 `intent_omitted_by_reason` NO lleva omitempty y sus OCHO claves se imprimen SIEMPRE, aunque estén
+	// todas a 0: un motivo a 0 es un dato («por aquí no se está yendo nadie»); un hueco obliga al que lee a
+	// adivinar si el motivo no existe, no se midió o no se dio. La lista se RECORRE, jamás se transcribe
+	// (INV-051.3) — ver `desgloseCompleto`.
+	IntentOmittedByReason map[string]int64 `json:"intent_omitted_by_reason"`
+	StuckHeads            int64            `json:"stuck_heads"`
+	StuckHeadPolls        int64            `json:"stuck_head_polls"`
+	// Los dos sellos, SEPARADOS y sin ningún campo que los sume (T3.12): sólo `failed_seal_dispatch` implica
+	// mensajes duplicados ya publicados en la nube. Sumarlos aquí desharía esa tarea en el único sitio donde
+	// el soporte lee el dato sin nube.
+	FailedSealDispatch int64 `json:"failed_seal_dispatch"`
+	FailedSealBudget   int64 `json:"failed_seal_budget"`
+}
+
+// desgloseCompleto devuelve el desglose por motivo con las OCHO claves canónicas presentes, partiendo del
+// cero de `health.DespachoStatsCero()` —que las construye RECORRIENDO `app.MotivosOmitido()`— y volcando
+// encima lo que traiga el Report.
+//
+// 🔴 NI UNA SOLA LISTA ESCRITA A MANO (INV-051.3): esa lista se ha quedado corta dos veces. Y se copia clave
+// a clave en vez de reusar el mapa del Report por el mismo motivo que en el colector: un motivo que el Report
+// no traiga —un rollback a un binario con menos motivos— sigue apareciendo a 0 en vez de desaparecer de la
+// serie, y un vacío/0 significa siempre «no lo sé / no ha pasado», nunca un hueco que interpretar.
+func desgloseCompleto(m map[string]int64) map[string]int64 {
+	out := health.DespachoStatsCero().OmitidosPorMotivo
+	for motivo, n := range m {
+		out[motivo] = n
+	}
+	return out
 }
 
 // subsystemsJSON serializa la salud de todas las sesiones + el daemon a JSON. Sin reporter devuelve un doc
@@ -156,6 +199,18 @@ func (b *Builder) subsystemsJSON(ctx context.Context) string {
 				IntentCircuit:     r.IntentCircuit,
 				OutboxDepth:       r.OutboxDepth,
 				BinaryVersion:     r.BinaryVersion,
+				// Plan 051 Ola 4: los siete de la ola, tal cual llegan del Report. Vacío/0 = «no lo sé», que
+				// es la semántica del propio Report (parte ausente o rancio ⇒ los tres del parte a su cero).
+				WorkerTaskset: r.WorkerTaskset,
+				IntentP50Ms:   r.IntentP50Ms,
+				// El desglose se NORMALIZA (no se copia el mapa a pelo): el Report de producción ya trae las
+				// ocho claves, pero este Reporter es una interfaz y un implementador que devuelva nil dejaría
+				// un `null` en el bundle — el hueco que INV-051.3 prohíbe.
+				IntentOmittedByReason: desgloseCompleto(r.IntentOmittedByReason),
+				StuckHeads:            r.StuckHeads,
+				StuckHeadPolls:        r.StuckHeadPolls,
+				FailedSealDispatch:    r.FailedSealDispatch,
+				FailedSealBudget:      r.FailedSealBudget,
 			}
 		}
 	}

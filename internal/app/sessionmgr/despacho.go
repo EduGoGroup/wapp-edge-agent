@@ -6,6 +6,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/despachador"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 )
 
 // despacho.go — CABLEADO DEL DESPACHADOR DE LA COLA POR SESIÓN (Plan 051 Ola 3 · T3.3).
@@ -110,6 +111,15 @@ func (m *Manager) startDespachador(ctx context.Context, s *liveSession) {
 		return
 	}
 
+	// RETENER LA REFERENCIA (Plan 051 Ola 4 · T4.0). Hasta esta ola `d` moría aquí: era una variable local
+	// capturada sólo por la clausura de abajo, así que sus contadores —los ocho motivos de omisión, las
+	// cabezas atascadas, los dos sellos— eran ilegibles desde cualquier otro hilo del proceso. El desglose
+	// existía y no llegaba ni al heartbeat ni a `/v1/health` por esto y por nada más.
+	//
+	// Se publica ANTES del `go`, no dentro de la goroutine: así hay happens-before con cualquier lector y los
+	// contadores son consultables aunque el bucle muera en su primera vuelta.
+	s.setDespachador(d)
+
 	// DOS contadores para la MISMA goroutine, y cada uno responde una pregunta distinta:
 	//   - m.wg es el join GLOBAL del apagado ordenado (Stop espera a que no quede ninguna goroutine viva);
 	//   - s.despachadores es el join POR SESIÓN, el que necesita stopLive para el borrado quirúrgico: al
@@ -141,6 +151,106 @@ func (m *Manager) startDespachador(ctx context.Context, s *liveSession) {
 			s.log.Error("sessionmgr: el despachador de la sesión terminó con error", "error", err)
 		}
 	}()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+// LECTURA DE CONTADORES (Plan 051 Ola 4 · T4.0, dueña de INV-051.3)
+// ─────────────────────────────────────────────────────────────────────────────────────────────────────
+
+// Compila-o-rompe: el Manager ES el lector de contadores que el colector de salud espera. Si alguien
+// cambia una firma, falla aquí y no en el wiring del daemon.
+var _ health.DespachoReader = (*Manager)(nil)
+
+// DespachoStats devuelve los contadores del despachador de UNA sesión viva (T4.0). ok=false si la sesión
+// no está viva o nunca arrancó despachador — que NO es lo mismo que un despachador con todo a cero: lo
+// primero es «no sé», lo segundo es «sé que no ha pasado nada», y confundirlos es cómo un Edge que dejó de
+// drenar pasa por un Edge tranquilo.
+//
+// CONCURRENCIA: se toma `m.mu` sólo para sacar el puntero del mapa y se SUELTA antes de tocar la sesión,
+// que tiene su propio candado. Es el mismo molde que `Health()` y `Stop()`; anidar los dos candados aquí
+// crearía un orden (m.mu → s.mu) que no existe hoy en ningún otro camino.
+// 🔴 LOS DOS CAMINOS DE ok=false DEVUELVEN `DespachoStatsCero()`, NO UN STRUCT VACÍO. El `DespachoStats{}`
+// de antes traía el mapa del desglose a NIL, contradiciendo el invariante que el propio tipo declara («las
+// OCHO claves SIEMPRE»). Hoy no hace daño porque el único llamante —`Collector.poblarDespacho`— sale antes
+// de mirar el mapa cuando ok=false; es decir, la mina está armada y desactivada por una casualidad del otro
+// lado de la frontera. El siguiente llamante que ignore el `ok` (un `wapp-ctl`, un endpoint nuevo) leería un
+// mapa nil y publicaría un hueco donde el contrato promete ocho ceros. Devolver el cero canónico no cuesta
+// nada y hace que la ausencia sea segura de usar; el `false` sigue siendo la ÚNICA forma de distinguir «no
+// sé nada de esta sesión» de «esta sesión no ha omitido nada», y eso no cambia.
+func (m *Manager) DespachoStats(sessionID string) (health.DespachoStats, bool) {
+	m.mu.Lock()
+	s, ok := m.live[sessionID]
+	m.mu.Unlock()
+	if !ok {
+		return health.DespachoStatsCero(), false
+	}
+	d := s.getDespachador()
+	if d == nil {
+		return health.DespachoStatsCero(), false
+	}
+	return statsDe(d), true
+}
+
+// DespachoStatsVivas agrega los contadores de TODAS las sesiones vivas, motivo a motivo (T4.0). Alimenta el
+// bloque de daemon de GET /v1/health: la vista LOCAL del desglose, la que el operador mira sin nube.
+//
+// 🔴 EL AGREGADO ES SÓLO DE SESIONES VIVAS, Y ESTÁ DECIDIDO ASÍ (no acumulativo). Los contadores del
+// despachador ya son POR PROCESO —nacen a cero en cada arranque, la durabilidad la da la cola en disco—, y
+// una sesión desvinculada se lleva los suyos al morir. La alternativa, un acumulador que sobreviva a la
+// sesión, obligaría al Manager a guardar contadores de sesiones que ya no existen: memoria que sólo crece,
+// y un número que mezcla la sesión de un cliente con la del siguiente. Lo que se pierde —lo que omitió una
+// sesión desvinculada— ya está en el bloque de log que el despachador emite al parar; el sitio de la
+// historia es el log, no un contador vivo.
+//
+// La consecuencia a tener presente al leerlo: este agregado puede BAJAR (al desvincular una sesión). No es
+// un bug del contador, es el significado de «vivas».
+func (m *Manager) DespachoStatsVivas() health.DespachoStats {
+	m.mu.Lock()
+	sesiones := make([]*liveSession, 0, len(m.live))
+	for _, s := range m.live {
+		sesiones = append(sesiones, s)
+	}
+	m.mu.Unlock()
+
+	total := health.DespachoStatsCero()
+	for _, s := range sesiones {
+		d := s.getDespachador()
+		if d == nil {
+			continue
+		}
+		st := statsDe(d)
+		// Se suma CADA MOTIVO CON SU HOMÓNIMO y nunca entre motivos distintos (INV-051.3): `fastlane` es el
+		// camino sano, `presupuesto` y `breaker` son fallos. Sumar el mismo motivo entre sesiones sí es
+		// legítimo — es la misma pregunta hecha al Edge entero.
+		for motivo, n := range st.OmitidosPorMotivo {
+			total.OmitidosPorMotivo[motivo] += n
+		}
+		total.CabezasAtascadas += st.CabezasAtascadas
+		total.PollsCabezaAtascada += st.PollsCabezaAtascada
+		// Los dos sellos, sumados cada uno POR SEPARADO y sin ningún «total» que los junte (T3.12): sólo el
+		// de despacho implica duplicados en la nube.
+		total.FallosSelloDespacho += st.FallosSelloDespacho
+		total.FallosSelloPresupuesto += st.FallosSelloPresupuesto
+	}
+	return total
+}
+
+// statsDe traduce los accesores del despachador al DTO neutro del puerto de salud.
+//
+// 🔴 EL DESGLOSE SE RECORRE, NUNCA SE TRANSCRIBE. Se parte de `health.DespachoStatsCero()` —que construye
+// las ocho claves desde `app.MotivosOmitido()`— y encima se vuelca lo que devuelve `OmitidosPorMotivo()`,
+// que a su vez recorre la MISMA lista canónica. En ninguno de los dos pasos hay una lista escrita a mano:
+// esa lista se ha quedado corta dos veces, y el guardarraíl AST de `internal/app` existe por eso.
+func statsDe(d *despachador.Despachador) health.DespachoStats {
+	st := health.DespachoStatsCero()
+	for motivo, n := range d.OmitidosPorMotivo() {
+		st.OmitidosPorMotivo[string(motivo)] = n
+	}
+	st.CabezasAtascadas = d.CabezasAtascadas()
+	st.PollsCabezaAtascada = d.PollsCabezaAtascada()
+	st.FallosSelloDespacho = d.FallosSelloDespacho()
+	st.FallosSelloPresupuesto = d.FallosSelloPresupuesto()
+	return st
 }
 
 // waitDespachadores bloquea hasta que el despachador de ESTA sesión (si lo hubo) haya retornado. Es el

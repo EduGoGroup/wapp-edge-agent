@@ -166,6 +166,35 @@ control (y, en instalaciones con autoarranque por systemd, sin el propio núcleo
 que `wapp-ctl --autostart` lanza) a un Edge cuya única falla real está en un botón. `https://` y
 loopback siempre se permiten.
 
+### Variables del worker-cajero
+
+Prefijo **`WAPP_WORKER_`**, **no** `WAPP_AGENT_`, y la distinción es real: el cajero
+(`agent cajero`) es un **proceso aparte** con su propio bloque de entorno en la unidad que lo
+lanza. Una variable del worker escrita con el prefijo del daemon **no la lee nadie** y el número
+que el operador cree haber fijado no gobierna nada. Precedencia: defaults < bloque `worker:` del
+mismo YAML < entorno.
+
+| Variable | Default | Propósito |
+|---|---|---|
+| `WAPP_WORKER_DATA_DIRS` | (el `data_dir` del daemon) | **Lista separada por comas** de los `data_dir` que el cajero atiende en **round-robin estricto** (Plan 051 O4 · T4.1): una entrada por **instalación** en la máquina, y una cola (`<data_dir>/cola_entrantes.db`) por entrada. Se **trimea** cada entrada, se descartan las vacías y se **absolutiza** cada una; **los duplicados son error de arranque** (dos colas sobre el mismo fichero SQLite serían un round-robin que se turna consigo mismo). Vacía o sin poner ⇒ la lista de un elemento de siempre, sin ninguna diferencia observable. **No confundir con `WAPP_AGENT_DATA_DIR`**, que es el data_dir del daemon y **no** es una lista. ⚠️ El **contrato de intenciones** se toma del **primer** `data_dir` de la lista y se comparte: ver ⁵. Clave YAML: `worker.data_dirs` (lista de verdad, no comas). |
+| `WAPP_WORKER_MAX_CONCURRENT` | `1` | Inferencias **simultáneas**. **Es por MÁQUINA, no por cola**: con N colas sigue habiendo un solo semáforo, porque protege al Ollama local, que es uno. El `1` está cerrado por la medición de la O0 (ADR-0038 Enmienda 1). |
+| `WAPP_WORKER_POLL_MS` | `500` | Espera cuando **todas** las colas están vacías. Con N colas se duerme una vez por **vuelta completa** en blanco, no una vez por cola. |
+| `WAPP_WORKER_INFERENCE_TIMEOUT_MS` | `15000` | Plazo de **una** inferencia. **NO es `WAPP_AGENT_INTENT_WAIT_MS`** (4000, el presupuesto del despachador): son dos números de dos caminos distintos y colapsarlos calibra el worker para fallar. |
+| `WAPP_WORKER_MAX_INTENTOS` | `3` | Reclamos que aguanta un lote antes de abandonarlo con `fallo_repetido`. Es el freno del **lote venenoso**: sin él, un texto que siempre falla conserva el `seq` más bajo y congela la cola entera. |
+| `WAPP_WORKER_MAX_RUNES` | `1000` | Techo de runas de la entrada a clasificar (guardarraíl de DoS del clasificador). |
+| `WAPP_WORKER_NUM_THREAD` · `NUM_PREDICT` · `NUM_CTX` | `5` · `256` · `4096` | Opciones que se le pasan a Ollama por inferencia. Calibradas en la O0; no se tocan sin medición. |
+| `WAPP_WORKER_STATS_EVERY_MS` | `300000` | Cadencia del bloque de contadores en el log del cajero. **`0` lo desactiva** (guardarraíl asimétrico: solo lo negativo cae al default). |
+
+Todos caen al default con un valor `<=0`, salvo `STATS_EVERY_MS` (ver arriba).
+
+⁵ **El contrato de intenciones con varios `data_dir` (límite conocido de T4.1).** El clasificador
+del proceso es **uno**: un solo prompt y un solo schema, sustituibles en caliente con `Reload`.
+Servir N contratos distintos exigiría N clasificadores, así que el cajero toma el contrato del
+**primer** `data_dir` de `WAPP_WORKER_DATA_DIRS` y clasifica con él todas las colas. En
+consecuencia, la lista está pensada para **N instalaciones del mismo tenant/contrato** en una
+máquina; si dos tuvieran contratos distintos, la segunda se clasificaría con el de la primera.
+Es una decisión **revisable**, escrita también en el código (`cmd/agent/cajero.go`).
+
 ## Store y custodia (zero-knowledge)
 
 - **BD única SQLite cifrada, dialecto-conmutable** (ADR-0018): `accounts`↔`devices`, DEK

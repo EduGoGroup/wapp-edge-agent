@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/despachador"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -88,6 +89,25 @@ type liveSession struct {
 	// sesión cuyo despachador aún esté abriendo filas. No lo protege `mu`: un WaitGroup ya es seguro entre
 	// goroutines, y su Add ocurre ANTES del `go` (happens-before), igual que el de `m.wg`.
 	despachadores sync.WaitGroup
+
+	// despachador es EL DESPACHADOR DE ESTA SESIÓN, retenido (Plan 051 Ola 4 · T4.0). Hasta esta ola la `d`
+	// que devolvía `despachador.New` era una VARIABLE LOCAL de `startDespachador` que sólo veía su propia
+	// goroutine: sus contadores —los ocho motivos de omisión, las cabezas atascadas, los dos sellos— existían
+	// y no había NINGUNA forma de leerlos desde fuera. No faltaba un tubo, faltaba esta referencia.
+	//
+	// SE PROTEGE CON `mu`, EL CANDADO QUE YA TIENE LA SESIÓN, y no con uno nuevo: lo escribe la goroutine que
+	// arranca el despachador y lo lee el colector de salud desde el hilo del heartbeat o del plano de control.
+	// Es el mismo par escritor/lector que `cancel` y `health`, así que comparte su candado (un tercer mutex
+	// sobre el mismo struct sólo añadiría un orden de bloqueo que alguien puede invertir).
+	//
+	// nil mientras no haya despachador arrancado: sin cola cableada, sin mux, sin sink, o si `New` falló. Ese
+	// nil es un HECHO («esta sesión escucha pero no drena»), y por eso `despachoStats` lo distingue de un
+	// despachador con todos los contadores a cero en vez de devolver un struct vacío.
+	//
+	// NO SE PONE A nil CUANDO EL BUCLE TERMINA, y es deliberado: una sesión viva cuyo despachador murió por
+	// pánico es exactamente el caso en el que hay que poder leer sus contadores. La referencia no queda
+	// colgando: muere con la propia liveSession cuando el Manager la saca de `live` (Unlink/cleanupPairing).
+	despachador *despachador.Despachador
 
 	// health es la salud de runtime observada por la goroutine listener (starting→listening→degraded→stopped).
 	health SessionHealth
@@ -209,4 +229,20 @@ func (s *liveSession) snapshot() (SessionHealth, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.health, s.lastErr
+}
+
+// setDespachador publica el despachador de esta sesión bajo lock (Plan 051 Ola 4 · T4.0). Lo invoca
+// startDespachador ANTES de lanzar la goroutine del bucle: así los contadores son legibles desde el primer
+// instante, incluso si el bucle muere en su primera vuelta.
+func (s *liveSession) setDespachador(d *despachador.Despachador) {
+	s.mu.Lock()
+	s.despachador = d
+	s.mu.Unlock()
+}
+
+// getDespachador lee el despachador de esta sesión bajo lock. nil si la sesión no llegó a arrancar uno.
+func (s *liveSession) getDespachador() *despachador.Despachador {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.despachador
 }

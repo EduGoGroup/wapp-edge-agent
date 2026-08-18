@@ -9,9 +9,11 @@ package diagnostics
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 )
 
@@ -149,6 +151,108 @@ func TestSubsystemsJSON_IncludesSessions(t *testing.T) {
 	for _, want := range []string{"sess-abc", "degraded", "dek_load_timeout", "1.0.0-test", `"uptime_s":123`} {
 		if !strings.Contains(js, want) {
 			t.Errorf("subsystems_json no contiene %q: %s", want, js)
+		}
+	}
+}
+
+// TestSubsystemsJSON_LlevaLoDeLaOla4 fija que el bundle NO se quede atrás respecto al heartbeat y a
+// GET /v1/health (Plan 051 Ola 4).
+//
+// 🔴 POR QUÉ IMPORTA MÁS DE LO QUE PARECE: el bundle es el canal de campo cuando el Edge está
+// DESCONECTADO, que es justo el escenario en el que alguien necesita saber por qué no se entrega nada. Si
+// `intent_omitted_by_reason` viaja en el latido pero no en el bundle, el soporte se queda ciego
+// exactamente cuando importa. Y no dependía de ningún release de proto: esto es JSON propio.
+func TestSubsystemsJSON_LlevaLoDeLaOla4(t *testing.T) {
+	reporter := fakeReporter{reports: map[string]health.Report{
+		"sess-ola4": {
+			SocketState:   "connected",
+			BinaryVersion: "1.0.0-test",
+			WorkerTaskset: "disjunta",
+			IntentP50Ms:   3736,
+			IntentCircuit: "half_open",
+			// Los motivos por su CONSTANTE, nunca por su literal: el día que uno cambie de nombre, esto se
+			// entera solo (INV-051.3).
+			IntentOmittedByReason: map[string]int64{
+				string(app.MotivoPresupuesto): 5,
+				string(app.MotivoBreaker):     2,
+			},
+			StuckHeads:         1,
+			StuckHeadPolls:     9,
+			FailedSealDispatch: 3,
+			FailedSealBudget:   7,
+		},
+	}}
+
+	js := NewBuilder(nil, reporter, 1).Build(context.Background(), "subsystems").SubsystemsJSON
+
+	for _, want := range []string{
+		`"worker_taskset":"disjunta"`,
+		`"intent_p50_ms":3736`,
+		`"stuck_heads":1`,
+		`"stuck_head_polls":9`,
+		// Los dos sellos, SEPARADOS y sin ningún agregado que los sume (T3.12): sólo el de despacho implica
+		// duplicados en la nube.
+		`"failed_seal_dispatch":3`,
+		`"failed_seal_budget":7`,
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("subsystems_json no contiene %q: %s", want, js)
+		}
+	}
+
+	// LAS OCHO CLAVES, SIEMPRE — y la lista se RECORRE, jamás se transcribe (INV-051.3). El fake sólo trajo
+	// dos motivos; los otros seis tienen que aparecer a 0, porque «este motivo no se ha dado» es un dato y
+	// un hueco no.
+	var doc struct {
+		Sessions map[string]struct {
+			OmitidosPorMotivo map[string]int64 `json:"intent_omitted_by_reason"`
+		} `json:"sessions"`
+	}
+	if err := json.Unmarshal([]byte(js), &doc); err != nil {
+		t.Fatalf("subsystems_json no es JSON válido: %v (%s)", err, js)
+	}
+	sh, ok := doc.Sessions["sess-ola4"]
+	if !ok {
+		t.Fatalf("falta la sesión en el snapshot: %s", js)
+	}
+	for _, motivo := range app.MotivosOmitido() {
+		n, presente := sh.OmitidosPorMotivo[string(motivo)]
+		if !presente {
+			t.Errorf("falta el motivo %q en el desglose del bundle; las ocho claves van siempre", motivo)
+			continue
+		}
+		var want int64
+		switch motivo {
+		case app.MotivoPresupuesto:
+			want = 5
+		case app.MotivoBreaker:
+			want = 2
+		}
+		if n != want {
+			t.Errorf("desglose del bundle[%q] = %d, want %d (los motivos no se mezclan entre sí)", motivo, n, want)
+		}
+	}
+	if got, want := len(sh.OmitidosPorMotivo), len(app.MotivosOmitido()); got != want {
+		t.Errorf("el desglose del bundle tiene %d claves, want %d", got, want)
+	}
+}
+
+// TestSubsystemsJSON_DesgloseNuncaNulo: un Reporter que devuelva el desglose a nil —cualquier doble, o un
+// Report armado a mano— NO puede dejar un `"intent_omitted_by_reason":null` en el bundle. Vacío/0/ausente
+// significa «no lo sé»; `null` obliga a quien lee a adivinar si el campo existe.
+func TestSubsystemsJSON_DesgloseNuncaNulo(t *testing.T) {
+	reporter := fakeReporter{reports: map[string]health.Report{
+		"sess-pelada": {SocketState: "connected"}, // sin desglose: el mapa es nil
+	}}
+
+	js := NewBuilder(nil, reporter, 1).Build(context.Background(), "subsystems").SubsystemsJSON
+
+	if strings.Contains(js, `"intent_omitted_by_reason":null`) {
+		t.Errorf("el desglose salió como null en vez de con las ocho claves a 0: %s", js)
+	}
+	for _, motivo := range app.MotivosOmitido() {
+		if !strings.Contains(js, `"`+string(motivo)+`":0`) {
+			t.Errorf("el motivo %q no aparece a 0 en el bundle de una sesión sin tráfico: %s", motivo, js)
 		}
 	}
 }

@@ -9,6 +9,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 )
 
 // fakeOutbox satisface OutboxDepther con una profundidad fija por sesión (o error).
@@ -33,7 +35,10 @@ func TestCollector_DerivesReport(t *testing.T) {
 	reg.SetDEKLoadDuration("S", 1500*time.Millisecond)
 	reg.MarkInbound("S", now.Add(-30*time.Second))
 
-	c := NewCollector(reg, fakeOutbox{depth: map[string]int64{"S": 4}}, func() string { return "half-open" },
+	// El circuito ya NO es un callback local (T4.3): llega en el parte del worker-cajero. Se pasa FRESCO
+	// (TS = now) para que la regla de rancidez lo deje pasar; su rechazo lo cubre collector_parte_test.go.
+	c := NewCollector(reg, fakeOutbox{depth: map[string]int64{"S": 4}},
+		parteFijo{p: app.ParteWorker{TS: now, Circuito: "half-open"}, ok: true},
 		"9.9.9", start, WithClock(func() time.Time { return now }))
 
 	r, ok := c.Collect(context.Background(), "S")

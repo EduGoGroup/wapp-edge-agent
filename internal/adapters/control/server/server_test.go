@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 )
@@ -133,10 +134,24 @@ func TestHealth(t *testing.T) {
 type fakeHealth struct {
 	uptime  int64
 	reports map[string]health.Report
+	// despacho es el agregado que devuelve DespachoVivas; nil ⇒ el CERO CANÓNICO. Es puntero para que
+	// «este test no se ocupa del bloque» y «este test quiere el bloque a 0» no se confundan.
+	despacho *health.DespachoStats
 }
 
 func (f fakeHealth) DaemonUptimeS() int64                             { return f.uptime }
 func (f fakeHealth) Reports(context.Context) map[string]health.Report { return f.reports }
+
+// DespachoVivas (Plan 051 Ola 4 · T4.0): el agregado del desglose sobre las sesiones vivas. Sin agregado
+// inyectado el doble devuelve el CERO CANÓNICO —las ocho claves a 0, construidas recorriendo
+// app.MotivosOmitido()— y no un struct vacío: así ejercita el mismo invariante que producción (el bloque
+// nunca sale con huecos).
+func (f fakeHealth) DespachoVivas() health.DespachoStats {
+	if f.despacho != nil {
+		return *f.despacho
+	}
+	return health.DespachoStatsCero()
+}
 
 // startServerWithHealth arranca el servidor con un colector de salud cableado (SetHealthProvider).
 func startServerWithHealth(t *testing.T, lister SessionLister, h HealthReporter) *http.Client {
@@ -192,6 +207,150 @@ func TestHealth_Enriched(t *testing.T) {
 	}
 	if sh.SocketState != "degraded" || sh.DegradedReason != "dek_load_timeout" || sh.OutboxDepth != 3 {
 		t.Errorf("salud sess-1 = %+v", sh)
+	}
+}
+
+// leerCuerpo devuelve el cuerpo CRUDO de la respuesta. Existe aparte de `decode` porque hay aserciones que
+// sólo se pueden hacer sobre el JSON tal cual salió del cable —qué claves hay y cuáles NO— y no sobre un
+// struct, que por definición ignora todo lo que no conoce.
+func leerCuerpo(t *testing.T, resp *http.Response) []byte {
+	t.Helper()
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("leyendo body: %v", err)
+	}
+	return body
+}
+
+// TestHealth_BloqueDespacho es el test que le faltaba entero al bloque `despacho` de GET /v1/health
+// (Plan 051 Ola 4 · T4.0): hasta la revisión adversarial del 2026-08-17, `despachoView` era código sin UNA
+// sola aserción — se construía, se serializaba y nadie miraba nunca lo que salía.
+//
+// QUÉ SE FIJA AQUÍ, y por qué cada cosa:
+//   - que el bloque EXISTE (es la mitad LOCAL de T4.0: el desglose tiene que poder leerse en el equipo del
+//     cliente con `wapp-ctl`, sin depender de que la nube reciba el latido — que es justo la situación en
+//     la que alguien lo está mirando);
+//   - que trae las OCHO claves, RECORRIENDO `app.MotivosOmitido()` y jamás transcribiéndolas (INV-051.3);
+//   - que los DOS SELLOS VIAJAN SEPARADOS y no hay ningún total que los sume (T3.12).
+//
+// Los contadores del doble son distintos entre sí a propósito: con todo a 1, un cruce de campos en
+// `handleHealth` —publicar los polls en `stuck_heads`, o los dos sellos al revés— pasaría en verde.
+func TestHealth_BloqueDespacho(t *testing.T) {
+	agg := health.DespachoStatsCero()
+	agg.OmitidosPorMotivo[string(app.MotivoPresupuesto)] = 5
+	agg.OmitidosPorMotivo[string(app.MotivoBreaker)] = 2
+	agg.CabezasAtascadas = 3
+	agg.PollsCabezaAtascada = 11
+	agg.FallosSelloDespacho = 7
+	agg.FallosSelloPresupuesto = 13
+
+	h := fakeHealth{
+		uptime:   42,
+		reports:  map[string]health.Report{"sess-1": {SocketState: "connected", BinaryVersion: testVersion}},
+		despacho: &agg,
+	}
+	c := startServerWithHealth(t, fakeLister{}, h)
+
+	resp := do(t, c, http.MethodGet, "/v1/health")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", resp.StatusCode)
+	}
+	body := leerCuerpo(t, resp)
+
+	// (1) EL BLOQUE EXISTE. Se mira sobre el JSON crudo: con `omitempty` y puntero, un bloque que no se
+	// construyera desaparecería del cuerpo sin que ningún struct se quejara.
+	var crudo struct {
+		Despacho map[string]json.RawMessage `json:"despacho"`
+	}
+	if err := json.Unmarshal(body, &crudo); err != nil {
+		t.Fatalf("unmarshal %q: %v", string(body), err)
+	}
+	if crudo.Despacho == nil {
+		t.Fatalf("GET /v1/health salió SIN bloque `despacho` con un colector cableado: %s", body)
+	}
+
+	var got healthResponse
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", string(body), err)
+	}
+	d := got.Despacho
+	if d == nil {
+		t.Fatalf("el bloque `despacho` no se pudo deserializar: %s", body)
+	}
+
+	// (2) LOS CONTADORES, uno a uno y sin cruces.
+	if d.SesionesConSalud != len(h.reports) {
+		t.Errorf("sesiones_con_salud = %d, want %d (es lo que hace legible el agregado: un stuck_heads:3 "+
+			"con una sesión y con veinte no dicen lo mismo)", d.SesionesConSalud, len(h.reports))
+	}
+	if d.StuckHeads != 3 {
+		t.Errorf("stuck_heads = %d, want 3", d.StuckHeads)
+	}
+	if d.StuckHeadPolls != 11 {
+		t.Errorf("stuck_head_polls = %d, want 11 (si sale 3, se está publicando el otro contador del par)", d.StuckHeadPolls)
+	}
+
+	// (3) 🔴 LOS DOS SELLOS, SEPARADOS. Sólo `failed_seal_dispatch` implica mensajes DUPLICADOS ya
+	// publicados en la nube; `failed_seal_budget` es una fila que se reintenta sola. Confundirlos convierte
+	// ruido operativo en un incidente, o al revés.
+	if d.FailedSealDispatch != 7 {
+		t.Errorf("failed_seal_dispatch = %d, want 7", d.FailedSealDispatch)
+	}
+	if d.FailedSealBudget != 13 {
+		t.Errorf("failed_seal_budget = %d, want 13", d.FailedSealBudget)
+	}
+
+	// (4) LAS OCHO CLAVES, SIEMPRE — recorriendo la lista canónica, nunca transcribiéndola (INV-051.3). El
+	// doble sólo movió dos motivos; los otros seis tienen que salir a 0, porque un motivo a 0 es un dato y
+	// un hueco no.
+	for _, motivo := range app.MotivosOmitido() {
+		n, presente := d.IntentOmittedByReason[string(motivo)]
+		if !presente {
+			t.Errorf("falta el motivo %q en el bloque `despacho`; las ocho claves van siempre: %s", motivo, body)
+			continue
+		}
+		switch motivo {
+		case app.MotivoPresupuesto:
+			if n != 5 {
+				t.Errorf("despacho.intent_omitted_by_reason[presupuesto] = %d, want 5", n)
+			}
+		case app.MotivoBreaker:
+			if n != 2 {
+				t.Errorf("despacho.intent_omitted_by_reason[breaker] = %d, want 2", n)
+			}
+		default:
+			if n != 0 {
+				t.Errorf("despacho.intent_omitted_by_reason[%q] = %d y el doble no lo tocó: los motivos se "+
+					"están mezclando entre sí", motivo, n)
+			}
+		}
+	}
+	if nClaves, want := len(d.IntentOmittedByReason), len(app.MotivosOmitido()); nClaves != want {
+		t.Errorf("el desglose del bloque `despacho` tiene %d claves, want %d", nClaves, want)
+	}
+
+	// (5) 🔴 NINGÚN TOTAL AGREGADO. Se comprueba sobre el JUEGO DE CLAVES del JSON crudo, no sobre el
+	// struct: un campo nuevo tipo `failed_seal_total` (o un `omitidos` que sume los ocho motivos) no
+	// rompería ninguna aserción de arriba y desharía T3.12 y INV-051.3 en el sitio donde el operador lee.
+	claves := map[string]bool{
+		"sesiones_con_salud":       true,
+		"intent_omitted_by_reason": true,
+		"stuck_heads":              true,
+		"stuck_head_polls":         true,
+		"failed_seal_dispatch":     true,
+		"failed_seal_budget":       true,
+	}
+	for k := range crudo.Despacho {
+		if !claves[k] {
+			t.Errorf("el bloque `despacho` trae una clave nueva %q: si es un total agregado, deshace T3.12 "+
+				"(los dos sellos separados) o INV-051.3 (los ocho motivos distinguibles). Cuerpo: %s", k, body)
+		}
+	}
+	for k := range claves {
+		if _, ok := crudo.Despacho[k]; !ok {
+			t.Errorf("el bloque `despacho` perdió la clave %q: %s", k, body)
+		}
 	}
 }
 

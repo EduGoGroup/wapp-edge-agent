@@ -459,3 +459,68 @@ func TestNingunIndiceDeLaColaDependeDeClaimToken(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestMigrateColaCreaParteWorkerSobreColaPreexistente es el gemelo de T4.5 del test de claim_token, y
+// existe porque el fallo que cubre es INVISIBLE POR DISEÑO.
+//
+// La Ola 4 decidió —bien— que un fallo al publicar el parte NO puede tumbar el bucle del cajero: es
+// telemetría, y el trabajo es la cola. Sale por un log.Warn y el bucle sigue. Combínalo con una tabla
+// `parte_worker` que no llegara a crearse sobre las colas QUE YA EXISTEN en UAT y en campo, y el
+// resultado es el peor de los posibles: el cajero funciona perfectamente, cada publicación falla con
+// `no such table: parte_worker`, y `intent_circuit` viaja VACÍO para siempre. Vacío es exactamente lo
+// que la ola define como «no lo sé» ⇒ el síntoma de la tabla ausente sería INDISTINGUIBLE del síntoma
+// de un cajero muerto. Sería un canal de salud que falla en el único modo que no sabe reportar.
+//
+// Que `applyMigrations` no lleve tabla de versión y re-ejecute los .sql en cada arranque es lo que
+// hace que esto funcione — pero eso era una afirmación LEÍDA. Este test la ejecuta.
+func TestMigrateColaCreaParteWorkerSobreColaPreexistente(t *testing.T) {
+	ctx := context.Background()
+	database := openColaDB(t)
+
+	// 1. La cola que ya está en disco: nacida de un binario ANTERIOR al 0002, sin parte_worker.
+	if _, err := database.ExecContext(ctx, colaSchemaViejo); err != nil {
+		t.Fatalf("crear el esquema viejo de la cola: %v", err)
+	}
+	if tableExists(t, ctx, database, "parte_worker") {
+		t.Fatal("premisa del test rota: el esquema viejo NO debía traer parte_worker")
+	}
+
+	// 2. Arranca el binario nuevo sobre ella.
+	if err := MigrateCola(ctx, database); err != nil {
+		t.Fatalf("MigrateCola sobre una cola preexistente: %v", err)
+	}
+
+	// 3. La tabla está…
+	if !tableExists(t, ctx, database, "parte_worker") {
+		t.Fatal("MigrateCola debía CREAR parte_worker sobre una cola que ya existía; sin ella, el cajero " +
+			"corre perfecto y intent_circuit viaja vacío para siempre, indistinguible de un cajero muerto")
+	}
+
+	// 4. …y es USABLE por el camino real del cajero: fila única (id=1) con UPSERT. Comprobar solo el
+	//    sqlite_master dejaría pasar una tabla creada con otra forma —y el fallo volvería a ser un Warn
+	//    que nadie mira.
+	if _, err := database.ExecContext(ctx,
+		`INSERT INTO parte_worker (id, ts_unix, circuito, taskset, p50_ms) VALUES (1, 1700000000, 'closed', 'disjunta', 1234)
+		 ON CONFLICT(id) DO UPDATE SET ts_unix=excluded.ts_unix, circuito=excluded.circuito,
+		                               taskset=excluded.taskset, p50_ms=excluded.p50_ms`); err != nil {
+		t.Fatalf("publicar el parte sobre la cola migrada: %v", err)
+	}
+	var circuito string
+	if err := database.QueryRowContext(ctx, `SELECT circuito FROM parte_worker WHERE id = 1`).Scan(&circuito); err != nil {
+		t.Fatalf("leer el parte recién publicado: %v", err)
+	}
+	if circuito != "closed" {
+		t.Fatalf("el parte leído no es el publicado: got %q, want %q", circuito, "closed")
+	}
+
+	// 5. Y un segundo arranque no rompe nada (el runner re-ejecuta los .sql SIEMPRE).
+	if err := MigrateCola(ctx, database); err != nil {
+		t.Fatalf("MigrateCola (2.º arranque) debía ser no-op y falló: %v", err)
+	}
+	if err := database.QueryRowContext(ctx, `SELECT circuito FROM parte_worker WHERE id = 1`).Scan(&circuito); err != nil {
+		t.Fatalf("el 2.º arranque no debía borrar el parte: %v", err)
+	}
+	if circuito != "closed" {
+		t.Fatalf("el 2.º arranque alteró el parte: got %q", circuito)
+	}
+}

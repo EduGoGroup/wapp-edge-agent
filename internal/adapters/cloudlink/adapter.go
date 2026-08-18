@@ -993,6 +993,21 @@ func (a *Adapter) collectHealth(sessionID string) *cloudlinkv1.SessionHealth {
 		OutboxDepth:          r.OutboxDepth,
 		BinaryVersion:        r.BinaryVersion,
 		DaemonUptimeS:        r.DaemonUptimeS,
+		// Plan 051 Ola 4 · T4.3: los tres del PARTE del worker-cajero. El colector ya aplicó la regla de
+		// rancidez (health.Collector.parteDelWorker), así que aquí "" y 0 significan «este Edge no lo sabe»
+		// y NUNCA un valor heredado de un cajero muerto. No se re-normaliza ni se rellena nada.
+		WorkerTaskset: r.WorkerTaskset,
+		IntentP50Ms:   r.IntentP50Ms,
+		// Plan 051 Ola 4 · T4.0: el desglose llega con las OCHO claves siempre presentes (el Report las
+		// construye recorriendo app.MotivosOmitido()). Se pasa TAL CUAL: filtrar o reordenar aquí sería
+		// transcribir la lista canónica por la puerta de atrás, y nunca se agrega entre motivos (INV-051.3).
+		IntentOmittedByReason: r.IntentOmittedByReason,
+		StuckHeads:            r.StuckHeads,
+		StuckHeadPolls:        r.StuckHeadPolls,
+		// 🔴 Los dos sellos, cada uno por su campo y sin ningún total que los sume (T3.12): sólo
+		// failed_seal_dispatch implica mensajes duplicados en la nube.
+		FailedSealDispatch: r.FailedSealDispatch,
+		FailedSealBudget:   r.FailedSealBudget,
 	}
 }
 

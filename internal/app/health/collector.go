@@ -1,9 +1,18 @@
 // collector.go — COLECTOR DE SALUD del Edge (Plan 031 T7). Arma un Report por sesión combinando el
 // snapshot de runtime del Registry (T6: prueba de vida del socket, motivo de degradación, duración de la
 // última carga de la DEK, edad del último entrante) con las señales de ALCANCE DAEMON que T6 no puebla:
-// profundidad del outbox (ADR-0003), estado del circuito del clasificador (Plan 029), versión del binario
-// (ldflags) y uptime del proceso. El Report es NEUTRAL (sin proto): el adapter CloudLink lo mapea a
-// SessionHealth para el heartbeat y el plano de control lo serializa a JSON en GET /v1/health.
+// profundidad del outbox (ADR-0003), versión del binario (ldflags) y uptime del proceso. El Report es
+// NEUTRAL (sin proto): el adapter CloudLink lo mapea a SessionHealth para el heartbeat y el plano de
+// control lo serializa a JSON en GET /v1/health.
+//
+// PLAN 051 OLA 4 · EL COLECTOR PASA A LEER DOS FUENTES MÁS, y las dos existen porque la Ola 3 partió el
+// Edge en DOS PROCESOS y la telemetría se quedó a un lado de la frontera:
+//
+//	T4.3 · el PARTE DEL WORKER-CAJERO (app.ParteWorkerLector) — circuito del clasificador, taskset y p50
+//	       de inferencia. Ocurren en el otro proceso; llegan por la BD de la cola, con REGLA DE RANCIDEZ
+//	       (ver parteDelWorker): un parte viejo se descarta ENTERO, jamás se hereda un "closed".
+//	T4.0 · los CONTADORES DEL DESPACHADOR por sesión (DespachoReader, ver despacho.go) — los ocho motivos
+//	       de omisión distinguibles (INV-051.3) y los cuatro contadores de atasco/sello.
 //
 // Frontera zero-knowledge (ADR-0007): el Report SOLO lleva METADATOS operativos (estados, edades,
 // duraciones, profundidades, versiones). JAMÁS la DEK, credenciales ni contenido de mensajes.
@@ -12,7 +21,11 @@ package health
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
+	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
 // Report es la foto de salud DERIVADA de una sesión, lista para el wire (edades/duraciones ya calculadas).
@@ -35,6 +48,42 @@ type Report struct {
 	BinaryVersion string
 	// DaemonUptimeS es el uptime del daemon en segundos (mismo valor para todas las sesiones del proceso).
 	DaemonUptimeS int64
+
+	// ─── Plan 051 Ola 4 · T4.3 · lo que el WORKER-CAJERO sabe y este proceso no ───
+	//
+	// Los TRES campos de abajo (IntentCircuit incluido) salen del MISMO parte, y por eso caen JUNTOS: si el
+	// parte está rancio o no se pudo leer, los tres quedan a su cero. Ver `parteDelWorker`.
+
+	// WorkerTaskset es cómo está confinado el worker-cajero ("disjunta"/"solapada"/"cajero_sin_confinar");
+	// "" si no se sabe (parte ausente, rancio o ilegible).
+	WorkerTaskset string
+	// IntentP50Ms es el p50 de la INFERENCIA del clasificador en ms, medido por el cajero. 0 = sin muestras
+	// (o parte ausente/rancio): NO significa «inferencia instantánea».
+	IntentP50Ms int64
+
+	// ─── Plan 051 Ola 4 · T4.0 · los OCHO motivos, distinguibles (INV-051.3) ───
+
+	// IntentOmittedByReason es el desglose de despachos SIN intención de ESTA sesión, motivo a motivo, con
+	// las OCHO claves de app.MotivosOmitido() SIEMPRE presentes (un motivo a 0 es un dato, no un hueco).
+	//
+	// 🔴 NUNCA AGREGADO ENTRE MOTIVOS (INV-051.3): `fastlane` es el camino SANO y `presupuesto`/`breaker`
+	// son fallos; sumarlos borra la única pregunta que este desglose responde («¿hay que mirar Ollama?»).
+	// Sumar el MISMO motivo entre sesiones sí es legítimo (es lo que hace el agregado del daemon).
+	IntentOmittedByReason map[string]int64
+	// StuckHeads es cuántas filas quedaron de cabeza en un estado que esta versión no conoce. 🔴 CERO ES EL
+	// ÚNICO VALOR SANO: cada una es una sesión que dejó de drenar y no vuelve sola.
+	StuckHeads int64
+	// StuckHeadPolls dice si el atasco es HISTORIA o es AHORA: sigue creciendo mientras la sesión siga
+	// bloqueada.
+	StuckHeadPolls int64
+	// FailedSealDispatch: falló `MarcarDespachada` tras una entrega CON ÉXITO. 🔴 Cada uno es un DUPLICADO
+	// en la nube. Es el número que se mira.
+	FailedSealDispatch int64
+	// FailedSealBudget: falló `DespacharSinIntent`. La fila se reintenta y nada sale mal aguas arriba.
+	//
+	// 🔴 SEPARADO DE FailedSealDispatch A PROPÓSITO (T3.12): sólo UNO de los dos implica mensajes duplicados.
+	// Sumarlos deshace esa distinción y convierte ruido operativo en un incidente (o al revés).
+	FailedSealBudget int64
 }
 
 // OutboxDepther es el puerto MÍNIMO que el colector necesita del outbox: la profundidad por sesión. Se
@@ -45,20 +94,31 @@ type OutboxDepther interface {
 }
 
 // Collector arma Reports de salud. Uno por daemon, compartido: lee el Registry (T6) y las señales daemon.
-// Todas sus dependencias externas son tolerantes a nil (outbox/circuit ausentes ⇒ campos en su cero).
+// Todas sus dependencias externas son tolerantes a nil (outbox/parte/despacho ausentes ⇒ campos en su cero).
 type Collector struct {
-	reg       *Registry
-	outbox    OutboxDepther
-	circuit   func() string // estado del circuito del clasificador; nil ⇒ "" (029 off)
+	reg    *Registry
+	outbox OutboxDepther
+	// parte es el LECTOR DEL PARTE DEL WORKER-CAJERO (Plan 051 Ola 4 · T4.3): el canal por el que este
+	// proceso se entera del circuito, el taskset y el p50 de inferencia, que ocurren en OTRO proceso. nil
+	// ⇒ los tres campos quedan a su cero, que es EXACTAMENTE el comportamiento previo a T4.3 (y el que
+	// siguen ejercitando los tests y los wirings que no lo cablean).
+	parte     app.ParteWorkerLector
 	version   string
 	startedAt time.Time
 	now       func() time.Time
+	log       sharedlogger.Logger
+
+	// muDespacho protege `despacho`, que se cablea TARDE (SetDespachoReader) porque en el wiring del daemon
+	// el colector nace ANTES que el session manager que lo implementa. Sin el candado, ese Set competiría
+	// con el primer heartbeat que ya puede estar corriendo (el multiplexor CloudLink se construye en medio).
+	muDespacho sync.RWMutex
+	despacho   DespachoReader
 }
 
-// CollectorOption ajusta el colector (reloj de test).
+// CollectorOption ajusta el colector (reloj de test, logger, lector de contadores del despachador).
 type CollectorOption func(*Collector)
 
-// WithClock inyecta el reloj (tests deterministas de edades/uptime).
+// WithClock inyecta el reloj (tests deterministas de edades/uptime Y de la RANCIDEZ del parte del worker).
 func WithClock(now func() time.Time) CollectorOption {
 	return func(c *Collector) {
 		if now != nil {
@@ -67,22 +127,74 @@ func WithClock(now func() time.Time) CollectorOption {
 	}
 }
 
+// WithLogger inyecta el logger del colector. Sólo se usa para AVISAR (warn) de un parte del worker que no
+// se pudo leer: la telemetría nunca tumba un heartbeat, pero tampoco debe fallar en silencio. nil ⇒
+// sharedlogger.Default().
+func WithLogger(log sharedlogger.Logger) CollectorOption {
+	return func(c *Collector) {
+		if log != nil {
+			c.log = log
+		}
+	}
+}
+
+// WithDespachoReader cablea, YA EN LA CONSTRUCCIÓN, el lector de los contadores del despachador por sesión
+// (T4.0). En producción NO se usa —el daemon lo cablea después, con SetDespachoReader, porque el Manager
+// nace más tarde—; existe para los tests, que sí pueden construirlo todo de una vez.
+func WithDespachoReader(r DespachoReader) CollectorOption {
+	return func(c *Collector) {
+		if r != nil {
+			c.despacho = r
+		}
+	}
+}
+
 // NewCollector construye el colector. reg puede ser nil (Collect devolverá ok=false para toda sesión);
-// outbox nil ⇒ profundidad 0; circuit nil ⇒ IntentCircuit "". version es la build del binario (ldflags) y
-// startedAt marca el arranque del proceso (base del uptime).
-func NewCollector(reg *Registry, outbox OutboxDepther, circuit func() string, version string, startedAt time.Time, opts ...CollectorOption) *Collector {
+// outbox nil ⇒ profundidad 0; parte nil ⇒ IntentCircuit/WorkerTaskset/IntentP50Ms en su cero. version es
+// la build del binario (ldflags) y startedAt marca el arranque del proceso (base del uptime).
+//
+// 🔴 EL TERCER PARÁMETRO CAMBIÓ EN T4.3 y no es un renombrado cosmético. Hasta la Ola 3 era un
+// `circuit func() string` que leía el breaker del decorador INLINE; T3.0 retiró ese decorador y el
+// parámetro quedó recibiendo un `nil` explícito desde el daemon, con `intent_circuit` viajando vacío para
+// siempre. El circuito REAL vive en el worker-cajero, en otro proceso, y sólo se puede leer por el canal
+// que ambos comparten: la BD de la cola. Por eso ahora se pide el LECTOR DEL PARTE y no un callback: un
+// callback local no puede volver a decir la verdad sobre un proceso que no es este.
+func NewCollector(reg *Registry, outbox OutboxDepther, parte app.ParteWorkerLector, version string, startedAt time.Time, opts ...CollectorOption) *Collector {
 	c := &Collector{
 		reg:       reg,
 		outbox:    outbox,
-		circuit:   circuit,
+		parte:     parte,
 		version:   version,
 		startedAt: startedAt,
 		now:       time.Now,
+		log:       sharedlogger.Default(),
 	}
 	for _, o := range opts {
 		o(c)
 	}
 	return c
+}
+
+// SetDespachoReader cablea (o recablea) el lector de los contadores del despachador por sesión (T4.0).
+//
+// POR QUÉ UN SETTER Y NO UNA OPCIÓN DEL CONSTRUCTOR: en el wiring del daemon el colector se construye
+// ANTES que el session manager —el multiplexor CloudLink necesita el colector, y el Manager necesita el
+// multiplexor—, así que en el momento de `NewCollector` el implementador todavía no existe. Es la misma
+// costura tardía que `srv.SetHealthProvider`. nil se IGNORA (no desconecta un lector ya cableado).
+func (c *Collector) SetDespachoReader(r DespachoReader) {
+	if c == nil || r == nil {
+		return
+	}
+	c.muDespacho.Lock()
+	c.despacho = r
+	c.muDespacho.Unlock()
+}
+
+// despachoReader lee el lector bajo el candado (ver muDespacho).
+func (c *Collector) despachoReader() DespachoReader {
+	c.muDespacho.RLock()
+	defer c.muDespacho.RUnlock()
+	return c.despacho
 }
 
 // Collect arma el Report de la sesión sessionID. ok=false si la sesión no tiene entrada de salud en el
@@ -98,11 +210,14 @@ func (c *Collector) Collect(ctx context.Context, sessionID string) (Report, bool
 		return Report{}, false
 	}
 	now := c.now()
+	circuito, taskset, p50 := c.parteDelWorker(ctx, now)
 	r := Report{
 		SocketState:       string(snap.SocketState),
 		DegradedReason:    snap.DegradedReason,
 		DEKLoadDurationMs: snap.DEKLoadDuration.Milliseconds(),
-		IntentCircuit:     c.intentCircuit(),
+		IntentCircuit:     circuito,
+		WorkerTaskset:     taskset,
+		IntentP50Ms:       p50,
 		BinaryVersion:     c.version,
 		DaemonUptimeS:     c.uptimeS(now),
 	}
@@ -116,7 +231,56 @@ func (c *Collector) Collect(ctx context.Context, sessionID string) (Report, bool
 			r.OutboxDepth = depth
 		}
 	}
+	c.poblarDespacho(&r, sessionID)
 	return r, true
+}
+
+// poblarDespacho vuelca en el Report los contadores del despachador de ESTA sesión (T4.0). El desglose por
+// motivo se rellena SIEMPRE con las ocho claves canónicas —haya o no lector, esté o no viva la sesión—,
+// porque «este motivo no se ha dado» y «no sé nada de esta sesión» se distinguen mirando el resto del
+// Report, no dejando huecos en el mapa que el consumidor tenga que adivinar.
+func (c *Collector) poblarDespacho(r *Report, sessionID string) {
+	r.IntentOmittedByReason = omitidosEnCero()
+	lector := c.despachoReader()
+	if lector == nil {
+		return
+	}
+	st, ok := lector.DespachoStats(sessionID)
+	if !ok {
+		return
+	}
+	// Se COPIA clave a clave (no se sustituye el mapa) por dos motivos: el lector podría devolver un mapa
+	// que él siga escribiendo, y así una clave que él no traiga —un rollback a un binario con menos
+	// motivos— sigue apareciendo a 0 en vez de desaparecer de la serie.
+	for motivo, n := range st.OmitidosPorMotivo {
+		r.IntentOmittedByReason[motivo] = n
+	}
+	r.StuckHeads = st.CabezasAtascadas
+	r.StuckHeadPolls = st.PollsCabezaAtascada
+	// 🔴 LOS DOS SELLOS VIAJAN SEPARADOS Y NO HAY NINGÚN CAMPO QUE LOS SUME (T3.12). `FailedSealDispatch`
+	// es un DUPLICADO ya publicado en la nube; `FailedSealBudget` es una fila que se reintenta sola en el
+	// poll siguiente. Un `+` en esta línea —o un tercer campo «total»— borraría esa diferencia justo en el
+	// sitio donde el operador la lee, y convertiría ruido operativo en un incidente (o al revés).
+	r.FailedSealDispatch = st.FallosSelloDespacho
+	r.FailedSealBudget = st.FallosSelloPresupuesto
+}
+
+// DespachoVivas devuelve el AGREGADO de los contadores del despachador sobre las sesiones VIVAS (T4.0),
+// para el bloque de daemon del plano de control local. Sin lector cableado devuelve el cero con las ocho
+// claves presentes. Ver el doc de sessionmgr.Manager.DespachoStatsVivas para la semántica de «vivas».
+func (c *Collector) DespachoVivas() DespachoStats {
+	if c == nil {
+		return DespachoStatsCero()
+	}
+	lector := c.despachoReader()
+	if lector == nil {
+		return DespachoStatsCero()
+	}
+	st := lector.DespachoStatsVivas()
+	if st.OmitidosPorMotivo == nil {
+		st.OmitidosPorMotivo = omitidosEnCero()
+	}
+	return st
 }
 
 // Reports arma el Report de TODAS las sesiones vivas (las que tienen entrada en el Registry). Lo consume
@@ -151,14 +315,64 @@ func (c *Collector) Version() string {
 	return c.version
 }
 
-// intentCircuit lee el estado del circuito y lo NORMALIZA al contrato del wire ("half-open" → "half_open").
-// El endpoint /v1/intent/status conserva su forma con guion; el heartbeat/bundle usan la forma con guion
-// bajo del contrato SessionHealth (ADR-0023). "" si 029 no está activo.
-func (c *Collector) intentCircuit() string {
-	if c.circuit == nil {
-		return ""
+// parteDelWorker lee el parte que el worker-cajero deja en la BD de la cola y devuelve los TRES campos que
+// de él dependen: circuito, taskset y p50 de inferencia. Es la única puerta por la que este proceso se
+// entera de lo que pasa en el otro (Plan 051 Ola 4 · T4.3).
+//
+// 🔴 LA REGLA DE RANCIDEZ, QUE ES EL CORAZÓN DE ESTA FUNCIÓN. Si el parte se aparta del ahora más de
+// `app.ParteRancio` —viejo por detrás O adelantado por delante, la ventana es SIMÉTRICA (ver abajo)—,
+// SE DESCARTA ENTERO y los tres campos salen a su cero. No se publica el `"closed"` del último parte de un
+// cajero que lleva media hora muerto: eso sería una señal de SALUD INVENTADA viajando a la nube en cada
+// latido, y una salud inventada es peor que la ausencia del dato — el operador la cree, y `intent_circuit`
+// vacío al menos le dice la verdad («este Edge no sabe»). El umbral se usa POR NOMBRE, nunca un literal.
+//
+// LOS TRES CAEN JUNTOS, y también es deliberado: vienen del mismo instante del mismo proceso. Conservar el
+// p50 y tirar el circuito daría una foto mitad viva mitad muerta que nadie sabría interpretar.
+//
+// ⚠️ UN ERROR DE LECTURA (BD bloqueada por el cajero, fichero movido) TAMPOCO TUMBA NADA: se avisa a warn
+// y los tres quedan a cero. Este código corre en el camino del HEARTBEAT; que la telemetría de un
+// subsistema impida decir «sigo vivo» sería el peor cambio posible.
+//
+// La ausencia de parte (el cajero nunca escribió: ok=false) NO es un error y NO se loguea: es el estado
+// normal de un Edge recién arrancado, y avisar por cada sesión en cada latido sería ruido perpetuo.
+func (c *Collector) parteDelWorker(ctx context.Context, now time.Time) (circuito, taskset string, p50 int64) {
+	if c.parte == nil {
+		return "", "", 0
 	}
-	return strings.ReplaceAll(c.circuit(), "-", "_")
+	p, ok, err := c.parte.LeerParte(ctx)
+	if err != nil {
+		c.log.Warn("health: no se pudo leer el parte del worker-cajero; intent_circuit/worker_taskset/"+
+			"intent_p50_ms viajan VACÍOS en este latido (nunca un valor heredado)", "error", err)
+		return "", "", 0
+	}
+	if !ok {
+		return "", "", 0
+	}
+	// 🔴 LA VENTANA ES SIMÉTRICA, Y EL LADO DEL FUTURO NO ES PARANOIA DE LIBRO. Con la comparación en un
+	// solo sentido (`now.Sub(p.TS) > ParteRancio`), un parte con TS EN EL FUTURO da una edad NEGATIVA, que
+	// nunca supera el umbral: sería fresco PARA SIEMPRE. El escenario concreto es el de la plataforma
+	// objetivo, un portátil que se suspende: el cajero escribe su parte, el reloj salta HACIA ATRÁS (NTP al
+	// despertar, cambio manual de hora), el cajero muere — y a partir de ahí el daemon publica en cada
+	// latido el `"closed"` de un clasificador APAGADO, sin caducar jamás. Es exactamente la salud inventada
+	// que esta regla existe para impedir, y encima con la peor cara posible: verde permanente.
+	//
+	// La migración `0002_parte_worker.sql` YA PROMETÍA este comportamiento («un salto de NTP hacia atrás …
+	// produce un parte que parece del futuro o rancio de más — degrada a `intent_circuit` vacío, que es el
+	// fallo seguro»). Hasta esta línea, la promesa era falsa por el lado del futuro.
+	//
+	// La tolerancia hacia el futuro es de un ParteRancio entero, y es GENEROSA a propósito: los dos procesos
+	// leen el reloj de LA MISMA MÁQUINA, así que el desfase legítimo es cero (sólo cabe la fracción de
+	// segundo que se pierde al truncar `ts_unix` a segundos). Un parte que se adelanta más de 90 s no es un
+	// desfase: es un reloj que saltó, y de un reloj que saltó no se puede deducir salud.
+	edad := now.Sub(p.TS)
+	if edad > app.ParteRancio || edad < -app.ParteRancio {
+		// Sin log: un cajero parado a propósito (o aún arrancando) haría de esto una línea por sesión y por
+		// latido. El hecho ya viaja —y de forma más útil— como `intent_circuit` vacío en el propio Report.
+		return "", "", 0
+	}
+	// Normaliza al contrato del wire ("half-open" → "half_open"): el endpoint /v1/intent/status conserva la
+	// forma con guion, el heartbeat y el bundle usan la del contrato SessionHealth (ADR-0023).
+	return strings.ReplaceAll(p.Circuito, "-", "_"), p.Taskset, p.P50ms
 }
 
 // uptimeS calcula el uptime en segundos (0 si startedAt es cero o el reloj retrocedió).

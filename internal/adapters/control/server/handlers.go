@@ -16,6 +16,11 @@ import (
 type HealthReporter interface {
 	Reports(ctx context.Context) map[string]health.Report
 	DaemonUptimeS() int64
+	// DespachoVivas es el AGREGADO de los contadores del despachador sobre las sesiones vivas (Plan 051
+	// Ola 4 · T4.0). Es la mitad LOCAL de esa tarea: el desglose por motivo tiene que poder leerse en el
+	// equipo del cliente, con `wapp-ctl`, sin depender de que la nube reciba el latido — que es justo la
+	// situación en la que alguien está mirando esto (un Edge que no entrega suele ser un Edge desconectado).
+	DespachoVivas() health.DespachoStats
 }
 
 // SessionLister es el puerto de lectura que consume GET /v1/sessions, RE-LLAVEADO a session_id
@@ -39,6 +44,10 @@ type healthResponse struct {
 	Version  string                       `json:"version"`
 	UptimeS  int64                        `json:"uptime_s,omitempty"`
 	Sessions map[string]sessionHealthView `json:"sessions,omitempty"`
+	// Despacho es el agregado del desglose de omisiones sobre las sesiones VIVAS (Plan 051 Ola 4 · T4.0):
+	// la respuesta a «¿por qué este Edge está entregando sin intención?» de un vistazo, sin sumar a mano las
+	// N sesiones. Puntero + omitempty: sin colector cableado el cuerpo sigue siendo el histórico.
+	Despacho *despachoView `json:"despacho,omitempty"`
 }
 
 // sessionHealthView es la proyección JSON de la salud de runtime de UNA sesión en GET /v1/health (misma
@@ -52,6 +61,45 @@ type sessionHealthView struct {
 	OutboxDepth       int64  `json:"outbox_depth"`
 	BinaryVersion     string `json:"binary_version"`
 	DaemonUptimeS     int64  `json:"daemon_uptime_s"`
+
+	// ── Plan 051 Ola 4 · lo que llegó del OTRO proceso (T4.3) ──
+	//
+	// Los tres son omitempty PORQUE SU AUSENCIA ES INFORMACIÓN: significan «el parte del worker-cajero no
+	// está, o está rancio». Un `intent_circuit: ""` o un `intent_p50_ms: 0` impresos como si fueran medidas
+	// se leerían como «circuito indefinido» y «inferencia instantánea», que es lo contrario de la verdad.
+	WorkerTaskset string `json:"worker_taskset,omitempty"`
+	IntentP50Ms   int64  `json:"intent_p50_ms,omitempty"`
+
+	// ── Plan 051 Ola 4 · los contadores del despachador de ESTA sesión (T4.0) ──
+	//
+	// 🔴 `intent_omitted_by_reason` NO lleva omitempty, a diferencia de todo lo de arriba: sus OCHO claves
+	// se imprimen siempre, incluso todas a 0. Un motivo a 0 es un dato («por aquí no se está yendo nadie»);
+	// un hueco obliga al que lee a preguntarse si el motivo no existe, no se midió o no se dio.
+	IntentOmittedByReason map[string]int64 `json:"intent_omitted_by_reason"`
+	StuckHeads            int64            `json:"stuck_heads"`
+	StuckHeadPolls        int64            `json:"stuck_head_polls"`
+	// Los dos sellos, separados y sin ningún «total» (T3.12): sólo `failed_seal_dispatch` implica duplicados
+	// publicados en la nube. Sumarlos aquí desharía la única distinción que el operador necesita.
+	FailedSealDispatch int64 `json:"failed_seal_dispatch"`
+	FailedSealBudget   int64 `json:"failed_seal_budget"`
+}
+
+// despachoView es el bloque de DAEMON del desglose: el mismo juego de contadores, agregado sobre las
+// sesiones vivas. Mismas reglas que el de sesión —las ocho claves siempre, los dos sellos separados—.
+type despachoView struct {
+	// SesionesConSalud es cuántas sesiones reporta el bloque `sessions` de esta misma respuesta. Se publica
+	// para poder LEER el agregado (un `stuck_heads: 3` con una sesión y con veinte no dicen lo mismo), no
+	// como censo: el agregado lo calcula el session manager sobre SUS sesiones vivas, que son las mismas
+	// salvo una carrera de milisegundos con un pairing/unlink en curso.
+	//
+	// El agregado NO es acumulativo: una sesión desvinculada deja de sumar, así que estos contadores pueden
+	// BAJAR. Es el significado de «vivas». Ver sessionmgr.Manager.DespachoStatsVivas.
+	SesionesConSalud      int              `json:"sesiones_con_salud"`
+	IntentOmittedByReason map[string]int64 `json:"intent_omitted_by_reason"`
+	StuckHeads            int64            `json:"stuck_heads"`
+	StuckHeadPolls        int64            `json:"stuck_head_polls"`
+	FailedSealDispatch    int64            `json:"failed_seal_dispatch"`
+	FailedSealBudget      int64            `json:"failed_seal_budget"`
 }
 
 // handleHealth responde 200 con {status:"ok", version} y, si hay colector de salud cableado (Plan 031 T7),
@@ -75,8 +123,29 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 					OutboxDepth:       hr.OutboxDepth,
 					BinaryVersion:     hr.BinaryVersion,
 					DaemonUptimeS:     hr.DaemonUptimeS,
+					WorkerTaskset:     hr.WorkerTaskset,
+					IntentP50Ms:       hr.IntentP50Ms,
+					// El desglose se COPIA tal cual llega del Report, que ya garantiza las ocho claves
+					// recorriendo `app.MotivosOmitido()`. Aquí no se filtra ni se reordena: filtrar sería
+					// transcribir la lista por la puerta de atrás.
+					IntentOmittedByReason: hr.IntentOmittedByReason,
+					StuckHeads:            hr.StuckHeads,
+					StuckHeadPolls:        hr.StuckHeadPolls,
+					FailedSealDispatch:    hr.FailedSealDispatch,
+					FailedSealBudget:      hr.FailedSealBudget,
 				}
 			}
+		}
+		// Bloque de DAEMON del desglose (T4.0): el agregado sobre las sesiones vivas, para no obligar a
+		// nadie a sumar N sesiones a mano en el equipo del cliente.
+		agg := s.health.DespachoVivas()
+		resp.Despacho = &despachoView{
+			SesionesConSalud:      len(reports),
+			IntentOmittedByReason: agg.OmitidosPorMotivo,
+			StuckHeads:            agg.CabezasAtascadas,
+			StuckHeadPolls:        agg.PollsCabezaAtascada,
+			FailedSealDispatch:    agg.FallosSelloDespacho,
+			FailedSealBudget:      agg.FallosSelloPresupuesto,
 		}
 	}
 	writeJSON(w, http.StatusOK, resp)

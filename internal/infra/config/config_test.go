@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -32,7 +33,12 @@ func TestLoad_Defaults(t *testing.T) {
 
 	want := defaults()
 	want.DataDir = dataDir // el override de entorno reemplaza el default sagrado
-	if cfg != want {
+	// La lista de colas del round-robin del cajero (Plan 051 O4 · T4.1) NO tiene default en defaults():
+	// se DERIVA en Load, después de anclar data_dir, y su default es exactamente la lista de un elemento
+	// con ese data_dir. Es la no-regresión de las instalaciones de una sola cola, aseverada aquí.
+	want.Worker.DataDirs = []string{dataDir}
+	// reflect.DeepEqual y no `!=`: Config dejó de ser comparable en T4.1 (WorkerConfig lleva un []string).
+	if !reflect.DeepEqual(cfg, want) {
 		t.Fatalf("defaults: got %+v, want %+v", cfg, want)
 	}
 	// El default de data_dir NO es "." y ES una ruta absoluta (MP-02, D1/D2): el store no depende del CWD.
@@ -713,10 +719,144 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	esperado := WorkerConfig{
 		MaxConcurrent: 2, PollMS: 250, MaxRunes: 1500, NumThread: 3, NumPredict: 64, NumCtx: 2048,
 		MaxIntentos: 5, InferenceTimeoutMS: 9000, StatsEveryMS: 60000,
+		// La lista de colas del round-robin (T4.1) no se toca en este test, así que vale su default: el
+		// data_dir único de siempre, ya absolutizado.
+		DataDirs: []string{cfg.DataDir},
 	}
-	if cfg.Worker != esperado {
+	// reflect.DeepEqual y NO `!=`: desde T4.1 WorkerConfig lleva un []string (DataDirs) y una struct con
+	// slice NO ES COMPARABLE — `cfg.Worker != esperado` ya no compila. Comparar campo a campo dejaría el
+	// test ciego al siguiente campo que se añada, que es justo la clase de agujero que este bloque existe
+	// para tapar (vigila que el PREFIJO propio gobierne el struct ENTERO).
+	if !reflect.DeepEqual(cfg.Worker, esperado) {
 		t.Fatalf("override con el prefijo propio: got %+v, want %+v", cfg.Worker, esperado)
 	}
+}
+
+// dirSinComas crea un directorio temporal cuya ruta NO contiene comas, y lo borra al terminar.
+//
+// Existe porque `t.TempDir()` deriva el nombre del directorio del NOMBRE DEL TEST, y los casos de
+// TestLoad_WorkerDataDirs se llaman con comas a propósito ("lista por comas, con espacios y comas de
+// más"). Esas comas acaban DENTRO de la ruta, `WAPP_WORKER_DATA_DIRS` se separa por comas, y la ruta
+// se parte por las suyas propias: los dos temporales se truncan al mismo prefijo y el caso muere con
+// un "apuntan al mismo directorio" que no tiene nada que ver con lo que estaba probando. Costó un
+// rojo entender que el test se saboteaba con su propio nombre.
+//
+// Sólo hace falta en los casos que meten la ruta DENTRO de la lista; para `WAPP_AGENT_DATA_DIR`, que
+// se lee como cadena entera, `t.TempDir()` sirve igual.
+func dirSinComas(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "wapp-cola")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// TestLoad_WorkerDataDirs cubre la lista de colas del ROUND-ROBIN del cajero (Plan 051 Ola 4 · T4.1).
+//
+// Lo que vigila, por orden de gravedad si se rompiera:
+//
+//   - EL DEFAULT. Sin la variable, la lista es exactamente `[cfg.DataDir]`. Es la no-regresión del 99 %
+//     de las instalaciones: una máquina con un solo data_dir no debe notar que el cajero sabe rotar.
+//   - LA ABSOLUTIZACIÓN, y que ocurre DESPUÉS de anclar Config.DataDir. Una entrada relativa que quedara
+//     sin anclar apuntaría al CWD del supervisor —no al del operador— y el cajero abriría la cola de un
+//     directorio que nadie escribió, sin error y sin síntoma.
+//   - LOS DUPLICADOS, que son ERROR y no deduplicación silenciosa: dos colas sobre el mismo fichero
+//     SQLite son un round-robin que se turna consigo mismo.
+//   - EL PREFIJO. Igual que el resto del bloque worker, es WAPP_WORKER_ y no WAPP_AGENT_.
+func TestLoad_WorkerDataDirs(t *testing.T) {
+	t.Run("sin la variable, la lista es el data_dir único de siempre", func(t *testing.T) {
+		dataDir := t.TempDir()
+		t.Setenv(EnvPrefix+"DATA_DIR", dataDir)
+
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !reflect.DeepEqual(cfg.Worker.DataDirs, []string{cfg.DataDir}) {
+			t.Fatalf("el default es la lista de un elemento con el data_dir: got %v, want %v",
+				cfg.Worker.DataDirs, []string{cfg.DataDir})
+		}
+	})
+
+	t.Run("lista por comas, con espacios y comas de más", func(t *testing.T) {
+		a, b := dirSinComas(t), dirSinComas(t)
+		t.Setenv(EnvPrefix+"DATA_DIR", t.TempDir())
+		// Espacios alrededor, una entrada vacía en medio y una coma colgando: es cómo queda una lista
+		// tecleada a mano en una unidad de systemd, y no debe fallar por eso.
+		t.Setenv(WorkerEnvPrefix+"DATA_DIRS", "  "+a+" , , "+b+" ,")
+
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !reflect.DeepEqual(cfg.Worker.DataDirs, []string{a, b}) {
+			t.Fatalf("lista trimeada y sin vacíos: got %v, want %v", cfg.Worker.DataDirs, []string{a, b})
+		}
+	})
+
+	t.Run("una lista entera vacía cae al default", func(t *testing.T) {
+		dataDir := t.TempDir()
+		t.Setenv(EnvPrefix+"DATA_DIR", dataDir)
+		t.Setenv(WorkerEnvPrefix+"DATA_DIRS", " , , ")
+
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		// Una lista vacía NO puede significar «ninguna cola»: el cajero se quedaría vivo sin reclamar nada.
+		if !reflect.DeepEqual(cfg.Worker.DataDirs, []string{cfg.DataDir}) {
+			t.Fatalf("una lista vacía cae al default: got %v", cfg.Worker.DataDirs)
+		}
+	})
+
+	t.Run("cada entrada se absolutiza", func(t *testing.T) {
+		t.Setenv(EnvPrefix+"DATA_DIR", t.TempDir())
+		t.Setenv(WorkerEnvPrefix+"DATA_DIRS", "relativo-a,otro-relativo")
+
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if len(cfg.Worker.DataDirs) != 2 {
+			t.Fatalf("se esperaban 2 entradas: got %v", cfg.Worker.DataDirs)
+		}
+		for _, dir := range cfg.Worker.DataDirs {
+			if !filepath.IsAbs(dir) {
+				t.Errorf("cada entrada de la lista se ancla a ruta absoluta (el CWD del supervisor no es el "+
+					"del operador): %q", dir)
+			}
+		}
+	})
+
+	t.Run("los duplicados son ERROR, no deduplicación silenciosa", func(t *testing.T) {
+		dir := dirSinComas(t)
+		t.Setenv(EnvPrefix+"DATA_DIR", t.TempDir())
+		t.Setenv(WorkerEnvPrefix+"DATA_DIRS", dir+","+dir)
+
+		_, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err == nil {
+			t.Fatal("dos entradas al mismo directorio deben fallar el arranque")
+		}
+		if !strings.Contains(err.Error(), dir) {
+			t.Errorf("el error debe nombrar el directorio repetido: %v", err)
+		}
+	})
+
+	t.Run("WAPP_AGENT_ no gobierna la lista del worker", func(t *testing.T) {
+		dataDir := t.TempDir()
+		t.Setenv(EnvPrefix+"DATA_DIR", dataDir)
+		t.Setenv(EnvPrefix+"DATA_DIRS", t.TempDir()+","+t.TempDir())
+
+		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !reflect.DeepEqual(cfg.Worker.DataDirs, []string{cfg.DataDir}) {
+			t.Fatalf("la lista es WAPP_WORKER_DATA_DIRS, no WAPP_AGENT_DATA_DIRS: got %v", cfg.Worker.DataDirs)
+		}
+	})
 }
 
 // TestLoad_InferenceTimeout_NoEsElPresupuestoDelDespachador es el arreglo de la calibración del worker,

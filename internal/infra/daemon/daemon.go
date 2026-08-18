@@ -171,18 +171,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 	edgeCfgSvc.Bootstrap(ctx)
 
 	healthReg := health.NewRegistry()
-	// 🔴 EL CIRCUITO DEL CLASIFICADOR YA NO SE PUEDE LEER DESDE AQUÍ (Plan 051 Ola 3 · T3.0) y por eso se
-	// pasa nil EXPLÍCITO. Hasta esta ola el colector leía el breaker del decorador inline; retirado el
-	// decorador, ese breaker no existe. El circuito REAL es el del worker-cajero, que corre en OTRO PROCESO.
+	// 🔴 AQUÍ SE PAGA LA DEUDA QUE LA OLA 3 DEJÓ DECLARADA (Plan 051 Ola 4 · T4.3). Hasta esta ola este
+	// argumento era un `nil` EXPLÍCITO donde antes iba el breaker del decorador inline: T3.0 retiró aquel
+	// decorador, el breaker dejó de existir en este proceso y `intent_circuit` quedó viajando VACÍO en cada
+	// latido y en cada bundle de diagnóstico. Vacío era honesto —«este proceso no tiene circuito»— pero era
+	// una pregunta sin responder: el circuito REAL existe, lo conoce el WORKER-CAJERO, y corre en OTRO
+	// PROCESO. La única frontera que los dos comparten es la BD de la cola, y por ahí llega ahora el PARTE.
 	//
-	// nil ⇒ `intent_circuit` viaja VACÍO en el heartbeat y en el bundle de diagnóstico (Collector.intentCircuit
-	// ya trata el nil así, y el campo es omitempty en el contrato ADR-0023). Vacío es la respuesta honesta:
-	// «este proceso no tiene circuito». Cablear aquí un "closed" fijo —o dejar el breaker muerto— habría
-	// mandado a la nube una señal de salud inventada, que es peor que la ausencia del dato.
+	// El parte trae los TRES campos que este proceso no puede conocer por sí mismo —circuito, taskset y p50
+	// de inferencia— con una regla de rancidez estricta: un parte viejo se descarta ENTERO (ver
+	// health.Collector.parteDelWorker). NUNCA se hereda un "closed" de un cajero muerto; eso sería mandar a
+	// la nube una señal de salud INVENTADA, que es exactamente lo que la Ola 3 se negó a hacer.
 	//
-	// ⚠️ DEUDA DECLARADA para la Ola 4 (telemetría): republicar `intent_circuit` desde el cajero, que sí lo
-	// conoce (internal/app/cajero · Circuito()), por el canal que ambos procesos comparten (la BD de la cola).
-	healthCollector := health.NewCollector(healthReg, outbox, nil, d.version, d.startedAt)
+	// Si el adaptador de la cola no respalda el lado lector, `parteDelWorker` devuelve nil y el colector se
+	// comporta como hasta hoy (los tres campos vacíos). La telemetría no decide la política de arranque.
+	healthCollector := health.NewCollector(healthReg, outbox, parteDelWorker(cola, log), d.version, d.startedAt,
+		health.WithLogger(log))
 	diagBuilder := diagnostics.NewBuilder(d.sink, healthCollector, cfg.DiagLogLines)
 
 	mux, authRelay := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder)
@@ -232,6 +236,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// que se publica. Es la mitad de la reparación del agujero que describe buildLatencia.
 		lat.opt,
 	)
+
+	// CABLEADO TARDÍO DEL DESGLOSE POR MOTIVO (Plan 051 Ola 4 · T4.0). El Manager es quien retiene el
+	// despachador de cada sesión, así que es él quien sabe contestar «cuántas omisiones por `breaker` lleva
+	// esta sesión». No se puede pasar en `health.NewCollector` porque el orden del wiring lo impide: el
+	// colector alimenta al multiplexor CloudLink (línea de arriba) y el multiplexor alimenta al Manager, de
+	// modo que el Manager es forzosamente lo último de la cadena. Misma costura que `srv.SetHealthProvider`.
+	//
+	// 🔴 VA ANTES DE `Restore`: en cuanto Restore levanta listeners, el multiplexor puede empezar a mandar
+	// latidos. Cablear después dejaría una ventana —corta, pero real— de heartbeats con el desglose a cero,
+	// que es indistinguible de un Edge sin tráfico.
+	healthCollector.SetDespachoReader(mgr)
 
 	if err := mgr.Restore(ctx); err != nil {
 		return fmt.Errorf("serve: restaurar sesiones activas: %w", err)
@@ -372,4 +387,27 @@ func colaContador(cola app.ColaEntrantes, log sharedlogger.Logger) app.ColaConta
 		return nil
 	}
 	return c
+}
+
+// parteDelWorker devuelve el lado LECTOR DEL PARTE del worker-cajero, o nil si el adaptador no lo respalda
+// (Plan 051 Ola 4 · T4.3).
+//
+// ES EL MISMO ADAPTADOR DE LA COLA VISTO POR OTRO PUERTO, no una segunda BD ni una conexión nueva: el parte
+// lo ESCRIBE el proceso del cajero y lo LEE éste, y el fichero `cola_entrantes.db` que los dos ya tienen
+// abierto es justo la frontera que comparten. Abrir aquí un segundo handle sobre el mismo SQLite sería
+// añadir un tercer escritor a la única BD del Edge con contención real (T3.15).
+//
+// La aserción de tipo se comprueba en vez de darse por hecha, por el mismo criterio que `colaContador`: con
+// el *Store real siempre se cumple, así que un fallo aquí es un error de cableado, no un modo de operación
+// — pero tumbar el daemon por una línea de telemetría sería peor que la ausencia del dato. Se avisa y se
+// sigue: `intent_circuit`, `worker_taskset` e `intent_p50_ms` viajarán vacíos, exactamente como en la Ola 3.
+func parteDelWorker(cola app.ColaEntrantes, log sharedlogger.Logger) app.ParteWorkerLector {
+	l, ok := cola.(app.ParteWorkerLector)
+	if !ok {
+		log.Warn("agent serve: la cola de entrantes no respalda el lado LECTOR DEL PARTE (app.ParteWorkerLector); " +
+			"el heartbeat viajará sin `intent_circuit`/`worker_taskset`/`intent_p50_ms`. Es un fallo de cableado, " +
+			"no un modo de operación")
+		return nil
+	}
+	return l
 }
