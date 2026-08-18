@@ -219,6 +219,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// devolver nil por su OTRO camino —que el adaptador no implemente el lado despachador—, que es un
 		// fallo de programación imposible con el *Store real y que él grita con un Warn.
 		sessionmgr.WithColaDespachador(wiring.BuildColaDespachador(cola, log)),
+		// Palanca de DIAGNÓSTICO del despachador (Plan 051 Ola 5 · T3.17). Viene ARMADA de
+		// opcionPalancaDespachador —en vez de un `sessionmgr.WithDespachadorApagado(cfg.…)` escrito aquí—
+		// por el mismo motivo que `lat.opt`: `Run` no lo mira ningún test, y una negación invertida en esta
+		// línea apagaría la entrega de entrantes en TODOS los Edge sin que nada se pusiera rojo.
+		opcionPalancaDespachador(cfg),
 		// Presupuesto de espera al cajero (WAPP_AGENT_INTENT_WAIT_MS, 4000 ms): el techo de latencia que la
 		// cola añade al camino de un mensaje. config.Load ya garantiza un valor > 0.
 		sessionmgr.WithPresupuestoIntent(time.Duration(cfg.Intent.WaitMS)*time.Millisecond),
@@ -368,8 +373,30 @@ func buildLatencia(cfg config.Config, cola app.ColaEntrantes, log sharedlogger.L
 			// pánico aquí por una implementación que no respalde el lado contador sería tumbar el daemon por
 			// una línea de observabilidad. nil ⇒ el bloque sale sin los campos de cola, que es correcto.
 			Cola: colaContador(cola, log),
+			// LA SEGUNDA PUNTA DE LA PALANCA DE T3.17 (la primera es opcionPalancaDespachador). El bloque
+			// periódico publica el estado en cada emisión porque el aviso del arranque se pierde en el
+			// scrollback y el síntoma en campo —la cola creciendo— no distingue una palanca olvidada de un
+			// despachador roto. Las dos puntas salen del MISMO campo de config, sin negación por medio.
+			DespachadorApagado: cfg.DespachadorApagado,
 		},
 	}
+}
+
+// opcionPalancaDespachador traduce la palanca de diagnóstico de T3.17 (WAPP_AGENT_DESPACHADOR_APAGADO) a la
+// opción del Manager que impide arrancar el despachador de cada sesión.
+//
+// 🔴 POR QUÉ ES UNA FUNCIÓN Y NO UNA LÍNEA DENTRO DE `Run`, que es exactamente la pregunta que se hizo
+// `buildLatencia` y por el mismo motivo: la lista de opciones de `Run` no la ejercita ningún test —sus
+// únicos importadores son `cmd/agent`, cuyos tests no la llaman—, así que una negación invertida aquí
+// (`WithDespachadorApagado(!cfg.DespachadorApagado)`) dejaría los cuatro gates en verde y APAGARÍA LA
+// ENTREGA DE ENTRANTES EN TODOS LOS EDGE, con la palanca sin echar y sin un solo error en el log. Extraerla
+// es lo que permite construir un Manager de verdad en un test y preguntarle qué le llegó.
+//
+// Sigue sin ser un no-op: `WithDespachadorApagado(false)` se pasa igual y el Manager lo ignora por diseño.
+// Devolver la opción SIEMPRE —en vez de nil cuando la palanca está bajada— evita que el caso normal tenga
+// una forma distinta del caso raro, que es como se cuelan los nils en una lista variádica.
+func opcionPalancaDespachador(cfg config.Config) sessionmgr.Option {
+	return sessionmgr.WithDespachadorApagado(cfg.DespachadorApagado)
 }
 
 // colaContador devuelve el lado SOLO-CONTAR de la cola, o nil si el adaptador no lo respalda.

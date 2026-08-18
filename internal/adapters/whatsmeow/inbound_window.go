@@ -49,6 +49,7 @@ import (
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types/events"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-shared/logger"
 )
 
@@ -98,10 +99,15 @@ type InboundStats struct {
 	// porque son el punto ciego del criterio: si crecen, la ventana está dejando pasar a ojos cerrados.
 	AdmittedNoTimestamp uint64
 	// ColaEnqueueErrors son los entrantes que NO pudieron anotarse en la cola durable porque Enqueue
-	// devolvió error (Plan 051 · INV-051.3). El mensaje se entregó igual al sink (REQ-051.8), así que
-	// nada se perdió HOY; lo que se pierde es la durabilidad, y por eso se cuenta aparte del panic:
-	// distinguir "la cola dijo que no" de "la cola explotó" es la diferencia entre un disco lleno o una
-	// DEK ausente y un bug del adaptador.
+	// devolvió error (Plan 051 · INV-051.3). Se cuenta aparte del panic porque distinguir "la cola dijo
+	// que no" de "la cola explotó" es la diferencia entre un disco lleno o una DEK ausente y un bug del
+	// adaptador.
+	//
+	// ⚠️ LO QUE MIDE HA CAMBIADO DOS VECES, y leerlo con la definición vieja lleva a conclusiones opuestas.
+	// Nació midiendo pérdida de DURABILIDAD (el mensaje se entregaba igual por el `sink.Deliver` inline).
+	// Con T3.0, retirado ese camino, pasó a medir MENSAJES PERDIDOS. Con T1.13 mide MENSAJES QUE WHATSAPP
+	// TENDRÁ QUE REOFRECER: el entrante que no deja fila ya no se acusa, así que sigue vivo del otro lado y
+	// vuelve en el siguiente intento. Quien lo publique en el latido no está publicando bajas.
 	ColaEnqueueErrors uint64
 	// ColaEnqueuePanics son los pánicos RECUPERADOS dentro del encolado. Separado del anterior a
 	// propósito: cualquier valor > 0 aquí es un defecto, no una condición de campo.
@@ -175,6 +181,15 @@ type bracketObserver struct {
 	newestAge, oldestAge               time.Duration
 
 	stats InboundStats
+
+	// puerta son los MISMOS dos contadores de degradación, pero COMPARTIDOS por todas las sesiones del
+	// Edge (T1.13): lo de arriba es de esta sesión y no lo publica nadie; esto es lo que sale en el bloque
+	// del latido. nil ⇒ no se comparte (listeners de test sin cronómetro cableado).
+	//
+	// 🔴 SE ESCRIBEN LOS DOS DESDE EL MISMO SITIO, y esa es toda la gracia: si el incremento compartido
+	// viviera en el listener, al lado de la llamada a estos métodos, serían DOS puntos que alguien tiene
+	// que acordarse de tocar a la vez. Aquí el método es uno y no hay nada que recordar.
+	puerta *latencia.Puerta
 }
 
 func newBracketObserver(log logger.Logger) *bracketObserver { return &bracketObserver{log: log} }
@@ -284,6 +299,9 @@ func (b *bracketObserver) countColaEnqueueError() {
 	b.mu.Lock()
 	b.stats.ColaEnqueueErrors++
 	b.mu.Unlock()
+	// El acumulado del EDGE, que es el que se publica en el bloque del latido. Fuera del candado a
+	// propósito: es un atómico y no tiene nada que hacer dentro de un mutex del camino caliente.
+	b.puerta.AnotaEnqueueError()
 }
 
 // countColaEnqueuePanic contabiliza un panic RECUPERADO dentro del encolado.
@@ -291,6 +309,8 @@ func (b *bracketObserver) countColaEnqueuePanic() {
 	b.mu.Lock()
 	b.stats.ColaEnqueuePanics++
 	b.mu.Unlock()
+	// Acumulado del EDGE (ver countColaEnqueueError).
+	b.puerta.AnotaEnqueuePanic()
 }
 
 // snapshot devuelve el acumulado de la sesión (copia, sin punteros vivos).

@@ -49,6 +49,30 @@ func WithColaDespachador(c app.ColaDespachador) Option {
 	}
 }
 
+// WithDespachadorApagado echa la PALANCA DE DIAGNÓSTICO que impide arrancar el despachador de cada sesión
+// (Plan 051 Ola 5 · T3.17). `false` es un NO-OP explícito: la opción no desactiva nada, solo puede activar
+// el apagado.
+//
+// 🔴 NO ES UN MODO DE OPERACIÓN, ES UN INSTRUMENTO DE MEDIDA. Con la palanca echada el Edge recibe y
+// ENCOLA con normalidad, pero NADA sube a la nube: la cola crece hasta su TTL/tope y a partir de ahí se
+// pierden filas. Existe porque T3.17 tiene que medir el p99 del handler con el despachador parado y el
+// cajero vivo, y hasta ahora eso era imposible: el despachador arrancaba con cada sesión de `agent serve`,
+// así que la única forma de pararlo era tumbar el daemon —que apaga también el listener y deja la serie
+// `encolado` en n=0, con el criterio `n >= 100` inalcanzable por construcción—.
+//
+// QUIEN LA ECHE TIENE QUE QUITARLA. El olvido no da error ni tumba nada: da un Edge que parece sano
+// (socket vivo, mensajes entrando, `/v1/health` en verde) y que lleva horas sin entregar un solo mensaje.
+// Por eso el arranque de cada sesión lo GRITA con un Warn y el bloque periódico de latencia publica
+// `despachador=APAGADO` en cada emisión (ver startDespachador y latencia.Deps.DespachadorApagado): un
+// aviso que solo sale en el instante del arranque se pierde en el scrollback del primer día.
+func WithDespachadorApagado(apagado bool) Option {
+	return func(m *Manager) {
+		if apagado {
+			m.despachadorApagado = true
+		}
+	}
+}
+
 // WithPresupuestoIntent fija cuánto RETIENE el despachador la cabeza de una sesión esperando a que el
 // cajero la clasifique, antes de entregarla igual sin intención (WAPP_AGENT_INTENT_WAIT_MS, 4000 ms por
 // defecto). Es el techo de latencia que la cola añade al camino de un mensaje.
@@ -67,13 +91,22 @@ func WithPresupuestoIntent(d time.Duration) Option {
 // startDespachador arranca, si procede, el bucle de drenado de UNA sesión. Lo llama startListener con el
 // ctx del listener ya creado, de modo que el mismo cancel apaga a los dos.
 //
-// TRES PUERTAS ANTES DE ARRANCAR, y ninguna es fatal para la sesión — el Manager no es el dueño de la
+// CUATRO PUERTAS ANTES DE ARRANCAR, y ninguna es fatal para la sesión — el Manager no es el dueño de la
 // política de arranque del proceso (ese es el daemon, y desde el 2026-08-17 él sí falla sin cola):
 //
+//  0. Con la PALANCA DE DIAGNÓSTICO echada (WAPP_AGENT_DESPACHADOR_APAGADO) ⇒ no se arranca, y se GRITA.
+//     Va la primera de todas a propósito: es la única puerta que un humano decide, y ponerla detrás de
+//     las otras tres haría que su Warn dependiera de un cableado que no tiene nada que ver con ella.
 //  1. Sin cola despachadora (opción no inyectada) ⇒ silencio absoluto: en producción no ocurre, y avisar
 //     por cada sesión sería ruido por un cableado de test.
 //  2. Sin multiplexor CloudLink (tests que cablean newListener a mano) ⇒ no hay sink al que entregar.
 //  3. Con sink nil (el mux existe pero devuelve nil, como los dobles de los tests) ⇒ igual.
+//
+// 🔴 LA PUERTA 0 ES LA ÚNICA QUE GRITA SIN CONDICIONES, y la diferencia con las otras tres importa: un
+// nil de cola/mux/sink solo pasa en tests (en producción el daemon falla antes), mientras que la palanca
+// SOLO puede estar echada en producción, porque solo se echa a mano. Su síntoma en campo —el Edge recibe,
+// nada sube— es idéntico al de un despachador roto, así que la línea que lo explica es la diferencia
+// entre cinco minutos y media tarde de diagnóstico.
 //
 // EL SINK ES EL CRUDO DE LA SESIÓN, `mux.SinkFor(sid)`. Cuando este bucle se escribió, había que decir
 // además «deliberadamente SIN el inboundDecorator»: existía un decorador que habría mandado el mensaje a
@@ -81,6 +114,13 @@ func WithPresupuestoIntent(d time.Duration) Option {
 // decorador se retiró en T3.0 y hoy no hay más sink que el crudo — la advertencia se conserva por si alguien
 // se plantea reintroducir una envoltura aquí: la intención llega YA resuelta, no hay nada que decorar.
 func (m *Manager) startDespachador(ctx context.Context, s *liveSession) {
+	if m.despachadorApagado {
+		s.log.Warn("sessionmgr: PALANCA DE DIAGNÓSTICO ECHADA (WAPP_AGENT_DESPACHADOR_APAGADO=true): esta " +
+			"sesión escucha y ENCOLA, pero NO drena su cola y NINGÚN entrante llegará a la nube mientras " +
+			"siga puesta; la cola crecerá hasta su TTL/tope y a partir de ahí se perderán filas. Es un " +
+			"instrumento de medida de T3.17, NO un modo de operación: quítala en cuanto acabe la medición")
+		return
+	}
 	if m.colaDespachador == nil {
 		return
 	}

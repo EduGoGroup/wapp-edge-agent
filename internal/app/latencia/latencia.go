@@ -19,9 +19,23 @@
 //   - Un histograma de buckets fijos son 16 `atomic.Uint64` por serie: SIN locks, SIN asignaciones, SIN
 //     sort en caliente, ~256 B por serie sea cual sea el volumen, y da acumulado y delta a la vez.
 //
-// El coste por evento es `time.Since` (~25 ns) + una búsqueda lineal de 16 comparaciones (~5 ns) + un
-// `atomic.Add` (~5-10 ns; 50-100 ns si rebota la línea de caché), frente a un handler cuyo acto caro es un
-// INSERT cifrado en SQLite. El efecto observador queda por debajo del 0,1 %.
+// EL COSTE, MEDIDO (no estimado). `BenchmarkObservar`, en coste_test.go, lo produce; el comando está
+// escrito en su cabecera. En un Apple M1 Pro (darwin/arm64), con `-benchtime 2s`:
+//
+//   - `Observar` sola: 9,1 ns/op — la búsqueda lineal de 16 comparaciones más el `atomic.Add`.
+//   - `Observar` con la muestra en el bucket de desbordamiento: 10,9 ns/op — el peor caso de la rejilla
+//     apenas se distingue del mejor, así que un handler patológico no paga además un instrumento lento.
+//   - EL NÚMERO DE CAMPO, con los dos relojes que el listener paga de verdad (`time.Now` a la entrada y
+//     `time.Since` en el defer): 90,5 ns/op. Cero asignaciones en los tres.
+//
+// ⚠️ EL REPARTO NO ES EL QUE ESTA CABECERA DECÍA ANTES DE MEDIRLO, y conviene saberlo antes de optimizar
+// nada: la parte cara son LOS RELOJES (~80 ns el par en arm64), no el histograma (9 ns). Aquí se decía
+// «~25 ns» para el reloj y «~5 ns + 5-10 ns» para búsqueda y atómico; el total quedaba en el mismo orden
+// por casualidad, pero quien fuera a recortar coste habría ido a por la mitad barata.
+//
+// Frente a un handler cuyo acto caro es un INSERT cifrado en SQLite (milisegundos), el efecto observador
+// queda por debajo del 0,1 %. La CONDICIÓN bajo la que ese número dejaría de valer —varias sesiones
+// midiendo a la vez en un Edge sin confinar a una CPU— está escrita en el sub-benchmark concurrente.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // MONOTÓNICO Y SIN RESET (y por qué eso NO es un detalle de implementación)
@@ -152,6 +166,23 @@ type serie struct {
 // puntero a tipo concreto no puede recibir una implementación que hable por la red.
 type Histograma struct {
 	series [numCaminos]serie
+	// puerta son los CONTADORES DE DEGRADACIÓN de la puerta de entrada (T1.13), compartidos por todas las
+	// sesiones igual que las series de arriba. Viven AQUÍ y no en un objeto propio porque este es el único
+	// instrumento que ya viaja hasta cada Listener y que el latido ya lee: hospedarlos aquí publicó T1.13
+	// sin un puerto nuevo, sin una opción nueva y sin tocar el cableado del daemon. Ver puerta.go.
+	//
+	// Es un VALOR, no un puntero: así `&Histograma{}` —que la doc de Nuevo declara igual de válido— sale
+	// con sus contadores listos y no hay ningún camino en el que Puerta() devuelva algo sin construir.
+	puerta Puerta
+}
+
+// Puerta da acceso a los contadores de la puerta de entrada de ESTE instrumento (T1.13). nil-safe: un
+// histograma nil devuelve una Puerta nil, cuyos métodos son a su vez no-ops.
+func (h *Histograma) Puerta() *Puerta {
+	if h == nil {
+		return nil
+	}
+	return &h.puerta
 }
 
 // Nuevo construye un histograma vacío. Existe por simetría con el resto del código; `&Histograma{}` es

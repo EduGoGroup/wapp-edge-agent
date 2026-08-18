@@ -88,11 +88,7 @@ func main() {
 		platformBaseURL = *platformURLFlag
 	}
 
-	sup := supervisor.New(supervisor.Config{
-		AgentBin:   *agentBin,
-		SocketPath: socketPath,
-		PIDFile:    *pidFile, // vacío ⇒ el supervisor usa <socket>.pid
-	}, log)
+	sup := supervisor.New(configNucleo(*agentBin, socketPath, *pidFile), log)
 
 	// SEGUNDO hijo (Plan 051 · T2.2): el worker cajero. MISMO binario del ecosistema, papel distinto
 	// (`agent cajero`), como el manager del Plan 048. Diferencias con el núcleo, todas deliberadas:
@@ -406,6 +402,43 @@ func openBrowser(url string, log sharedlogger.Logger) {
 // 056 · T11). Extraída de main() para poder probar la decisión sin arrancar el supervisor completo.
 func platformAPIBaseURLLeftAtDevDefault(cfg config.Config) bool {
 	return cfg.PlatformAPIBaseURL == config.DefaultPlatformAPIBaseURL
+}
+
+// configNucleo arma la Config del supervisor DEL NÚCLEO (`agent serve`). Extraída de main() por el mismo
+// motivo que platformAPIBaseURLLeftAtDevDefault: main() no lo mira ningún test, y lo que decide esta
+// función ya costó cinco minutos de recepción caída en el VPS.
+//
+// 🔴 RELANZADO AUTOMÁTICO ACTIVADO (Plan 051 Ola 5 · T5.4). Hasta aquí esta Config NO llevaba campo
+// `Restart`, así que la política quedaba en su valor cero (Enabled false) y el núcleo que moría solo se
+// quedaba muerto hasta que alguien llamaba a POST /v1/daemon/start. El hallazgo de campo de PC-13 fue el
+// caro: la unidad systemd vigila a `wapp-ctl` (su ExecStart) y el núcleo es HIJO suyo, así que con el
+// núcleo muerto y el portero vivo `systemctl is-active wapp-edge` sigue diciendo `active`. Tras un
+// `kill -9` el cajero —que sí llevaba la política— volvió solo y el núcleo no: el VPS pasó ~5 minutos sin
+// poder recibir WhatsApp con el indicador en verde.
+//
+// Se arregla AQUÍ y no en la unidad systemd a propósito: el criterio de T5.4 admite las dos salidas («que
+// `is-active` no diga active» O «que el conjunto se reinicie solo en menos de 60 s») y esta no obliga a
+// redesplegar ninguna unidad en el VPS, que es donde este proyecto ya se pegó un susto.
+//
+// QUÉ NO CAMBIA, y conviene tenerlo escrito porque es lo que asusta de este cambio:
+//
+//   - EL ARRANQUE NO SE VUELVE AUTOMÁTICO. `Restart` solo gobierna al hijo que YA arrancó y se murió: el
+//     derecho a relanzarse se concede en adoptLocked, tras un Start que llegó a ready. El núcleo se sigue
+//     pidiendo por POST /v1/daemon/start (el `ExecStartPost` de la unidad) o con -autostart.
+//   - LA PARADA PEDIDA SIGUE PARANDO. Stop cierra la puerta del relanzado ANTES de matar al hijo
+//     (supervisor.Stop), así que POST /v1/daemon/stop deja el núcleo abajo y abajo se queda.
+//
+// El backoff es el de la casa (1 s → ×2 → 60 s, sin tope de intentos): un núcleo que no arranca debe
+// seguir intentándolo. Aquí eso es menos ciego que en el cajero, porque el núcleo SÍ tiene plano HTTP: su
+// Status.Healthy sale de un GET /v1/health real, de modo que un crash-loop se ve como running=false o
+// healthy=false en /v1/daemon/status, y no como un "todo bien" constante.
+func configNucleo(agentBin, socketPath, pidFile string) supervisor.Config {
+	return supervisor.Config{
+		AgentBin:   agentBin,
+		SocketPath: socketPath,
+		PIDFile:    pidFile, // vacío ⇒ el supervisor usa <socket>.pid
+		Restart:    supervisor.RestartPolicy{Enabled: true},
+	}
 }
 
 // cajeroPIDFile deriva el PID/lock file del cajero SIEMPRE del socket: <socket>.cajero.pid. Que sea

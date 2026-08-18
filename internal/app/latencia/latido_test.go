@@ -124,12 +124,21 @@ func correrLatido(t *testing.T, d Deps, vida time.Duration) {
 // camposObligatorios es el CONTRATO DE LA LÍNEA con quien la lee en el VPS. Cada campo está aquí porque sin
 // él la línea deja de ser interpretable: `n` da la población (un p99 sin ella no significa nada),
 // `p99_bucket` da la resolución, la serie de descartes dice de qué población salió el número bueno, el
-// acumulado sobrevive a que nadie mirara la ventana interesante, y `conteo_ms` publica el efecto observador.
+// acumulado sobrevive a que nadie mirara la ventana interesante, `conteo_ms` publica el efecto observador,
+// y los dos de la puerta (T1.13) dicen si el Edge está teniendo que hacer reofrecer entrantes a WhatsApp —
+// que es el único sitio donde eso se ve, porque el acumulado por sesión del listener no lo publica nadie.
+//
+// `despachador` (T3.17) entró aquí por el mismo criterio, y es el único campo que no habla del cronómetro:
+// dice si la palanca de diagnóstico está echada, y con ella echada TODOS los demás números de la línea
+// significan otra cosa (la cola sube porque nadie drena, no porque haya carga). Un campo que solo apareciera
+// cuando la palanca está puesta no serviría: la pregunta que se hace en el VPS es «¿está puesta?», y esa
+// pregunta no se puede contestar con una ausencia.
 var camposObligatorios = []string{
-	"emision", "ventana_ms", "uptime_s",
+	"emision", "despachador", "ventana_ms", "uptime_s",
 	"n", "p50_ms", "p95_ms", "p99_ms", "p99_bucket",
 	"n_descartes", "p99_ms_descartes",
 	"n_acum", "p99_ms_acum", "max_ms_acum",
+	"cola_enqueue_errores", "cola_enqueue_panics",
 	"cola_pendientes", "cola_nuevo", "cola_tomado", "cola_clasificado", "conteo_ms",
 }
 

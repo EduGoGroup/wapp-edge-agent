@@ -207,18 +207,17 @@ func (g *ListenGateway) Listen(ctx context.Context, dek []byte) error {
 	return g.serve(ctx, device)
 }
 
-// serve cablea el Listener al cliente real y mantiene el socket vivo hasta la cancelación del ctx.
-// whatsmeow loguea por el puente waLog→slog (walog.go): un fallo/caída del websocket YA queda trazado
-// en el log del agente (antes waLog.Noop lo silenciaba); el nivel lo gobierna el logger del agente.
-func (g *ListenGateway) serve(ctx context.Context, device *store.Device) error {
-	client := wm.NewClient(device, newWALog(g.log))
-	client.EnableAutoReconnect = true // whatsmeow reintenta el socket; el Listener traza el backoff.
-	disableHistorySync(client)
-
-	// Publica el cliente VIVO para que el envío reutilice esta misma conexión, y lo limpia al salir.
-	g.setLiveClient(client)
-	defer g.setLiveClient(nil)
-
+// listenerOpts traduce lo que los setters dejaron en el gateway a las opciones con que nace su Listener.
+// Es la ÚNICA fuente de esas opciones: serve() no arma ninguna por su cuenta.
+//
+// 🔴 ESTÁ EXTRAÍDO DE serve() POR UN MOTIVO DE PRUEBA, y conviene que se sepa. serve() exige un
+// *store.Device pareado y un socket vivo contra WhatsApp, así que el CABLE entre los setters (SetCola,
+// SetClasificadorActivo, SetLatencia) y el Listener no era ejercitable por ningún test: borrar cualquiera
+// de estos `append` dejaba los cuatro gates en VERDE y en campo apagaba en silencio la cola, el
+// interruptor del clasificador o el cronómetro de INV-051.2. Con el ensamblaje aquí, un test construye el
+// Listener EXACTAMENTE como lo construye serve() y comprueba que lo cableado llega. El comportamiento no
+// cambia ni una coma respecto de tenerlo inline.
+func (g *ListenGateway) listenerOpts() []ListenerOption {
 	// Cola durable de entrantes (Plan 051 Ola 1): las dos opciones viajan JUNTAS o no viaja ninguna, de modo
 	// que nunca se llega a WithCola sin WithSessionID (ese caso degrada con un log de Error en el Listener).
 	//
@@ -237,14 +236,35 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device) error {
 	// clasificador— porque mide el handler ENTERO, incluidos los caminos que no encolan: una sesión sin cola
 	// sigue gastando tiempo del hilo de whatsmeow y ese tiempo cuenta para INV-051.2. nil se ignora.
 	listenerOpts = append(listenerOpts, WithLatencia(g.latencia))
-	listener := NewListener(g.log, listenerOpts...)
+	// Margen de la ventana temporal de ingesta (ADR-0037). Va también FUERA del bloque de la cola: la
+	// ventana decide QUÉ ENTRA por la puerta, y esa decisión es anterior e independiente de que haya cola
+	// donde anotarlo. 0 (no configurado) se ignora en la opción y manda el default del Listener.
+	//
+	// ⚠️ SE ENSAMBLA AQUÍ DESDE EL 2026-08-18 y antes se aplicaba en serve() con un `if g.inboundMargin > 0`
+	// propio. El `if` NO se ha movido: se ha RETIRADO, porque el mismo guardián ya vive en
+	// Listener.SetConnectMargin y dos defensas que producen el mismo síntoma son una que ningún test puede
+	// custodiar —borrabas la de arriba y todo seguía verde—. Ahora el valor no positivo lo juzga un solo
+	// sitio. El comportamiento es idéntico.
+	listenerOpts = append(listenerOpts, WithConnectMargin(g.inboundMargin))
+	return listenerOpts
+}
+
+// serve cablea el Listener al cliente real y mantiene el socket vivo hasta la cancelación del ctx.
+// whatsmeow loguea por el puente waLog→slog (walog.go): un fallo/caída del websocket YA queda trazado
+// en el log del agente (antes waLog.Noop lo silenciaba); el nivel lo gobierna el logger del agente.
+func (g *ListenGateway) serve(ctx context.Context, device *store.Device) error {
+	client := wm.NewClient(device, newWALog(g.log))
+	client.EnableAutoReconnect = true // whatsmeow reintenta el socket; el Listener traza el backoff.
+	disableHistorySync(client)
+
+	// Publica el cliente VIVO para que el envío reutilice esta misma conexión, y lo limpia al salir.
+	g.setLiveClient(client)
+	defer g.setLiveClient(nil)
+
+	listener := NewListener(g.log, g.listenerOpts()...)
 	// Salud por sesión (Plan 031 T6): el Listener reporta connected/connecting/dead + edad del último
 	// entrante al registro. nil ⇒ no reporta.
 	listener.SetHealthReporter(g.reporter)
-	// Ventana temporal de ingesta (ADR-0037); 0 ⇒ se respeta el default del Listener.
-	if g.inboundMargin > 0 {
-		listener.SetConnectMargin(g.inboundMargin)
-	}
 	// Acuses (delivered/read) → destino de la sesión (nil en T0; T2 lo cablea con SetReceiptHandler).
 	listener.onReceipt = g.onReceipt
 	// Cierre de sesión (LoggedOut) → destino de la sesión (Plan 020 T3): propaga el estado ZOMBIE a la nube.

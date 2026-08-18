@@ -404,7 +404,29 @@ type Config struct {
 	//
 	// Durante una sesión de PC-11 se baja a 10000 para no depender de que el tick caiga en el momento
 	// bueno. NO se deja así: los logs del VPS van a un fichero y esa cadencia lo engorda.
+	//
+	// ⚠️ NO CONFUNDIR CON `whatsmeow.InboundStats`, pese al nombre. Esto gobierna la CADENCIA del bloque
+	// de log y nada más; aquello es el acumulado POR SESIÓN de la puerta de entrada del listener
+	// (ADR-0037 §4), que no se publica por ninguna vía. Lo que sí sale en el bloque —desde T1.13— son los
+	// dos contadores de degradación del EDGE, que viajan dentro del propio histograma (ver
+	// internal/app/latencia/puerta.go). Casi se deduce lo contrario al barrer el repo buscando quién
+	// publica el contador: comparten prefijo y no comparten nada.
 	InboundStatsEveryMS int `yaml:"inbound_stats_every_ms"`
+	// DespachadorApagado ECHA LA PALANCA DE DIAGNÓSTICO que impide arrancar el despachador de la cola en
+	// cada sesión viva (Plan 051 Ola 5 · T3.17). Se lee de WAPP_AGENT_DESPACHADOR_APAGADO.
+	//
+	// 🔴 NO ES UN MODO DE OPERACIÓN. Con la palanca echada el Edge SIGUE recibiendo y encolando, pero la
+	// cola NO DRENA: ni un solo entrante llega a la nube mientras esté puesta, y las filas se acumulan
+	// hasta el TTL/tope de la cola (ColaTTLHours/ColaMaxRows), que es donde empiezan a perderse de verdad.
+	// Existe SOLO para T3.17: medir el p99 del handler con el despachador parado y el cajero vivo, para
+	// separar la contención intra-proceso de la inter-proceso. Se quita en cuanto acaba la medida.
+	//
+	// EL NOMBRE ESTÁ EN NEGATIVO A PROPÓSITO, y no es estilo: así el VALOR CERO —el de un `Config{}` de
+	// test, el de un YAML sin la clave, el de una variable ausente, vacía o tecleada mal— significa
+	// «despachador ACTIVO». Con un `DespachadorEnabled` la seguridad dependería de que alguien se
+	// acordara de ponerlo a true en cada sitio que construye una Config, y el olvido apagaría la entrega
+	// en silencio. Aquí el olvido no puede apagar nada.
+	DespachadorApagado bool `yaml:"despachador_apagado"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -561,6 +583,10 @@ func defaults() Config {
 		DiagLogLines:          DefaultDiagLogLines,
 		InboundMarginSeconds:  DefaultInboundMarginSeconds,
 		InboundStatsEveryMS:   DefaultInboundStatsEveryMS,
+		// La palanca de diagnóstico de T3.17 nace SIEMPRE bajada: el despachador arranca. Se escribe
+		// explícita aunque `false` sea el cero de Go —igual que EnableAlphaTestAccounts— porque este
+		// default es el que sostiene la entrega de entrantes, no una preferencia.
+		DespachadorApagado: false,
 		CloudLink: CloudLinkConfig{
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
@@ -626,6 +652,12 @@ func Load(path string) (Config, error) {
 	cfg.DiagLogLines = loader.GetInt("DIAG_LOG_LINES", cfg.DiagLogLines)
 	cfg.InboundMarginSeconds = loader.GetInt("INBOUND_MARGIN_SECONDS", cfg.InboundMarginSeconds)
 	cfg.InboundStatsEveryMS = loader.GetInt("INBOUND_STATS_EVERY_MS", cfg.InboundStatsEveryMS)
+	// Palanca de DIAGNÓSTICO del despachador (T3.17). Los tres caminos de fallo del overlay —variable
+	// ausente, presente pero VACÍA, y presente con un valor que no es booleano— acaban en el mismo sitio:
+	// `GetBool` devuelve el default (aquí `false`) y el despachador arranca. Un nombre de variable mal
+	// tecleado ni siquiera se lee. Es el guardarraíl entero de esta palanca, y no hay ninguna rama que
+	// pueda apagar la entrega sin que alguien haya escrito exactamente esta clave con un booleano válido.
+	cfg.DespachadorApagado = loader.GetBool("DESPACHADOR_APAGADO", cfg.DespachadorApagado)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)

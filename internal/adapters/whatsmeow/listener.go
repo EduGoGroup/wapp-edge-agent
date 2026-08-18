@@ -5,7 +5,7 @@
 //   - *events.Message      -> ANOTA el entrante en la COLA DURABLE y retorna. NO entrega a nadie: quien
 //     entrega al cable es el DESPACHADOR de la sesión (internal/app/despachador), que corre en su propia
 //     goroutine (Plan 051 Ola 3 · T3.0, INV-051.2). El hilo de whatsmeow queda libre en cuanto el INSERT
-//     cifrado termina.
+//     cifrado termina. Y devuelve el PERMISO DE ACUSE (ver abajo).
 //   - *events.Connected    -> marca estado conectado y RESETEA el backoff.
 //   - *events.Disconnected -> marca estado desconectado y AVANZA el backoff (whatsmeow auto-reconecta).
 //   - *events.LoggedOut    -> marca la sesión CAÍDA (no se re-empareja automáticamente).
@@ -15,13 +15,28 @@
 //
 // La lógica de enrutado/mapeo vive en handleEvent(ctx, evt any), TESTEABLE con eventos sintéticos sin
 // un *whatsmeow.Client real. Register() solo cablea handleEvent al AddEventHandler real (no se cubre
-// en tests: requiere socket/red, por diseño).
+// en tests: requiere socket/red, por diseño; lo que sí se custodia es la FORMA de ese cableado, ver
+// listener_acuse_test.go).
+//
+// 🔴 EL VALOR QUE DEVUELVE EL HANDLER ES EL PERMISO DE ACUSE (Plan 051 · T1.13). El listener se registra
+// con client.AddEventHandlerWithSuccessStatus, NO con AddEventHandler, y eso no es un detalle de firma:
+// whatsmeow acusa el mensaje a WhatsApp DESPUÉS de correr los handlers (message.go:431 los invoca, :467
+// acusa) y se salta el acuse si alguno devuelve false (message.go:437, sobre el dispatchEvent síncrono de
+// client.go:918-933). Con el AddEventHandler pelado el envoltorio devuelve true SIEMPRE (client.go:763-768),
+// así que hasta el 2026-08-18 un INSERT fallido se acusaba igual: WhatsApp daba el mensaje por entregado,
+// no lo reenviaba nunca y se perdía EN SILENCIO, en un plan cuya promesa entera es «ni un mensaje perdido».
+//
+// Devolver false es, literalmente, PEDIR A WHATSAPP QUE REENVÍE. Por eso lo devuelve UNA sola situación —el
+// entrante que no dejó fila por un fallo de escritura— y todo lo demás devuelve true, incluidos los
+// descartes deliberados: reclamar el reenvío de algo que hemos decidido no procesar es un bucle, porque lo
+// reenviado vuelve idéntico y se vuelve a descartar. El veredicto camino a camino está en onMessage.
 package whatsmeow
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -225,8 +240,31 @@ func WithLatencia(h *latencia.Histograma) ListenerOption {
 	return func(l *Listener) {
 		if h != nil {
 			l.latencia = h
+			// 🔴 Y CON ÉL VIAJAN LOS CONTADORES DE LA PUERTA (T1.13). El mismo instrumento compartido lleva
+			// las dos cosas —la rejilla de duraciones y las dos cardinalidades de degradación— para que
+			// publicar T1.13 no necesitara ni un puerto, ni una opción, ni un setter, ni una línea del
+			// cableado del daemon. La consecuencia buena: esto HEREDA la custodia del cronómetro, que ya
+			// tiene test de que llega hasta el Listener que nace de listenerOpts().
+			//
+			// Se cablea sobre el observador de corchetes y no sobre el Listener porque es él quien cuenta,
+			// y así el acumulado por sesión y el del Edge se escriben desde el mismo sitio.
+			l.brackets.puerta = h.Puerta()
 		}
 	}
+}
+
+// WithConnectMargin cablea el MARGEN de la ventana temporal de ingesta (ADR-0037) que el Edge trae
+// configurado (WAPP_AGENT_INBOUND_MARGIN_SECONDS) para ESTA sesión. <=0 se ignora y manda el default
+// (defaultConnectMargin): ver el porqué de esa asimetría en SetConnectMargin, a quien delega — el guardián
+// del valor no positivo vive AHÍ y solo ahí, para que un solo test lo pueda custodiar.
+//
+// 🔴 EXISTE COMO OPCIÓN, Y NO SOLO COMO SETTER, POR UN MOTIVO DE PRUEBA. Hasta el 2026-08-18 el margen se
+// aplicaba en serve() —que exige un device pareado y un socket vivo—, así que el cable entre
+// SetInboundMargin y el Listener no lo ejercitaba ningún test: borrarlo dejaba los cuatro gates en VERDE y
+// en campo devolvía la ventana a su default sin que nadie lo notara hasta la siguiente microcaída. Pasando
+// por listenerOpts() el cable queda interrogable, igual que los de la cola, el clasificador y el cronómetro.
+func WithConnectMargin(d time.Duration) ListenerOption {
+	return func(l *Listener) { l.SetConnectMargin(d) }
 }
 
 // SetHealthReporter liga el listener al registro de salud de SU sesión (Plan 031 T6). Se llama ANTES de
@@ -308,25 +346,77 @@ func (l *Listener) State() ConnState {
 	return l.state
 }
 
-// Register cablea handleEvent al AddEventHandler REAL del cliente whatsmeow. El ctx (vida de la
-// sesión Listen) se propaga a cada anotación en la cola. NO se cubre en tests (requiere un client real).
+// Register cablea handleEvent al despachador de eventos REAL del cliente whatsmeow. El ctx (vida de la
+// sesión Listen) se propaga a cada anotación en la cola. NO se cubre en tests (requiere un client real);
+// su FORMA sí se custodia, porque es donde se decide si el acuse depende de nosotros: ver
+// TestRegister_SeRegistraConElHandlerQueGobiernaElAcuse.
+//
+// 🔴 SE REGISTRA CON AddEventHandlerWithSuccessStatus, Y NO ES INTERCAMBIABLE CON AddEventHandler
+// (T1.13). El de siempre envuelve el handler en uno que devuelve true SIEMPRE (client.go:763-768), y ese
+// true es lo que autoriza a whatsmeow a acusar el mensaje a WhatsApp. Con él, un entrante que NO se pudo
+// escribir en la cola se acusaba igual: WhatsApp lo daba por entregado, dejaba de reenviarlo y el mensaje
+// desaparecía sin un solo síntoma para el cliente final. Con esta variante, el false que devuelve
+// handleEvent llega hasta message.go:437 y whatsmeow retorna ANTES del acuse ⇒ WhatsApp reenvía.
+//
+// Volver al AddEventHandler pelado deja los cuatro gates en VERDE y reabre el agujero entero: la firma
+// compila, el handler sigue corriendo y lo único que se pierde es el valor de retorno.
 func (l *Listener) Register(ctx context.Context, client *wm.Client) uint32 {
 	// Sello de la ventana temporal (ADR-0037): Client.LastSuccessfulConnect leído FRESCO en cada
 	// evaluación, nunca cacheado. Se lee desde el handler de mensaje, que es exactamente donde la cadena
 	// happens-before del handlerQueue ya lo ordena (ver la cabecera de inbound_window.go, y ahí también el
 	// residual F2/F3 que esta lectura NO cubre y por el que resolveThreshold desconfía del valor).
 	l.connectSeal = func() time.Time { return client.LastSuccessfulConnect }
-	return client.AddEventHandler(func(evt any) {
-		l.handleEvent(ctx, evt)
+	return client.AddEventHandlerWithSuccessStatus(func(evt any) bool {
+		return l.handleEvent(ctx, evt)
 	})
 }
 
 // handleEvent es el ENRUTADOR PURO (testeable): recibe un evento de whatsmeow y reacciona según su
 // tipo. No abre sockets ni depende de un client; en tests se le pasan eventos sintéticos.
-func (l *Listener) handleEvent(ctx context.Context, evt any) {
+//
+// DEVUELVE EL PERMISO DE ACUSE (T1.13): true = whatsmeow puede acusar. Solo el camino del ENTRANTE puede
+// negarlo; el resto de los eventos devuelve true incondicionalmente, y no por simetría estética: un false
+// CORTA la cadena de handlers en seco (dispatchEvent retorna en el primero que falla, client.go:929), así
+// que negarlo en un *events.Receipt o un *events.Connected dejaría ciegos a los demás handlers del cliente
+// sin ganar nada a cambio — esos eventos no llevan acuse por esta vía.
+//
+// 🔴 EL recover DE AQUÍ ES LO QUE HACE QUE LA GARANTÍA NO DEPENDA DE QUE NADIE SE DESPISTE. Sin él, la
+// promesa «no se acusa lo que no se escribió» se sostenía sobre que el recover de enqueueCola siguiera
+// cubriendo TODO el camino de escritura: un pánico un centímetro más arriba —el reporter de salud, la
+// lectura del sello, cualquier hook de sesión— se escapaba del handler y lo recogía whatsmeow, y ahí pasan
+// dos cosas malas a la vez:
+//
+//  1. SE ACUSA EL MENSAJE PERDIDO. dispatchEvent recupera el pánico en un defer que NO toca su resultado
+//     con nombre (client.go:918-933), así que `handlerFailed` se queda en su valor CERO —false— y
+//     whatsmeow sigue hasta el acuse. El modo de fallo exacto que T1.13 vino a cerrar, por la puerta de
+//     atrás.
+//  2. SE FILTRA CONTENIDO AL LOG. Antes de eso, whatsmeow imprime el valor recuperado con %v y la pila
+//     entera (`Event handler panicked while handling a %T: %v`), y ese valor puede arrastrar el argumento
+//     que provocó el pánico — es decir, el TEXTO del mensaje. Por el puente waLog→slog eso aterriza en
+//     NUESTRO log, que es justo lo que prohíbe INV-051.1 / ADR-0034 nivel 3.
+//
+// NO ES EL MISMO GUARDIÁN QUE EL DE enqueueCola, y la diferencia es la razón de que convivan: aquél SABE
+// dónde ocurrió el pánico y por eso CUENTA (ColaEnqueuePanics, el desglose de INV-051.3) y anota el
+// message_id; éste no sabe nada, no cuenta nada y solo garantiza. Quitar el de abajo deja el contador a
+// cero con la garantía intacta; quitar éste deja el contador intacto y la garantía rota en todo lo que no
+// sea el INSERT. Cada uno tiene su propia mutación en rojo, que es como debe ser.
+//
+// El false NO se asigna a mano, por lo mismo que en enqueueCola: al recuperar, el resultado con nombre
+// queda en su valor cero, que ya es la respuesta. Una asignación explícita sería una línea borrable sin
+// efecto observable.
+func (l *Listener) handleEvent(ctx context.Context, evt any) (acusar bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			// INV-051.1: NI el valor recuperado NI el evento se imprimen — los dos pueden arrastrar el
+			// contenido del mensaje. Solo el TIPO del evento, que es lo que permite orientar el diagnóstico
+			// sin transcribir nada.
+			l.log.Error("listener: panic recuperado en el handler de eventos; la escucha SIGUE y el entrante NO se acusa (WhatsApp lo reenviará)",
+				"evento", fmt.Sprintf("%T", evt))
+		}
+	}()
 	switch e := evt.(type) {
 	case *events.Message:
-		l.onMessage(ctx, e)
+		return l.onMessage(ctx, e)
 	case *events.Connected:
 		l.onConnected()
 	case *events.Disconnected:
@@ -344,6 +434,7 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 	default:
 		// Otros eventos (presencia, history sync, …) no son del alcance actual.
 	}
+	return true
 }
 
 // onMessage decide si el entrante se ADMITE y, si lo hace, lo ANOTA EN LA COLA DURABLE y RETORNA. No
@@ -366,7 +457,30 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) {
 //
 // El descarte es SILENCIOSO hacia el cliente final y CONTADO hacia nosotros: un descarte invisible es
 // indistinguible de un bug. Se cuenta, no se transcribe (ADR-0034 nivel 3): ni texto ni teléfono al log.
-func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
+//
+// 🔴 EL VEREDICTO DEL ACUSE, CAMINO A CAMINO (T1.13). Lo que esta función devuelve NO es «hubo fila»: es
+// «whatsmeow puede acusar este mensaje a WhatsApp». Los dos conceptos coinciden en el caso que importa y
+// se separan en los descartes, y confundirlos tiene un precio caro en cada dirección — un true de más
+// pierde el mensaje para siempre; un false de más le pide a WhatsApp que reenvíe algo que volveremos a
+// descartar, es decir un bucle a ritmo de reconexión. El criterio es UNO: solo el FALLO DE ESCRITURA
+// niega el acuse, porque solo él es un fallo NUESTRO y transitorio, y por tanto lo único que un reenvío
+// puede arreglar.
+//
+//	ACUSA (true)  · ECO PROPIO (IsFromMe)         — es nuestro; no hay nada que persistir ni que reenviar.
+//	ACUSA (true)  · FUERA DE VENTANA (ADR-0037)   — decisión deliberada y DETERMINISTA: el reenvío traería
+//	                                                el MISMO Info.Timestamp, volvería a caer fuera y
+//	                                                pediríamos otro reenvío. Bucle sin salida (REQ-051.5).
+//	ACUSA (true)  · SIN HORA UTILIZABLE           — encola: el acuse lo decide su INSERT, como el normal.
+//	ACUSA (true)  · SIN TEXTO / GRUPO / APAGADO /
+//	                FASTLANE                      — ⚠️ NO SON DESCARTES: los cuatro DEJAN FILA (nacen en
+//	                                                EstadoClasificado con su marca de omisión). Acusan
+//	                                                porque el mensaje está en disco, no por indulgencia.
+//	NO ACUSA (false) · el INSERT falló, entró en
+//	                   pánico, o no hay cola       — el mensaje NO está en ningún sitio. Acusarlo es
+//	                                                perderlo en silencio; no acusarlo lo deja en manos de
+//	                                                WhatsApp, que lo reenviará, y el segundo intento es
+//	                                                IDEMPOTENTE por (session_id, wa_message_id).
+func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 	// ⏱️ CRONÓMETRO (T3.13). Envuelve la función ENTERA —no solo el Enqueue— porque lo que INV-051.2 acota
 	// es cuánto tiempo del hilo de whatsmeow consume este handler, y eso incluye los filtros de la puerta.
 	//
@@ -397,7 +511,9 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 	if e.Info.IsFromMe {
 		camino = latencia.Descartado // (T3.13) sale sin fila: su tiempo no es tiempo de encolar
 		l.brackets.countSelfDrop()
-		return
+		// SE ACUSA (T1.13): el mensaje lo mandamos nosotros. No hay nada que persistir, y pedir su reenvío
+		// sería pedir que nos devuelvan nuestro propio eco una y otra vez.
+		return true
 	}
 
 	// 2 · Sin hora utilizable ⇒ SE ADMITE, explícitamente y contado. No es teórico: GetUnixTime devuelve
@@ -419,8 +535,10 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 		// 1970, y la poda por TTL de la cola se llevaría la fila en el primer barrido, o sea perder justo el
 		// mensaje que acabamos de admitir por precaución. Se sella con la hora LOCAL de recepción, que es lo
 		// único cierto que tenemos de él: no es su hora real, pero sitúa la fila en la ventana de retención.
-		l.enqueueCola(ctx, e, time.Now().Unix())
-		return
+		//
+		// ACUSE (T1.13): lo decide su INSERT, exactamente igual que el camino normal. Este mensaje se ADMITE,
+		// así que su durabilidad se exige como la de cualquier otro admitido.
+		return l.enqueueCola(ctx, e, time.Now().Unix())
 	}
 
 	// 3 · Ventana temporal (ADR-0037): el criterio ÚNICO. Info.Timestamp es el reloj del SERVIDOR del
@@ -444,7 +562,12 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 		l.brackets.countWindowDrop(age)
 		l.log.Warn("listener: entrante descartado por caer fuera de la ventana temporal (ADR-0037)",
 			"edad", age.Round(time.Second).String(), "margen", l.margin.String())
-		return
+		// SE ACUSA (T1.13), y es la decisión más delicada de esta función. El descarte es DELIBERADO y
+		// DETERMINISTA sobre un dato inmutable: Info.Timestamp es el reloj del servidor del mensaje ORIGINAL,
+		// así que un reenvío llegaría con el mismo sello, volvería a caer fuera de la ventana y volveríamos a
+		// pedir otro reenvío. Negar el acuse aquí no rescata ni un mensaje: convierte la ráfaga de miles de
+		// eventos del ADR-0037 en una ráfaga PERPETUA que se repite en cada reconexión.
+		return true
 	}
 
 	// 4 · COLA DURABLE (Plan 051 Ola 1) — y AQUÍ SE ACABA EL TRABAJO DEL LISTENER (Ola 3 · T3.0).
@@ -465,7 +588,11 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 	//     entrega.
 	//
 	// Un descartado por la ventana (paso 3) ya ha vuelto: no genera fila (REQ-051.5).
-	l.enqueueCola(ctx, e, e.Info.Timestamp.Unix())
+	//
+	// Y AQUÍ SE DECIDE EL ACUSE (T1.13): lo que devuelva el INSERT es lo que whatsmeow usa para acusar —o no—
+	// a WhatsApp. Es lo que convierte «durable antes del acuse» de un orden de instrucciones en una GARANTÍA:
+	// sin fila no hay acuse, y sin acuse WhatsApp reenvía.
+	return l.enqueueCola(ctx, e, e.Info.Timestamp.Unix())
 }
 
 // enqueueCola anota el entrante en la cola durable. tsWhatsApp va en epoch-SEGUNDOS (no milis): es el
@@ -474,17 +601,35 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) {
 // REQ-051.8 — un fallo del Enqueue se REGISTRA y ya: no tumba el socket y no aborta el handler. INV-051.1 —
 // el texto del mensaje NUNCA sale por el log, ni entero ni truncado: solo identificadores y el error.
 //
-// ⚠️ LO QUE SIGNIFICA UN FALLO CAMBIÓ EN T3.0. Mientras existió el camino inline, un Enqueue fallido solo
-// costaba la intención: el mensaje llegaba igual por el `sink.Deliver`. Retirado el inline, un Enqueue
-// fallido es un MENSAJE PERDIDO. La política no cambia (no se tumba la escucha por un fallo de disco: eso
-// dejaría sordas también a las sesiones sanas), pero el contador `cola_enqueue_error` de InboundStats deja
-// de ser una métrica de calidad y pasa a ser una métrica de PÉRDIDA — quien la publique en la Ola 4 debe
-// tratarla como tal.
+// ⚠️ LO QUE SIGNIFICA UN FALLO HA CAMBIADO DOS VECES, y conviene leer las dos. En T3.0, retirado el camino
+// inline (`sink.Deliver`), un Enqueue fallido pasó de costar solo la intención a ser un MENSAJE PERDIDO. En
+// T1.13 deja de serlo: el fallo ya no se acusa, así que WhatsApp REENVÍA y el mensaje sigue vivo del otro
+// lado. La política de no tumbar la escucha no cambia en ninguna de las dos (un fallo de disco no puede
+// dejar sordas también a las sesiones sanas); lo que cambia es qué mide `cola_enqueue_error` en InboundStats:
+// de métrica de calidad (T1.7) a métrica de PÉRDIDA (T3.0) a métrica de REINTENTO (T1.13). Quien la publique
+// en el latido debe leerla como «mensajes que WhatsApp tendrá que reofrecer», no como bajas.
 //
-// cola == nil ⇒ no-op, y el mensaje se pierde (NewListener ya gritó al construir; ver allí).
-func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsApp int64) {
+// cola == nil ⇒ no-op (NewListener ya gritó al construir; ver allí).
+//
+// 🔴 DEVUELVE SI LA FILA QUEDÓ EN DISCO (T1.13), y ese bool es lo que gobierna el acuse a WhatsApp: false
+// ⇒ whatsmeow NO acusa ⇒ WhatsApp REENVÍA. Es lo que convierte el contador de arriba de «métrica de
+// pérdida» en «métrica de reintento»: desde el 2026-08-18 un Enqueue fallido ya no pierde el mensaje, lo
+// aplaza. El reenvío es seguro por construcción: el segundo intento choca contra el índice único
+// (session_id, wa_message_id) y el store lo trata como duplicado devolviendo nil, así que un mensaje que
+// SÍ se escribió y falló después no se duplica — se acusa a la segunda.
+func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsApp int64) (dejoFila bool) {
 	if l.cola == nil {
-		return
+		// SIN COLA NO SE ACUSA, y es deliberado pese a que aquí no ha fallado ninguna escritura: es que no
+		// hay dónde escribir. Un listener sin cola es un fallo de CABLEADO (imposible desde `agent serve`
+		// desde el Plan 051 O3, ver NewListener), y acusar sería tragarse en silencio TODOS los mensajes de
+		// esa sesión — el modo de fallo que este plan existe para eliminar.
+		//
+		// El precio conocido: mientras dure el cableado roto, WhatsApp reofrece los mismos mensajes en cada
+		// reconexión. Se prefiere a la alternativa por dos razones. Una, los mensajes SOBREVIVEN: en cuanto
+		// el proceso arranque bien cableado —y el daemon no arranca de otra forma— entran todos. Dos, el
+		// fallo se hace VISIBLE donde nadie lo puede ignorar: quien escribe al negocio ve su mensaje sin
+		// confirmar en vez de verlo confirmado y sin respuesta.
+		return false
 	}
 	// REQ-051.8 / T1.10 — RED DE SEGURIDAD. Un panic aquí dentro (driver de la BD, un crypterFor ajeno,
 	// un nil inesperado) subiría al bucle de handlers de whatsmeow y TUMBARÍA LA SESIÓN entera: la cola
@@ -494,11 +639,21 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 	// argumento que lo provocó —y aquí ese argumento puede ser el TEXTO del mensaje o su meta—, así que
 	// imprimirlo con %v filtraría contenido de negocio al log. Se anota solo el identificador del
 	// mensaje, que es lo que permite correlacionar sin transcribir nada.
+	//
+	// 🔴 UN PÁNICO RECUPERADO CUENTA COMO «NO DEJÓ FILA» (T1.13), y por tanto NO SE ACUSA. Un pánico a mitad
+	// del camino de escritura no deja ninguna prueba de que la fila llegara al disco, y ante la duda la
+	// asimetría es la del plan: reenviar de más es barato (el índice único absorbe el duplicado), acusar de
+	// más es perder el mensaje para siempre.
+	//
+	// El false NO se asigna aquí a mano: al recuperar un pánico, el resultado de la función queda en su
+	// valor cero, que es exactamente la respuesta correcta. Escribir `dejoFila = false` sería una segunda
+	// defensa que dice lo mismo que la primera — y una línea que se puede borrar sin que nada cambie es una
+	// línea que ningún test puede custodiar.
 	defer func() {
 		if r := recover(); r != nil {
 			// INV-051.3: la degradación se CUENTA además de loguearse.
 			l.brackets.countColaEnqueuePanic()
-			l.log.Error("listener: panic al encolar el entrante; la escucha sigue (REQ-051.8)",
+			l.log.Error("listener: panic al encolar el entrante; la escucha sigue (REQ-051.8) y el mensaje NO se acusa: WhatsApp lo reenviará",
 				"message_id", e.Info.ID)
 		}
 	}()
@@ -585,13 +740,15 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 		// gritó, y aquí únicamente se baja el nivel. Sin esto, una sesión con la DEK ausente escribía un
 		// Error por mensaje entrante, a ritmo de socket.
 		if errors.Is(err, app.ErrColaFalloRepetido) {
-			l.log.Debug("listener: la cola durable sigue rechazando los entrantes de esta sesión (fallo ya reportado); este mensaje SE PIERDE",
+			l.log.Debug("listener: la cola durable sigue rechazando los entrantes de esta sesión (fallo ya reportado); este mensaje NO se acusa y WhatsApp lo reenviará",
 				"message_id", e.Info.ID)
-			return
+			return false
 		}
-		l.log.Error("listener: no se pudo anotar el entrante en la cola durable; el mensaje SE PIERDE (ya no hay camino inline que lo rescate) y la escucha sigue (REQ-051.8)",
+		l.log.Error("listener: no se pudo anotar el entrante en la cola durable; el mensaje NO SE ACUSA (T1.13: WhatsApp lo reenviará en vez de darlo por entregado) y la escucha sigue (REQ-051.8)",
 			"error", err, "message_id", e.Info.ID)
+		return false
 	}
+	return true
 }
 
 // clasificadorEstaActivo consulta el interruptor del clasificador con el DEFAULT SEGURO aplicado: sin

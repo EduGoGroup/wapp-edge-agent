@@ -51,6 +51,12 @@ func fakeAgentMain() {
 	sock := os.Getenv("WAPP_AGENT_CONTROL_SOCKET_PATH")
 	noReady := os.Getenv("SUPERVISOR_FAKE_MODE") == "noready"
 
+	// 🔴 EL SOCKET ANTERIOR SE BORRA ANTES DE ESCUCHAR, igual que hace el núcleo REAL
+	// (control/server.Listen). No es un detalle del fake: un `kill -9` al núcleo NO borra su socket file, y
+	// sin este `Remove` el hijo relanzado moriría con "address already in use" en cada intento. Es decir,
+	// el fake fingiría un crash-loop eterno justo en el escenario que el relanzado automático del núcleo
+	// (T5.4) viene a cubrir, y el test diría que el arreglo no funciona cuando el que no funciona es el doble.
+	_ = os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		os.Exit(2)

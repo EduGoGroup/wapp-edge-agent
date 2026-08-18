@@ -136,6 +136,17 @@ type Manager struct {
 	// llegar a cablear el Manager. Lo inyecta WithColaDespachador.
 	colaDespachador app.ColaDespachador
 
+	// despachadorApagado es la PALANCA DE DIAGNÓSTICO de T3.17 (Plan 051 Ola 5): con ella echada, ninguna
+	// sesión arranca su despachador aunque la cola, el mux y el sink estén cableados. Existe para poder
+	// medir el p99 del handler con el despachador parado Y EL DAEMON VIVO —hasta ahora la única forma de
+	// pararlo era tumbar el proceso, que se lleva también al listener y deja la serie `encolado` en n=0—.
+	//
+	// 🔴 EL CAMPO ESTÁ EN NEGATIVO PARA QUE SU CERO SEA EL ESTADO SEGURO: un Manager al que nadie le pasó
+	// la opción (todos los tests, cualquier cableado futuro) DRENA. Si el campo fuera `despachadorActivo`,
+	// olvidar la opción apagaría la entrega de entrantes en silencio y en todas partes. Lo inyecta
+	// WithDespachadorApagado; en producción sale de WAPP_AGENT_DESPACHADOR_APAGADO.
+	despachadorApagado bool
+
 	// presupuestoIntent es cuánto retiene el despachador la cabeza de una sesión esperando a que el cajero
 	// la clasifique, antes de entregarla sin intención (WAPP_AGENT_INTENT_WAIT_MS). 0 (opción no inyectada)
 	// ⇒ manda el default del propio despachador. Lo inyecta WithPresupuestoIntent.

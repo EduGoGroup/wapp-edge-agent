@@ -484,10 +484,11 @@ func TestOnMessage_Cola_EncolaYNoHaceNadaMas(t *testing.T) {
 // TestOnMessage_Cola_ErrorNoTumbaLaEscucha: REQ-051.8 — un Enqueue que falla se registra y se CUENTA, pero
 // no entra en pánico ni aborta el handler.
 //
-// ⚠️ LO QUE ESTE TEST YA NO PUEDE AFIRMAR: que el mensaje llegue igual. Antes de T3.0 lo rescataba el
-// `sink.Deliver`; hoy un Enqueue fallido es un mensaje PERDIDO. La política de no tumbar la escucha sigue
-// siendo la correcta (un disco lleno no puede dejar sordas también a las sesiones sanas), pero el contador
-// ColaEnqueueErrors pasó a medir pérdida, no calidad — y por eso sigue siendo obligatorio comprobarlo.
+// ⚠️ LO QUE ESTE TEST NO AFIRMA: que el mensaje llegue igual. Antes de T3.0 lo rescataba el `sink.Deliver`
+// y ya no existe. Quien lo rescata desde T1.13 es WHATSAPP: el entrante que no deja fila tampoco se acusa,
+// así que se reofrece (ver listener_acuse_test.go, que es donde se custodia esa decisión). Aquí se sigue
+// comprobando lo de siempre —que la escucha no se cae y que la degradación queda CONTADA—, porque el
+// contador es lo único que dice cuánto está costando; el acuse es una decisión aparte.
 func TestOnMessage_Cola_ErrorNoTumbaLaEscucha(t *testing.T) {
 	calls := &callLog{}
 	cola := &spyCola{calls: calls, err: errors.New("disco lleno")}

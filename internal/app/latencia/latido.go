@@ -57,6 +57,20 @@ type Deps struct {
 	// Cola cuenta lo pendiente. nil ⇒ el bloque sale SIN los campos de cola (y sin `conteo_ms`), que es lo
 	// correcto: mejor un bloque más corto que unos ceros que se leen como «la cola está vacía».
 	Cola app.ColaContador
+	// DespachadorApagado dice si la PALANCA DE DIAGNÓSTICO de T3.17 está echada
+	// (WAPP_AGENT_DESPACHADOR_APAGADO). No cambia NADA de lo que el latido mide: cambia lo que la línea
+	// SIGNIFICA, y por eso se publica aquí y en el primer tramo del bloque.
+	//
+	// 🔴 POR QUÉ ESTE DATO VIVE EN EL LATIDO Y NO SOLO EN UN AVISO DE ARRANQUE. Con la palanca echada la
+	// cola no drena y ningún entrante sube; el síntoma que se ve es `cola_pendientes` subiendo sin freno,
+	// que es EXACTAMENTE el síntoma de un despachador roto, de una nube caída o de un Edge saturado. El
+	// aviso del arranque explica eso una vez, hace tres días, en un fichero de log de cientos de miles de
+	// líneas. Esta línea lo explica cada vez que alguien la mira, que es cuando hace falta.
+	//
+	// El cero (false) significa «activo», que es el estado sano: una Deps a medio cablear publica el
+	// estado bueno, no una alarma falsa. La contrapartida —una palanca echada que nadie cableó aquí
+	// saldría como `activo`— la custodia el test de cableado del daemon, que es donde nace el dato.
+	DespachadorApagado bool
 	// Ahora es el reloj, inyectable para los tests. nil ⇒ time.Now.
 	Ahora func() time.Time
 }
@@ -130,6 +144,12 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 
 	args := []any{
 		"emision", emision,
+		// EL ESTADO DEL DESPACHADOR VA AL PRINCIPIO, y no es una preferencia estética: si está APAGADO,
+		// todos los números que vienen detrás significan otra cosa (`cola_pendientes` sube porque nadie
+		// drena, no porque haya carga). Leerlo al final obligaría a reinterpretar la línea entera hacia
+		// atrás. Va SIEMPRE, como `n` y los contadores de la puerta: un `activo` explícito es un dato, y un
+		// campo ausente sería la duda de si alguien dejó de mirarlo.
+		"despachador", estadoDespachador(d.DespachadorApagado),
 		// La ventana REAL medida, no la pedida: en el bloque final (y tras un tick que se retrasó) las dos
 		// no coinciden, y es la real la que da sentido a `n`.
 		"ventana_ms", t.Sub(desde).Milliseconds(),
@@ -156,6 +176,28 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 	args = append(args, percentil(encAcum, 0.99, "p99_ms_acum", "")...)
 	args = append(args, "max_ms_acum", encAcum.MaxMS())
 
+	// LA PUERTA DE ENTRADA (T1.13). Van SIEMPRE, incluso en cero, y por dos motivos distintos:
+	//
+	//   - un cero explícito es un DATO («no se ha degradado nada en toda la vida del proceso») y un campo
+	//     ausente es una DUDA («¿no pasó nada, o dejó de mirarse?»). Es el mismo criterio que `n` y
+	//     `cola_pendientes`, y el contrario que el de los percentiles —que sí se omiten con n=0, porque
+	//     allí el cero se leería como «tardó 0 ms», que es una afirmación falsa y no una ausencia—;
+	//   - van FUERA del bloque de `d.Cola`: estos contadores los lleva el instrumento en memoria y no
+	//     dependen del COUNT ni de que el adaptador respalde el lado contador. Un Edge cuya cola no sepa
+	//     contar sigue teniendo derecho a ver si está reofreciendo mensajes.
+	//
+	// `d.Hist` no puede ser nil aquí (Latido retorna antes si lo es), así que estos dos campos no tienen
+	// ninguna condición que los pueda dejar fuera de la línea.
+	//
+	// ⚠️ `cola_enqueue_errores` NO CUENTA MENSAJES PERDIDOS desde T1.13: cuenta mensajes que WhatsApp
+	// tendrá que REOFRECER, porque lo que no deja fila tampoco se acusa. Sube = el Edge está reintentando.
+	// `cola_enqueue_panics` es otra cosa: cualquier valor > 0 ahí es un defecto, no una condición de campo.
+	puerta := d.Hist.Puerta().Snapshot()
+	args = append(args,
+		"cola_enqueue_errores", puerta.EnqueueErrors,
+		"cola_enqueue_panics", puerta.EnqueuePanics,
+	)
+
 	if d.Cola != nil {
 		t0 := ahora()
 		p, err := d.Cola.Pendientes(ctx)
@@ -177,6 +219,27 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 		args = append(args, "conteo_ms", conteoMS)
 	}
 	return args
+}
+
+// Valores del campo `despachador` del bloque. Son constantes porque el runbook y los tests afirman sobre
+// ellas, y una cadena suelta en dos sitios es una divergencia esperando a ocurrir (mismo criterio que las
+// etiquetas de `emision`).
+const (
+	despachadorActivo = "activo"
+	// El valor del estado APAGADO lleva dentro su propia explicación, y es deliberado: la lectura de campo
+	// es un `grep … | tail -3` cuyo resultado se pega crudo en el journal, así que la línea tiene que
+	// bastarse sola. Nadie va a ir a buscar qué significa una etiqueta de tres letras a las 3 de la mañana.
+	// En el caso sano el campo mide seis caracteres; el texto largo solo aparece cuando hace falta.
+	despachadorApagado = "APAGADO (palanca de diagnostico WAPP_AGENT_DESPACHADOR_APAGADO: se ENCOLA pero NO se drena; nada sube a la nube)"
+)
+
+// estadoDespachador traduce la palanca al valor del campo. Existe para que las dos constantes se nombren
+// en un solo sitio y el `bloque` no cargue con un condicional.
+func estadoDespachador(apagado bool) string {
+	if apagado {
+		return despachadorApagado
+	}
+	return despachadorActivo
 }
 
 // percentil devuelve los pares clave/valor de un percentil, o NADA si la población está vacía.
