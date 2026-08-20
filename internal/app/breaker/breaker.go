@@ -1,6 +1,14 @@
-// Package breaker es el CIRCUIT BREAKER del clasificador local, extraído para que lo compartan sus dos
-// consumidores (Plan 051 Ola 2 · T2.4): el decorador inline de `agent serve`
-// (internal/adapters/intent/sink.go, ADR-0020) y el worker-cajero (internal/app/cajero, ADR-0038).
+// Package breaker es el CIRCUIT BREAKER del clasificador local. Se extrajo (Plan 051 Ola 2 · T2.4) para
+// que lo compartieran DOS consumidores: el decorador inline de `agent serve` y el worker-cajero.
+//
+// 🔧 CORREGIDO EL 2026-08-20 (MP-09): HOY EL CONSUMIDOR ES UNO. La frase anterior decía «para que lo
+// compartan sus dos consumidores» en presente y citaba `internal/adapters/intent/sink.go`, que YA NO
+// EXISTE: lo borró `0e3a730` («chore(intent): borrar el decorador inline muerto», 2026-08-17, T3.0 del
+// propio Plan 051), TRES DÍAS DESPUÉS de que este comentario se escribiera en la migración del T2.4. El
+// paquete `intent` sólo conserva `status.go` y el único llamante vivo es internal/app/cajero
+// (ADR-0038). Se deja dicho porque un
+// comentario que inventa un consumidor no es cosmético: hace que quien viene a cambiar algo aquí crea
+// que tiene que negociar con dos sitios, y sobreestime el riesgo de tocarlo.
 //
 // 🔴 ES UNA MIGRACIÓN, NO UN REDISEÑO. La lógica viene ÍNTEGRA de sink.go (beginAttempt/recordSuccess/
 // recordFailure), con sus dos números intactos: 5 fallos CONSECUTIVOS abren el circuito por 60 s, y
@@ -9,10 +17,25 @@
 // T2.4 dice literalmente que ningún umbral puede cambiar de valor durante la migración: si vienes a
 // «afinarlos de paso», no lo hagas aquí — hazlo con una medición delante y un ADR que lo respalde.
 //
-// LO QUE EL BREAKER NO CUENTA COMO FALLO (semántica heredada, se sostiene en los llamantes, no aquí):
-// un intent vacío o la intención reservada «desconocido» NO son fallos —el clasificador respondió
-// bien, simplemente sin intención accionable— y por tanto el llamante debe invocar RecordSuccess, no
-// RecordFailure. Fallo es error de red, timeout o pánico del clasificador.
+// 📌 ESE AVISO YA SE ESTRENÓ, Y LA FORMA EN QUE SE RESOLVIÓ ES LA GUÍA. El MP-09 (2026-08-20) encontró
+// que este circuito NO ABRE con un Ollama lento —el modo de enfermedad más probable— porque un solo
+// acierto intercalado pone `failures` a cero, y en campo dos de cada tres intentos aciertan mientras el
+// servicio tarda 9-15 s por lote. El arreglo (ADR-0042) NO tocó estos dos números ni una línea de este
+// fichero: cambió QUÉ le cuenta el cajero, aprovechando que la semántica de fallo vive en los llamantes
+// (ver el bloque de abajo). Si vuelves con otra medición, ese es el orden a imitar — primero mira si lo
+// que hay que corregir es el criterio del llamante, y sólo después la calibración de aquí.
+//
+// QUÉ CUENTA COMO FALLO NO SE DECIDE AQUÍ (semántica heredada: se sostiene en los llamantes). Hay dos
+// casos vivos, y los dos son del cajero:
+//
+//   - Un intent vacío o la intención reservada «desconocido» NO es un fallo —el clasificador respondió
+//     bien, simplemente sin intención accionable—, así que el llamante invoca RecordSuccess.
+//   - Un ACIERTO que consumió >= 80 % de su plazo SÍ es un fallo (ADR-0042 · MP-09): el clasificador
+//     respondió, pero tan cerca de agotar su presupuesto que lo siguiente que hará es agotarlo. El
+//     llamante invoca RecordFailure aunque el lote se cierre con su intent. Ver cajero.FraccionLentitud
+//     para la medición que lo motivó.
+//
+// Lo demás —error de red, timeout o pánico del clasificador— es fallo sin matices.
 //
 // Seguro para uso concurrente: todo el estado va bajo un único mutex. El reloj es inyectable
 // (WithClock) para que los tests no dependan de esperas reales; por defecto es time.Now.
