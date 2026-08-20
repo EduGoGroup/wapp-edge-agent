@@ -154,6 +154,19 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 				_, err := gateway.SendMediaViaLiveClientTracked(ctx, commandID, to, presignedURL, filename, mime, kind, caption)
 				return err
 			})
+			// Rota el INYECTOR DE ENTRANTES SINTÉTICOS de ESTE ciclo (MP-10 Parte A). Va aquí, con sus dos
+			// hermanos, porque es exactamente el mismo problema: el gateway se recrea en cada (re)conexión, así
+			// que cualquier referencia a él que se guarde fuera envejece: una inyección disparada contra el
+			// gateway del ciclo anterior mediría un camino muerto, que es el peor resultado posible para un
+			// instrumento de medida (un número, y falso). La indirección estable que el plano de control ve es
+			// s.inyectarVia; esto solo la reapunta al gateway vivo.
+			//
+			// SE PASA EL MÉTODO, NO UNA CLOSURE QUE LO ENVUELVA, y la diferencia importa: los dos emisores de
+			// arriba envuelven porque DESCARTAN su primer valor de retorno, aquí no hay nada que adaptar. Al
+			// pasarlo pelado, la firma del gateway y la del campo tienen que coincidir EXACTAMENTE, así que el
+			// día que una de las dos cambie la rotura sale en esta línea —en el cableado— y no en un `false`
+			// silencioso al final de una medición.
+			s.setLiveInyector(gateway.InyectarEntrante)
 			// Cablea la SALIDA de acuses de ESTA sesión (Plan 013 T2a): al llegar un events.Receipt, se
 			// etiqueta con el session_id, se correlaciona con el command_id del envío (Correlator) y se
 			// sube al cloud por el stream. Sin correlación (vencido/desconocido) sube como estado crudo.

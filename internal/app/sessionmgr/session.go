@@ -16,6 +16,26 @@ import (
 // traduce a Ack{ok=false} y NO tumba nada: es un envío que llegó con la sesión sin cliente vivo.
 var ErrNoLiveSender = errors.New("sessionmgr: sin cliente vivo para enviar en esta sesión")
 
+// ErrInyectorNoCableado: la sesión ESTÁ VIVA pero no hay camino entrante por el que inyectar AHORA MISMO
+// (MP-10 Parte A). Es el gemelo exacto de ErrNoLiveSender para el camino ENTRANTE, y se mantiene DISTINTO
+// del error de «no hay sesión viva con ese id» (ErrSesionNoViva, inyector.go) porque los dos se arreglan de
+// forma opuesta: este se arregla ESPERANDO (el ciclo de escucha está subiendo), el otro emparejando o
+// restaurando la sesión. Colapsarlos mandaría al operador a reparar lo que no está roto.
+//
+// ⚠️ CUBRE DOS ESTADOS, no uno, y el segundo es el que de verdad se pisa en campo — por eso el texto ya no
+// dice solo «aún no cableó»:
+//
+//  1. AÚN NO SE CABLEÓ: la sesión se acaba de registrar y su factory todavía no publicó el cable
+//     (`liveInyectar` nil). Es el arranque, y dura lo que tarda el primer ciclo.
+//  2. SE DESCABLEÓ POR RECONEXIÓN: el cable está puesto pero apunta a un gateway cuyo `serve()` ya salió y
+//     limpió su Listener. `runListener` está esperando el backoff exponencial (hasta 60 s) para reconstruir
+//     el gateway, y nadie pone el cable a nil mientras tanto. Lo detecta la traducción de
+//     whatsmeow.ErrSinEscuchaViva en Manager.InyectarEntrante (inyector.go), no la guarda `fn == nil`.
+//
+// Los dos piden lo mismo a quien llama —esperar y repetir— y por eso comparten centinela y comparten 409.
+var ErrInyectorNoCableado = errors.New("sessionmgr: la sesión está viva pero no hay escucha a la que inyectar " +
+	"(su listener aún no cableó el inyector, o se descableó al caer y espera el backoff de reconexión)")
+
 // SessionHealth es la salud de RUNTIME del listener de una sesión (design §10.H): un estado vivo,
 // distinto del estado de NEGOCIO persistido (domain.SessionState: pairing/active/loggedout). El
 // plano de control (GET /v1/sessions, T6) lo expone para que el operador vea una sesión 'degraded'
@@ -117,17 +137,42 @@ type liveSession struct {
 	// ciclo de (re)conexión (el gateway whatsmeow se recrea por ciclo, lección Plan 006: nada efímero).
 	// El multiplex CloudLink registra sendVia (indirección ESTABLE) UNA sola vez al arrancar; así un
 	// comando SendText siempre llega al cliente vivo ACTUAL de la sesión, no a uno muerto de un ciclo
-	// previo. nil entre ciclos / antes del primer Connect: sendVia devuelve ErrNoLiveSender. Recibe el
+	// previo. nil SOLO antes del primer Connect —nadie lo limpia nunca: el factory lo re-apunta, no lo
+	// borra—, y en ese estado sendVia devuelve ErrNoLiveSender. Recibe el
 	// command_id del envío (Plan 013 §10.E) para alimentar la correlación command_id ↔ MessageID.
 	liveSend func(ctx context.Context, commandID, to, text string) error
 	// liveMediaSend es el emisor de ARCHIVOS por cliente vivo (Plan 017 §7), hermano de liveSend: lo rota
 	// el factory del listener en cada ciclo apuntando al gateway recién creado. El multiplex registra
-	// sendViaMedia (indirección estable). nil entre ciclos / antes del primer Connect: sendViaMedia
-	// devuelve ErrNoLiveSender.
+	// sendViaMedia (indirección estable). nil SOLO antes del primer Connect (mismo motivo que liveSend:
+	// el cable se re-apunta, nunca se limpia); en ese estado sendViaMedia devuelve ErrNoLiveSender.
 	liveMediaSend func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error
+	// liveInyectar es el INYECTOR DE ENTRANTES SINTÉTICOS de esta sesión (MP-10 Parte A): mete un mensaje
+	// fabricado por el camino REAL del handler entrante del gateway, para poder medir el p99 de INV-051.2 sin
+	// mandar cien mensajes de verdad contra el número de producción. Es el TERCER campo función de este
+	// bloque y se rota igual que sus dos hermanos —el factory del listener lo publica en cada ciclo de
+	// (re)conexión apuntando al gateway recién creado (lección Plan 006: nada efímero)—, con una asimetría que
+	// conviene tener presente: los otros dos son SALIDA (el mux empuja hacia WhatsApp) y este es ENTRADA (el
+	// plano de control empuja hacia el handler), así que el disparador no es el stream del cloud sino una
+	// petición local.
+	//
+	// 🔴 CUÁNDO ES NIL, DE VERDAD: SOLO antes del primer ciclo. NADIE lo limpia nunca — el factory es el
+	// único que lo escribe (listen.go:169) y siempre con una función, así que entre ciclos el cable NO
+	// vuelve a nil: se queda apuntando al gateway del ciclo ANTERIOR durante todo el backoff de
+	// reconexión (hasta 60 s). La guarda `fn == nil` de inyectarVia cubre por tanto el ARRANQUE, no la
+	// reconexión, y quien cubre la reconexión es otra cosa: el centinela ErrSinEscuchaViva que devuelve
+	// el gateway sin Listener publicado, traducido a ErrInyectorNoCableado en Manager.InyectarEntrante
+	// (inyector.go). Creerse lo contrario es exactamente el agujero por el que una tanda lanzada en
+	// backoff contestaba 200 con `inyectados: 0` en vez de 409.
+	//
+	// El bool que devuelve es el ACUSE del camino entrante (si la inyección fue efectivamente admitida y
+	// anotada, o si el propio handler la descartó por sus filtros normales), no un «hubo error»: el error va
+	// aparte. Un false SIN error es un resultado legítimo y significativo —el camino real dijo que no—, y
+	// aplastarlo contra el error perdería exactamente la señal que la medición busca.
+	liveInyectar func(ctx context.Context, p app.InyeccionEntrante) (bool, error)
 }
 
-// setLiveSender publica (o limpia con nil) el emisor por cliente vivo de ESTE ciclo de escucha. Lo
+// setLiveSender publica el emisor por cliente vivo de ESTE ciclo de escucha (acepta nil, pero ningún
+// camino de producción lo llama así: el cable se re-apunta, no se limpia). Lo
 // invoca el factory del listener en cada (re)conexión, apuntando al gateway recién creado.
 func (s *liveSession) setLiveSender(fn func(ctx context.Context, commandID, to, text string) error) {
 	s.mu.Lock()
@@ -148,7 +193,7 @@ func (s *liveSession) sendVia(ctx context.Context, commandID, to, text string) e
 	return fn(ctx, commandID, to, text)
 }
 
-// setLiveMediaSender publica (o limpia con nil) el emisor de ARCHIVOS por cliente vivo de ESTE ciclo de
+// setLiveMediaSender publica el emisor de ARCHIVOS por cliente vivo de ESTE ciclo de
 // escucha (Plan 017 §7). Hermano de setLiveSender; lo invoca el factory del listener en cada (re)conexión.
 func (s *liveSession) setLiveMediaSender(fn func(ctx context.Context, commandID, to, presignedURL, filename, mime, kind, caption string) error) {
 	s.mu.Lock()
@@ -167,6 +212,37 @@ func (s *liveSession) sendViaMedia(ctx context.Context, commandID, to, presigned
 		return ErrNoLiveSender
 	}
 	return fn(ctx, commandID, to, presignedURL, filename, mime, kind, caption)
+}
+
+// setLiveInyector publica el inyector de entrantes sintéticos de ESTE ciclo de escucha (MP-10 Parte A).
+// Hermano de setLiveSender/setLiveMediaSender; lo invoca el factory del listener en cada (re)conexión,
+// apuntando al gateway recién creado.
+//
+// Acepta nil por simetría con sus hermanos, pero NINGÚN camino de producción lo llama así: el cable se
+// re-apunta, no se limpia. Ver el doc del campo liveInyectar para lo que eso implica.
+func (s *liveSession) setLiveInyector(fn func(ctx context.Context, p app.InyeccionEntrante) (bool, error)) {
+	s.mu.Lock()
+	s.liveInyectar = fn
+	s.mu.Unlock()
+}
+
+// inyectarVia mete un entrante SINTÉTICO por el camino real del handler del cliente vivo ACTUAL de la
+// sesión (MP-10 Parte A). Calcado de sendVia, y con su misma propiedad crítica: la función se LEE bajo el
+// candado y se LLAMA fuera de él. No es un detalle de estilo — la llamada recorre el handler entrante
+// entero, que serializa metadatos y ESCRIBE una fila cifrada en SQLite; sostener `s.mu` durante ese I/O
+// congelaría a todo el que lee la salud o el despachador de esta sesión.
+//
+// Si no hay ciclo de escucha activo (liveInyectar nil), devuelve ErrInyectorNoCableado, que es un error
+// DISTINTO del de sus hermanos (ErrNoLiveSender) a propósito: aquí no hay ningún envío que reintentar, hay
+// una medición que aún no puede empezar.
+func (s *liveSession) inyectarVia(ctx context.Context, p app.InyeccionEntrante) (bool, error) {
+	s.mu.Lock()
+	fn := s.liveInyectar
+	s.mu.Unlock()
+	if fn == nil {
+		return false, ErrInyectorNoCableado
+	}
+	return fn(ctx, p)
 }
 
 // arm prepara la sesión para su goroutine listener bajo lock: guarda su cancel (apagado ordenado /
