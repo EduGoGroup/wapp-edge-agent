@@ -85,6 +85,55 @@ const (
 // distintos, de dos caminos distintos.
 const DefaultInferenceTimeoutMS = 15000
 
+// FraccionLentitud es la fracción del presupuesto de inferencia (Deps.Timeout) por encima de la cual un
+// ACIERTO deja de contar como señal de salud: el clasificador respondió, sí, pero tan cerca de agotar su
+// plazo que lo siguiente que hará es agotarlo. Ese acierto NO cierra el circuito, castiga al breaker
+// igual que un timeout — y el LOTE se cierra con su intent, que se clasificó bien y no se tira.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// POR QUÉ EXISTE ESTA CONSTANTE (MP-09, medido en campo el 2026-08-20)
+// ─────────────────────────────────────────────────────────────────────────────
+// El breaker cuenta fallos CONSECUTIVOS y cualquier éxito pone el contador a cero (breaker.go:68-71).
+// Contra un Ollama CAÍDO eso funciona: no acierta nunca, los cinco fallos llegan en ~2 s y el circuito
+// abre. Contra un Ollama LENTO —vivo, respondiendo, e inútil a efectos prácticos— NO FUNCIONA, y la
+// medición del VPS de UAT lo enseñó en crudo con un backlog de 240 entrantes:
+//
+//	T · OK(12190 ms) · OK(12626 ms) · T · T · OK(9460 ms) · OK(9803 ms) · T · OK(14878 ms) · OK(10795 ms)
+//
+// Racha máxima de timeouts consecutivos: 2. Umbral: 5. En la corrida entera, 95 timeouts y 316 lotes
+// clasificados, y el circuito NO ABRIÓ NI UNA VEZ. Aproximadamente dos de cada tres intentos aciertan
+// mientras el servicio tarda 9-15 s por lote.
+//
+// 🔴 EL DATO QUE DECIDE EL DISEÑO: uno de esos «aciertos» tardó 14.878 ms contra un plazo de 15.000. Se
+// quedó a 122 ms de ser un timeout. La frontera entre «éxito» y «fallo» ahí no es una señal de salud, es
+// un accidente de milisegundos — y el breaker estaba tomando su decisión más importante justo sobre esa
+// frontera. Redefinir qué cuenta como éxito ataca eso; subir el peso de los timeouts o bajar el umbral
+// no, porque el problema no es cuántos fallos hacen falta sino que un acierto casual los borra todos.
+//
+// POR QUÉ 0,8 Y NO OTRO NÚMERO. Con el plazo por defecto (15 s) el umbral cae en 12 s, y esa cifra tiene
+// las dos propiedades que hacen falta, medidas y no supuestas:
+//
+//   - SEPARA de lo sano por un orden de magnitud. La O0 midió p50 = 2.613 ms y p95 = 3.736 ms
+//     (docs/plans/051-worker-cajero-edge/O0-resultados-2026-08-09.md): una inferencia normal no roza los
+//     12 s ni con el VPS cargado. Para abrir el circuito harían falta CINCO SEGUIDAS por encima de 12 s,
+//     así que un pico aislado —ni dos, ni tres— no lo abre. Esa era la calibración que la opción de
+//     «bajar el umbral a 2 o 3» se cargaba.
+//   - CAPTURA lo enfermo. Aplicada a la secuencia real de arriba, el contador ya no se reinicia:
+//     T(1) · 12190(2) · 12626(3) · T(4) · T(5) ⇒ ABRE al quinto evento, ~62 s antes que hoy (que es
+//     «nunca»).
+//
+// LO QUE ESTA CONSTANTE NO ES: no es una perilla. Se deriva del plazo —que sí es configurable
+// (WAPP_WORKER_INFERENCE_TIMEOUT_MS)—, así que quien mueva el presupuesto mueve el umbral con él y la
+// relación entre los dos números no se puede desincronizar a mano. Si algún día hace falta afinarla en
+// campo sin recompilar, hacerla configurable es un cambio de una línea; hasta que la medición lo pida,
+// una perilla más es una forma de romper esta calibración por descuido.
+//
+// CON EL PLAZO DESACTIVADO (Deps.Timeout <= 0, manda el ctx del proceso) NO HAY PRESUPUESTO del que
+// derivar nada y el criterio se apaga entero: el breaker vuelve exactamente a la conducta de antes del
+// MP-09. Es la única lectura honesta —sin plazo, «tardar demasiado» no está definido—, y además es la
+// que mantiene intacta la promesa de Deps.Timeout <= 0.
+const FraccionLentitud = 0.8
+
 // DefaultMaxIntentos es cuántas veces se RECLAMA un lote antes de abandonarlo con
 // app.MotivoFalloRepetido (WAPP_WORKER_MAX_INTENTOS). Es 3, y el número dice esto: dos reintentos
 // gratis y a la tercera se cierra.
@@ -288,16 +337,20 @@ type Cajero struct {
 	// cursor es la POSICIÓN del round-robin. Sólo lo toca bucle(), que es una única goroutine, así que no
 	// necesita candado: las goroutines de procesar() no lo leen (cada una recibe SU cola por parámetro) y
 	// el barrido las recorre todas sin cursor.
-	cursor        int
-	clasificador  Clasificador
-	breaker       Interruptor
-	despertador   Despertador
-	log           sharedlogger.Logger
-	ahora         func() time.Time
-	maxFilas      int
-	maxIntentos   int64
-	lease         time.Duration
-	timeout       time.Duration
+	cursor       int
+	clasificador Clasificador
+	breaker      Interruptor
+	despertador  Despertador
+	log          sharedlogger.Logger
+	ahora        func() time.Time
+	maxFilas     int
+	maxIntentos  int64
+	lease        time.Duration
+	timeout      time.Duration
+	// umbralLento es el plazo por encima del cual un ACIERTO deja de contar como éxito para el breaker
+	// (MP-09). Se DERIVA de timeout en New —timeout × FraccionLentitud— y vale 0 cuando no hay plazo
+	// propio (Deps.Timeout <= 0), que es como se apaga el criterio entero. Ver FraccionLentitud.
+	umbralLento   time.Duration
 	statsEvery    time.Duration
 	listo         func() bool
 	configVersion func() string
@@ -341,6 +394,12 @@ type Cajero struct {
 	fallos           atomic.Int64
 	rescatados       atomic.Int64
 	aperturasBreaker atomic.Int64
+	// lentas son los ACIERTOS que pasaron de umbralLento y por tanto castigaron al breaker en vez de
+	// cerrarlo (MP-09). NO son fallos —el lote se clasificó y se cerró con su intent, y por eso no suma
+	// en `fallos`— y son la única forma de distinguir en el log un circuito abierto por lentitud de uno
+	// abierto por caída: con Ollama caído este contador es 0 y `fallos` sube; con Ollama lento suben los
+	// dos.
+	lentas atomic.Int64
 }
 
 // chatJIDHashLen es cuántos caracteres HEX del hash del chat_jid se escriben en el log. 8, y el número
@@ -472,6 +531,7 @@ func New(deps Deps) (*Cajero, error) {
 		maxIntentos:   int64(maxIntentos),
 		lease:         lease,
 		timeout:       deps.Timeout,
+		umbralLento:   umbralLentoDe(deps.Timeout),
 		statsEvery:    deps.StatsEvery,
 		listo:         deps.Listo,
 		configVersion: deps.ConfigVersion,
@@ -546,6 +606,7 @@ func (c *Cajero) contadores() []any {
 		"abandonados", c.Abandonados(),
 		"relevados", c.Relevados(),
 		"fallos", c.Fallos(),
+		"lentas", c.Lentas(),
 		"rescatados", c.Rescatados(),
 		"aperturas_breaker", c.AperturasBreaker(),
 		"circuito", c.Circuito(),
@@ -917,7 +978,7 @@ func (c *Cajero) procesar(ctx context.Context, cm *colaMontada, lote *app.ColaLo
 		return
 	}
 	c.inferencia.observar(transcurrido) // el camino de éxito, con el MISMO reloj que el de fallo
-	c.breaker.RecordSuccess()
+	lento := c.registrarAcierto(transcurrido)
 
 	// T2.6 · el log de métricas. 🔴 INV-051.1: aquí NO va el texto clasificado ni ningún valor de
 	// res.Params. `intent` es el NOMBRE de la intención del contrato (un identificador cerrado que la
@@ -929,6 +990,13 @@ func (c *Cajero) procesar(ctx context.Context, cm *colaMontada, lote *app.ColaLo
 		"prompt_tokens", res.Metrics.PromptTokens,
 		"output_tokens", res.Metrics.OutputTokens,
 		"tokens_per_sec", res.Metrics.TokensPerSec,
+		// 🔴 `latencia_ms` NO ES `total_ms`, y las dos van aquí a propósito (MP-09). total_ms es lo que
+		// Ollama dice que tardó por dentro; latencia_ms es lo que el cajero ESPERÓ de verdad —viaje HTTP,
+		// serialización y cola del propio Ollama incluidos—, que es el número contra el que se juzga la
+		// lentitud y el que gobierna la plaza del semáforo. Hasta el MP-09 sólo se publicaba el primero,
+		// así que el camino de ÉXITO no dejaba rastro del tiempo que de verdad costaba (el de fallo sí).
+		"latencia_ms", transcurrido.Milliseconds(),
+		"lento", lento,
 		"mensajes", len(lote.Mensajes),
 		"runas", runas,
 		"truncado", res.Truncado,
@@ -1022,12 +1090,83 @@ func (c *Cajero) cerrar(ctx context.Context, cm *colaMontada, lote *app.ColaLote
 // aperturas de la misma o perder una. Ahora no hay nada que serializar aquí.
 func (c *Cajero) registrarFallo() {
 	c.fallos.Add(1)
+	c.anotarApertura(c.breaker.RecordFailure(), causaFallo)
+}
 
-	if c.breaker.RecordFailure() {
-		n := c.aperturasBreaker.Add(1)
-		c.log.Warn("cajero: el circuit breaker del clasificador se ABRIÓ; el cajero deja de reclamar lotes",
-			"aperturas", n, "abierto_por_s", int(breaker.DefaultOpenFor.Seconds()))
+// Las dos CAUSAS por las que el circuito puede abrirse. No son estados del breaker —que sigue teniendo
+// tres y no se ha tocado— sino la enfermedad que lo abrió, y distinguirlas en el log es lo único que
+// separa en campo un Ollama CAÍDO de uno LENTO: los dos dejan la misma línea de apertura y piden
+// intervenciones distintas (arrancarlo vs. mirar quién le está comiendo la CPU).
+const (
+	// causaFallo: la inferencia no respondió (error de red, timeout propio o pánico del clasificador).
+	causaFallo = "fallo"
+	// causaLentitud: la inferencia SÍ respondió, por encima de umbralLento (MP-09).
+	causaLentitud = "lentitud"
+)
+
+// registrarAcierto le cuenta al breaker una inferencia que RESPONDIÓ, y decide si esa respuesta es señal
+// de salud o de enfermedad. Devuelve si fue LENTA, para que el llamante pueda decirlo en su log.
+//
+// 🔴 ES EL ARREGLO DEL MP-09, Y VIVE AQUÍ A PROPÓSITO. El paquete breaker declara en su cabecera que la
+// semántica de «qué cuenta como fallo» SE SOSTIENE EN LOS LLAMANTES y no en él —ya hay un precedente
+// vivo: un intent vacío o «desconocido» es un éxito porque el clasificador respondió bien—, así que
+// añadir aquí una segunda excepción es extender un patrón que ya existía, no romper la migración
+// intacta que exige REQ-051.12. El breaker no cambia ni una línea: sigue contando fallos consecutivos
+// contra un umbral de 5 y abriendo 60 s. Lo que cambia es QUÉ le contamos.
+//
+// EL LOTE NO SE PIERDE NI SE DEGRADA. Una inferencia lenta se clasificó correctamente: su intent se
+// escribe y el lote se cierra por el camino normal. Lo único que cambia es que el breaker aprende de
+// ella. Por eso `lentas` es un contador aparte y NO suma en `fallos` —que gobierna el freno del lote
+// venenoso (DefaultMaxIntentos)—: castigar los intentos de un lote por la lentitud de Ollama abandonaría
+// mensajes ajenos al problema.
+func (c *Cajero) registrarAcierto(transcurrido time.Duration) bool {
+	if c.umbralLento <= 0 || transcurrido < c.umbralLento {
+		c.breaker.RecordSuccess()
+		return false
 	}
+
+	n := c.lentas.Add(1)
+	abrio := c.breaker.RecordFailure()
+
+	// 🔴 INV-051.1: sólo duraciones y cuentas. Ni texto, ni intención, ni chat.
+	//
+	// Warn y no Info: el lote salió bien, pero el clasificador está diciendo con todas las letras que va
+	// camino de no salir. Es la línea que un operador quiere ver ANTES de la apertura, no después — y con
+	// el semáforo en 1 aparece como mucho una vez cada `umbral_lento_ms`, así que no puede inundar el log.
+	c.log.Warn("cajero: inferencia LENTA; respondió, pero se comió casi todo su plazo y cuenta como fallo "+
+		"para el circuit breaker (el lote se cierra con su intent, no se pierde)",
+		"latencia_ms", transcurrido.Milliseconds(),
+		"umbral_lento_ms", c.umbralLento.Milliseconds(),
+		"timeout_ms", c.timeout.Milliseconds(),
+		"lentas", n,
+		"circuito", c.breaker.State(),
+	)
+
+	c.anotarApertura(abrio, causaLentitud)
+	return true
+}
+
+// anotarApertura cuenta y anuncia la apertura del circuito cuando el fallo recién registrado fue el del
+// FLANCO (no-abierto → abierto). El flanco lo decide el breaker dentro de su propio lock: aquí sólo se
+// consume el bool, que es lo que hace que dos fallos concurrentes no puedan contar dos aperturas de la
+// misma ni perderla.
+func (c *Cajero) anotarApertura(abrio bool, causa string) {
+	if !abrio {
+		return
+	}
+	n := c.aperturasBreaker.Add(1)
+	c.log.Warn("cajero: el circuit breaker del clasificador se ABRIÓ; el cajero deja de reclamar lotes",
+		"causa", causa, "aperturas", n, "abierto_por_s", int(breaker.DefaultOpenFor.Seconds()))
+}
+
+// umbralLentoDe deriva el umbral de lentitud del presupuesto de inferencia (ver FraccionLentitud). Un
+// presupuesto <= 0 —Deps.Timeout desactivado, manda el ctx del proceso— devuelve 0, que APAGA el
+// criterio: sin plazo no hay «demasiado tarde» que definir.
+func umbralLentoDe(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return 0
+	}
+	return time.Duration(float64(timeout) * FraccionLentitud)
 }
 
 // parteTimeout es el plazo de UNA publicación del parte. Es corto a propósito y no es cosmético: el
@@ -1380,6 +1519,12 @@ func (c *Cajero) RescatadosPorCola() map[string]int64 {
 // que mirar para saber si Ollama se está cayendo — no el de omisiones por `breaker`, que con el
 // semáforo en 1 es casi siempre cero (ver el doc comment de bucle()).
 func (c *Cajero) AperturasBreaker() int64 { return c.aperturasBreaker.Load() }
+
+// Lentas son los ACIERTOS que se pasaron del umbral de lentitud y castigaron al breaker en vez de
+// cerrarlo (MP-09). NO son fallos: sus lotes se clasificaron y se cerraron con su intent. Leído junto a
+// Fallos distingue las dos enfermedades — Ollama caído sube `fallos` y deja esto en 0; Ollama lento sube
+// los dos.
+func (c *Cajero) Lentas() int64 { return c.lentas.Load() }
 
 // Circuito devuelve el estado del circuito, con las mismas etiquetas que `GET /v1/intent/status`.
 func (c *Cajero) Circuito() string { return c.breaker.State() }
