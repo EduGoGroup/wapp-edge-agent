@@ -39,13 +39,27 @@ type ListenGateway struct {
 	loadDevice loadDeviceFunc
 	log        logger.Logger
 
-	// mu protege SOLO el puntero `client` (no las llamadas a whatsmeow, que son seguras concurrentes).
+	// mu protege SOLO los punteros `client` y `listener` (no las llamadas a whatsmeow ni al Listener, que
+	// son seguras concurrentes por su cuenta).
 	mu sync.RWMutex
 	// client es el cliente VIVO de la escucha mientras serve() bloquea; nil fuera de una sesión Listen.
 	// Permite que el envío reutilice la MISMA conexión que recibe (una sola conexión por sesión): con
 	// la misma identidad multi-dispositivo, un cliente efímero aparte REEMPLAZARÍA esta conexión y
 	// dejaría el socket de escucha sordo. El device ya está autenticado: enviar NO requiere la DEK.
 	client *wm.Client
+
+	// listener es el Listener VIVO de esta sesión mientras serve() bloquea; nil fuera de una sesión
+	// Listen. Es el HERMANO EXACTO de `client` de arriba —mismo lock, mismo ciclo de vida, mismo par
+	// publicar/limpiar— y existe por el mismo motivo estructural: hasta MP-10 el Listener era una
+	// variable LOCAL de serve() que se soltaba tras Register, así que nadie fuera de aquel bloque podía
+	// alcanzarlo. El inyector de entrantes sintéticos (inyector.go) necesita justamente eso: entregarle
+	// un evento al handler REAL de la sesión que está escuchando ahora mismo.
+	//
+	// 🔴 NO ES UN SEGUNDO CAMINO DE ENTRADA PARA TRÁFICO REAL. Lo único que llega por aquí lo fabrica
+	// FabricarEntranteSintetico, y lleva el prefijo `SINTETICO-` en su wa_message_id justamente para que
+	// sea distinguible aguas abajo. Quien reciba tráfico de WhatsApp sigue siendo el handler que
+	// Register cableó en el cliente.
+	listener *Listener
 
 	// correlator ata command_id ↔ MessageID por sesión (§10.E): lo alimenta el envío por cliente vivo
 	// (SendViaLiveClientTracked) al capturar el SendResponse, y lo consulta el CloudLink en T2 al llegar
@@ -293,6 +307,21 @@ func (g *ListenGateway) serve(ctx context.Context, device *store.Device) error {
 		}
 	}
 	listener.Register(ctx, client)
+	// Publica el Listener VIVO para que el inyector de entrantes sintéticos (MP-10 Parte A) pueda meter un
+	// evento por SU handler, y lo limpia al salir. Exactamente el par de `setLiveClient` de arriba, y por
+	// las mismas dos razones: el gateway sobrevive a serve() y un puntero sin limpiar apuntaría a una
+	// sesión muerta (ver setLiveListener).
+	//
+	// VA DESPUÉS DE Register, no antes, y eso importa: hasta que Register no corre, el Listener no tiene
+	// cableado el sello de la ventana temporal (`connectSeal`, listener.go:368). Un inyectado que llegara
+	// en ese hueco se juzgaría con el respaldo `now` de resolveThreshold en vez de con el sello real — no
+	// lo descartaría (un sintético se sella con time.Now()), pero mediría un handler que no es el de campo.
+	//
+	// ⚠️ EL `defer` DE ABAJO CIERRA MENOS DE LO QUE PARECE: frena las inyecciones que EMPIEZAN tras él, no
+	// las que ya están dentro de handleEvent, y por LIFO corre DESPUÉS del `client.Disconnect()` de abajo.
+	// El alcance exacto y por qué se acepta están en el doc de setLiveListener: léelo antes de tocarlo.
+	g.setLiveListener(listener)
+	defer g.setLiveListener(nil)
 
 	if err := client.Connect(); err != nil {
 		return fmt.Errorf("whatsapp: conectar (listen): %w", err)
@@ -328,6 +357,47 @@ func (g *ListenGateway) setLiveClient(client *wm.Client) {
 	g.mu.Lock()
 	g.client = client
 	g.mu.Unlock()
+}
+
+// setLiveListener publica (o limpia con nil) el Listener VIVO de la escucha bajo lock de escritura.
+// CALCADO de setLiveClient a propósito: mismo lock, misma forma, mismo par publicar/limpiar en serve().
+//
+// 🔴 EL `defer …(nil)` DE serve() NO ES SIMETRÍA ESTÉTICA. El gateway SOBREVIVE a serve(): lo construye el
+// factory del sessionmgr y lo retiene mientras la sesión exista, así que al salir de serve() —cancelación
+// del ctx, error de Connect, LoggedOut— el gateway sigue en pie y el Listener ya no tiene socket detrás.
+// Sin la limpieza, una inyección tardía entraría por el handler de un Listener MUERTO: escribiría una fila
+// en la cola de una sesión que ya no escucha, y el número que se midiera sería el de un handler que en
+// campo nadie ejecuta. Un p99 medido sobre eso es peor que no medir.
+//
+// ⚠️ LO QUE LA LIMPIEZA **NO** CUMPLE, dicho aquí porque un comentario que promete de más es peor que
+// ninguno. Cierra el paso a las inyecciones que EMPIEZAN después de ella, y solo a esas. Quedan fuera:
+//
+//   - LA INYECCIÓN YA EN VUELO. `InyectarEntrante` lee el puntero bajo `RLock` y llama a `handleEvent`
+//     FUERA del candado (liveListener, abajo), así que una inyección que ya pasó la lectura sigue corriendo
+//     contra el Listener muerto pase lo que pase aquí. Sostener el candado durante la llamada la cerraría,
+//     y NO se hace a propósito: sería reintroducir I/O bajo candado —el handler entero, con su escritura
+//     cifrada en SQLite—, que es justamente lo que el Plan 050 quitó de este adaptador.
+//   - EL INSTANTE ENTRE `Disconnect()` Y ESTA LIMPIEZA. Por LIFO, el `defer client.Disconnect()` de serve()
+//     se registró DESPUÉS que este, así que corre ANTES: hay una ventana —corta, pero real— con el socket
+//     ya cerrado y el Listener todavía publicado. Una inyección que entre justo ahí mide un handler cuyo
+//     socket ya no existe.
+//
+// Las dos ventanas son cortas y ninguna corrompe datos (la fila nace igual de bien); lo que producen es una
+// MUESTRA de más en el histograma, tomada sobre un handler que no es el de campo.
+func (g *ListenGateway) setLiveListener(l *Listener) {
+	g.mu.Lock()
+	g.listener = l
+	g.mu.Unlock()
+}
+
+// liveListener devuelve el Listener VIVO de la escucha, o nil si no hay sesión escuchando. Hermano del
+// patrón de lectura de `client` en sendViaLiveClient/LogoutLiveClient: el RWMutex solo protege la lectura
+// del puntero, no la llamada posterior (el Listener es seguro para uso concurrente — whatsmeow ya lo
+// invoca desde sus propias goroutines).
+func (g *ListenGateway) liveListener() *Listener {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.listener
 }
 
 // LogoutLiveClient implementa app.LiveLogout: hace un LOGOUT REMOTO best-effort sobre el cliente VIVO de

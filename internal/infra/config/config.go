@@ -427,6 +427,27 @@ type Config struct {
 	// acordara de ponerlo a true en cada sitio que construye una Config, y el olvido apagaría la entrega
 	// en silencio. Aquí el olvido no puede apagar nada.
 	DespachadorApagado bool `yaml:"despachador_apagado"`
+	// InyectorEntrantes ENCIENDE EL INYECTOR DE ENTRANTES SINTÉTICOS (MP-10 Parte A). Se lee de
+	// WAPP_AGENT_INYECTOR_ENTRANTES.
+	//
+	// 🔴 QUÉ HACE SI ALGUIEN LO ENCIENDE. Fabrica mensajes entrantes FALSOS y los mete por el mismo camino
+	// que los de verdad. En un Edge de producción —que es un daemon 24/7 conectado a un número de WhatsApp
+	// real— eso significa filas inventadas en la cola, inferencias del cajero gastadas en texto que nadie
+	// escribió, eventos sintéticos subiendo a la nube y, sobre todo, un histograma de latencia
+	// CONTAMINADO: el p99 que se publique ya no describe el tráfico real. No hay ninguna razón de negocio
+	// para tenerlo puesto; existe SOLO para medir el p99 del handler sin mandar cien mensajes de verdad
+	// por WhatsApp (INV-051.2), que es justo la prueba de campo que el riesgo de bloqueo del número tenía
+	// atascada. Se quita en cuanto acaba la medida.
+	//
+	// EL NOMBRE VA EN POSITIVO, al revés que DespachadorApagado de arriba, Y POR LA MISMA RAZÓN QUE aquél
+	// va en negativo: que el VALOR CERO DE GO sea el ESTADO SANO. Lo que cambia no es el criterio, es
+	// cuál es el estado sano. Allí lo sano es «el despachador DRENA», un estado ACTIVO, y por eso hubo
+	// que invertir el nombre para que el cero —`Config{}` de test, YAML sin la clave, variable ausente,
+	// vacía o mal tecleada— cayera en él. Aquí lo sano es «el inyector NO EXISTE», que ya es la AUSENCIA
+	// de algo: `false` significa apagado sin invertir nada, y un `InyectorEntrantesApagado` obligaría a
+	// acordarse de poner `true` en cada sitio que construye una Config para no inyectar tráfico falso.
+	// La regla, en las dos, es la misma: el olvido no puede hacer daño.
+	InyectorEntrantes bool `yaml:"inyector_entrantes"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -587,6 +608,12 @@ func defaults() Config {
 		// explícita aunque `false` sea el cero de Go —igual que EnableAlphaTestAccounts— porque este
 		// default es el que sostiene la entrega de entrantes, no una preferencia.
 		DespachadorApagado: false,
+		// El inyector de entrantes sintéticos (MP-10 Parte A) nace SIEMPRE apagado: en un Edge de campo
+		// no existe. Se escribe explícito aunque `false` sea el cero de Go —igual que DespachadorApagado
+		// y EnableAlphaTestAccounts— porque este default no es una preferencia: es lo que separa el
+		// tráfico real del fabricado, y quien lea defaults() tiene que VER que la decisión está tomada
+		// aquí y no deducirla de una línea ausente.
+		InyectorEntrantes: false,
 		CloudLink: CloudLinkConfig{
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
@@ -658,6 +685,15 @@ func Load(path string) (Config, error) {
 	// tecleado ni siquiera se lee. Es el guardarraíl entero de esta palanca, y no hay ninguna rama que
 	// pueda apagar la entrega sin que alguien haya escrito exactamente esta clave con un booleano válido.
 	cfg.DespachadorApagado = loader.GetBool("DESPACHADOR_APAGADO", cfg.DespachadorApagado)
+	// Palanca del INYECTOR DE ENTRANTES SINTÉTICOS (MP-10 Parte A). Mismos tres caminos de fallo del
+	// overlay que la palanca de arriba —variable ausente, presente pero VACÍA (la línea a medio editar de
+	// un EnvironmentFile), y presente con un valor que no es booleano (`si`, `yes`, `2`)— y los tres
+	// acaban en el mismo sitio: `GetBool` devuelve el default (aquí `false`) y NO hay inyector. Un nombre
+	// mal tecleado ni siquiera se lee, así que cae en el caso «ausente». La diferencia con el despachador
+	// es hacia dónde apunta ese default: allí protege que la entrega siga viva, aquí protege que no
+	// aparezca tráfico fabricado en un Edge de producción. Solo un booleano válido y verdadero,
+	// escrito con esta clave exacta, lo enciende.
+	cfg.InyectorEntrantes = loader.GetBool("INYECTOR_ENTRANTES", cfg.InyectorEntrantes)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)

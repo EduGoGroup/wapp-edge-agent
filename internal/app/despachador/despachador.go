@@ -693,6 +693,10 @@ func (d *Despachador) evento(c *app.ColaCabeza) (domain.InboundEvent, veredicto)
 		// antes de encolar, así que no existe fila de la cola con un mensaje propio. Ver app.ColaMeta.
 		IsFromMe: false,
 		IsGroup:  meta.IsGroup,
+		// `meta.Sintetico` NO SE PROPAGA, y es una decisión (MP-10): domain.InboundEvent no tiene campo de
+		// metadatos, así que traerlo obligaría a tocar el contrato de dominio Y el adaptador de CloudLink por un
+		// dato que la nube YA recibe —el prefijo `SINTETICO-` del `WAMessageID`, que sí está en el proto—. Ver
+		// app.ColaMeta.Sintetico: ese bool es la marca LOCAL, el ID es la portante.
 	}
 
 	if motivo, ok := app.EsOmitido(c.IntentJSON); ok {

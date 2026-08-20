@@ -28,6 +28,13 @@ import "encoding/json"
 // de UNA línea: que T3.0 sustituya `colaMetaPayload` por este tipo y borre aquel. Mientras tanto, lo que
 // impide que diverjan es que las etiquetas de abajo son la copia literal de las suyas.
 //
+// ⚠️ EL SÉPTIMO CAMPO (`Sintetico`, MP-10) ROMPE ESA SIMETRÍA A PROPÓSITO, Y HAY QUE SABERLO AL LEERLO:
+// aquí se DECLARA para poder leerlo, pero el camino de los entrantes REALES no lo escribe nunca (su valor
+// es siempre el cero y `omitempty` lo deja fuera del JSON). Quien lo pone a true es el camino del inyector,
+// en el adaptador. Si `colaMetaPayload` no lo lleva, la marca local sencillamente no aparece en la fila —
+// lo que NO se pierde en ese caso es la marca portante, el prefijo `SINTETICO-` del `WAMessageID`, que es
+// columna propia y no depende de este sobre.
+//
 // 🔴 `IsFromMe` NO ESTÁ, Y NO ES UN OLVIDO. El listener descarta el ECO PROPIO en la PUERTA
 // (`onMessage`, filtro 1: `if e.Info.IsFromMe { … return }`), ANTES de encolar, así que NO EXISTE una
 // fila de la cola cuyo mensaje sea propio: persistir el campo sería persistir una constante `false`. El
@@ -48,6 +55,24 @@ type ColaMeta struct {
 	Type string `json:"type,omitempty"`
 	// IsGroup indica que el chat es un grupo/lista de difusión.
 	IsGroup bool `json:"is_group,omitempty"`
+	// Sintetico marca que esta fila NO nació de WhatsApp: la fabricó el INYECTOR DE ENTRANTES (MP-10 Parte
+	// A, ver app.InyeccionEntrante) para medir el p99 del handler sin mandar cien mensajes reales contra el
+	// número de producción.
+	//
+	// 🔴 ES LA MARCA **LOCAL**, Y NO ES LA QUE VE LA NUBE. Vive donde vive el resto del sobre: en la fila
+	// CIFRADA de la cola, que no sale del Edge. La marca **PORTANTE** —la que sí viaja— es el prefijo
+	// `SINTETICO-` del `WAMessageID`, porque el ID del mensaje es lo que el adaptador de CloudLink pone en
+	// el proto; este campo no tiene hueco allí. Quien audite «qué mensajes sintéticos llegaron al cloud»
+	// mirando SOLO este bool está mirando una columna que la nube nunca recibió: la pregunta se responde
+	// sobre el ID.
+	//
+	// ⚠️ `omitempty` NO ES COSMÉTICA. Sin él, TODA fila real —las que ya están escritas en disco y las que
+	// escriba el listener a partir de ahora— pasaría a llevar `"sintetico":false` en su sobre: se cambiaría
+	// el JSON persistido de filas que no tienen nada que ver con el inyector, y con él lo que un dump de la
+	// cola enseña y lo que cualquier comparación byte a byte de esos bytes devuelve. Con `omitempty`, el
+	// camino real produce EXACTAMENTE los mismos bytes que antes de MP-10 y la clave solo existe donde
+	// significa algo.
+	Sintetico bool `json:"sintetico,omitempty"`
 }
 
 // DecodeColaMeta abre el JSON de `meta_enc` YA DESCIFRADO. Un `raw` nil o vacío devuelve el cero sin
