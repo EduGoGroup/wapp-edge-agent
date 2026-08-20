@@ -71,6 +71,22 @@ type Deps struct {
 	// estado bueno, no una alarma falsa. La contrapartida —una palanca echada que nadie cableó aquí
 	// saldría como `activo`— la custodia el test de cableado del daemon, que es donde nace el dato.
 	DespachadorApagado bool
+	// InyectorEntrantes dice si la PALANCA DE DIAGNÓSTICO de MP-10 Parte A está echada
+	// (WAPP_AGENT_INYECTOR_ENTRANTES). Igual que su vecina de arriba, no cambia NADA de lo que el latido
+	// mide: cambia lo que la línea SIGNIFICA, y por eso se publica aquí y en el primer tramo del bloque.
+	//
+	// 🔴 POR QUÉ ESTE DATO ES IMPRESCINDIBLE EN LA LÍNEA. Con el inyector encendido, la población del
+	// histograma —`n`, `p50_ms`, `p99_ms`, todo— puede estar hecha de entrantes SINTÉTICOS fabricados dentro
+	// del proceso, no de mensajes de clientes. Los dos casos producen exactamente la misma línea: mismos
+	// campos, mismos buckets, mismo aspecto. Quien lea un `p99_ms` sin este campo no tiene forma de saber si
+	// está mirando el rendimiento de producción o el de una tanda de prueba que alguien lanzó ayer — y el
+	// criterio que se juzga con esta línea (INV-051.2) es precisamente sobre el camino de producción.
+	//
+	// El cero (false) significa «no hay inyector», que es el estado sano y el de todos los Edge en campo:
+	// una Deps a medio cablear publica el estado bueno, no una alarma falsa. La contrapartida —una palanca
+	// echada que nadie cableó aquí saldría como `no` en la línea— la custodia el test de cableado del
+	// daemon, que es donde nace el dato.
+	InyectorEntrantes bool
 	// Ahora es el reloj, inyectable para los tests. nil ⇒ time.Now.
 	Ahora func() time.Time
 }
@@ -150,6 +166,12 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 		// atrás. Va SIEMPRE, como `n` y los contadores de la puerta: un `activo` explícito es un dato, y un
 		// campo ausente sería la duda de si alguien dejó de mirarlo.
 		"despachador", estadoDespachador(d.DespachadorApagado),
+		// EL ESTADO DEL INYECTOR VA JUSTO DETRÁS, y por el mismo criterio exacto: si está ACTIVO, los
+		// números que vienen después pueden no ser de tráfico real sino de entrantes fabricados dentro del
+		// proceso. Es otro estado que cambia el SIGNIFICADO del resto de la línea, así que va en el primer
+		// tramo y no al final. Va SIEMPRE: la pregunta que se hace en el VPS es «¿estos números son de
+		// verdad?», y esa pregunta no se puede contestar con una ausencia.
+		"inyector", estadoInyector(d.InyectorEntrantes),
 		// La ventana REAL medida, no la pedida: en el bloque final (y tras un tick que se retrasó) las dos
 		// no coinciden, y es la real la que da sentido a `n`.
 		"ventana_ms", t.Sub(desde).Milliseconds(),
@@ -240,6 +262,29 @@ func estadoDespachador(apagado bool) string {
 		return despachadorApagado
 	}
 	return despachadorActivo
+}
+
+// Valores del campo `inyector` del bloque (MP-10 Parte A). Constantes por el mismo motivo que las de
+// `despachador`: el runbook y los tests afirman sobre ellas.
+const (
+	// El estado sano es corto y aburrido a propósito: la línea se emite cada minuto durante meses en todos
+	// los Edge del ecosistema, y `no` son dos caracteres que no compiten con los números por la atención.
+	inyectorInactivo = "no"
+	// El valor del estado ACTIVO lleva dentro su propia explicación, igual que `despachadorApagado`, y aquí
+	// la explicación importa MÁS que allí: la lectura de campo es un `grep … | tail -3` que se pega crudo en
+	// el journal como evidencia de un criterio, así que la línea tiene que decir por sí sola que los números
+	// que la acompañan pueden no ser de tráfico real. Un `si` a secas se leería y se olvidaría.
+	inyectorActivo = "ACTIVO (palanca de diagnostico WAPP_AGENT_INYECTOR_ENTRANTES: hay entrantes SINTETICOS en la cola; " +
+		"los numeros de esta linea pueden no ser de trafico real)"
+)
+
+// estadoInyector traduce la palanca al valor del campo. Existe para que las dos constantes se nombren en un
+// solo sitio y el `bloque` no cargue con un condicional (mismo molde que estadoDespachador).
+func estadoInyector(activo bool) string {
+	if activo {
+		return inyectorActivo
+	}
+	return inyectorInactivo
 }
 
 // percentil devuelve los pares clave/valor de un percentil, o NADA si la población está vacía.
