@@ -37,6 +37,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -773,6 +774,18 @@ type colaMetaPayload struct {
 	PushName       string `json:"push_name,omitempty"`
 	Type           string `json:"type,omitempty"`
 	IsGroup        bool   `json:"is_group,omitempty"`
+	// Sintetico marca la fila que NO vino de WhatsApp sino del inyector de entrantes sintéticos
+	// (MP-10 Parte A, internal/adapters/whatsmeow/inyector.go).
+	//
+	// 🔴 ES LA MARCA **LOCAL**, Y NO ES LA QUE SOSTIENE EL GUARDARRAÍL. Estos bytes se persisten CIFRADOS
+	// con la DEK de la sesión (INV-051.1) y no salen de la máquina: la nube no los ve nunca. La marca
+	// PORTANTE —la que sí viaja aguas abajo hasta el proto de CloudLink— es el prefijo
+	// `PrefijoSintetico` del `wa_message_id`, que es columna propia de la cola y que el despachador copia
+	// al `domain.InboundEvent`. Ésta es comodidad de auditoría local; aquélla es el contrato.
+	//
+	// Se DERIVA del prefijo, no se inyecta: así las dos marcas no pueden discrepar. Un true aquí con un
+	// wa_message_id sin prefijo sería una fila que el Edge cree sintética y la nube cree real.
+	Sintetico bool `json:"sintetico,omitempty"`
 }
 
 // colaMeta serializa los metadatos a JSON. Un fallo de serialización NO impide anotar la fila: se anota
@@ -785,6 +798,11 @@ func (l *Listener) colaMeta(e *events.Message) []byte {
 		PushName:       e.Info.PushName,
 		Type:           e.Info.Type,
 		IsGroup:        e.Info.IsGroup,
+		// MARCA LOCAL del inyector (MP-10 Parte A). Se DERIVA del wa_message_id en vez de venir por un
+		// campo aparte: la marca portante y la local salen así del MISMO dato y no pueden divergir.
+		// Coste en el camino caliente: un HasPrefix sobre una cadena corta (nanosegundos), y solo para los
+		// mensajes que llegan a encolarse.
+		Sintetico: strings.HasPrefix(e.Info.ID, PrefijoSintetico),
 	})
 	if err != nil {
 		l.log.Error("listener: no se pudo serializar el metadato de la cola; la fila se anota sin meta",

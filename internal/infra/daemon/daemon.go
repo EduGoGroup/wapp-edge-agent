@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/diag"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/enrolladapter"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/inventory"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/control/logsink"
@@ -277,6 +278,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	srv.RegisterPairing(mgr)
 	srv.RegisterUnlink(mgr)
 	srv.RegisterEnroll(enrolladapter.New(cfg, log))
+	// POST /v1/diag/inbound/inject — SOLO si la palanca de diagnóstico está echada (MP-10 Parte A). Ver
+	// registrarInyectorEntrantes: con la palanca bajada la ruta NO EXISTE, no es que responda 403.
+	registrarInyectorEntrantes(srv, cfg, mgr, log)
 
 	ln, err := srv.Listen()
 	if err != nil {
@@ -378,6 +382,12 @@ func buildLatencia(cfg config.Config, cola app.ColaEntrantes, log sharedlogger.L
 			// scrollback y el síntoma en campo —la cola creciendo— no distingue una palanca olvidada de un
 			// despachador roto. Las dos puntas salen del MISMO campo de config, sin negación por medio.
 			DespachadorApagado: cfg.DespachadorApagado,
+			// LA SEGUNDA PUNTA DE LA PALANCA DEL INYECTOR (la primera es registrarInyectorEntrantes, que es
+			// quien cuelga la ruta). Mismo argumento que la línea de arriba y por el mismo modo de fallo: el
+			// aviso del arranque explica UNA vez, hace tres días, que en esta cola hay entrantes falsos; esta
+			// línea lo dice cada vez que alguien mira los números, que es cuando importa. Sin ella, un p99
+			// medido sobre tráfico sintético se lee como un p99 de producción.
+			InyectorEntrantes: cfg.InyectorEntrantes,
 		},
 	}
 }
@@ -397,6 +407,49 @@ func buildLatencia(cfg config.Config, cola app.ColaEntrantes, log sharedlogger.L
 // una forma distinta del caso raro, que es como se cuelan los nils en una lista variádica.
 func opcionPalancaDespachador(cfg config.Config) sessionmgr.Option {
 	return sessionmgr.WithDespachadorApagado(cfg.DespachadorApagado)
+}
+
+// inyectorDeEntrantes es el puerto ESTRECHO que el registro del inyector necesita: lo cumple
+// `*sessionmgr.Manager`. Mismo molde que `server.sessionUnlinker` — el borde declara el método que usa y el
+// Manager lo satisface estructuralmente, sin que nadie tenga que construir un Manager para probar esto.
+type inyectorDeEntrantes interface {
+	InyectarEntrante(ctx context.Context, sessionID string, p app.InyeccionEntrante) (bool, error)
+}
+
+// registrarInyectorEntrantes cuelga POST /v1/diag/inbound/inject SOLO cuando la palanca de diagnóstico
+// (WAPP_AGENT_INYECTOR_ENTRANTES) está echada, y GRITA al hacerlo (MP-10 Parte A).
+//
+// 🔴 CON LA PALANCA BAJADA LA RUTA NO SE REGISTRA, Y NO ES LO MISMO QUE REGISTRARLA PARA CONTESTAR 403.
+// Registrarla siempre dejaría la superficie VIVA en todos los Edge del ecosistema: una plantilla en el mux,
+// un handler construido, un cuerpo que se decodifica y una ruta que aparece en el `Allow` del 405 — es
+// decir, un camino de código alcanzable desde fuera cuyo único guardián sería un `if` dentro del handler.
+// Un `if` mal negado ahí, o un `return` que se olvida, y cualquiera con el token puede fabricar entrantes
+// falsos en un Edge de producción que además LOS SUBE A LA NUBE. No registrándola, el guardián no es un
+// booleano dentro del handler: es que el handler no está en el mux, y `server.ServeHTTP` devuelve el 404 que
+// devuelve para cualquier ruta que no existe. La superficie con la palanca bajada es CERO, no «cero si el
+// código de dentro se porta bien».
+//
+// 🔴 POR QUÉ ES UNA FUNCIÓN Y NO CINCO LÍNEAS DENTRO DE `Run`, que es la misma pregunta que se hicieron
+// `buildLatencia` y `opcionPalancaDespachador` y por el mismo motivo: `Run` no lo ejercita ningún test —sus
+// únicos importadores son `cmd/agent`, cuyos tests no lo llaman—, así que un `if !cfg.InyectorEntrantes`
+// invertido registraría la ruta en TODOS los Edge y NO la registraría en el que la pidió, con los cuatro
+// gates en verde y sin un solo error. Extraerlo es lo que permite montar un `*server.Server` de verdad en un
+// test y preguntarle qué contesta a esa ruta en los dos estados (ver palanca_inyector_test.go).
+func registrarInyectorEntrantes(srv *server.Server, cfg config.Config, mgr inyectorDeEntrantes, log sharedlogger.Logger) {
+	if !cfg.InyectorEntrantes {
+		return
+	}
+	// EL GRITO DE ARRANQUE. Mensaje único y sin campos estructurados, calcado del de la palanca del
+	// despachador (sessionmgr.startDespachador): nombra la variable, dice qué hace, dice a dónde llega lo
+	// inyectado y dice que es un instrumento de medida y no un modo de operación. Va aquí dentro y no fuera
+	// del `if` porque un aviso que sale siempre deja de leerse.
+	log.Warn("plano de control: PALANCA DE DIAGNÓSTICO ECHADA (WAPP_AGENT_INYECTOR_ENTRANTES=true): este " +
+		"daemon acepta POST /v1/diag/inbound/inject, que fabrica entrantes FALSOS y los mete por el camino " +
+		"REAL del handler; acaban en la cola durable como cualquier entrante y, si el despachador drena, " +
+		"SUBEN A LA NUBE marcados como sintéticos. Es un instrumento de medida de MP-10, NO un modo de " +
+		"operación: quítala en cuanto acabe la medición")
+	srv.HandleAuthorized(http.MethodPost, diag.RutaInyectar, diag.RecursoInyectar, true,
+		diag.InyectorHandler(diag.InyectorDeps{Inyectar: mgr.InyectarEntrante}))
 }
 
 // colaContador devuelve el lado SOLO-CONTAR de la cola, o nil si el adaptador no lo respalda.

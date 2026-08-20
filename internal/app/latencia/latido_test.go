@@ -133,8 +133,15 @@ func correrLatido(t *testing.T, d Deps, vida time.Duration) {
 // significan otra cosa (la cola sube porque nadie drena, no porque haya carga). Un campo que solo apareciera
 // cuando la palanca está puesta no serviría: la pregunta que se hace en el VPS es «¿está puesta?», y esa
 // pregunta no se puede contestar con una ausencia.
+//
+// `inyector` (MP-10 Parte A) entró por ese mismo criterio y es el segundo campo que no habla del cronómetro:
+// dice si la palanca del inyector de entrantes sintéticos está echada, y con ella echada la POBLACIÓN de los
+// percentiles puede estar hecha de mensajes fabricados dentro del proceso en vez de tráfico de clientes. Los
+// dos casos producen una línea idéntica en todo lo demás, así que sin este campo un p99 de una tanda de
+// prueba es indistinguible de un p99 de producción — y el criterio que se juzga con esta línea (INV-051.2)
+// es sobre el camino de producción.
 var camposObligatorios = []string{
-	"emision", "despachador", "ventana_ms", "uptime_s",
+	"emision", "despachador", "inyector", "ventana_ms", "uptime_s",
 	"n", "p50_ms", "p95_ms", "p99_ms", "p99_bucket",
 	"n_descartes", "p99_ms_descartes",
 	"n_acum", "p99_ms_acum", "max_ms_acum",
