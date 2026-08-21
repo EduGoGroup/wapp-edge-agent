@@ -384,6 +384,11 @@ func (reporterQuePanica) SetSocketState(health.SocketState, string) {}
 func (reporterQuePanica) SetDEKLoadDuration(time.Duration)          {}
 func (reporterQuePanica) MarkInbound(time.Time)                     { panic("registro de salud roto") }
 
+// CountPassiveDrop (Plan 046 · T2.3) NO revienta: el pánico de este doble se provoca en MarkInbound, que es
+// lo primero que toca onMessage. Si además reventara aquí, el test del recover no distinguiría cuál de los
+// dos hooks falló.
+func (reporterQuePanica) CountPassiveDrop() {}
+
 // --- lo que hace VISIBLE el cambio de garantía (T1.13) ---
 
 // TestListenerOpts_LaDegradacionLLEGA_AlAcumuladoDelEdge custodia el otro extremo del cable de T1.13: no

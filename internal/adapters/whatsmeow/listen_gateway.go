@@ -91,11 +91,17 @@ type ListenGateway struct {
 	// Listener. 0 ⇒ no se toca el Listener y manda su default (defaultConnectMargin).
 	inboundMargin time.Duration
 
-	// cola es la COLA DURABLE DE ENTRANTES compartida (Plan 051 Ola 1) y sessionID la sesión con la que se
-	// etiquetan (y sellan) sus filas. serve() los pasa al Listener SIEMPRE JUNTOS: la cola sin session_id
-	// dejaría filas que el adaptador no sabría con qué DEK cifrar. Ambos vacíos/nil ⇒ el Listener queda SIN
-	// cola y, desde T3.0, SIN destino ninguno para el entrante. Lo cablea el factory del sessionmgr (SetCola).
-	cola      app.ColaEntrantes
+	// cola es la COLA DURABLE DE ENTRANTES compartida (Plan 051 Ola 1); nil ⇒ el Listener queda SIN cola y,
+	// desde T3.0, SIN destino ninguno para el entrante. Lo cablea el factory del sessionmgr (SetCola).
+	cola app.ColaEntrantes
+
+	// sessionID es la IDENTIDAD de esta sesión, y tiene DOS consumidores independientes:
+	//   - la COLA la usa como etiqueta y —lo que de verdad importa— como clave con la que el adaptador elige
+	//     la DEK que sella la fila. Por eso `cola` NUNCA viaja al Listener sin esto: sería escribir filas que
+	//     nadie puede descifrar.
+	//   - el FILTRO DE PERFILES (Plan 046) la usa para preguntar por sí misma en el mapa del tenant. Este
+	//     consumidor NO depende de la cola, así que el id se guarda y viaja aunque no haya cola (ver SetCola
+	//     y listenerOpts): sin él, un gateway sin cola apagaría el filtro entero en silencio.
 	sessionID string
 
 	// clasificadorActivo es el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
@@ -104,6 +110,14 @@ type ListenGateway struct {
 	// Edge), a diferencia de la cola, que se etiqueta por sesión. nil ⇒ el Listener aplica su default
 	// SEGURO (activo: clasifica de más antes que callar). Lo cablea el factory del sessionmgr.
 	clasificadorActivo func() bool
+
+	// sesionPasiva es el CONSULTOR DE PERFILES de sesión (Plan 046 · Ola 2 · T2.2) que serve() pasa al
+	// Listener: dice si un session_id está marcado como PASIVO en la config que la nube empuja, y con eso el
+	// listener corta el entrante en la puerta (REQ-07). COMPARTIDO por todas las sesiones —un mapa por
+	// tenant—, como el interruptor del clasificador y el cronómetro; por eso recibe el session_id en vez de
+	// venir ligado a uno. nil ⇒ el Listener aplica su default FAIL-OPEN (nadie es pasiva). Lo cablea el
+	// factory del sessionmgr (SetSesionPasiva).
+	sesionPasiva func(sessionID string) bool
 
 	// latencia es el CRONÓMETRO COMPARTIDO del handler de entrantes (Plan 051 Ola 3 · T3.13) que serve()
 	// pasa al Listener. A diferencia de la cola —que va ligada a SU sesión porque el session_id elige la
@@ -133,16 +147,46 @@ func (g *ListenGateway) SetClasificadorActivo(fn func() bool) {
 	g.clasificadorActivo = fn
 }
 
-// SetCola liga el gateway (y su Listener) a la cola durable de entrantes de ESTA sesión (Plan 051 Ola 1).
-// Se llama ANTES de Listen (al construir el gateway), como el resto de setters. Exige AMBOS: una cola nil
-// o un session_id vacío dejan el gateway SIN cola (no se cablea a medias), que es el fallback explícito de
-// la ola. El session_id no es secreto ni PII.
+// SetSesionPasiva liga el gateway (y su Listener) al CONSULTOR DE PERFILES de sesión (Plan 046 · Ola 2 ·
+// T2.2): el predicado que dice si un session_id está marcado como PASIVO en la config empujada por la nube.
+// Se llama ANTES de Listen (al construir el gateway), como el resto de setters.
+//
+// nil se ignora y manda el default FAIL-OPEN del Listener (nadie es pasiva): un cableado a medias tiene que
+// subir tráfico de más —que la nube ya sabe ignorar (D-046.7)— y nunca dejar una sesión sorda en silencio.
+// No es secreto ni PII: solo perfiles por session_id.
+func (g *ListenGateway) SetSesionPasiva(fn func(sessionID string) bool) {
+	if fn == nil {
+		return
+	}
+	g.sesionPasiva = fn
+}
+
+// SetCola liga el gateway (y su Listener) a la cola durable de entrantes de ESTA sesión (Plan 051 Ola 1) y,
+// de paso, le dice QUIÉN ES. Se llama ANTES de Listen (al construir el gateway), como el resto de setters.
+//
+// LA COLA exige AMBOS: una cola nil o un session_id vacío dejan el gateway SIN cola (no se cablea a medias),
+// que es el fallback explícito de la ola — una fila sin session_id es una fila que nadie puede descifrar,
+// porque esa es la clave con la que el adaptador elige la DEK.
+//
+// 🔴 EL session_id, EN CAMBIO, SE GUARDA AUNQUE NO HAYA COLA (2026-08-21), y no es una relajación del pacto
+// de arriba: es que el session_id NO es una opción de la cola, es la IDENTIDAD de la sesión, y tiene un
+// segundo consumidor que no depende de ella — el filtro de perfiles del Plan 046, que pregunta al mapa del
+// tenant por SU propia sesión (`Listener.sesionEsPasiva`, que corta en seco si el id está vacío). Con el
+// comportamiento anterior, un gateway sin cola perdía también su identidad y el filtro de privacidad se
+// apagaba ENTERO, en silencio y sin contar un solo descarte: exactamente lo que REQ-07 promete que no pasa.
+//
+// Qué NO cambia: sin cola la sesión sigue estando SORDA y NewListener lo sigue gritando. Lo que se gana es
+// que la degradación sea «esta sesión no anota» y no, además, «esta sesión ha olvidado quién es».
+//
+// El session_id no es secreto ni PII.
 func (g *ListenGateway) SetCola(c app.ColaEntrantes, sessionID string) {
+	if sessionID != "" {
+		g.sessionID = sessionID
+	}
 	if c == nil || sessionID == "" {
 		return
 	}
 	g.cola = c
-	g.sessionID = sessionID
 }
 
 // SetInboundMargin fija el margen de la ventana temporal de ingesta de ESTA sesión (ADR-0037). Se llama
@@ -232,20 +276,45 @@ func (g *ListenGateway) Listen(ctx context.Context, dek []byte) error {
 // Listener EXACTAMENTE como lo construye serve() y comprueba que lo cableado llega. El comportamiento no
 // cambia ni una coma respecto de tenerlo inline.
 func (g *ListenGateway) listenerOpts() []ListenerOption {
-	// Cola durable de entrantes (Plan 051 Ola 1): las dos opciones viajan JUNTAS o no viaja ninguna, de modo
-	// que nunca se llega a WithCola sin WithSessionID (ese caso degrada con un log de Error en el Listener).
+	// IDENTIDAD DE LA SESIÓN. Va la PRIMERA y FUERA de cualquier condicional desde el 2026-08-21, y el cambio
+	// no es de orden: es la corrección de una promesa falsa. Hasta esa fecha `WithSessionID` viajaba DENTRO
+	// del bloque de la cola —«las dos opciones van juntas»— mientras el comentario de tres líneas más abajo
+	// afirmaba que el filtro de perfiles funciona sin cola. Las dos cosas no podían ser ciertas a la vez:
+	// `Listener.sesionEsPasiva()` corta en seco con `l.sessionID == ""`, así que un listener sin cola se
+	// quedaba sin identidad y el filtro se apagaba ENTERO, en silencio y sin contar un solo descarte.
+	//
+	// El session_id NO es una opción «de la cola»: es QUIÉN ES esta sesión. La cola lo usa para elegir la DEK
+	// con que sella la fila, y el filtro de perfiles para preguntar por sí misma en el mapa del tenant — dos
+	// consumidores independientes. Vacío se ignora en la opción, así que esto no cablea nada de más.
+	//
+	// Lo que SÍ sigue prohibido —y lo custodia su test— es lo contrario: una cola SIN session_id. Esa pareja
+	// sigue siendo indivisible, porque una fila que nadie puede descifrar es peor que no tener fila.
+	var listenerOpts []ListenerOption
+	listenerOpts = append(listenerOpts, WithSessionID(g.sessionID))
+
+	// Cola durable de entrantes (Plan 051 Ola 1): NO viaja sin session_id, de modo que nunca se llega a
+	// WithCola con la identidad vacía (ese caso degrada con un log de Error en el Listener).
 	//
 	// ⚠️ SIN COLA CABLEADA LA SESIÓN QUEDA SORDA (T3.0): el listener ya no entrega por su cuenta, así que
 	// «cero opciones» dejó de ser el comportamiento histórico y pasó a ser un fallo de arranque. NewListener
 	// lo grita; aquí no se aborta porque este método no decide la política de arranque del daemon.
-	var listenerOpts []ListenerOption
 	if g.cola != nil && g.sessionID != "" {
-		listenerOpts = append(listenerOpts, WithCola(g.cola), WithSessionID(g.sessionID))
+		listenerOpts = append(listenerOpts, WithCola(g.cola))
 		// El interruptor del clasificador viaja DENTRO de este bloque a propósito (T2.12): lo único que
 		// gobierna es el ESTADO EN QUE NACE una fila de la cola, así que sin cola no tiene nada que decidir
 		// y pasarlo solo añadiría una opción inerte. nil se ignora en la opción (default ACTIVO).
 		listenerOpts = append(listenerOpts, WithClasificadorActivo(g.clasificadorActivo))
 	}
+	// Consultor de PERFILES de sesión (Plan 046 · Ola 2 · T2.2). Va FUERA del bloque de la cola, y la
+	// diferencia con el interruptor del clasificador —que sí va dentro— es de naturaleza: aquél solo decide
+	// en qué ESTADO nace una fila, así que sin cola no tiene nada que decidir; éste decide si el mensaje
+	// ENTRA por la puerta, y esa decisión es anterior e independiente de que haya cola donde anotarlo. Un
+	// listener sin cola con una sesión pasiva tiene que descartar igual (y contarlo). nil se ignora en la
+	// opción y manda el default fail-open del Listener.
+	//
+	// 🔑 Y ESTO SOLO ES CIERTO PORQUE `WithSessionID` SALIÓ DEL BLOQUE DE ARRIBA. El predicado por sí solo no
+	// basta: el Listener pregunta por SU session_id y sin él no pregunta nada.
+	listenerOpts = append(listenerOpts, WithSesionPasiva(g.sesionPasiva))
 	// Cronómetro del handler (T3.13). Va FUERA del bloque de la cola —al contrario que el interruptor del
 	// clasificador— porque mide el handler ENTERO, incluidos los caminos que no encolan: una sesión sin cola
 	// sigue gastando tiempo del hilo de whatsmeow y ese tiempo cuenta para INV-051.2. nil se ignora.

@@ -160,6 +160,14 @@ type Manager struct {
 	// y manda el default SEGURO del Listener (activo). Lo inyecta WithClasificadorActivo.
 	clasificadorActivo func() bool
 
+	// sesionPasiva es el CONSULTOR DE PERFILES de sesión (Plan 046 · Ola 2 · T2.2) que el factory pasa al
+	// gateway de cada sesión y de ahí al Listener: dice si un session_id está marcado como PASIVO en la
+	// config que la nube empuja (kind:"filters"), y con eso el listener corta el entrante en la puerta sin
+	// dejar NADA local (REQ-07). Es COMPARTIDO por todo el Edge —un mapa por tenant—, como el interruptor
+	// del clasificador; por eso recibe el session_id como argumento. nil (opción no inyectada) ⇒ NO se toca
+	// el gateway y manda el default FAIL-OPEN del Listener (nadie es pasiva). Lo inyecta WithSesionPasiva.
+	sesionPasiva func(sessionID string) bool
+
 	// latencia es el CRONÓMETRO COMPARTIDO del handler de entrantes (Plan 051 Ola 3 · T3.13): el factory lo
 	// pasa al gateway de cada sesión y de ahí al Listener, que anota en él cuánto tardó cada onMessage. Es
 	// uno para todo el Edge porque INV-051.2 se juzga sobre el Edge, no sesión a sesión. nil ⇒ no se mide y
@@ -266,6 +274,26 @@ func WithClasificadorActivo(fn func() bool) Option {
 	return func(m *Manager) {
 		if fn != nil {
 			m.clasificadorActivo = fn
+		}
+	}
+}
+
+// WithSesionPasiva inyecta el CONSULTOR DE PERFILES de sesión (Plan 046 · Ola 2 · T2.2): cada listener lo
+// consulta en la puerta, por entrante, para decidir si el mensaje se descarta por pertenecer a una sesión
+// PASIVA —sin encolarlo, sin persistirlo y sin entregarlo (REQ-07)—.
+//
+// En producción lo cablea el daemon desde wiring.RegisterFilters (el kind:"filters" que la nube empuja); los
+// tests que no lo pasan quedan con el default del Listener. Se pide un `func(string) bool` y no un mapa ya
+// resuelto para que el perfil pueda cambiar EN CALIENTE sin que el Manager quede con la foto del arranque, y
+// recibe el session_id porque el consultor es uno solo para todo el Edge.
+//
+// nil se IGNORA (default FAIL-OPEN: nadie es pasiva). La asimetría no es estética — subir tráfico de más lo
+// absorbe la nube (`reactiveBlocked`, D-046.7); dejar una sesión sorda por un cableado incompleto no lo
+// absorbe nadie y no da un solo error en el log.
+func WithSesionPasiva(fn func(sessionID string) bool) Option {
+	return func(m *Manager) {
+		if fn != nil {
+			m.sesionPasiva = fn
 		}
 	}
 }
