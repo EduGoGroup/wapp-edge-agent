@@ -103,6 +103,11 @@
         <div id="pair-qr-wrap" class="qr-wrap hidden">
           <img id="pair-qr" alt="Código QR de emparejamiento" />
         </div>
+        <!-- Aviso de sesión pasiva (Plan 046 · T3.2 mitad (a)): se rellena por JS con el literal
+             canónico AVISO_SESION_PASIVA_V1 que sirve GET /v1/ui/aviso-sesion-pasiva. El texto NO
+             se teclea aquí (fuente única: webui.AvisoSesionPasiva en Go) y es texto plano: el
+             realce lo pone .passive-notice por CSS, sin marcado dentro del literal. -->
+        <p id="pair-passive-notice" class="passive-notice hidden" aria-live="polite"></p>
       </section>
 
       <!-- ===================== Logs en vivo ===================== -->

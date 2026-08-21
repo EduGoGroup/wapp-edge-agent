@@ -1,0 +1,8 @@
+Tu WhatsApp quedó vinculado a wApp, y esta sesión nació en perfil PASIVA.
+
+Qué significa: por esta sesión SOLO SE ENVÍAN mensajes. Lo que te escriban NO SALE
+DE ESTE EQUIPO: se queda aquí y no sube a la nube, así que wApp todavía no responde
+solo.
+
+Para que responda, cambia el perfil de la sesión a ACTIVA desde el panel de wApp, o
+llama a POST /api/v1/sessions/{id}/profile con {"profile":"active"}.

@@ -70,3 +70,11 @@ type daemonStatusResponse struct {
 func toDaemonStatus(s supervisor.Status) daemonStatusResponse {
 	return daemonStatusResponse{State: s.State, PID: s.PID, Healthy: s.Healthy}
 }
+
+// avisoSesionPasivaResponse es el cuerpo de GET /v1/ui/aviso-sesion-pasiva (Plan 046 · T3.2): el
+// literal canónico del aviso de sesión pasiva, servido desde la constante webui.AvisoSesionPasiva
+// para que la pantalla de éxito del emparejamiento no tenga una segunda copia del texto.
+type avisoSesionPasivaResponse struct {
+	ID    string `json:"id"`    // AVISO_SESION_PASIVA_V1
+	Texto string `json:"texto"` // texto plano, sin marcado (contrato §4 del runbook)
+}

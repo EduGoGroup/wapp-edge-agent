@@ -284,6 +284,18 @@ func newRouterConCajero(sup, cajeroSup *supervisor.Supervisor, socketPath, platf
 		})
 	}
 
+	// Aviso de sesión pasiva (Plan 046 · T3.2 mitad (a)): la pantalla de éxito del emparejamiento
+	// pide aquí el literal canónico AVISO_SESION_PASIVA_V1 en vez de tenerlo tecleado en el HTML —
+	// la fuente única del repo es la constante webui.AvisoSesionPasiva. Lo atiende wapp-ctl (no se
+	// proxya: el núcleo no lo conoce). GET puro, sin CSRF ni sesión: no muta nada y el texto no
+	// lleva secretos ni PII.
+	mux.HandleFunc("GET /v1/ui/aviso-sesion-pasiva", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, avisoSesionPasivaResponse{
+			ID:    webui.AvisoSesionPasivaID,
+			Texto: webui.AvisoSesionPasiva,
+		})
+	})
+
 	// Reverse-proxy endurecido del resto de /v1/* al Unix socket del núcleo (Bearer de la cookie + CSRF +
 	// retry-on-401 con refresh single-flight). /v1/daemon/* gana por especificidad del ServeMux.
 	mux.Handle("/v1/", newCoreProxy(socketPath, auth, store, log))
