@@ -165,6 +165,23 @@ type sessionHealthDoc struct {
 	// el soporte lee el dato sin nube.
 	FailedSealDispatch int64 `json:"failed_seal_dispatch"`
 	FailedSealBudget   int64 `json:"failed_seal_budget"`
+
+	// ─── Plan 046 · Ola 2 · T2.3 · el contador del filtro de la sesión PASIVA ───
+	//
+	// Entra aquí por el MISMO argumento escrito doce líneas más arriba para los de la Ola 4: el bundle es el
+	// canal de campo cuando el Edge no habla con la nube, y este contador no viaja en el heartbeat (INV-5 de
+	// la ola prohíbe tocar el proto), así que sin esta línea el soporte solo podría verlo con `wapp-ctl`
+	// contra el `GET /v1/health` del equipo del cliente.
+	//
+	// Sin omitempty y sin agregado: un 0 es un dato («esta sesión no descarta nada»). Y se lee junto al
+	// número de descartes por VENTANA: el corte pasivo va antes del ADR-0037, así que le quita cuenta.
+	DroppedPassive uint64 `json:"dropped_passive"`
+
+	// FiltersVersion es la versión del MAPA de perfiles con la que el Edge filtró esos descartes (D-046.2).
+	// Va aquí y no solo en `/v1/health` porque el bundle es lo que el soporte recibe cuando el equipo del
+	// cliente no habla con la nube, y sin este número el `dropped_passive` de al lado no se puede contrastar
+	// con lo que la consola cree haber empujado — que es la ÚNICA forma de ver un mapa retrasado.
+	FiltersVersion int64 `json:"filters_version"`
 }
 
 // desgloseCompleto devuelve el desglose por motivo con las OCHO claves canónicas presentes, partiendo del
@@ -211,6 +228,10 @@ func (b *Builder) subsystemsJSON(ctx context.Context) string {
 				StuckHeadPolls:        r.StuckHeadPolls,
 				FailedSealDispatch:    r.FailedSealDispatch,
 				FailedSealBudget:      r.FailedSealBudget,
+				// Plan 046 · T2.3, tal cual llega del Report (ver el campo).
+				DroppedPassive: r.DroppedByPassiveProfile,
+				// Plan 046 · Ola 2: la versión del mapa que produjo esos descartes (ver el campo).
+				FiltersVersion: r.FiltersVersion,
 			}
 		}
 	}

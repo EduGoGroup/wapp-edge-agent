@@ -168,6 +168,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	edgeCfgSvc := wiring.SharedEdgeConfigService(intentStack, log)
 	authKeyStore := wiring.RegisterJWKS(edgeCfgSvc, log)
+	// PERFILES DE SESIÓN (Plan 046 · Ola 2 · T2.2): el tercer kind del mismo Service compartido. Registra
+	// kind:"filters" y devuelve la vista consultable que cada listener usará en la puerta.
+	//
+	// 🔴 VA ANTES DEL Bootstrap DE ABAJO, Y NO ES ORDEN COSMÉTICO: Bootstrap solo recorre los kinds YA
+	// REGISTRADOS (edgeconfig/service.go:103-122). Registrar después dejaría al Edge arrancando SIN saber
+	// quién estaba callado —todas las sesiones activas— hasta que la nube volviera a empujar, y en esa
+	// ventana una sesión pasiva subiría todo lo que le llegara. Es el criterio (f) de la tarea.
+	perfiles := wiring.RegisterFilters(edgeCfgSvc, log)
 	intentStack.Applier = edgeCfgSvc
 	edgeCfgSvc.Bootstrap(ctx)
 
@@ -187,7 +195,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Si el adaptador de la cola no respalda el lado lector, `parteDelWorker` devuelve nil y el colector se
 	// comporta como hasta hoy (los tres campos vacíos). La telemetría no decide la política de arranque.
 	healthCollector := health.NewCollector(healthReg, outbox, parteDelWorker(cola, log), d.version, d.startedAt,
-		health.WithLogger(log))
+		health.WithLogger(log),
+		// Plan 046 · Ola 2: con QUÉ VERSIÓN de mapa está filtrando este Edge (`filters_version` en
+		// GET /v1/health y en el bundle). Se pasa el MÉTODO, no su resultado: el mapa cambia en caliente y una
+		// copia tomada aquí publicaría la del arranque para siempre.
+		//
+		// ✅ ESTA LÍNEA SÍ LA CUSTODIA UN TEST desde el 2026-08-21, y hace falta decir cuál porque no es del
+		// tipo habitual: `Run` no lo ejercita nadie, así que borrarla dejaría los cuatro gates en verde y el
+		// campo publicando 0 —que se lee como «este Edge no tiene mapa», una mentira plausible—. Quien lo
+		// impide es TestCableado_FiltersVersion_SePasaElMetodoNoSuResultado, que lo comprueba sobre el AST de
+		// ESTE fichero, no sobre la conducta. No se extrajo a un helper como `opcionPerfilesSesion` porque el
+		// colector se construye con siete argumentos que dependen de medio wiring.
+		health.WithFiltersVersion(perfiles.Version))
 	diagBuilder := diagnostics.NewBuilder(d.sink, healthCollector, cfg.DiagLogLines)
 
 	mux, authRelay := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder)
@@ -233,6 +252,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// descartarlo igual. Tras T3.0 el stack ya no tiene decorador y este predicado lee el flag de config
 		// directamente — que es lo que `MotivoApagado` siempre significó.
 		sessionmgr.WithClasificadorActivo(intentStack.ClasificadorActivoFunc()),
+		// Perfiles de sesión (Plan 046 · Ola 2 · T2.2): con este predicado, el listener de una sesión marcada
+		// PASIVA descarta su entrante en la puerta —no se encola, no se persiste, no se entrega (REQ-07)— y
+		// lo cuenta. El mapa lo empuja la nube (kind:"filters") y `perfiles` lo mantiene al día en caliente;
+		// sin config aplicada, el predicado responde «no pasiva» y el Edge se comporta como hasta hoy.
+		//
+		// Viene ARMADA de opcionPerfilesSesion —en vez de un `sessionmgr.WithSesionPasiva(…)` escrito aquí—
+		// por el mismo motivo que `lat.opt` y `opcionPalancaDespachador`: esta lista no la ejercita ningún
+		// test, y borrar la línea deja los cuatro gates en VERDE con el filtro apagado en toda la flota.
+		opcionPerfilesSesion(perfiles),
 		// Cronómetro del handler de entrantes (Plan 051 Ola 3 · T3.13): cada listener anota en él cuánto
 		// tardó su onMessage. Es lo único que hace MEDIBLE el criterio de cierre de la ola; sin esta línea
 		// el histograma existe y nadie lo llena.
@@ -407,6 +435,26 @@ func buildLatencia(cfg config.Config, cola app.ColaEntrantes, log sharedlogger.L
 // una forma distinta del caso raro, que es como se cuelan los nils en una lista variádica.
 func opcionPalancaDespachador(cfg config.Config) sessionmgr.Option {
 	return sessionmgr.WithDespachadorApagado(cfg.DespachadorApagado)
+}
+
+// opcionPerfilesSesion traduce la vista de perfiles del Plan 046 (kind:"filters") a la opción del Manager con
+// la que cada listener corta en la puerta los entrantes de una sesión PASIVA (REQ-07).
+//
+// 🔴 EXISTE POR EL MISMO MOTIVO QUE `opcionPalancaDespachador` Y `buildLatencia`, y aquí el agujero era el
+// más caro de los tres: la lista de opciones de `Run` no la ejercita ningún test, así que BORRAR esta línea
+// —o pasar un predicado distinto— dejaba `go build`, `go vet` y los cuatro gates en VERDE, con el mapa de
+// perfiles perfectamente construido, empujado por la nube y aplicado… y ningún Listener consultándolo. TODAS
+// las sesiones pasivas de la flota siguen encolando, persistiendo y entregando su tráfico entrante, y REQ-07
+// queda incumplido sin un solo síntoma: el filtro no deja fila, no sube al cable y acusa igual que si hubiera
+// entregado. Extraerla es lo que permite construir un Manager de verdad en un test y preguntarle qué le llegó.
+//
+// Se pasa el MÉTODO (`PasivaFunc` devuelve `p.EsPasiva`), no un bool ya evaluado: el perfil cambia en caliente
+// y una foto tomada aquí congelaría la del arranque para toda la vida del proceso.
+//
+// Con `p` nil, `PasivaFunc` devuelve nil y la opción se ignora en el Manager ⇒ default FAIL-OPEN (nadie es
+// pasiva). Es la asimetría de D-046.2: subir tráfico de más lo absorbe la nube; dejar una sesión sorda no.
+func opcionPerfilesSesion(p *wiring.Perfiles) sessionmgr.Option {
+	return sessionmgr.WithSesionPasiva(p.PasivaFunc())
 }
 
 // inyectorDeEntrantes es el puerto ESTRECHO que el registro del inyector necesita: lo cumple

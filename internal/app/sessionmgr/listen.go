@@ -133,6 +133,15 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// cajero o ya resuelta con la marca `apagado`. nil (opción no inyectada) ⇒ no se toca el gateway
 			// y manda el default SEGURO del Listener: se considera ACTIVO y se clasifica de más.
 			gateway.SetClasificadorActivo(m.clasificadorActivo)
+			// Consultor de PERFILES de sesión (Plan 046 · Ola 2 · T2.2): mismo molde que el interruptor del
+			// clasificador —COMPARTIDO por todo el Edge, no ligado a la sesión, por eso recibe el session_id—.
+			// Con él, el listener de una sesión marcada PASIVA descarta el entrante en la puerta sin dejar
+			// nada local (REQ-07). m.sesionPasiva nil (opción no inyectada) ⇒ no se toca el gateway y manda el
+			// default FAIL-OPEN del Listener: ninguna sesión es pasiva y todo se comporta como antes del 046.
+			//
+			// VA FUERA de cualquier condicional de la cola a propósito: el corte decide si el mensaje ENTRA,
+			// no en qué estado nace su fila.
+			gateway.SetSesionPasiva(m.sesionPasiva)
 			// Cronómetro del handler de entrantes (Plan 051 Ola 3 · T3.13): mismo molde que el interruptor
 			// del clasificador —COMPARTIDO por todo el Edge, no ligado a la sesión— porque el criterio
 			// INV-051.2 («handler < 50 ms p99») se juzga sobre el Edge entero. m.latencia nil (opción no

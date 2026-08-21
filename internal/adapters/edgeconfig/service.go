@@ -36,6 +36,37 @@ type Service struct {
 
 	mu    sync.Mutex
 	kinds map[string]registration
+
+	// aplicaMu SERIALIZA EL CICLO ENTERO de aplicación —leer la fila, validar, persistir y notificar— de modo
+	// que sea UNA SOLA sección crítica. Es un candado DISTINTO de `mu` (que solo protege el mapa de kinds) y
+	// tiene que serlo: `Apply` toma éste y luego llama a `registrationFor`, que toma aquél; con un único
+	// sync.Mutex —que no es reentrante— eso sería un auto-bloqueo inmediato. El orden es siempre
+	// aplicaMu → mu, y NADIE lo toma al revés, así que no hay ciclo posible.
+	//
+	// 🔴 QUÉ AGUJERO CIERRA, Y POR QUÉ NO BASTABA CON LA GUARDA DEL KIND. Los ConfigUpdate llegan por
+	// `disp.dispatch` del adapter CloudLink, que corre UN WORKER POR session_id EN PARALELO, y `PushConfig`
+	// fanea el MISMO frame a todas las sesiones vivas del tenant. Sin este candado, dos workers con dos
+	// versiones distintas hacen `Get → validar → Put → notificar` entrelazados: el frame VIEJO puede validar
+	// (contra la foto en memoria de antes) y hacer su `Put` DESPUÉS del nuevo, porque `Store.Put` sobrescribe
+	// SIN CONDICIÓN. Resultado: disco con la versión vieja y memoria con la nueva, sin un solo error.
+	//
+	// El síntoma no aparece hasta el REINICIO siguiente, y entonces es total: `Bootstrap` lee el disco, la
+	// memoria arranca vacía y la guarda de monotonicidad —que compara contra lo vigente EN MEMORIA— no tiene
+	// nada con qué disparar, así que el Edge levanta con el mapa retrasado. Una sesión que la nube reactivó
+	// sigue muda para siempre y no hay ni log, ni métrica, ni error que lo diga.
+	//
+	// ⚠️ DESVIACIÓN DELIBERADA: esto es el mecanismo COMPARTIDO, así que también serializa `intents` y `jwks`.
+	// Es estrictamente una mejora —los tres kinds ganan la atomicidad que ninguno tenía— y no toca ningún
+	// camino caliente: aplicar config ocurre en el arranque y cuando la nube empuja, mientras que el camino
+	// caliente del Edge es `onMessage`, que no pasa por aquí ni de lejos (INV-051.2 intacto). El precio es que
+	// dos pushes de kinds DISTINTOS ya no se aplican a la vez; a la escala de este Service (un `Put` sobre una
+	// fila) eso es invisible.
+	//
+	// ⚠️ SE MANTIENE TOMADO MIENTRAS CORREN LOS SUSCRIPTORES (`notify`), y es a propósito: publicar la foto en
+	// memoria FUERA de la sección crítica devolvería la carrera por la puerta de atrás. Ningún suscriptor
+	// llama de vuelta a Apply/Bootstrap —si alguno lo hiciera, se auto-bloquearía—, y todos son rápidos por
+	// contrato (ver el doc de Subscriber).
+	aplicaMu sync.Mutex
 }
 
 // NewService construye el Service sobre un Store. Registra los kinds con RegisterKind antes de Apply/Bootstrap.
@@ -61,6 +92,12 @@ func (s *Service) RegisterKind(kind string, validate Validator, subs ...Subscrib
 //   - versión ya aplicada    ⇒ nil (Ack idempotente, sin trabajo).
 //   - blob inválido          ⇒ log ERROR + conserva la anterior + nil (no reintentable).
 //   - válido y nuevo         ⇒ persistir + notificar suscriptores + nil.
+//
+// 🔴 EL CUERPO ENTERO ES UNA SOLA SECCIÓN CRÍTICA (`aplicaMu`, ver su campo): leer-validar-persistir-notificar
+// no puede entrelazarse con otro Apply, porque los workers del demux corren en paralelo y `Store.Put`
+// sobrescribe sin condición. El kind desconocido se resuelve ANTES de tomarlo: es una consulta al mapa de
+// registraciones y no toca ni el store ni a ningún suscriptor, así que un frame de un kind que nadie escucha
+// no tiene por qué esperar a que termine la aplicación de otro.
 func (s *Service) Apply(ctx context.Context, kind, version string, payload []byte) error {
 	reg, known := s.registrationFor(kind)
 	if !known {
@@ -68,6 +105,9 @@ func (s *Service) Apply(ctx context.Context, kind, version string, payload []byt
 			"kind", kind, "version", version)
 		return nil
 	}
+
+	s.aplicaMu.Lock()
+	defer s.aplicaMu.Unlock()
 
 	cur, found, err := s.store.Get(ctx, kind)
 	if err != nil {
@@ -100,11 +140,21 @@ func (s *Service) Apply(ctx context.Context, kind, version string, payload []byt
 // reinicio): por cada kind con fila, notifica a sus suscriptores para que el clasificador arranque con la
 // última config buena sin esperar un nuevo push del Cloud. Un fallo de lectura NO es fatal (se loguea y se
 // sigue): el Cloud reempuja al conectar.
+//
+// 🔴 NO SE AUTO-BLOQUEA CON `Apply`, y el orden de los candados es lo que lo garantiza. Bootstrap toma `mu`
+// SOLO para copiar el mapa de kinds y lo SUELTA antes de tocar nada más; recién entonces toma `aplicaMu` para
+// el recorrido. Nunca sostiene los dos a la vez, así que la única secuencia anidada del fichero sigue siendo
+// la de Apply (aplicaMu → mu) y no hay ciclo. Tomarlo aquí sí hace falta: en el cableado del daemon Bootstrap
+// corre antes de que el stream CloudLink exista, pero este método es público y notifica a los MISMOS
+// suscriptores que Apply — dejarlo fuera del candado reabriría la carrera para cualquier otro orden de arranque.
 func (s *Service) Bootstrap(ctx context.Context) {
 	s.mu.Lock()
 	kinds := make(map[string]registration, len(s.kinds))
 	maps.Copy(kinds, s.kinds)
 	s.mu.Unlock()
+
+	s.aplicaMu.Lock()
+	defer s.aplicaMu.Unlock()
 
 	for kind, reg := range kinds {
 		rec, found, err := s.store.Get(ctx, kind)

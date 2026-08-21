@@ -4,8 +4,12 @@ package latencia
 //
 // 🔴 QUÉ SE CUSTODIA AQUÍ. T1.13 cambió el comportamiento del Edge —lo que no deja fila ya no se acusa, así
 // que WhatsApp lo reofrece— y hasta hoy ese cambio era INOBSERVABLE: los contadores existían en el listener
-// y `InboundStats()` no tenía ni un llamante de producción. Estos dos campos son la única ventana a eso, así
+// y `InboundStats()` no tenía ni un llamante de producción. Estos campos son la única ventana a eso, así
 // que la línea sin ellos es una garantía cambiada a ciegas.
+//
+// El Plan 046 · T2.3 sumó el TERCERO —`descartes_perfil_pasivo`— por la misma lección y antes de que doliera:
+// el corte de la sesión pasiva no deja fila, no sube al cable y acusa igual que si hubiera entregado, así que
+// sin este campo un filtro roto (0 con tráfico) o un filtro que corta de más son invisibles.
 
 import (
 	"testing"
@@ -29,6 +33,13 @@ func TestLatido_LosContadoresDeLaPuerta_SalenConSuValor(t *testing.T) {
 	h.Puerta().AnotaEnqueueError()
 	h.Puerta().AnotaEnqueuePanic()
 
+	// Plan 046 · T2.3 — el tercer contador de la puerta, con un valor DISTINTO de los otros dos a propósito:
+	// con todo a 1 (o a 2), un cruce de campos en `bloque()` —publicar los panics en el hueco del pasivo, o
+	// al revés— pasaría en verde y el operador leería un defecto donde hay una sesión callada, o al revés.
+	for i := 0; i < 4; i++ {
+		h.Puerta().AnotaDescartePasivo()
+	}
+
 	correrLatido(t, Deps{Hist: h, Cada: 0, Log: log}, 20*time.Millisecond)
 
 	finales := log.porEmision(emisionFinal)
@@ -45,6 +56,9 @@ func TestLatido_LosContadoresDeLaPuerta_SalenConSuValor(t *testing.T) {
 			"repetidas en Debug"},
 		{"cola_enqueue_panics", 1, "cualquier valor > 0 aquí es un DEFECTO, no una condición de campo, y es " +
 			"la diferencia entre «el disco está lleno» y «hay un bug en el adaptador»"},
+		{"descartes_perfil_pasivo", 4, "es la ÚNICA huella de un filtro que no deja fila, no sube al cable y " +
+			"ACUSA a WhatsApp igual que si hubiera entregado: sin este campo, «la sesión pasiva está " +
+			"filtrando» y «a esa sesión no le escribe nadie» son indistinguibles desde fuera"},
 	}
 	for _, c := range casos {
 		v, ok := finales[0].clave(c.clave)
@@ -79,7 +93,7 @@ func TestLatido_LosContadoresDeLaPuerta_SalenAunqueSeanCeroYNoHayaCola(t *testin
 	if len(finales) != 1 {
 		t.Fatalf("se esperaba 1 bloque final, hubo %d", len(finales))
 	}
-	for _, clave := range []string{"cola_enqueue_errores", "cola_enqueue_panics"} {
+	for _, clave := range []string{"cola_enqueue_errores", "cola_enqueue_panics", "descartes_perfil_pasivo"} {
 		v, ok := finales[0].clave(clave)
 		if !ok {
 			t.Errorf("%q desapareció de la línea por valer cero (o por no haber contador de cola).\n"+

@@ -49,6 +49,52 @@ type Report struct {
 	// DaemonUptimeS es el uptime del daemon en segundos (mismo valor para todas las sesiones del proceso).
 	DaemonUptimeS int64
 
+	// ─── Plan 046 · Ola 2 · T2.3 · el contador del filtro de PRIVACIDAD ───
+
+	// DroppedByPassiveProfile son los entrantes que la puerta de ESTA sesión descartó por tener PERFIL
+	// PASIVO (REQ-07: «se descartan en el Edge, nada local»). Sale a JSON como `dropped_passive` y SIN
+	// omitempty: un cero es un DATO («esta sesión no está descartando nada») y un hueco obligaría al que lee
+	// a preguntarse si el mecanismo existe siquiera.
+	//
+	// Es `uint64` y no `int64` como sus vecinos A PROPÓSITO: nace uint64 en el listener y en el Registry, y
+	// convertirlo aquí solo añadiría una conversión que un día alguien tendrá que justificar ante el linter
+	// a cambio de nada — el JSON de un entero sin signo es idéntico.
+	//
+	// 🔴 CAMBIA EL SIGNIFICADO DE `DroppedByWindow`, Y HAY QUE LEER LAS DOS SERIES JUNTAS. El filtro pasivo
+	// corta ANTES de la ventana temporal del ADR-0037 (listener.go, paso 1.5), así que un entrante de una
+	// sesión pasiva que ADEMÁS venía fuera de ventana se cuenta aquí y DEJA de contarse allí. Para la sesión
+	// pasiva da igual —se descarta todo—, pero para quien mira las métricas no: una CAÍDA de
+	// `DroppedByWindow` puede no ser «el Edge está ingiriendo mejor» sino «hay más sesiones pasivas». Ver el
+	// mismo aviso en whatsmeow.InboundStats.DroppedByWindow y en el campo `descartes_perfil_pasivo` del
+	// bloque del latido.
+	//
+	// ⚠️ VIVE EN MEMORIA Y SE REINICIA CON EL PROCESO (y desde T5.4 del Plan 051 el núcleo se relanza solo):
+	// un `dropped_passive: 0` tras un reinicio significa «este proceso acaba de nacer», no «no descartó nada».
+	//
+	// ⚠️ NO VIAJA EN EL HEARTBEAT. INV-5 de esta ola prohíbe tocar el proto, así que `SessionHealth` no lo
+	// lleva: sale por GET /v1/health, por el bundle de diagnóstico y por el bloque del latido. El día que el
+	// proto se abra, este es el campo que se mapea.
+	DroppedByPassiveProfile uint64
+
+	// FiltersVersion es la VERSIÓN DEL MAPA DE PERFILES con la que este Edge está filtrando ahora mismo —el
+	// `version` del último ConfigUpdate kind:"filters" aplicado (D-046.2)—. Sale a JSON como
+	// `filters_version`, y ese nombre es CONTRATO con `wapp-ctl` y con el runbook.
+	//
+	// 🔴 ES DEL EDGE, NO DE LA SESIÓN, y viaja en la vista por sesión por el mismo motivo que `binary_version`
+	// y `daemon_uptime_s`: quien lee `dropped_passive` de una sesión necesita, EN LA MISMA FOTO, con qué mapa
+	// se tomó esa decisión. Separarlo en otro bloque obligaría a correlacionar dos lecturas a mano.
+	//
+	// 🔴 SIN ÉL, EL PEOR MODO DE FALLO DE ESTA OLA ES INDIAGNOSTICABLE. `Store.Put` sobrescribe sin condición y
+	// los ConfigUpdate llegan por workers en paralelo: un push viejo que persistiera después de uno nuevo deja
+	// al Edge, tras el siguiente reinicio, filtrando con un mapa RETRASADO —sesiones reactivadas que siguen
+	// mudas— sin error, sin log y sin métrica. Este número es lo único que delata ese estado: se compara con
+	// el que la consola dice haber empujado y, si no cuadran, ahí está el diagnóstico.
+	//
+	// 0 significa «aún no hay config de filtros aplicada» ⇒ NADIE es pasiva (fail-open de D-046.2), que es
+	// exactamente el comportamiento anterior al Plan 046. Ojo: es también el valor legítimo del tenant sin
+	// ninguna fila de sesión (regla 2 de T2.1). `dropped_passive` al lado distingue los dos casos.
+	FiltersVersion int64
+
 	// ─── Plan 051 Ola 4 · T4.3 · lo que el WORKER-CAJERO sabe y este proceso no ───
 	//
 	// Los TRES campos de abajo (IntentCircuit incluido) salen del MISMO parte, y por eso caen JUNTOS: si el
@@ -108,6 +154,13 @@ type Collector struct {
 	now       func() time.Time
 	log       sharedlogger.Logger
 
+	// filtersVersion LEE la versión del mapa de perfiles vigente (Plan 046 · Ola 2). Es un `func` y no un
+	// entero copiado al construir porque el mapa cambia EN CALIENTE: la nube empuja una versión nueva y el
+	// siguiente latido tiene que publicarla, no la del arranque. nil ⇒ 0, que es lo mismo que responde la
+	// vista de perfiles cuando aún no hay config: los cableados que no lo pasan (tests, arranques que no
+	// vienen de `agent serve`) se comportan igual que antes de esta línea.
+	filtersVersion func() int64
+
 	// muDespacho protege `despacho`, que se cablea TARDE (SetDespachoReader) porque en el wiring del daemon
 	// el colector nace ANTES que el session manager que lo implementa. Sin el candado, ese Set competiría
 	// con el primer heartbeat que ya puede estar corriendo (el multiplexor CloudLink se construye en medio).
@@ -145,6 +198,23 @@ func WithDespachoReader(r DespachoReader) CollectorOption {
 	return func(c *Collector) {
 		if r != nil {
 			c.despacho = r
+		}
+	}
+}
+
+// WithFiltersVersion cablea el LECTOR de la versión del mapa de perfiles de sesión (Plan 046 · Ola 2). En
+// producción lo pasa el daemon con `perfiles.Version` —el método, no su resultado—, de modo que cada Report
+// publique la versión VIGENTE en ese momento y no la del arranque.
+//
+// 🔴 SIN ESTA OPCIÓN EL CAMPO SALE A 0 SIEMPRE, y un 0 se lee como «este Edge no tiene mapa» (fail-open). Es
+// decir: olvidar esta línea en el cableado no rompe nada visible, publica una MENTIRA plausible. Por eso el
+// cable tiene su propio test (internal/infra/daemon), igual que el del cronómetro.
+//
+// nil se IGNORA (no desconecta un lector ya cableado), como el resto de opciones del colector.
+func WithFiltersVersion(fn func() int64) CollectorOption {
+	return func(c *Collector) {
+		if fn != nil {
+			c.filtersVersion = fn
 		}
 	}
 }
@@ -220,6 +290,12 @@ func (c *Collector) Collect(ctx context.Context, sessionID string) (Report, bool
 		IntentP50Ms:       p50,
 		BinaryVersion:     c.version,
 		DaemonUptimeS:     c.uptimeS(now),
+		// Plan 046 · T2.3: sale del MISMO Snapshot que el resto de la salud de runtime, tal cual. No se
+		// deriva, no se agrega y no se condiciona a nada: es el acumulado del proceso para esta sesión.
+		DroppedByPassiveProfile: snap.DroppedByPassiveProfile,
+		// Plan 046 · Ola 2: la versión del mapa con que se tomó esa decisión. Se lee FRESCA en cada Report
+		// (ver el campo filtersVersion): el mapa cambia en caliente y una copia del arranque mentiría.
+		FiltersVersion: c.versionDeFiltros(),
 	}
 	if !snap.LastInboundAt.IsZero() {
 		if age := now.Sub(snap.LastInboundAt); age > 0 {
@@ -373,6 +449,17 @@ func (c *Collector) parteDelWorker(ctx context.Context, now time.Time) (circuito
 	// Normaliza al contrato del wire ("half-open" → "half_open"): el endpoint /v1/intent/status conserva la
 	// forma con guion, el heartbeat y el bundle usan la del contrato SessionHealth (ADR-0023).
 	return strings.ReplaceAll(p.Circuito, "-", "_"), p.Taskset, p.P50ms
+}
+
+// versionDeFiltros lee la versión del mapa de perfiles vigente, con el 0 como respuesta cuando no hay lector
+// cableado. Existe como método —en vez de un `if` en Collect— para que el nil se juzgue en UN solo sitio: un
+// pánico aquí ocurriría en el camino del HEARTBEAT, y que la telemetría de un subsistema impida decir «sigo
+// vivo» es el peor cambio posible (mismo criterio que parteDelWorker).
+func (c *Collector) versionDeFiltros() int64 {
+	if c.filtersVersion == nil {
+		return 0
+	}
+	return c.filtersVersion()
 }
 
 // uptimeS calcula el uptime en segundos (0 si startedAt es cero o el reloj retrocedió).

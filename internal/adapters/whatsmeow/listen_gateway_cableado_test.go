@@ -153,38 +153,54 @@ func TestListenerOpts_LaColaYSuSessionID_LLEGAN_AlListener(t *testing.T) {
 	}
 }
 
-// TestListenerOpts_ColaYSessionID_ViajanJUNTAS_ONoViajaNinguna convierte en test el pacto que hasta ahora
-// era una promesa en prosa en el comentario de producción.
+// TestListenerOpts_LaColaNoViajaSinSessionID_PeroElSessionIDSiViajaSolo convierte en test la relación REAL
+// entre las dos opciones, que NO es simétrica — y hasta el 2026-08-21 este fichero afirmaba que sí lo era.
+//
+// LA REGLA, en sus dos mitades:
+//
+//   - LA COLA NO VIAJA SIN session_id. Sigue igual y sigue siendo lo importante: el session_id es la clave
+//     con la que el adaptador elige la DEK que sella la fila, así que una cola sin él no escribe filas mal
+//     etiquetadas, escribe filas que NADIE PUEDE DESCIFRAR.
+//   - EL session_id SÍ VIAJA SOLO. Esto es lo que cambió, y era un BUG con la forma de un contrato. El
+//     session_id no es una opción «de la cola»: es la IDENTIDAD de la sesión, y tiene un segundo consumidor
+//     que no depende de ella — `Listener.sesionEsPasiva()` (Plan 046), que corta en seco si el id está
+//     vacío. Con la regla vieja, un listener sin cola perdía su identidad y el FILTRO DE PRIVACIDAD se
+//     apagaba ENTERO, en silencio y sin contar un solo descarte, mientras el comentario de producción
+//     afirmaba lo contrario en tres líneas seguidas. Hoy no muerde en campo (sin cola el daemon no arranca
+//     desde el Plan 051 O3), pero una promesa escrita que el código no cumple es una trampa con fecha.
 //
 // 🔴 POR QUÉ SE MIRAN LAS OPCIONES Y NO LA CONDUCTA, que es lo contrario de lo que hace el resto del
-// fichero. La defensa está DUPLICADA a propósito: el `if` de listenerOpts() impide que la pareja salga
-// rota, y NewListener —si aun así le llegara rota— desactiva la cola y lo grita (listener.go). Las dos
+// fichero. La defensa está DUPLICADA a propósito: el `if` de listenerOpts() impide que la cola salga sin
+// identidad, y NewListener —si aun así le llegara rota— la desactiva y lo grita (listener.go). Las dos
 // desembocan en la misma conducta observable («no se anota nada»), así que un test por conducta se
 // quedaría VERDE al romper el `if`, tapado por la red de seguridad de abajo. Aplicando las opciones sobre
-// un Listener DESNUDO se salta esa red y se interroga solo al punto de ensamblaje, que es el que este
-// test dice custodiar.
+// un Listener DESNUDO se salta esa red y se interroga solo al punto de ensamblaje.
 //
-// Lo que se defiende con eso: que la degradación siga siendo «esta sesión no tiene cola» —un hecho
-// limpio— y no «esta sesión tiene cola y escribe filas que nadie podrá descifrar», que es a donde lleva
-// una cola con el session_id vacío.
-//
-// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): relajar el guardián a `if g.cola != nil` (o a
-// `if g.sessionID != ""`) ⇒ la mitad presente viaja sola.
-func TestListenerOpts_ColaYSessionID_ViajanJuntas_ONoViajaNinguna(t *testing.T) {
+// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO:
+//   - relajar el guardián a `if g.cola != nil` ⇒ la cola viaja con el session_id vacío;
+//   - devolver `WithSessionID(g.sessionID)` DENTRO del bloque de la cola —que es de donde salió— ⇒ cae la
+//     segunda mitad, y con ella el filtro de perfiles de cualquier listener sin cola.
+func TestListenerOpts_LaColaNoViajaSinSessionID_PeroElSessionIDSiViajaSolo(t *testing.T) {
 	casos := []struct {
-		nombre    string
-		cola      app.ColaEntrantes
-		sessionID string
+		nombre       string
+		cola         app.ColaEntrantes
+		sessionID    string
+		quiereCola   bool
+		quiereSesion string
 	}{
-		{"cola sin session_id", &spyCola{calls: &callLog{}}, ""},
-		{"session_id sin cola", nil, "sess-huerfano"},
+		{"cola sin session_id: no viaja ninguna de las dos",
+			&spyCola{calls: &callLog{}}, "", false, ""},
+		{"session_id sin cola: la identidad viaja igual (el filtro de perfiles la necesita)",
+			nil, "sess-huerfano", false, "sess-huerfano"},
+		{"las dos presentes: el caso de campo",
+			&spyCola{calls: &callLog{}}, "sess-42", true, "sess-42"},
 	}
 
 	for _, cs := range casos {
 		t.Run(cs.nombre, func(t *testing.T) {
 			g := gatewayDePrueba()
-			// Se escriben los campos a mano: los setters ya rechazan la pareja rota (SetCola exige ambos),
-			// y lo que aquí se interroga es el ENSAMBLAJE, que es la segunda oportunidad de romperla.
+			// Se escriben los campos a mano: lo que aquí se interroga es el ENSAMBLAJE, que es la segunda
+			// oportunidad de romper la pareja después de los setters.
 			g.cola, g.sessionID = cs.cola, cs.sessionID
 
 			// Listener DESNUDO: sin NewListener, para que su red de seguridad no tape el fallo.
@@ -193,18 +209,54 @@ func TestListenerOpts_ColaYSessionID_ViajanJuntas_ONoViajaNinguna(t *testing.T) 
 				opt(desnudo)
 			}
 
-			if desnudo.cola != nil {
-				t.Errorf("viajó WithCola con el session_id vacío.\n" +
-					"    CONSECUENCIA: la cola llegaría al Listener sin la clave que elige la DEK. Hoy lo\n" +
-					"    rescata NewListener desactivándola con un log de Error, pero eso es una RED, no el\n" +
-					"    contrato: si alguien la quita, la sesión escribe filas que nadie podrá descifrar.")
+			if hayCola := desnudo.cola != nil; hayCola != cs.quiereCola {
+				t.Errorf("cola cableada = %v, se esperaba %v.\n"+
+					"    CONSECUENCIA (si viajó de más): la cola llega al Listener sin la clave que elige la DEK.\n"+
+					"    Hoy lo rescata NewListener desactivándola con un log de Error, pero eso es una RED, no el\n"+
+					"    contrato: si alguien la quita, la sesión escribe filas que nadie podrá descifrar.",
+					hayCola, cs.quiereCola)
 			}
-			if desnudo.sessionID != "" {
-				t.Errorf("viajó WithSessionID (%q) sin cola: una opción inerte que dice que hay cola cuando "+
-					"no la hay, y que engaña a quien lea el cableado buscando por qué no se anota nada",
-					desnudo.sessionID)
+			if desnudo.sessionID != cs.quiereSesion {
+				t.Errorf("session_id cableado = %q, se esperaba %q.\n"+
+					"    CONSECUENCIA (si falta): `Listener.sesionEsPasiva()` corta en seco con el id vacío, así\n"+
+					"    que el consultor de perfiles llegaría perfectamente cableado y el filtro de privacidad\n"+
+					"    estaría APAGADO igualmente — sin log, sin contador y sin un solo descarte anotado.",
+					desnudo.sessionID, cs.quiereSesion)
 			}
 		})
+	}
+}
+
+// TestListenerOpts_SinCola_ElFiltroDePerfilesSIGUE_CORTANDO es la mitad de CONDUCTA de lo anterior, y es la
+// que de verdad importa: no basta con que la opción viaje, tiene que producir el corte.
+//
+// El escenario es el que la regla vieja rompía en silencio: un gateway con identidad y SIN cola. Antes, el
+// `WithSessionID` se quedaba dentro del bloque de la cola, el Listener nacía sin saber quién era y
+// `sesionEsPasiva()` devolvía false por su primera guarda — el filtro entero desactivado, con el predicado
+// cableado y el mapa perfectamente aplicado.
+//
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO: devolver `WithSessionID(g.sessionID)` al `if g.cola != nil && …` de
+// listenerOpts() ⇒ `DroppedByPassiveProfile` se queda en 0 y el entrante se trata como el de una sesión
+// activa. (Nótese que este test NO puede afirmar sobre filas: sin cola no hay dónde anotarlas. El contador
+// es la única huella, que es exactamente el argumento de T2.3.)
+func TestListenerOpts_SinCola_ElFiltroDePerfilesSigueCortando(t *testing.T) {
+	const sid = "sess-sin-cola"
+
+	g := gatewayDePrueba()
+	// SetCola con la cola a nil: en producción es lo que hace el factory del sessionmgr cuando `m.cola` no
+	// está inyectada. La identidad SÍ tiene que quedar guardada (ver SetCola).
+	g.SetCola(nil, sid)
+	g.SetSesionPasiva(pasiva(t, sid))
+
+	l := NewListener(g.log, g.listenerOpts()...)
+	if !l.handleEvent(context.Background(), liveMessage("MSG-SIN-COLA-PASIVA", "quiero dos empanadas")) {
+		t.Fatal("el descarte por perfil pasivo debe ACUSAR también sin cola")
+	}
+	if s := l.InboundStats(); s.DroppedByPassiveProfile != 1 {
+		t.Errorf("DroppedByPassiveProfile = %d, se esperaba 1.\n"+
+			"    CONSECUENCIA: el listener sin cola perdió su identidad, así que `sesionEsPasiva()` cortó en su\n"+
+			"    primera guarda (`l.sessionID == \"\"`) y el filtro de privacidad quedó APAGADO ENTERO — con el\n"+
+			"    consultor cableado, el mapa aplicado y ni un solo síntoma.", s.DroppedByPassiveProfile)
 	}
 }
 

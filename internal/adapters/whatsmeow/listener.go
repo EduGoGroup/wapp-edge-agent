@@ -176,6 +176,26 @@ type Listener struct {
 	// hacia «activo», lo peor que pasa es que el cajero gaste Ollama de más — visible al instante en la
 	// telemetría y sin pérdida de negocio. Se falla hacia el lado ruidoso y barato.
 	clasificadorActivo func() bool
+
+	// sesionPasiva dice si la sesión que se le pase está marcada como PASIVA en la config de perfiles que
+	// la nube empuja (kind:"filters", Plan 046 · Ola 2 · T2.2 / ADR-0027). Con `true`, el entrante se
+	// descarta EN LA PUERTA: no se encola, no se persiste y no se entrega (REQ-07, «nada local»).
+	//
+	// Se pide un predicado y NO un bool porque el perfil cambia EN CALIENTE: la consola de la nube marca
+	// una sesión como pasiva —o la devuelve a activa— y el efecto tiene que verse en el mensaje siguiente,
+	// sin reiniciar el Edge. Un bool capturado al construir el Listener congelaría la foto del arranque.
+	//
+	// RECIBE EL session_id EN VEZ DE CERRARSE SOBRE ÉL porque el consultor es COMPARTIDO por todas las
+	// sesiones del Edge (un solo mapa por tenant, igual que el cronómetro o el interruptor del
+	// clasificador): una closure por sesión obligaría a construir N predicados y a que el cableado no se
+	// equivocara de sesión en ninguno. El Listener ya sabe cuál es la suya (l.sessionID).
+	//
+	// 🔴 nil ⇒ NINGUNA SESIÓN ES PASIVA (fail-open, D-046.2), y la asimetría es la misma que la de
+	// clasificadorActivo: de los dos fallos posibles, un cableado incompleto que cayera hacia «pasiva»
+	// dejaría al Edge SORDO —el cliente escribe y no pasa nada, sin un solo error en el log— mientras que
+	// caer hacia «activa» solo sube tráfico que la nube ya sabe ignorar (`reactiveBlocked`, D-046.7). Se
+	// falla hacia el lado que no pierde mensajes.
+	sesionPasiva func(sessionID string) bool
 }
 
 // ListenerOption configura el Listener sin romper la firma de NewListener (variádica), igual que
@@ -229,6 +249,21 @@ func WithClasificadorActivo(fn func() bool) ListenerOption {
 	}
 }
 
+// WithSesionPasiva inyecta el CONSULTOR DE PERFILES de sesión (Plan 046 · Ola 2 · T2.2): un predicado que
+// se consulta por mensaje —pasándole el session_id de ESTA sesión— para decidir si el entrante se corta en
+// la puerta por pertenecer a una sesión PASIVA (REQ-07).
+//
+// Se pide un `func(string) bool` y NO un bool, y el porqué está en el campo sesionPasiva: el perfil cambia
+// en caliente. nil se ignora y el Listener queda en su default FAIL-OPEN (nadie es pasiva), que es el
+// comportamiento anterior a esta tarea byte a byte.
+func WithSesionPasiva(fn func(sessionID string) bool) ListenerOption {
+	return func(l *Listener) {
+		if fn != nil {
+			l.sesionPasiva = fn
+		}
+	}
+}
+
 // WithLatencia cablea el CRONÓMETRO del handler de entrantes (Plan 051 Ola 3 · T3.13): el histograma
 // COMPARTIDO por todas las sesiones del Edge donde se acumula cuánto tarda onMessage, que es lo que hace
 // medible «handler < 50 ms p99» (INV-051.2).
@@ -270,7 +305,22 @@ func WithConnectMargin(d time.Duration) ListenerOption {
 
 // SetHealthReporter liga el listener al registro de salud de SU sesión (Plan 031 T6). Se llama ANTES de
 // Register (al construir el ciclo de escucha). nil ⇒ no se reporta salud. No es secreto ni PII.
-func (l *Listener) SetHealthReporter(r health.SessionReporter) { l.reporter = r }
+//
+// 🔴 CABLEA DOS CAMPOS CON LA MISMA INSTANCIA (Plan 046 · T2.3), Y ESA ES LA ÚNICA FORMA DE QUE NO DIVERJAN.
+// El listener lo usa para sellar la prueba de vida (`MarkInbound`, en onMessage); el observador de corchetes
+// lo usa para publicar el contador de descartes por perfil pasivo desde el mismo sitio donde lo incrementa
+// (ver countPassiveDrop). Dos setters separados —o un segundo Set que alguien olvidara llamar— dejarían el
+// contador de una sesión reportándose en el registro de OTRA, o en ninguno. Es una línea; que sean dos
+// asignaciones aquí es preferible a que sean dos llamadas en el cableado.
+// ⚠️ LA SEGUNDA ASIGNACIÓN VA POR `setSalud` Y NO A PELO: el observador lee ese campo desde el hilo de
+// whatsmeow (countPassiveDrop) y aquí se escribe desde la goroutine que monta el ciclo de escucha. Hoy hay
+// happens-before —esto corre antes de Register— pero es justo el patrón que `-race` delata bajo el daemon
+// real; el candado del observador ya se paga en esa ruta, así que cerrarlo no cuesta nada. `l.reporter` no
+// lo necesita: lo lee el mismo hilo de whatsmeow que ya está ordenado por el registro del handler.
+func (l *Listener) SetHealthReporter(r health.SessionReporter) {
+	l.reporter = r
+	l.brackets.setSalud(r)
+}
 
 // NewListener construye el listener con el logger dado, el backoff por defecto del spike y el observador
 // de corchetes. El margen de la ventana arranca en su default; SetConnectMargin lo ajusta.
@@ -335,9 +385,16 @@ func (l *Listener) SetConnectMargin(d time.Duration) {
 func (l *Listener) SetConnectSeal(fn func() time.Time) { l.connectSeal = fn }
 
 // InboundStats devuelve el acumulado de la puerta de entrada de esta sesión (ADR-0037 §4): corchetes
-// reconciliados, descartados por la ventana, ecos propios, admitidos sin hora y las dos degradaciones del
-// encolado durable (Plan 051 · INV-051.3). Son cardinalidades, sin PII. Es el material que la telemetría
-// de flota (ADR-0023) debe publicar; publicarlo al heartbeat es tarea de la Ola 4.
+// reconciliados, descartados por la ventana, ecos propios, admitidos sin hora, descartados por PERFIL
+// PASIVO (Plan 046 · T2.2) y las dos degradaciones del encolado durable (Plan 051 · INV-051.3). Son
+// cardinalidades, sin PII.
+//
+// ⚠️ SIGUE SIN TENER LLAMANTES DE PRODUCCIÓN, Y YA NO IMPORTA. Este método fue el caso de estudio de T1.13
+// («once llamantes y los once eran tests»); lo que se arregló no fue darle un llamante, sino que los
+// contadores se publicaran desde donde se incrementan. Hoy los descartes por perfil pasivo salen en el
+// bloque del latido (`descartes_perfil_pasivo`) y en `GET /v1/health` (`dropped_passive`) sin pasar por
+// aquí. Esta función es la vista POR SESIÓN que usan los tests del corte; añadirle un llamante de
+// producción sería reabrir la discusión, no cerrarla.
 func (l *Listener) InboundStats() InboundStats { return l.brackets.snapshot() }
 
 // State devuelve el estado de conexión observado (para observabilidad/tests).
@@ -448,8 +505,11 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) (acusar bool) {
 //
 // Los filtros de la puerta, en este orden:
 //  1. ECO PROPIO (IsFromMe): lo mandamos nosotros; no es una conversación entrante y no tiene por qué subir.
-//  2. SIN HORA UTILIZABLE: se ADMITE explícitamente (ver abajo).
-//  3. VENTANA TEMPORAL (ADR-0037, criterio único): anterior a `inicioDeConexión − margen` ⇒ se descarta.
+//  2. PERFIL PASIVO (Plan 046 · T2.2, REQ-07): la sesión está marcada como PASIVA en la config empujada
+//     por la nube ⇒ se descarta SIN dejar nada local. Va ANTES de «SIN HORA UTILIZABLE» —y no en el
+//     «3.5» que el plan proponía— porque ese paso también encola: ver el bloque del filtro.
+//  3. SIN HORA UTILIZABLE: se ADMITE explícitamente (ver abajo).
+//  4. VENTANA TEMPORAL (ADR-0037, criterio único): anterior a `inicioDeConexión − margen` ⇒ se descarta.
 //
 // Lo ADMITIDO sigue el orden del Plan 051: ventana → PUERTA DE ELEGIBILIDAD (sin texto / grupo / feature
 // apagada / fastlane, ver el switch de enqueueCola) → INSERT cifrado en la cola durable → fin. El INSERT es
@@ -468,6 +528,10 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) (acusar bool) {
 // puede arreglar.
 //
 //	ACUSA (true)  · ECO PROPIO (IsFromMe)         — es nuestro; no hay nada que persistir ni que reenviar.
+//	ACUSA (true)  · PERFIL PASIVO (Plan 046)      — decisión deliberada y DETERMINISTA sobre config estable:
+//	                                                el reenvío llegaría idéntico y se volvería a descartar.
+//	                                                Negarlo convertiría el tráfico de la pasiva en una
+//	                                                ráfaga perpetua de reofrecimientos.
 //	ACUSA (true)  · FUERA DE VENTANA (ADR-0037)   — decisión deliberada y DETERMINISTA: el reenvío traería
 //	                                                el MISMO Info.Timestamp, volvería a caer fuera y
 //	                                                pediríamos otro reenvío. Bucle sin salida (REQ-051.5).
@@ -488,7 +552,8 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 	// `camino` decide en qué SERIE cae la medida y se reasigna en cada salida temprana; el `defer` es lo que
 	// garantiza que se anota pase lo que pase, incluido el recover de enqueueCola. Sale por `Encolado` por
 	// defecto porque los caminos que encolan son tres (normal, fastlane y el del entrante sin hora) y los
-	// que descartan son dos: el default cubre el caso mayoritario y cada descarte lo dice explícitamente.
+	// que descartan son tres (eco propio, perfil pasivo y fuera de ventana): el default cubre el caso
+	// mayoritario —el mensaje que entra— y cada descarte lo dice explícitamente.
 	//
 	// COSTE: una sola llamada extra al reloj (MarkInbound reusa `inicio`), más una búsqueda de 16
 	// comparaciones y un atomic.Add. Ver el análisis en la cabecera de internal/app/latencia.
@@ -514,6 +579,52 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 		l.brackets.countSelfDrop()
 		// SE ACUSA (T1.13): el mensaje lo mandamos nosotros. No hay nada que persistir, y pedir su reenvío
 		// sería pedir que nos devuelvan nuestro propio eco una y otra vez.
+		return true
+	}
+
+	// 1.5 · PERFIL DE SESIÓN — LA SESIÓN PASIVA NO RECIBE (Plan 046 · Ola 2 · T2.2, REQ-07/ADR-0027).
+	//
+	// 🔴 EL PLAN DECÍA «PASO 3.5» (entre la ventana y el enqueueCola) Y ESO NO BASTA — DESVIACIÓN DELIBERADA.
+	// `enqueueCola` se alcanza desde DOS sitios, no uno: el camino normal de abajo Y el del entrante SIN HORA
+	// UTILIZABLE (`Info.Timestamp.IsZero()`, el `t="0"` del paso 2), que ADMITE por precaución y encola
+	// ANTES de que la ventana llegue a evaluarse. Un filtro colocado tras la ventana dejaría escribirse en
+	// disco —cifrado, pero escrito— los entrantes de una sesión pasiva que llegaran con `t="0"`. Son raros;
+	// REQ-07 no dice «casi nada local», dice NADA. Puesto aquí, el corte domina los dos caminos.
+	//
+	// POR QUÉ ESTE SITIO Y NO OTRO:
+	//   - DESPUÉS de `MarkInbound` (arriba): eso es prueba de vida del SOCKET, no señal de negocio, y se
+	//     marca para TODO mensaje incluidos los descartados. La salud de una sesión pasiva tiene que seguir
+	//     latiendo (D-046.3: Heartbeat/SessionHealth SIEMPRE suben).
+	//   - DESPUÉS del eco propio: así `DroppedSelf` conserva su significado exacto —«ecos nuestros»— en vez
+	//     de perder los de las sesiones pasivas en otro contador.
+	//   - ANTES de la rama del timestamp: el veredicto es DETERMINISTA y no depende de la hora, así que no
+	//     tiene ninguna razón para ir detrás de algo que sí depende de ella.
+	//
+	// 🔴 SE ACUSA (true), por el MISMO razonamiento que la ventana del ADR-0037 (ver el paso 3, más abajo): el
+	// descarte es deliberado y determinista sobre config ESTABLE, así que el reenvío llegaría idéntico y se
+	// volvería a descartar. Negar el acuse convertiría el tráfico de una sesión pasiva —que puede ser todo
+	// el de un número muy activo— en una ráfaga PERPETUA de reofrecimientos de WhatsApp.
+	//
+	// 🔴 Y SE MARCA `Descartado`: sin esta línea, el p99 del handler contaría estos descartes de microsegundos
+	// como encolados y MEJORARÍA justo cuando el Edge más filtra (INV-051.2 se juzga contra la serie
+	// `Encolado`).
+	//
+	// 🔴 EL PERFIL SE JUZGA UNA VEZ, AQUÍ. No se re-evalúa en el despachador ni en el cajero: una fila que ya
+	// está en la cola entró cuando la sesión era ACTIVA y ya fue acusada a WhatsApp; filtrarla al salir sería
+	// una pérdida silenciosa de un mensaje que el cliente ve con doble check.
+	if l.sesionEsPasiva() {
+		camino = latencia.Descartado // sale sin fila: su tiempo no es tiempo de encolar
+		l.brackets.countPassiveDrop()
+		// Nivel DEBUG y no Warn a propósito: esto no es una anomalía, es la configuración funcionando, y una
+		// sesión pasiva con tráfico escribiría una línea por mensaje a ritmo de socket. ADR-0034 nivel 3: ni
+		// texto ni teléfono; solo el identificador del mensaje, que es lo que permite correlacionar.
+		//
+		// 📌 EN CAMPO ESTA LÍNEA NO SE VE (el Edge corre en Info), y por eso NO es la línea del filtro: la que
+		// se lee la emite `countPassiveDrop` (T2.3), en Info, THROTTLED a una por sesión y por ventana de
+		// enfriamiento, con el ACUMULADO y sin un solo identificador de mensaje. Esta de aquí es la de
+		// diagnóstico fino, para cuando alguien sube el nivel a Debug a propósito.
+		l.log.Debug("listener: entrante descartado en la puerta — la sesión tiene perfil PASIVO (Plan 046, REQ-07): no se encola, no se persiste y no se entrega",
+			"message_id", e.Info.ID)
 		return true
 	}
 
@@ -761,6 +872,23 @@ func (l *Listener) clasificadorEstaActivo() bool {
 		return true
 	}
 	return l.clasificadorActivo()
+}
+
+// sesionEsPasiva consulta el perfil de ESTA sesión con el DEFAULT FAIL-OPEN aplicado (Plan 046 · T2.2):
+// sin predicado cableado —o sin session_id conocido— la respuesta es NO PASIVA, de modo que un arranque al
+// que le falte la opción se comporte exactamente como antes de esta tarea en vez de dejar sorda a media
+// flota en silencio (D-046.2).
+//
+// El session_id vacío merece su propia rama y no es paranoia: `NewListener` DESACTIVA la cola cuando llega
+// sin él (listener.go, «cableado incompleto»), así que es un estado alcanzable de verdad. Consultar el mapa
+// con la cadena vacía no encontraría nada y daría el mismo resultado, pero por casualidad; aquí queda dicho.
+//
+// Se llama UNA VEZ por entrante y no se cachea: el perfil cambia en caliente (ver el campo sesionPasiva).
+func (l *Listener) sesionEsPasiva() bool {
+	if l.sesionPasiva == nil || l.sessionID == "" {
+		return false
+	}
+	return l.sesionPasiva(l.sessionID)
 }
 
 // colaMetaPayload son los metadatos de negocio que acompañan a la fila. Es lo que el despachador (Ola 3)

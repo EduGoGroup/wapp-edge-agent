@@ -82,6 +82,40 @@ type sessionHealthView struct {
 	// publicados en la nube. Sumarlos aquí desharía la única distinción que el operador necesita.
 	FailedSealDispatch int64 `json:"failed_seal_dispatch"`
 	FailedSealBudget   int64 `json:"failed_seal_budget"`
+
+	// ── Plan 046 Ola 2 · T2.3 · el contador del filtro de PRIVACIDAD (REQ-11) ──
+	//
+	// 🔴 SIN omitempty, por el mismo criterio que `intent_omitted_by_reason`: un cero es un DATO («esta
+	// sesión no está descartando nada») y un hueco obliga al que lee a preguntarse si el mecanismo existe.
+	// Y aquí pesa el doble, porque el filtro de la sesión pasiva es SILENCIOSO por diseño —no deja fila, no
+	// sube al cable y acusa igual que si hubiera entregado—: este número es la ÚNICA prueba de que existe.
+	//
+	// 🔴 LEER CON `DroppedByWindow` AL LADO. El corte por perfil pasivo ocurre ANTES de la ventana temporal
+	// del ADR-0037, así que un entrante de una pasiva que además venía fuera de ventana se cuenta AQUÍ y
+	// deja de contarse allí. Una caída de los descartes por ventana puede significar «hay más sesiones
+	// pasivas», no «el Edge ingiere mejor».
+	//
+	// ⚠️ SE REINICIA CON EL PROCESO —y el núcleo se relanza solo desde T5.4 del Plan 051—: un 0 recién
+	// arrancado significa «este proceso acaba de nacer», no «no descartó nada». `daemon_uptime_s`, en esta
+	// misma vista, es el campo con el que se distingue.
+	//
+	// ⚠️ ES DE ESTE PROCESO Y DE ESTA SESIÓN. No hay agregado en `despacho`: ese bloque es del despachador.
+	DroppedPassive uint64 `json:"dropped_passive"`
+
+	// FiltersVersion es la versión del MAPA DE PERFILES con la que este Edge está filtrando (D-046.2). Va
+	// pegado a `dropped_passive` porque las dos cifras solo significan algo JUNTAS: la de arriba dice cuánto
+	// se cortó, ésta dice CON QUÉ MAPA se decidió cortarlo.
+	//
+	// 🔴 ES DEL EDGE, NO DE LA SESIÓN, igual que `binary_version` y `daemon_uptime_s`, que ya viven en esta
+	// misma vista por la misma razón: quien mira una sesión necesita el contexto del proceso sin tener que
+	// correlacionar dos lecturas.
+	//
+	// 🔴 ES EL CAMPO QUE HACE DIAGNOSTICABLE EL MAPA RETRASADO. Si un push viejo gana la carrera de escritura,
+	// el Edge levanta tras el reinicio filtrando con una versión anterior a la que la consola cree haber
+	// empujado — sin error, sin log y sin métrica. La única forma de verlo es comparar este número con el que
+	// la nube dice tener. Sin omitempty: un `filters_version: 0` es un DATO («este Edge no tiene mapa: nadie
+	// es pasiva»), y es justo el valor que hay que poder ver.
+	FiltersVersion int64 `json:"filters_version"`
 }
 
 // despachoView es el bloque de DAEMON del desglose: el mismo juego de contadores, agregado sobre las
@@ -133,6 +167,11 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 					StuckHeadPolls:        hr.StuckHeadPolls,
 					FailedSealDispatch:    hr.FailedSealDispatch,
 					FailedSealBudget:      hr.FailedSealBudget,
+					// Plan 046 · T2.3: el contador del filtro de la sesión pasiva, tal cual llega del Report.
+					// Sin condicional y sin omitempty: el cero se publica.
+					DroppedPassive: hr.DroppedByPassiveProfile,
+					// Plan 046 · Ola 2: y con QUÉ MAPA se filtró. Las dos van juntas o ninguna sirve.
+					FiltersVersion: hr.FiltersVersion,
 				}
 			}
 		}
