@@ -280,6 +280,23 @@ th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--bord
 th { color: var(--muted); font-weight: 600; }
 td { word-break: break-all; }
 
+/* Aviso de sesión pasiva (Plan 046 · T3.2): caja destacada bajo el éxito del emparejamiento.
+   white-space: pre-wrap respeta los saltos del literal AVISO_SESION_PASIVA_V1 sin meter marcado
+   en el texto (contrato §4 del runbook: texto plano; el énfasis son sus MAYÚSCULAS). */
+.passive-notice {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--wapp-color-brand-primary);
+  border-radius: 8px;
+  background: var(--wapp-color-brand-container);
+  color: var(--wapp-color-brand-on-container);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.95em;
+  line-height: 1.45;
+}
+
 .qr-wrap { margin-top: 8px; display: flex; justify-content: center; }
 .qr-wrap img { width: 256px; height: 256px; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 8px; background: #fff; padding: 8px; }
 

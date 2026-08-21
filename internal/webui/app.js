@@ -15,6 +15,8 @@
 //   DELETE /v1/sessions/{id} -> 200 {jid,unlinked,previous_state?,remote_logout} | 404    (server/unlink.go)
 //   GET    /v1/logs          -> SSE; cada evento `data: <línea de log>`                    (logsink/handler.go)
 //
+//   GET    /v1/ui/aviso-sesion-pasiva -> {id,texto} literal AVISO_SESION_PASIVA_V1       (cmd/wapp-ctl/main.go)
+//
 // NOTA (honestidad): /v1/logs es el log GLOBAL del daemon, no filtrado por sesión (ver index.html).
 
 "use strict";
@@ -35,6 +37,7 @@ const el = {
   pairStatus: $("pair-status"),
   pairQrWrap: $("pair-qr-wrap"),
   pairQr: $("pair-qr"),
+  pairPassiveNotice: $("pair-passive-notice"),
   logsState: $("logs-state"),
   logs: $("logs"),
   // Onboarding / enrolar (Plan 023 · T1) + secciones del dashboard (para conmutar la vista).
@@ -513,6 +516,7 @@ async function startPairing() {
   el.pairStatus.textContent = "Generando código QR…";
   el.pairStatus.className = "detail";
   el.pairQrWrap.classList.add("hidden");
+  el.pairPassiveNotice.classList.add("hidden"); // un nuevo intento retira el aviso del anterior
   ui.lastQr = "";
 
   try {
@@ -567,6 +571,7 @@ function pollPairing(id) {
         if (data.qr) showQr(data.qr); // refresca solo si el QR cambió (ver showQr)
       } else if (data.status === "success") {
         finishPairing("Emparejado correctamente.", true);
+        showPassiveNotice(); // Plan 046 · T3.2 (a): la sesión nació PASIVA; avisar al dueño
         refreshSessions();
       } else if (data.status === "error") {
         finishPairing("Error de emparejamiento: " + (data.error || "desconocido"), false);
@@ -575,6 +580,25 @@ function pollPairing(id) {
       finishPairing("Error consultando el emparejamiento: " + err.message, false);
     }
   }, 2000);
+}
+
+// showPassiveNotice pinta el aviso de sesión pasiva tras un emparejamiento con éxito (Plan 046 ·
+// T3.2 mitad (a)). El literal NO vive en este fichero: es AVISO_SESION_PASIVA_V1, fuente única en
+// la constante Go webui.AvisoSesionPasiva, servida por GET /v1/ui/aviso-sesion-pasiva (wapp-ctl).
+// Se inyecta con textContent (nunca innerHTML): el contrato exige texto plano sin marcado, y los
+// saltos de línea los respeta el CSS (.passive-notice, white-space: pre-wrap).
+async function showPassiveNotice() {
+  try {
+    const res = await fetch("/v1/ui/aviso-sesion-pasiva", { cache: "no-store" });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json(); // {id, texto}
+    el.pairPassiveNotice.textContent = data.texto;
+  } catch (err) {
+    // Sin copia local del literal (divergiría del contrato): si no se pudo cargar, se dice.
+    el.pairPassiveNotice.textContent =
+      "La sesión nació en perfil pasiva, pero no se pudo cargar el aviso completo: " + err.message;
+  }
+  el.pairPassiveNotice.classList.remove("hidden");
 }
 
 // showQr pinta el data-URL en la <img> solo si cambió, para no parpadear en cada poll.
