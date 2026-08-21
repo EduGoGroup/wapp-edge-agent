@@ -36,7 +36,8 @@ package latencia
 // por sesión del listener —el que no publicaba nadie— pese a llamarse casi igual. Comparten prefijo y no
 // comparten nada: quien busque «InboundStats» en la config y deduzca que aquello se publica, deducirá mal.
 //
-// 🔴 INV-051.1: aquí no entra nada derivado del contenido. Dos cardinalidades.
+// 🔴 INV-051.1: aquí no entra nada derivado del contenido. Tres cardinalidades (el Plan 046 · T2.3 sumó la
+// tercera: los descartes por perfil pasivo).
 
 import "sync/atomic"
 
@@ -54,6 +55,30 @@ type PuertaStats struct {
 	// valor > 0 aquí es un DEFECTO, no una condición de campo, y confundirlo con lo de arriba borraría esa
 	// diferencia justo cuando importa.
 	EnqueuePanics uint64
+	// DescartesPasivos son los entrantes que la puerta descartó por venir a una sesión con PERFIL PASIVO
+	// (Plan 046 · Ola 2 · T2.3, REQ-07/REQ-11). Es el TERCER contador de la puerta y el primero que NO es
+	// una degradación: los dos de arriba son cosas que van mal; este es la configuración funcionando.
+	//
+	// 🔴 SE PUBLICA IGUAL, Y POR LA RAZÓN CONTRARIA A LAS OTRAS DOS. El descarte por perfil pasivo no deja
+	// fila, no sube al cable y ACUSA a WhatsApp exactamente igual que si hubiera entregado: para cualquier
+	// observador externo es indistinguible de «a esa sesión no le escribió nadie». Este número es la única
+	// prueba de que el filtro existe y de cuánto corta — y, por tanto, la única forma de ver un filtro roto
+	// (0 con tráfico) o un filtro que corta de más (sube en una sesión que debería estar activa).
+	//
+	// 🔴 LEER JUNTO A `n_descartes` Y AL ACUMULADO POR VENTANA. El corte pasivo vive en el paso 1.5 del
+	// handler, ANTES de la ventana temporal del ADR-0037, así que un entrante de una pasiva que además venía
+	// fuera de ventana se cuenta AQUÍ y deja de contarse como descarte por ventana. Consecuencia práctica:
+	// una CAÍDA de los descartes por ventana puede no significar «el Edge ingiere mejor» sino «hay más
+	// sesiones pasivas». Los dos números solo se interpretan a la vez.
+	//
+	// ⚠️ ES DEL EDGE ENTERO, no de una sesión (misma decisión que los dos de arriba: la línea tiene que ser
+	// de forma fija). Para saber QUÉ sesión está callada hay que ir a `GET /v1/health`, donde el mismo
+	// contador sale por sesión como `dropped_passive`.
+	//
+	// ⚠️ VIVE EN MEMORIA Y MUERE CON EL PROCESO, que desde T5.4 del Plan 051 se relanza solo. Un 0 recién
+	// arrancado no dice «no descartó nada»: dice «este proceso acaba de nacer». `uptime_s` va en la misma
+	// línea justamente para poder distinguirlo.
+	DescartesPasivos uint64
 }
 
 // Puerta lleva los contadores de degradación de la puerta de entrada, COMPARTIDOS por todas las sesiones
@@ -65,8 +90,9 @@ type PuertaStats struct {
 // Todos sus métodos son nil-safe, por el mismo criterio que el histograma: un instrumento de medida no
 // puede ser jamás la causa de que se caiga la escucha.
 type Puerta struct {
-	enqueueErrors atomic.Uint64
-	enqueuePanics atomic.Uint64
+	enqueueErrors    atomic.Uint64
+	enqueuePanics    atomic.Uint64
+	descartesPasivos atomic.Uint64
 }
 
 // AnotaEnqueueError suma un entrante que no dejó fila por error del Enqueue. Corre en el hilo de
@@ -86,7 +112,18 @@ func (p *Puerta) AnotaEnqueuePanic() {
 	p.enqueuePanics.Add(1)
 }
 
-// Snapshot devuelve la foto acumulada. Las dos lecturas NO son atómicas ENTRE SÍ: se puede leer un error
+// AnotaDescartePasivo suma un entrante descartado en la puerta por PERFIL PASIVO de su sesión (Plan 046 ·
+// T2.3). Corre en el hilo de whatsmeow, igual que sus dos hermanas: un solo atomic.Add, sin locks ni
+// asignaciones. Nil-safe por el mismo criterio que el resto (un instrumento de medida jamás puede ser la
+// causa de que se caiga la escucha).
+func (p *Puerta) AnotaDescartePasivo() {
+	if p == nil {
+		return
+	}
+	p.descartesPasivos.Add(1)
+}
+
+// Snapshot devuelve la foto acumulada. Las tres lecturas NO son atómicas ENTRE SÍ: se puede leer un error
 // contado y su pánico hermano aún no, si el snapshot cae justo en medio. Es aceptable y deliberado —son
 // series independientes que se leen cada minuto para decidir si hay que ir a mirar, no un balance que
 // tenga que cuadrar— y montar un candado para esto metería contención en el camino caliente a cambio de
@@ -96,7 +133,8 @@ func (p *Puerta) Snapshot() PuertaStats {
 		return PuertaStats{}
 	}
 	return PuertaStats{
-		EnqueueErrors: p.enqueueErrors.Load(),
-		EnqueuePanics: p.enqueuePanics.Load(),
+		EnqueueErrors:    p.enqueueErrors.Load(),
+		EnqueuePanics:    p.enqueuePanics.Load(),
+		DescartesPasivos: p.descartesPasivos.Load(),
 	}
 }

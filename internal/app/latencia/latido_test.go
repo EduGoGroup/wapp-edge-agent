@@ -140,12 +140,19 @@ func correrLatido(t *testing.T, d Deps, vida time.Duration) {
 // dos casos producen una línea idéntica en todo lo demás, así que sin este campo un p99 de una tanda de
 // prueba es indistinguible de un p99 de producción — y el criterio que se juzga con esta línea (INV-051.2)
 // es sobre el camino de producción.
+//
+// `descartes_perfil_pasivo` (Plan 046 · T2.3) entró como TERCER contador de la puerta, y es el único que no
+// habla de una degradación: son los entrantes cortados por venir a una sesión con perfil PASIVO. Está en la
+// lista por dos razones — es la ÚNICA huella de un filtro que por diseño no deja fila, no sube al cable y
+// acusa igual que si hubiera entregado; y porque LE QUITA CUENTA a los descartes por ventana (el corte va
+// antes del ADR-0037), así que sin él una caída de aquella serie se lee como una mejora del Edge cuando lo
+// que ha pasado es que hay más sesiones calladas.
 var camposObligatorios = []string{
 	"emision", "despachador", "inyector", "ventana_ms", "uptime_s",
 	"n", "p50_ms", "p95_ms", "p99_ms", "p99_bucket",
 	"n_descartes", "p99_ms_descartes",
 	"n_acum", "p99_ms_acum", "max_ms_acum",
-	"cola_enqueue_errores", "cola_enqueue_panics",
+	"cola_enqueue_errores", "cola_enqueue_panics", "descartes_perfil_pasivo",
 	"cola_pendientes", "cola_nuevo", "cola_tomado", "cola_clasificado", "conteo_ms",
 }
 

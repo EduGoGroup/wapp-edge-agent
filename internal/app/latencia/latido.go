@@ -198,7 +198,8 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 	args = append(args, percentil(encAcum, 0.99, "p99_ms_acum", "")...)
 	args = append(args, "max_ms_acum", encAcum.MaxMS())
 
-	// LA PUERTA DE ENTRADA (T1.13). Van SIEMPRE, incluso en cero, y por dos motivos distintos:
+	// LA PUERTA DE ENTRADA (T1.13, ampliada por el Plan 046 · T2.3). Van SIEMPRE, incluso en cero, y por dos
+	// motivos distintos:
 	//
 	//   - un cero explícito es un DATO («no se ha degradado nada en toda la vida del proceso») y un campo
 	//     ausente es una DUDA («¿no pasó nada, o dejó de mirarse?»). Es el mismo criterio que `n` y
@@ -208,16 +209,32 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 	//     dependen del COUNT ni de que el adaptador respalde el lado contador. Un Edge cuya cola no sepa
 	//     contar sigue teniendo derecho a ver si está reofreciendo mensajes.
 	//
-	// `d.Hist` no puede ser nil aquí (Latido retorna antes si lo es), así que estos dos campos no tienen
+	// `d.Hist` no puede ser nil aquí (Latido retorna antes si lo es), así que estos TRES campos no tienen
 	// ninguna condición que los pueda dejar fuera de la línea.
 	//
 	// ⚠️ `cola_enqueue_errores` NO CUENTA MENSAJES PERDIDOS desde T1.13: cuenta mensajes que WhatsApp
 	// tendrá que REOFRECER, porque lo que no deja fila tampoco se acusa. Sube = el Edge está reintentando.
 	// `cola_enqueue_panics` es otra cosa: cualquier valor > 0 ahí es un defecto, no una condición de campo.
+	//
+	// `descartes_perfil_pasivo` (Plan 046 · T2.3) es el TERCERO y el único que NO es una degradación: son
+	// los entrantes cortados en la puerta por venir a una sesión con perfil PASIVO (REQ-07), o sea la
+	// configuración funcionando. Va aquí y no en otro tramo porque se llena desde el mismo sitio y con el
+	// mismo instrumento; y va SIEMPRE, en cero incluido, por el mismo criterio que sus dos vecinos.
+	//
+	// 🔴 EL AVISO QUE NO SE PUEDE OMITIR: este contador LE QUITA CUENTA A LOS DESCARTES POR VENTANA. El
+	// corte pasivo está en el paso 1.5 del handler, ANTES de la ventana del ADR-0037, así que un entrante de
+	// una pasiva que además venía fuera de ventana se cuenta aquí y ya no allí. Quien vea bajar los
+	// descartes por ventana sin leer este campo concluirá «el Edge ingiere mejor» cuando lo que pasa es que
+	// hay más sesiones pasivas. Los dos números se leen a la vez o no se leen.
+	//
+	// ⚠️ Y ES DEL EDGE, NO DE UNA SESIÓN: para saber CUÁL está callada, `GET /v1/health` publica el mismo
+	// contador por sesión como `dropped_passive`. Los tres mueren con el proceso (que se relanza solo desde
+	// T5.4): un cero recién arrancado no dice «no pasó nada», dice «acabo de nacer» — `uptime_s` lo aclara.
 	puerta := d.Hist.Puerta().Snapshot()
 	args = append(args,
 		"cola_enqueue_errores", puerta.EnqueueErrors,
 		"cola_enqueue_panics", puerta.EnqueuePanics,
+		"descartes_perfil_pasivo", puerta.DescartesPasivos,
 	)
 
 	if d.Cola != nil {

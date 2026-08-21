@@ -49,6 +49,7 @@ import (
 	wm "go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types/events"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-shared/logger"
 )
@@ -91,6 +92,14 @@ type InboundStats struct {
 	Brackets uint64
 	// DroppedByWindow son los entrantes descartados por caer fuera de la ventana temporal. Es EL contador
 	// del criterio.
+	//
+	// ⚠️ LO QUE MIDE SE ESTRECHÓ CON EL PLAN 046 · T2.2, y leerlo con la definición vieja lleva a la
+	// conclusión CONTRARIA. El filtro de la sesión PASIVA se evalúa en el paso 1.5 del handler, ANTES de la
+	// ventana, así que un entrante de una sesión pasiva que ADEMÁS venía fuera de ventana ya no llega hasta
+	// aquí: se cuenta en DroppedByPassiveProfile y DESAPARECE de este contador. Para la sesión pasiva da
+	// igual por qué se descarta —se descarta todo—, pero para quien mira la métrica no da igual en absoluto:
+	// una CAÍDA de este número puede significar «hay más sesiones pasivas», no «el Edge está ingiriendo
+	// mejor». Este contador mide, desde entonces, «entrantes de sesiones ACTIVAS caídos fuera de ventana».
 	DroppedByWindow uint64
 	// DroppedSelf son los ECOS PROPIOS descartados (IsFromMe). No es del ADR-0037: es el filtro aprobado
 	// aparte para dejar de subir a la nube lo que mandamos nosotros mismos.
@@ -98,6 +107,22 @@ type InboundStats struct {
 	// AdmittedNoTimestamp son los entrantes ADMITIDOS por no traer hora utilizable (t="0"). Se cuentan
 	// porque son el punto ciego del criterio: si crecen, la ventana está dejando pasar a ojos cerrados.
 	AdmittedNoTimestamp uint64
+	// DroppedByPassiveProfile son los entrantes descartados en la puerta por pertenecer a una sesión con
+	// perfil PASIVO (Plan 046 · Ola 2 · T2.2, REQ-07). No es del ADR-0037: es el filtro de PRIVACIDAD que
+	// cumple «se descartan en el Edge, nada local».
+	//
+	// 🔴 ES LA ÚNICA PRUEBA DE QUE EL FILTRO EXISTE. Un descarte que no deja fila, no deja log (va en Debug)
+	// y no deja acuse distinguible es indistinguible de «esa sesión no recibió nada»: sin este contador,
+	// un filtro roto —o un filtro que corta de más— no se ve por ninguna parte.
+	//
+	// ✅ YA ESTÁ PUBLICADO (T2.3, y no en «una ola futura»): el MISMO incremento que llena este campo llena
+	// el acumulado del Edge (`latencia.Puerta`, que sale en el bloque del latido como
+	// `descartes_perfil_pasivo`) y el registro de salud por sesión (`health.Registry`, que sale en
+	// `GET /v1/health` como `dropped_passive` y en el bundle de diagnóstico). Ver `countPassiveDrop`.
+	//
+	// ⚠️ LE QUITA CUENTA A `DroppedByWindow` (ver el aviso de aquel campo): el corte pasivo va ANTES de la
+	// ventana, así que lo que se suma aquí deja de sumarse allí.
+	DroppedByPassiveProfile uint64
 	// ColaEnqueueErrors son los entrantes que NO pudieron anotarse en la cola durable porque Enqueue
 	// devolvió error (Plan 051 · INV-051.3). Se cuenta aparte del panic porque distinguir "la cola dijo
 	// que no" de "la cola explotó" es la diferencia entre un disco lleno o una DEK ausente y un bug del
@@ -182,15 +207,64 @@ type bracketObserver struct {
 
 	stats InboundStats
 
-	// puerta son los MISMOS dos contadores de degradación, pero COMPARTIDOS por todas las sesiones del
+	// ultimoGritoPasivo es cuándo se emitió la última línea de resumen del filtro de sesión pasiva
+	// (Plan 046 · T2.3). Cero ⇒ aún ninguna, y la primera sale en el acto: ver countPassiveDrop.
+	ultimoGritoPasivo time.Time
+
+	// puerta son los MISMOS contadores de degradación, pero COMPARTIDOS por todas las sesiones del
 	// Edge (T1.13): lo de arriba es de esta sesión y no lo publica nadie; esto es lo que sale en el bloque
 	// del latido. nil ⇒ no se comparte (listeners de test sin cronómetro cableado).
 	//
-	// 🔴 SE ESCRIBEN LOS DOS DESDE EL MISMO SITIO, y esa es toda la gracia: si el incremento compartido
+	// 🔴 SE ESCRIBEN TODOS DESDE EL MISMO SITIO, y esa es toda la gracia: si el incremento compartido
 	// viviera en el listener, al lado de la llamada a estos métodos, serían DOS puntos que alguien tiene
 	// que acordarse de tocar a la vez. Aquí el método es uno y no hay nada que recordar.
 	puerta *latencia.Puerta
+
+	// salud es el registro de salud de ESTA sesión (Plan 031 T6), y es la TERCERA boca del mismo
+	// incremento (Plan 046 · T2.3): por ella el contador de descartes pasivos llega a `GET /v1/health` como
+	// `dropped_passive` y al bundle de diagnóstico.
+	//
+	// 🔴 VIVE AQUÍ Y NO EN EL LISTENER POR LA MISMA RAZÓN QUE `puerta`, y esta vez el precio de no hacerlo
+	// era mayor: son ya TRES destinos (acumulado por sesión, acumulado del Edge y salud por sesión) y
+	// repartirlos entre el llamante y el contador garantizaría que un día se incrementen dos y no el
+	// tercero — que es exactamente el modo de fallo que hace inútil a un contador de observabilidad, porque
+	// las dos cifras discrepantes no delatan cuál miente.
+	//
+	// Es la MISMA instancia que `Listener.reporter`: la cablea `Listener.SetHealthReporter`, en una sola
+	// línea, para que no puedan divergir. nil ⇒ no se reporta salud (tests sin registro), como siempre.
+	//
+	// 🔴 VIVE BAJO `mu` COMO EL RESTO DEL STRUCT, y no es formalismo. Lo ESCRIBE el cableado del ciclo de
+	// escucha (`SetHealthReporter`, en la goroutine del sessionmgr) y lo LEE `countPassiveDrop`, en el hilo de
+	// whatsmeow. Hoy hay un happens-before real —el setter corre antes de `Register`, que es quien engancha el
+	// handler— así que el bug no puede darse; pero es exactamente el patrón que `-race` delata bajo el daemon
+	// real en cuanto una reconexión recablee el reporter con el listener anterior aún drenando eventos, y un
+	// `-race` rojo intermitente en el gate cuesta más de depurar que este candado. Se cierra en vez de
+	// documentarse como seguro: la lectura ya está dentro de una sección crítica que se paga igual.
+	salud health.SessionReporter
 }
+
+// setSalud cablea el registro de salud de la sesión BAJO EL CANDADO del observador (ver el campo `salud`).
+// Lo llama Listener.SetHealthReporter, que es el único escritor.
+func (b *bracketObserver) setSalud(r health.SessionReporter) {
+	b.mu.Lock()
+	b.salud = r
+	b.mu.Unlock()
+}
+
+// passiveDropLogCooldown es cada cuánto, COMO MUCHO, el filtro de sesión pasiva escribe su línea de resumen
+// (Plan 046 · T2.3).
+//
+// 🔴 POR QUÉ HAY THROTTLE Y NO UNA LÍNEA POR MENSAJE. Una sesión pasiva no es un caso raro: es una sesión
+// que descarta TODO su tráfico, así que «una línea por descarte» es una línea por mensaje a ritmo de socket,
+// para siempre, en el fichero que el operador lee con `grep | tail`. Ese fue el motivo de que T2.2 pusiera
+// su línea por-mensaje en Debug — donde en campo no se ve—, y por eso hace falta ESTA, en Info y acotada.
+//
+// 🔴 POR QUÉ 5 MINUTOS Y NO MENOS. La pregunta que responde esta línea no es «¿cuántos van?» —para eso está
+// el contador, que se lee en `/v1/health` y en el latido— sino «¿esta sesión está callada A PROPÓSITO?», y
+// esa pregunta se contesta igual de bien cada cinco minutos que cada dos segundos. Coincide además con el
+// orden de magnitud del bloque del latido (1 min por defecto), así que las dos señales se leen juntas sin
+// que una ahogue a la otra.
+const passiveDropLogCooldown = 5 * time.Minute
 
 func newBracketObserver(log logger.Logger) *bracketObserver { return &bracketObserver{log: log} }
 
@@ -285,6 +359,71 @@ func (b *bracketObserver) countSelfDrop() {
 	b.mu.Lock()
 	b.stats.DroppedSelf++
 	b.mu.Unlock()
+}
+
+// msgPasivaResumen es el PREFIJO DE GREP de la línea de resumen del filtro de sesión pasiva, y es contrato
+// con el runbook igual que `msgLatido`: cambiarlo deja mudo al operador que sigue el procedimiento escrito.
+// Se declara como constante porque el test afirma sobre ella y una cadena suelta en dos sitios es una
+// divergencia esperando a ocurrir.
+const msgPasivaResumen = "listener: sesión pasiva — entrantes descartados en la puerta (Plan 046, REQ-07)"
+
+// countPassiveDrop contabiliza un entrante descartado por perfil PASIVO de la sesión (Plan 046 · T2.2) y lo
+// PUBLICA por las tres bocas que tiene (T2.3). Es el ÚNICO sitio del repo donde este hecho se registra.
+//
+// LAS TRES BOCAS, y qué pregunta contesta cada una:
+//
+//	b.stats  → el acumulado por sesión (`Listener.InboundStats`). Es el que leen los tests del corte.
+//	b.puerta → el acumulado del EDGE, que sale en el bloque del latido como `descartes_perfil_pasivo`.
+//	           Contesta «¿está pasando, y cuánto?» en la línea que el operador ya lee con grep.
+//	b.salud  → el registro de salud POR SESIÓN, que sale en `GET /v1/health` como `dropped_passive` (y en
+//	           el bundle de diagnóstico). Contesta «¿a QUIÉN?», que la línea de forma fija no puede.
+//
+// 🔴 LOS TRES SE ESCRIBEN AQUÍ, y esa es toda la gracia (misma lección que `countColaEnqueueError`): tres
+// incrementos repartidos entre el llamante y el contador serían tres puntos que alguien tiene que acordarse
+// de tocar a la vez, y el día que se toquen dos de tres las cifras discrepantes no delatarán cuál miente.
+//
+// 🔑 Y ES LA LECCIÓN DE T1.13 DEL PLAN 051 APLICADA ANTES DE QUE DUELA: `Listener.InboundStats()` tuvo once
+// llamantes durante una ola entera y los once eran tests — los números vivían en memoria por sesión y morían
+// con el proceso. Este contador NACE publicado; no hay una ola futura que se ocupe de ello.
+//
+// ⚠️ Y HEREDA SU TRAMPA: los tres acumulados VIVEN EN MEMORIA y se reinician con el proceso, que desde T5.4
+// del Plan 051 se relanza solo. Un `dropped_passive: 0` tras un reinicio no significa «no descartó nada»:
+// significa «este proceso acaba de nacer». Se lee con `daemon_uptime_s`/`uptime_s` al lado.
+//
+// NO se imputa a la reconciliación del corchete (a diferencia de countWindowDrop): el corchete reconcilia
+// «lo que el servidor anunció en la ráfaga contra lo que la VENTANA descartó», y meter aquí un descarte de
+// otro criterio haría que esa resta dejara de cuadrar. Son dos preguntas distintas.
+//
+// LA LÍNEA DE LOG es de RESUMEN y va THROTTLED (ver passiveDropLogCooldown): la primera sale en el acto —es
+// la prueba de que el filtro se activó— y a partir de ahí como mucho una por ventana, con el acumulado. Su
+// único dato es una CARDINALIDAD; el `session_id` lo arrastra el logger de la sesión (sessionmgr/listen.go).
+// INV-6/ADR-0034: ni el JID del remitente, ni su número, ni una runa del texto.
+func (b *bracketObserver) countPassiveDrop() {
+	b.mu.Lock()
+	b.stats.DroppedByPassiveProfile++
+	n := b.stats.DroppedByPassiveProfile
+	ahora := time.Now()
+	gritar := b.ultimoGritoPasivo.IsZero() || ahora.Sub(b.ultimoGritoPasivo) >= passiveDropLogCooldown
+	if gritar {
+		b.ultimoGritoPasivo = ahora
+	}
+	// El reporter se LEE aquí dentro y se USA fuera. Leerlo bajo el candado es lo que lo empareja con
+	// `setSalud` (ver el campo `salud`); llamarlo fuera es lo que impide que un registro de salud lento ate
+	// el mutex del camino caliente. La copia local es el puente entre las dos cosas.
+	salud := b.salud
+	b.mu.Unlock()
+
+	// Los dos acumulados COMPARTIDOS, fuera del candado a propósito: uno es un atómico y el otro tiene su
+	// propio mutex, y ninguno de los dos tiene nada que hacer dentro del mutex del camino caliente. Ambos
+	// son nil-safe (`*latencia.Puerta` por método; la interfaz de salud, por la guarda de abajo).
+	b.puerta.AnotaDescartePasivo()
+	if salud != nil {
+		salud.CountPassiveDrop()
+	}
+
+	if gritar {
+		b.log.Info(msgPasivaResumen, "descartados", n, "enfriamiento", passiveDropLogCooldown.String())
+	}
 }
 
 // countNoTimestamp contabiliza un entrante ADMITIDO por no traer hora utilizable.

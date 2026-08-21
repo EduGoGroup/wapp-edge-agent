@@ -63,6 +63,25 @@ type Snapshot struct {
 	// T7 deriva la EDAD (now - LastInboundAt) al armar el heartbeat: una edad creciente con socket "connected"
 	// es la firma del arranque mudo (§1 del runbook).
 	LastInboundAt time.Time
+
+	// DroppedByPassiveProfile es cuántos entrantes ha descartado LA PUERTA de esta sesión por tener PERFIL
+	// PASIVO (Plan 046 · Ola 2 · T2.3, REQ-07/REQ-11). Es una cardinalidad, sin PII: no dice de quién ni
+	// qué, solo cuántos.
+	//
+	// 🔴 ES LA ÚNICA PRUEBA DE QUE EL FILTRO EXISTE. Un descarte que no deja fila, no sube al cable y no
+	// deja acuse distinguible es indistinguible de «esa sesión no recibió nada»: sin este número, un filtro
+	// roto —o un filtro que corta de más— no se ve por ninguna parte. Por eso el contador viaja hasta aquí
+	// en vez de quedarse en el acumulado por sesión del listener (`whatsmeow.InboundStats`), que hasta el
+	// Plan 051 · T1.13 no tenía un solo llamante de producción.
+	//
+	// ⚠️ VIVE EN MEMORIA Y SE REINICIA CON EL PROCESO, y desde T5.4 del Plan 051 el núcleo SE RELANZA SOLO.
+	// Un 0 después de un reinicio NO significa «no descartó nada»: significa «este proceso acaba de nacer».
+	// Se lee como una serie que sube, no como un total histórico.
+	//
+	// ⚠️ Y SE VA CON LA SESIÓN: `Remove` borra la entrada al desvincular, así que el contador vuelve a 0 si
+	// la sesión se re-empareja. Es coherente con el resto del Snapshot (es salud de una sesión VIVA), pero
+	// hay que saberlo antes de restarle dos lecturas.
+	DroppedByPassiveProfile uint64
 }
 
 // sessionHealth es el estado mutable por sesión, protegido por el mutex del Registry.
@@ -71,6 +90,12 @@ type sessionHealth struct {
 	reason      string
 	dekDuration time.Duration
 	lastInbound time.Time
+	// droppedPassive es el acumulado de descartes por PERFIL PASIVO de esta sesión (Plan 046 · T2.3). Va
+	// bajo el MISMO mutex que el resto y no como atómico suelto: quien lo escribe es el hilo de whatsmeow —
+	// una vez por entrante descartado, que en una sesión pasiva con tráfico es a ritmo de socket— y quien lo
+	// lee es el colector, una vez por latido. La contención real es la del `entry()` que ya se paga, y un
+	// atómico aquí obligaría a sacar el campo del Snapshot coherente que este tipo promete.
+	droppedPassive uint64
 }
 
 // Registry es el registro vivo de salud por session_id (Plan 031 T6). Thread-safe: lo pueblan varias
@@ -137,6 +162,27 @@ func (r *Registry) MarkInbound(id string, at time.Time) {
 	r.mu.Unlock()
 }
 
+// CountPassiveDrop suma UN entrante descartado en la puerta por PERFIL PASIVO de la sesión id (Plan 046 ·
+// Ola 2 · T2.3). Lo llama el listener, en el hilo de whatsmeow, desde el MISMO sitio donde incrementa su
+// acumulado por sesión (whatsmeow.bracketObserver.countPassiveDrop): dos puntos de incremento separados
+// serían dos cosas que alguien tiene que acordarse de tocar a la vez, y una de las dos se quedaría atrás.
+//
+// Crea la entrada si no existe, igual que el resto de setters. En el camino real ya existe —onMessage llama
+// a MarkInbound ANTES de filtrar, para TODO mensaje— así que esta rama no cambia qué sesiones enumera
+// SessionIDs(); se documenta porque un cableado que llamara aquí sin haber reportado nunca salud haría
+// aparecer la sesión en GET /v1/health con el resto de campos a cero.
+//
+// Nil-safe (los tests sin registro cableado operan sin ramificaciones). No lleva PII: es una cardinalidad.
+func (r *Registry) CountPassiveDrop(id string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	sh := r.entry(id)
+	sh.droppedPassive++
+	r.mu.Unlock()
+}
+
 // Snapshot devuelve la foto de salud de la sesión id (ok=false si no hay entrada). Nil-safe. Lo consume T7
 // para armar el heartbeat y el plano de control para GET /v1/health.
 func (r *Registry) Snapshot(id string) (Snapshot, bool) {
@@ -150,10 +196,11 @@ func (r *Registry) Snapshot(id string) (Snapshot, bool) {
 		return Snapshot{}, false
 	}
 	snap := Snapshot{
-		SocketState:     sh.state,
-		DegradedReason:  sh.reason,
-		DEKLoadDuration: sh.dekDuration,
-		LastInboundAt:   sh.lastInbound,
+		SocketState:             sh.state,
+		DegradedReason:          sh.reason,
+		DEKLoadDuration:         sh.dekDuration,
+		LastInboundAt:           sh.lastInbound,
+		DroppedByPassiveProfile: sh.droppedPassive,
 	}
 	r.mu.RUnlock()
 	return snap, true
@@ -198,6 +245,13 @@ type SessionReporter interface {
 	SetDEKLoadDuration(d time.Duration)
 	// MarkInbound sella el instante del último evento entrante de esta sesión.
 	MarkInbound(at time.Time)
+	// CountPassiveDrop suma un entrante descartado en la puerta por PERFIL PASIVO (Plan 046 · T2.3).
+	//
+	// Está en ESTA interfaz —y no en un puerto nuevo— porque es exactamente el mismo tipo de dato que
+	// MarkInbound: una señal por-sesión que nace en el hilo de whatsmeow, no lleva PII y sale por las mismas
+	// dos bocas (el heartbeat y GET /v1/health). Un puerto propio habría duplicado el cableado del factory
+	// del sessionmgr para transportar un entero.
+	CountPassiveDrop()
 }
 
 // For liga el Registry a una sesión concreta y devuelve su SessionReporter. Nil-safe: un *Registry nil
@@ -218,3 +272,4 @@ func (b boundReporter) SetSocketState(state SocketState, reason string) {
 }
 func (b boundReporter) SetDEKLoadDuration(d time.Duration) { b.reg.SetDEKLoadDuration(b.id, d) }
 func (b boundReporter) MarkInbound(at time.Time)           { b.reg.MarkInbound(b.id, at) }
+func (b boundReporter) CountPassiveDrop()                  { b.reg.CountPassiveDrop(b.id) }
