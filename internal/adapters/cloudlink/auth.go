@@ -14,6 +14,7 @@ import (
 	"time"
 
 	cloudlinkv1 "github.com/EduGoGroup/wapp-cloudlink/gen/wapp/cloudlink/v1"
+	cltransport "github.com/EduGoGroup/wapp-cloudlink/transport"
 	edgeauth "github.com/EduGoGroup/wapp-edge-agent/internal/auth"
 	"github.com/google/uuid"
 )
@@ -27,7 +28,12 @@ import (
 // WhatsApp. Un id de control fijo resuelve ambas cosas: es estable, existe siempre, y como la respuesta se
 // correlaciona por command_id en el pre-switch del demux (handleUserAuthResponse), el Edge no necesita que
 // este id esté registrado como sesión de WhatsApp en su propio Registry.
-const controlSessionID = "__wapp_control__"
+//
+// 🔴 EL VALOR YA NO SE ESCRIBE AQUÍ (MP-11, 2026-08-21): vive en el módulo del CONTRATO, porque la nube
+// también tiene que reconocerlo —para NO persistirlo como sesión de flota— y dos literales que nada ata
+// habrían divergido sin dar error, reapareciendo la fila fantasma en silencio. Este alias se conserva para
+// no tocar los llamantes y porque el nombre local dice el papel que cumple EN EL EDGE: estamparlo.
+const controlSessionID = cltransport.ControlSessionID
 
 // authRelayTimeout acota la espera de la respuesta de auth cuando el contexto del llamador no trae deadline
 // propio, para que un stream vivo pero mudo no cuelgue el endpoint /v1/auth indefinidamente.
