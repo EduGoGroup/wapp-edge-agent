@@ -2,7 +2,6 @@ package sessionmgr
 
 import (
 	"context"
-	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/despachador"
@@ -31,8 +30,9 @@ import (
 // en frío, en vez de tolerarlo hasta la primera vuelta del bucle de una sesión viva.
 
 // WithColaDespachador inyecta el lado DESPACHADOR de la cola durable (Plan 051 Ola 3): con él, cada sesión
-// arranca —junto a su listener— el bucle que drena su cola y entrega al cable en orden de `seq`, con el
-// presupuesto de espera al cajero acotado por WithPresupuestoIntent.
+// arranca —junto a su listener— el bucle que drena su cola y entrega al cable en orden de `seq`, SIN
+// retener nada (el presupuesto de espera al cajero y su `WithPresupuestoIntent` murieron en T1.6-5,
+// ADR-0045).
 //
 // En producción lo cablea el daemon desde wiring.BuildColaDespachador (el MISMO *Store que respalda
 // WithColaEntrantes; son dos caras del mismo adaptador, no dos colas). nil se IGNORA.
@@ -69,21 +69,6 @@ func WithDespachadorApagado(apagado bool) Option {
 	return func(m *Manager) {
 		if apagado {
 			m.despachadorApagado = true
-		}
-	}
-}
-
-// WithPresupuestoIntent fija cuánto RETIENE el despachador la cabeza de una sesión esperando a que el
-// cajero la clasifique, antes de entregarla igual sin intención (WAPP_AGENT_INTENT_WAIT_MS, 4000 ms por
-// defecto). Es el techo de latencia que la cola añade al camino de un mensaje.
-//
-// Un valor <= 0 se IGNORA (no desactiva nada): manda el default del propio despachador. Un presupuesto de
-// 0 no significaría «no esperes», significaría «despacha sin intención SIEMPRE», que apaga el clasificador
-// entero por la puerta de atrás y sin decirlo.
-func WithPresupuestoIntent(d time.Duration) Option {
-	return func(m *Manager) {
-		if d > 0 {
-			m.presupuestoIntent = d
 		}
 	}
 }
@@ -141,8 +126,7 @@ func (m *Manager) startDespachador(ctx context.Context, s *liveSession) {
 		SessionID: sid,
 		// s.log ya arrastra session_id/jid: la traza del drenado sale etiquetada por sesión, igual que la
 		// de la carga de DEK.
-		Log:         s.log,
-		Presupuesto: m.presupuestoIntent,
+		Log: s.log,
 	})
 	if err != nil {
 		// Error y no fatal: la sesión queda escuchando y ENCOLANDO, pero sin drenar. Nada se pierde —las
@@ -259,16 +243,19 @@ func (m *Manager) DespachoStatsVivas() health.DespachoStats {
 			continue
 		}
 		st := statsDe(d)
-		// Se suma CADA MOTIVO CON SU HOMÓNIMO y nunca entre motivos distintos (INV-051.3): `fastlane` es el
-		// camino sano, `presupuesto` y `breaker` son fallos. Sumar el mismo motivo entre sesiones sí es
-		// legítimo — es la misma pregunta hecha al Edge entero.
+		// Se suma CADA MOTIVO CON SU HOMÓNIMO y nunca entre motivos distintos (INV-051.3): `fastlane` era el
+		// camino sano, `presupuesto` y `breaker` eran fallos, y agregarlos deja un número que no responde
+		// ninguna pregunta. Sumar el mismo motivo entre sesiones sí es legítimo — es la misma pregunta hecha
+		// al Edge entero. (Bajo pull ninguno de los ocho tiene productor vivo: sólo se mueven al drenar
+		// filas antiguas. Ver app.MotivoOmitido.)
 		for motivo, n := range st.OmitidosPorMotivo {
 			total.OmitidosPorMotivo[motivo] += n
 		}
 		total.CabezasAtascadas += st.CabezasAtascadas
 		total.PollsCabezaAtascada += st.PollsCabezaAtascada
-		// Los dos sellos, sumados cada uno POR SEPARADO y sin ningún «total» que los junte (T3.12): sólo el
-		// de despacho implica duplicados en la nube.
+		// Se suman TODOS los campos, incluidos los tres que hoy sólo pueden valer 0 (ver `statsDe`): el
+		// agregado no debe saber cuáles tienen productor vivo. El día que uno vuelva a moverse, esto ya
+		// funciona.
 		total.FallosSelloDespacho += st.FallosSelloDespacho
 		total.FallosSelloPresupuesto += st.FallosSelloPresupuesto
 	}
@@ -286,10 +273,12 @@ func statsDe(d *despachador.Despachador) health.DespachoStats {
 	for motivo, n := range d.OmitidosPorMotivo() {
 		st.OmitidosPorMotivo[string(motivo)] = n
 	}
-	st.CabezasAtascadas = d.CabezasAtascadas()
-	st.PollsCabezaAtascada = d.PollsCabezaAtascada()
 	st.FallosSelloDespacho = d.FallosSelloDespacho()
-	st.FallosSelloPresupuesto = d.FallosSelloPresupuesto()
+	// 🔴 `CabezasAtascadas`, `PollsCabezaAtascada` y `FallosSelloPresupuesto` NO SE ASIGNAN, y no es un
+	// olvido: sus productores murieron con el push (T1.6-5, ADR-0045) y el despachador ya no expone
+	// accesor para ellos. Se quedan en el 0 que puso `DespachoStatsCero()`, que es la verdad. Los campos
+	// siguen aquí porque son campos de PROTO (`stuck_heads`, `stuck_head_polls`, `failed_seal_budget`) y
+	// retirarlos es un cambio de contrato que no es de esta tarea. Ver health.DespachoStats.
 	return st
 }
 

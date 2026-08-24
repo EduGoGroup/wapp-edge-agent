@@ -47,89 +47,183 @@ type ColaItem struct {
 	// Meta son los metadatos de negocio del mensaje en JSON (push_name, …). Se sella igual que Texto
 	// (INV-051.1); puede ser nil (columna NULL).
 	Meta []byte
-	// IntentJSON es la clasificación ya resuelta. El listener la trae rellena solo cuando el fastlane
-	// (regex, µs) atrapó el mensaje al nacer; "" ⇒ NULL en la columna, y el cajero la rellenará.
+	// IntentJSON es la columna `intent_json` de la fila.
+	//
+	// 🔴 EL LISTENER YA NO LA RELLENA NUNCA (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045). Bajo pull el Edge no
+	// clasifica, así que no hay ni intención que anotar ni omisión que justificar al nacer la fila: se
+	// encola siempre "" ⇒ NULL. El campo sobrevive porque el Enqueue lo sigue escribiendo (a NULL) y
+	// porque la columna sigue teniendo que LEERSE para drenar las colas escritas por binarios anteriores.
 	IntentJSON string
-	// Estado es el estado inicial de la fila: EstadoNuevo, o EstadoClasificado si el fastlane ya resolvió
-	// el intent (el cajero nunca la reclama). Los otros dos estados son transiciones del worker/despachador.
+	// Estado es el estado inicial de la fila. Hoy es SIEMPRE EstadoNuevo: el ciclo quedó en
+	// `nuevo → tomado → despachado` (ADR-0045 §Decisión.4) y el atajo por el que una fila podía NACER ya
+	// resuelta murió con el push.
 	Estado string
 }
 
 // Estados de una fila de la cola (etiquetas estables; se persisten literales en la columna `estado`).
-// El ciclo normal es nuevo → tomado → clasificado → despachado; el fastlane atajaba naciendo en
-// clasificado. Un barrido devuelve a "nuevo" las filas cuyo lease ("tomado") venció, y la poda por TTL
-// borra las "despachado".
+// El ciclo es **nuevo → tomado → despachado** (ADR-0045 §Decisión.4). Un barrido devuelve a "nuevo" las
+// filas cuyo lease ("tomado") venció, y la poda por TTL borra las "despachado".
+//
+// 🔴 ERAN CUATRO HASTA EL PLAN 044 · Ola 1.6 · T1.6-5 (2026-08-24). El cuarto era `clasificado` —«con
+// intent resuelto, lista para entregarse»— y lo disolvió el paso de PUSH a PULL: si el Edge no clasifica,
+// no hay un momento en la vida de una fila en el que esté «ya clasificada». Hoy el despachador entrega
+// CUALQUIER cabeza que no esté `despachado`, sin mirar su estado, así que una fila vieja marcada
+// `clasificado` en el disco de un cliente se drena sola por el camino normal — por eso el retiro no
+// necesitó migración de la cola.
 const (
-	// EstadoNuevo: recién anotada por el listener, pendiente de que el cajero la reclame.
+	// EstadoNuevo: recién anotada por el listener. Es el estado en el que NACEN todas las filas.
 	EstadoNuevo = "nuevo"
-	// EstadoTomado: reclamada por el cajero (lease vivo). Si el lease vence, vuelve a EstadoNuevo.
+	// EstadoTomado: reclamada con el claim por fencing (ADR-0038, conservado íntegro por el ADR-0045 §4).
+	// Si el lease vence, vuelve a EstadoNuevo.
+	//
+	// ⚠️ `tomado` NO ES UN DERECHO DE RETENCIÓN SOBRE LA ENTREGA, y nunca lo fue: el despachador entrega
+	// una cabeza `tomado` igual que cualquier otra. El claim protege que dos procesos no cierren el mismo
+	// lote, no que nadie más mire la fila.
 	EstadoTomado = "tomado"
-	// EstadoClasificado: con intent RESUELTO —por el cajero, por el fastlane del listener, o por el
-	// PRESUPUESTO VENCIDO del despachador (que escribe un sobre de omisión, no un intent)— y por tanto
-	// lista para entregarse. Es el único estado desde el que se sella `despachado`.
-	EstadoClasificado = "clasificado"
-	// EstadoDespachado: ya entregada al despachador (cloudlink/outbox); solo espera la poda por TTL.
+	// EstadoDespachado: ya entregada al despachador (cloudlink/outbox); solo espera la poda por TTL. Es el
+	// ÚNICO estado terminal, y el único que el despachador excluye al buscar cabeza.
 	EstadoDespachado = "despachado"
+
+	// EstadoClasificado salió del CICLO el 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045
+	// §Decisión.4): significaba «con intent resuelto, lista para entregarse» y era el único estado desde
+	// el que el despachador entregaba. Hoy el despachador entrega cualquier cabeza que no esté
+	// `despachado`, así que este estado ya no gobierna nada.
+	//
+	// ─────────────────────────────────────────────────────────────────────────────
+	// EL VALOR SE CONSERVA POR DOS RAZONES DISTINTAS, Y SÓLO LA SEGUNDA ES PARA SIEMPRE
+	// ─────────────────────────────────────────────────────────────────────────────
+	//
+	//  (1) ✅ RESUELTA EL 2026-08-24 POR T1.6-2 — YA NO HAY ESCRITOR. Esta entrada decía que
+	//      `Store.MarcarClasificado` (colaentrantes/claim.go) seguía escribiéndolo, porque el cajero
+	//      clasificaba por iniciativa propia «hasta que T1.6-2 le cambie el oficio a servir inferencia».
+	//      Eso ya ocurrió: el bucle del cajero dejó de reclamar y `MarcarClasificado` se quedó SIN UN SOLO
+	//      LLAMANTE en producción. El método y su fencing se CONSERVAN —siguen en el puerto app.ColaCajero
+	//      y en el Store— porque retirarlos es una amputación del adaptador con su propia migración, no un
+	//      efecto colateral de esta tarea; pero nadie los invoca, así que desde hoy NINGUNA fila nueva
+	//      nace con esta etiqueta.
+	//
+	//  (2) PERMANENTE — HAY FILAS YA PERSISTIDAS QUE HAY QUE PODER DECODIFICAR. En las colas
+	//      (`<data_dir>/cola_entrantes.db`) de equipos de clientes hay filas escritas con esta etiqueta
+	//      por binarios anteriores, y el Edge tiene que seguir sabiendo LEERLAS mientras se vacían. Ésta
+	//      es la razón que impide borrar el valor NUNCA, y ahora que (1) está resuelta es la ÚNICA: es el precedente
+	//      exacto de `MotivoNoElegible`, que lleva huérfano desde T1.5-3 y sigue aquí por lo mismo.
+	//
+	// LOS DOS LECTORES QUE SEGUIRÁN VIVOS CUANDO (1) SE RESUELVA:
+	//
+	//   - `colaentrantes/pendientes.go` — el desglose por estado. Lo cuenta para poder VER vaciarse las
+	//     colas antiguas (ver ColaPendientes.Clasificado).
+	//   - `colaentrantes/colaentrantes.go` — la capa 2 del sacrificio por tope. Una fila vieja
+	//     `clasificado` es la primera candidata a descartarse bajo presión, exactamente como antes.
+	//
+	// Que el despachador las ENTREGUE lo custodian dos tests, uno por nivel: `TestCabezaClasificadaDeUn
+	// BinarioAnteriorSeEntrega` (bucle, internal/app/despachador) y
+	// `TestCircuitoFilaAntiguaClasificadaSeDrenaSeSellaYSePoda` (BD real, adapters/colaentrantes).
+	EstadoClasificado = "clasificado"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
 // El sobre `omitido` y su enum de MOTIVOS (Plan 051 Ola 2 · ADR-0038 §(e))
 // ─────────────────────────────────────────────────────────────────────────────
 
-// MotivoOmitido es la razón por la que una fila de la cola se despacha SIN intent. Se serializa en la
+// MotivoOmitido es la razón por la que una fila de la cola se despachó SIN intent. Se serializa en la
 // columna `intent_json` como el sobre `{"omitido":"<motivo>"}` — la OTRA forma del sobre, frente a
-// `{"intent":…,"params":…,"confidence":…,"config_version":…}` que escribe el cajero cuando sí clasifica.
+// `{"intent":…,"params":…,"confidence":…,"config_version":…}` que escribía el cajero cuando sí clasificaba.
 //
-// 🔴 EL SOBRE `omitido` NUNCA VIAJA AL CABLE. Muere en el Edge (ADR-0038 §(e), REQ-051.6, INV-051.3):
-// el proto no tiene dónde ponerlo (`ClassifiedIntent` solo lleva intent/params/confidence/
-// config_version) y el despachador, al ver un `omitido`, entrega el mensaje SIN `Intent` y punto. Lo
-// que sí sale del Edge es el CONTADOR por motivo, al heartbeat (Ola 4) — nunca agregado, porque
-// «se omitió» y «se omitió porque el breaker está abierto» son dos hechos operativos distintos.
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 LOS OCHO MOTIVOS ESTÁN HUÉRFANOS DESDE EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045).
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// LA DECISIÓN, ESCRITA AQUÍ PARA QUE NO SEA IMPLÍCITA. El ADR-0045 invirtió la clasificación de PUSH a
+// PULL: el Edge ya no clasifica por iniciativa propia y entrega cada entrante al instante; cuando el
+// Cloud necesita saber si un texto es una solicitud, la PIDE por el frame `inference_request`. Un motivo
+// de omisión responde a la pregunta «¿por qué esta fila sale SIN intención?», y esa pregunta sólo tiene
+// sentido si alguien iba a ponerle una. Bajo pull NADIE iba a ponérsela nunca ⇒ **ninguno de los ocho
+// tiene ya productor en el Edge**. Motivo a motivo, en la lista de abajo, está anotado quién lo escribía.
+//
+// ⚠️ SE CONSIDERÓ —Y SE DESCARTÓ— la hipótesis de que los motivos «de puerta» (`sin_texto`, `apagado`)
+// sobrevivieran «porque deciden si se encola». NO deciden eso: **todos los entrantes se encolan y se
+// entregan igual**, sin texto y con la feature apagada incluidos. Lo que decidían era el ESTADO en que
+// NACÍA la fila (`clasificado` en vez de `nuevo`), o sea si el cajero la reclamaba — y eso es una
+// pregunta del push, no de la puerta. Confundir «no se encola» con «el cajero no la toca» habría dejado
+// dos ramas vivas escribiendo sobres que nadie volvería a mirar.
+//
+// 🔴 Y AUN ASÍ NO SE BORRA NI UN VALOR DEL ENUM. Hay filas en discos de clientes y en la nube con estas
+// marcas ya persistidas, y el despachador tiene que poder DECODIFICARLAS mientras esas colas se vacían.
+// Es el precedente exacto de `no_elegible` (huérfano desde T1.5-3 y conservado por lo mismo), sólo que
+// ahora aplica a los ocho. Un valor retirado del enum convierte una fila vieja en un sobre ilegible: se
+// perdería el desglose justo en el tramo en que sirve para vigilar la migración.
+//
+// 🔴 EL SOBRE `omitido` NUNCA VIAJÓ AL CABLE, y sigue sin viajar (ADR-0038 §(e), REQ-051.6, INV-051.3).
+// Lo que sí sale del Edge es el CONTADOR por motivo, al heartbeat — nunca agregado, porque «se omitió» y
+// «se omitió porque el breaker está abierto» son dos hechos operativos distintos.
 //
 // POR QUÉ VIVE AQUÍ, LOCAL AL EDGE, Y NO EN `wapp-shared` (decisión del 2026-08-16, tasks.md:701-710):
 // un vocabulario que por diseño nunca cruza el cable no gana nada viviendo en el módulo compartido, y
 // a cambio impondría un release por cada motivo nuevo. Precedente en casa: `DegradedReason`
 // (health/registry.go:38) es un enum de motivos que SÍ cruza a la nube y aun así vive en el Edge.
 //
-// LA REGLA: si añades un motivo, añádelo a la lista `motivosOmitido` de abajo. Ese slice es la lista
-// canónica —la que cuenta la Ola 4 y la que documenta el ADR— y `SobreOmitido` deriva de él, así que
-// un motivo que no esté en la lista no tiene sobre y el test lo caza.
+// LA REGLA SIGUE EN PIE: si algún día vuelve a haber un motivo, se añade a la lista `motivosOmitido` de
+// abajo. Ese slice es la lista canónica —la que cuenta la telemetría y la que documenta el ADR— y
+// `SobreOmitido` deriva de él, así que un motivo que no esté en la lista no tiene sobre y el test lo caza.
 type MotivoOmitido string
 
-// Los OCHO motivos. Fueron siete hasta el 2026-08-16 y cada añadido tiene su causa de campo:
-// `sin_texto` entró en T1.8 porque `classifier.FastLane("")` devuelve true y hacía pasar por `fastlane`
-// todo mensaje NO textual (imagen, audio, sticker, ubicación) —una mentira en la telemetría, no un
-// detalle—, y `fallo_repetido` entró en T2.19 porque un lote que siempre falla congelaba la cola entera.
+// Los OCHO motivos. Fueron siete hasta el 2026-08-16 y cada añadido tuvo su causa de campo: `sin_texto`
+// entró en T1.8 porque `classifier.FastLane("")` devuelve true y hacía pasar por `fastlane` todo mensaje
+// NO textual (imagen, audio, sticker, ubicación) —una mentira en la telemetría, no un detalle—, y
+// `fallo_repetido` entró en T2.19 porque un lote que siempre falla congelaba la cola entera.
+//
+// Cada uno lleva anotado, en su propio comentario, DESDE CUÁNDO nadie lo escribe y POR QUÉ.
 const (
-	// MotivoFastlane: el regex del fastlane resolvió el intent en µs; el cajero nunca reclama la fila.
-	// Lo escribe el LISTENER, al nacer la fila (Ola 1, T1.8).
+	// MotivoFastlane: el regex del fastlane resolvió el intent en µs; el cajero nunca reclamaba la fila.
+	// Lo escribía el LISTENER, al nacer la fila (Ola 1, T1.8).
+	//
+	// 🔴 HUÉRFANO DESDE EL 2026-08-24 (ADR-0045). El carril rápido no desaparece: CAMBIA DE SEDE. Bajo
+	// pull la pregunta «¿hace falta el LLM para esto?» se la hace quien va a llamar al LLM, y eso es el
+	// motor de flujos del Cloud (ADR-0044 §1.B). Un fastlane en el Edge sólo podía ahorrar una inferencia
+	// que el Edge ya no decide lanzar.
 	MotivoFastlane MotivoOmitido = "fastlane"
 	// MotivoSinTexto: el mensaje no tiene cuerpo textual que clasificar (imagen, audio, sticker,
-	// ubicación). Lo escribe el LISTENER, y se comprueba ANTES que el fastlane (ver arriba); y, como
-	// DEFENSA EN PROFUNDIDAD, también el CAJERO (Ola 2), cuando un lote le llega sin texto que concatenar.
-	// El cajero no debería ver nunca ese caso —el listener lo corta en T1.8—, así que si lo ve es por un
-	// bug de ese corte o por un descifrado que devolvió cadena vacía; el motivo es el mismo porque el
-	// hecho es el mismo (no había qué clasificar), y así el contador de la Ola 4 no se parte en dos.
+	// ubicación). Lo escribían el LISTENER (T1.8) y, como defensa en profundidad, el CAJERO (Ola 2).
+	//
+	// 🔴 HUÉRFANO DESDE EL 2026-08-24 (ADR-0045) EN EL LADO DEL LISTENER. ⚠️ Y NO ES UNA PUERTA: un
+	// mensaje sin texto se encola y se entrega EXACTAMENTE IGUAL que uno con texto —una imagen es un
+	// entrante de pleno derecho y la nube la quiere—; lo único que este motivo decidía era que el cajero
+	// no gastara una plaza del semáforo en una fila que no tenía nada que clasificar. Sin cajero que
+	// clasifique, no queda nada que decidir.
 	MotivoSinTexto MotivoOmitido = "sin_texto"
 	// MotivoNoElegible: el mensaje no cumple las condiciones de elegibilidad del clasificador — venir de un
 	// GRUPO.
 	//
-	// 🔴 HISTÓRICO DESDE EL PLAN 044 · Ola 1.5 · T1.5-3 (REQ-36/D-044.30): YA NO LO ESCRIBE NADIE. Este era
-	// el motivo del tráfico de grupos, y desde T1.5-3 un entrante de grupo se DESCARTA en la puerta del
-	// listener (paso 5 de `onMessage`) sin dejar fila, así que no hay fila nueva que marcar. El valor se
-	// conserva —y sigue en la lista canónica— porque hay filas ANTIGUAS con esta marca en la cola local y
-	// en la nube, y borrarlo del enum las volvería indecodificables. Si un día vuelve a haber un criterio
-	// de elegibilidad que no sea el grupo, este es su sitio; hasta entonces, un `no_elegible` en una fila
-	// NUEVA es un defecto, no una condición de campo.
+	// 🔴 HISTÓRICO DESDE EL PLAN 044 · Ola 1.5 · T1.5-3 (REQ-36/D-044.30) — el PRIMERO en quedarse
+	// huérfano, y el precedente que gobierna a los otros siete. Era el motivo del tráfico de grupos, y
+	// desde T1.5-3 un entrante de grupo se DESCARTA en la puerta del listener (paso 5 de `onMessage`) sin
+	// dejar fila, así que no hay fila nueva que marcar. El valor se conserva —y sigue en la lista
+	// canónica— porque hay filas ANTIGUAS con esta marca en la cola local y en la nube, y borrarlo del
+	// enum las volvería indecodificables.
 	MotivoNoElegible MotivoOmitido = "no_elegible"
-	// MotivoPresupuesto: el despachador agotó su presupuesto de espera (WAPP_AGENT_INTENT_WAIT_MS,
-	// 4000 ms) sin que el cajero llegara a clasificar. Lo escribe el DESPACHADOR (Ola 3).
+	// MotivoPresupuesto: el despachador agotó su presupuesto de espera (`WAPP_AGENT_INTENT_WAIT_MS`,
+	// 4000 ms) sin que el cajero llegara a clasificar. Lo escribía el DESPACHADOR (Ola 3).
+	//
+	// 🔴 EL ÚNICO DE LOS OCHO QUE MURIÓ POR BORRADO DEL MECANISMO, no por falta de trabajo: el 2026-08-24
+	// se retiró la espera entera (`correrPresupuesto`, la variable de entorno y su constante). No hay
+	// reloj que pueda vencer porque no hay reloj. Los otros siete siguen siendo escribibles en teoría; a
+	// éste no le queda ni el código.
 	MotivoPresupuesto MotivoOmitido = "presupuesto"
 	// MotivoBreaker: el circuit breaker del clasificador está abierto; ni siquiera se llamó a Ollama.
-	// Lo escribe el CAJERO (Ola 2, T2.4).
+	// Lo escribía el CAJERO (Ola 2, T2.4).
+	//
+	// 🔴 HUÉRFANO DESDE EL 2026-08-24 (ADR-0045), pero el BREAKER NO SE VA: pasa a guardar la inferencia
+	// que el Edge SIRVE al Cloud (ADR-0042 + ADR-0045 §Decisión.5). Lo que cambia es cómo se cuenta un
+	// breaker abierto: ya no es un sobre en una fila de la cola, sino el ERROR NOMBRADO `breaker_open` en
+	// la respuesta `inference_result`. La señal se conserva; cambia de canal.
 	MotivoBreaker MotivoOmitido = "breaker"
 	// MotivoDesconocido: se clasificó y el modelo devolvió la intención reservada «desconocido», o la
-	// confianza quedó por debajo del umbral. NO castiga al breaker: es una respuesta válida, no un fallo.
+	// confianza quedó por debajo del umbral. NO castigaba al breaker: es una respuesta válida, no un fallo.
+	// Lo escribía el CAJERO (vía LLM).
+	//
+	// 🔴 HUÉRFANO DESDE EL 2026-08-24 (ADR-0045): el umbral y el saneo de params los aplica ahora el
+	// CALLER del puerto, en el Cloud (ADR-0045 §Decisión.5), que es quien tiene el contrato de intenciones
+	// del tenant. El Edge devuelve JSON crudo y no juzga.
 	//
 	// 🔴 SE REFERENCIA, NO SE REDECLARA: el valor tiene dueño fuera de este repo
 	// (shared/wapp-shared/intents/intents.go:21, `ReservedUnknown`), y es el único del enum que lo tiene.
@@ -137,25 +231,36 @@ const (
 	// existe para impedir — el día que `wapp-shared` renombre la reservada, esto deja de compilar, que
 	// es justo lo que queremos que pase.
 	MotivoDesconocido MotivoOmitido = intents.ReservedUnknown
-	// MotivoApagado: la feature `llm_intent` está apagada para esta sesión/empresa (entitlement).
+	// MotivoApagado: la feature `llm_intent` está apagada para esta sesión/empresa (entitlement). Lo
+	// escribía el LISTENER, leyendo el interruptor local del clasificador.
+	//
+	// 🔴 HUÉRFANO DESDE EL 2026-08-24 (ADR-0045). ⚠️ El ENTITLEMENT sigue vivo y sigue mandando; lo que
+	// muere es que se exprese como un sobre en una fila. Con la feature apagada, hoy, el entrante se
+	// encola y se entrega igual —siempre se entregó igual— y quien no pregunta por la intención es el
+	// Cloud. Cuando el Edge sirva inferencia (T1.6-2), el mismo interruptor decidirá si atiende o
+	// responde con un error nombrado.
 	MotivoApagado MotivoOmitido = "apagado"
 	// MotivoFalloRepetido: el lote AGOTÓ SUS INTENTOS de clasificación (ColaLote.Intentos llegó al tope
-	// WAPP_WORKER_MAX_INTENTOS) y se cierra SIN intent para que la cola pueda avanzar. Lo escribe el
+	// WAPP_WORKER_MAX_INTENTOS) y se cerraba SIN intent para que la cola pudiera avanzar. Lo escribía el
 	// CAJERO (Ola 2, T2.19).
 	//
-	// 🔴 EXISTE POR UN LOTE VENENOSO QUE CONGELABA LA COLA ENTERA, y el mecanismo es peor de lo que
-	// parece. Un fallo de inferencia NO cierra el lote a propósito (es un reintento gratis: ver el bloque
-	// «QUIÉN ESCRIBE app.MotivoBreaker» en cajero.bucle), así que las filas se quedan en `tomado` y el
-	// barrido de leases las devuelve a `nuevo` a los 60 s — SIN TOCAR SU `seq`. Y el claim elige siempre
-	// la conversación con el `seq` MÁS BAJO. Un lote cuyo texto siempre hace fallar la inferencia
-	// conserva su seq, vuelve a `nuevo` y se lo lleva OTRA VEZ el siguiente claim, para siempre. Con
-	// WAPP_WORKER_MAX_CONCURRENT=1 —el default— eso es la cola entera parada: ningún otro mensaje se
-	// clasifica jamás, y el único síntoma es el contador de fallos subiendo.
+	// 🔴 HUÉRFANO DESDE EL 2026-08-24 (ADR-0045): sin clasificación por iniciativa propia no hay lote que
+	// reintentar, así que no hay intentos que agotar. ⚠️ LA LECCIÓN QUE LO TRAJO SÍ SIGUE VIVA y hay que
+	// llevársela a la inferencia servida: un trabajo que siempre falla y que se reintenta sin tope
+	// congela la cola entera. Todo el párrafo de abajo es esa lección, y por eso no se resume.
 	//
-	// El reintento gratis sigue siendo lo correcto para un fallo TRANSITORIO (Ollama reiniciándose, un
+	// 🔴 EXISTIÓ POR UN LOTE VENENOSO QUE CONGELABA LA COLA ENTERA, y el mecanismo era peor de lo que
+	// parece. Un fallo de inferencia NO cerraba el lote a propósito (era un reintento gratis), así que las
+	// filas se quedaban en `tomado` y el barrido de leases las devolvía a `nuevo` a los 60 s — SIN TOCAR
+	// SU `seq`. Y el claim elige siempre la conversación con el `seq` MÁS BAJO. Un lote cuyo texto siempre
+	// hacía fallar la inferencia conservaba su seq, volvía a `nuevo` y se lo llevaba OTRA VEZ el siguiente
+	// claim, para siempre. Con WAPP_WORKER_MAX_CONCURRENT=1 —el default— eso era la cola entera parada:
+	// ningún otro mensaje se clasificaba jamás, y el único síntoma era el contador de fallos subiendo.
+	//
+	// El reintento gratis seguía siendo lo correcto para un fallo TRANSITORIO (Ollama reiniciándose, un
 	// pico de carga); lo que faltaba era distinguirlo de un fallo PERMANENTE. El contador de intentos es
-	// esa distinción, y este motivo es lo que se escribe cuando ya no hay duda: el mensaje sale igual,
-	// sin intent, que es el fallo seguro — se pierde una clasificación, nunca un mensaje.
+	// esa distinción, y este motivo es lo que se escribía cuando ya no había duda: el mensaje salía igual,
+	// sin intent, que es el fallo seguro — se perdía una clasificación, nunca un mensaje.
 	MotivoFalloRepetido MotivoOmitido = "fallo_repetido"
 )
 
@@ -429,9 +534,12 @@ type ColaCajero interface {
 // POR QUÉ ES UN TIPO PROPIO Y NO SE REUSA ColaMensaje: son dos preguntas distintas. ColaMensaje es una
 // fila de un LOTE ya reclamado (la unidad del cajero, que no necesita saber en qué estado está: acaba
 // de ponerla `tomado` él mismo). La cabeza es una fila SUELTA cuyo dato más importante es justo el que
-// a ColaMensaje le sobra: `Estado` —si está `clasificado` sale ya, y si sigue `nuevo`/`tomado` es que
-// el cajero aún no ha llegado y hay que correrle el presupuesto (T3.4)—. Meterle esos campos a
-// ColaMensaje ensuciaría el contrato del cajero con dos campos que él nunca mira.
+// a ColaMensaje le sobra: `Estado` e `IntentJSON`. Meterle esos campos a ColaMensaje ensuciaría el
+// contrato del cajero con dos campos que él nunca mira.
+//
+// ⚠️ DESDE T1.6-5 EL `Estado` YA NO DECIDE NADA en el despachador: entrega cualquier cabeza que la
+// consulta le devuelva (y la consulta ya excluye `despachado`). Se conserva porque es lo que se loguea
+// para diagnosticar una fila concreta, y porque el desglose de pendientes lo cuenta.
 type ColaCabeza struct {
 	// ID es la clave primaria: lo que se pasa a MarcarDespachada / DespacharSinIntent.
 	ID int64
@@ -444,14 +552,15 @@ type ColaCabeza struct {
 	// WAMessageID y TSWhatsApp son los identificadores de trazabilidad del mensaje de WhatsApp.
 	WAMessageID string
 	TSWhatsApp  int64
-	// Estado es el estado literal de la fila: EstadoNuevo, EstadoTomado o EstadoClasificado. Nunca
-	// EstadoDespachado (esas filas no son cabeza de nada: la consulta las excluye).
+	// Estado es el estado literal de la fila: EstadoNuevo o EstadoTomado en las filas nuevas, y el
+	// histórico `clasificado` en las que escribió un binario anterior a T1.6-5. Nunca EstadoDespachado
+	// (esas filas no son cabeza de nada: la consulta las excluye).
 	Estado string
-	// IntentJSON es el sobre persistido, o "" si la columna era NULL.
+	// IntentJSON es el sobre persistido, o "" si la columna era NULL. 🔴 En una fila nueva es SIEMPRE ""
+	// (bajo pull nadie escribe la columna); un valor aquí es una fila vieja drenándose.
 	IntentJSON string
-	// TieneIntent distingue "" de NULL, que NO son lo mismo (INV-051.3): NULL significa «esta fila aún
-	// no pasó por el cajero», nunca «se clasificó y no tenía intención». Es la diferencia entre esperar
-	// al worker y despachar sin intent.
+	// TieneIntent distingue "" de NULL, que NO son lo mismo (INV-051.3). Hoy sólo sirve para decidir si
+	// merece la pena intentar leer el sobre de una fila antigua.
 	TieneIntent bool
 	// Texto es el cuerpo del mensaje YA DESCIFRADO con la DEK de SessionID.
 	Texto string
@@ -475,35 +584,19 @@ type ColaDespachador interface {
 	// mismo criterio que ya sigue ColaCajero.Reclamar.
 	CabezaDeSesion(ctx context.Context, sessionID string) (*ColaCabeza, error)
 
-	// MarcarDespachada sella `estado='despachado'` + `despachado_en` sobre una fila que sigue
-	// `clasificado` (REQ-051.20). Es lo que des-inertiza el TTL de REQ-051.7: la poda solo borra filas
-	// `despachado` CON sello, y hasta esta ola nadie escribía ninguna de las dos cosas.
+	// MarcarDespachada sella `estado='despachado'` + `despachado_en` sobre una fila que NO estuviera ya
+	// sellada (REQ-051.20). Es lo que des-inertiza el TTL de REQ-051.7: la poda solo borra filas
+	// `despachado` CON sello.
 	//
-	// Si la fila ya NO está `clasificado`, la operación es no-op y NO es error: el despachador la
-	// releerá en el poll siguiente y decidirá otra vez con lo que haya en disco.
+	// 🔴 EL FENCE ES `estado <> 'despachado'`, NO UN ESTADO CONCRETO (T1.6-5). Hasta el 2026-08-24 exigía
+	// `estado = 'clasificado'`, que era el único estado desde el que se entregaba. Al disolverse ese
+	// estadio, un fence por igualdad habría dejado sin sellar TODO lo que ahora se entrega —es decir,
+	// todo—: la fila se re-entregaría en cada poll, para siempre, y la poda por TTL no podría tocarla
+	// nunca. El fence sigue existiendo y sigue siendo idempotente: sellar dos veces no reescribe el
+	// `despachado_en` de la primera.
+	//
+	// Si la fila ya estaba `despachado`, la operación es no-op y NO es error.
 	MarcarDespachada(ctx context.Context, id int64) error
-
-	// DespacharSinIntent escribe, en UNA sola sentencia, el sobre de omisión y pasa a `clasificado` una
-	// fila que sigue `nuevo` o `tomado`, soltando su claim (`tomado_en`/`claim_token` a NULL): es el
-	// camino del presupuesto vencido (T3.4), el que garantiza que un cajero atascado nunca detenga la
-	// entrega de un mensaje.
-	//
-	// 🔴 NO SELLA `despachado` NI `despachado_en` — el nombre engaña. Deja la fila LISTA PARA ENTREGARSE
-	// SIN INTENCIÓN, y quien la entrega y la sella es el despachador por su camino normal (la relee como
-	// `clasificado`, `EsOmitido` la reconoce, `evt.Intent` queda nil y `MarcarDespachada` cierra). Hasta
-	// el 2026-08-17 sellaba `despachado` aquí, y eso PERDÍA el mensaje: `CabezaDeSesion` excluye ese
-	// estado, así que la fila desaparecía del alcance del despachador antes de haber salido al cable.
-	// El orden correcto es el mismo que rige en MarcarDespachada: ENTREGA ANTES DE SELLO. Esto ENMIENDA
-	// la letra de REQ-051.19 (que decía `estado='despachado'`) conservando su intención.
-	//
-	// Si el cajero la cerró justo antes (la fila pasó a `clasificado` mientras corría el presupuesto),
-	// la operación es NO-OP SILENCIOSA y tampoco es error: el despachador la relee como `clasificado` y
-	// la entrega CON su intent, que es el desenlace bueno de esa carrera.
-	//
-	// motivo debe pertenecer a la lista canónica (ver MotivosOmitido): un motivo sin sobre se rechaza
-	// con error en vez de persistir un `intent_json` NULL, que en disco significaría lo contrario de lo
-	// que pasó («esta fila no pasó por el cajero»).
-	DespacharSinIntent(ctx context.Context, id int64, motivo MotivoOmitido) error
 }
 
 // ColaPendientes es el DESGLOSE POR ESTADO de lo que la cola tiene sin despachar. Son cardinalidades
@@ -518,7 +611,11 @@ type ColaPendientes struct {
 	Nuevo int64
 	// Tomado son las filas con un claim vivo (una inferencia en vuelo, o un lease por vencer).
 	Tomado int64
-	// Clasificado son las filas listas para que el despachador las entregue.
+	// Clasificado son filas HISTÓRICAS: el estadio `clasificado` se disolvió en T1.6-5 (ADR-0045) y
+	// ningún binario actual lo escribe. Se sigue contando aparte —en vez de dejarlo caer en el hueco
+	// entre `Total` y la suma— para poder VER vaciarse las colas escritas por binarios anteriores. Un
+	// número que baja hasta 0 y se queda ahí es la migración terminando; uno que sube es un escritor
+	// que no debería existir.
 	Clasificado int64
 	// Total son TODAS las filas con estado <> 'despachado'.
 	Total int64

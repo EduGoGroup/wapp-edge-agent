@@ -184,6 +184,26 @@ type Adapter struct {
 	pendingMu sync.Mutex
 	pending   map[string]bool
 
+	// inferencia es el puerto hacia el proveedor LOCAL de LLM (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045):
+	// lo implementa internal/adapters/inferenciacliente hablando por el socket unix del proceso `agent
+	// cajero`, que es el ÚNICO que puede hablar con Ollama (REQ-051.10). nil ⇒ un inference_request se
+	// responde OLLAMA_DOWN (que es la verdad: no hay proveedor alcanzable desde este proceso).
+	inferencia app.ServidorInferencia
+	// inferenciaMaxInflight son las inferencias que este Edge acepta atender A LA VEZ, y a la vez los
+	// workers del carril (WAPP_AGENT_INFERENCE_MAX_INFLIGHT). <=0 ⇒ defaultInferenceMaxInflight.
+	inferenciaMaxInflight int
+	// inferenciaLeaseGracia es cuánto espera el gate de lease de una inferencia a que alguna sesión se
+	// vuelva operable antes de rechazar (WAPP_AGENT_INFERENCE_LEASE_GRACIA_MS). Existe porque el Validator
+	// NACE CERRADO: ver defaultInferenceLeaseGracia. <=0 ⇒ el default.
+	inferenciaLeaseGracia time.Duration
+	// Contadores de la inferencia servida por el DAEMON (INV-051.3: por separado, nunca agregados). Aquí
+	// sólo viven los dos desenlaces que este proceso decide por sí mismo; los otros tres los cuenta el
+	// cajero, que es quien los produce (ver internal/app/cajero, «LOS CONTADORES DE LA INFERENCIA
+	// SERVIDA»). Partirlos así no es un descuido: cada contador vive donde está la información que lo
+	// explica, y sumarlos aquí obligaría a inventar un tubo de vuelta desde el cajero para un número.
+	inferenciasServidas atomic.Int64
+	errLeaseInvalido    atomic.Int64
+
 	mu       sync.Mutex
 	cl       *client.Client           // stream activo; nil mientras está desconectado
 	sessions map[string]*sessionEntry // registro multi-sesión por session_id
@@ -310,6 +330,37 @@ func WithOutboxDrainInterval(d time.Duration) Option {
 	}
 }
 
+// WithServidorInferencia cablea el proveedor LOCAL de LLM (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045): con
+// él, un `inference_request` del Cloud se sirve; sin él se responde OLLAMA_DOWN. nil se ignora.
+func WithServidorInferencia(s app.ServidorInferencia) Option {
+	return func(a *Adapter) {
+		if s != nil {
+			a.inferencia = s
+		}
+	}
+}
+
+// WithInferenciaMaxInflight fija cuántas inferencias atiende el Edge a la vez (y los workers del
+// carril). <=0 se ignora (conserva el default), para que un 0 en la config no deje el carril sin un solo
+// worker — que sería un Edge que rechaza TODA inferencia sin un error que lo delate.
+func WithInferenciaMaxInflight(n int) Option {
+	return func(a *Adapter) {
+		if n > 0 {
+			a.inferenciaMaxInflight = n
+		}
+	}
+}
+
+// WithInferenciaLeaseGracia fija la gracia del gate de lease de las inferencias (ver
+// defaultInferenceLeaseGracia: el Validator nace cerrado 0,5-1,1 s). <=0 se ignora.
+func WithInferenciaLeaseGracia(d time.Duration) Option {
+	return func(a *Adapter) {
+		if d > 0 {
+			a.inferenciaLeaseGracia = d
+		}
+	}
+}
+
 // NewAdapter construye el multiplexor CloudLink sobre una conexión gRPC ya establecida (cc).
 //   - newValidator: factory del Validator de lease POR SESIÓN (nil => gate de lease desactivado).
 //   - log: logger estructurado (nunca imprime DEK ni secretos).
@@ -320,19 +371,21 @@ func NewAdapter(cc grpc.ClientConnInterface, log logger.Logger, newValidator Val
 		log = logger.Default()
 	}
 	a := &Adapter{
-		cc:                  cc,
-		newValidator:        newValidator,
-		log:                 log,
-		hbInterval:          30 * time.Second,
-		baseDelay:           1 * time.Second,
-		maxDelay:            60 * time.Second,
-		cmdTimeout:          defaultCommandTimeout,
-		cmdQueueSize:        defaultCommandQueueSize,
-		outboxDrainInterval: defaultOutboxDrainInterval,
-		pending:             make(map[string]bool),
-		sessions:            make(map[string]*sessionEntry),
-		diagSeen:            make(map[string]struct{}),
-		authPending:         make(map[string]chan *cloudlinkv1.UserAuthResponse),
+		cc:                    cc,
+		newValidator:          newValidator,
+		log:                   log,
+		hbInterval:            30 * time.Second,
+		baseDelay:             1 * time.Second,
+		maxDelay:              60 * time.Second,
+		cmdTimeout:            defaultCommandTimeout,
+		cmdQueueSize:          defaultCommandQueueSize,
+		inferenciaMaxInflight: defaultInferenceMaxInflight,
+		inferenciaLeaseGracia: defaultInferenceLeaseGracia,
+		outboxDrainInterval:   defaultOutboxDrainInterval,
+		pending:               make(map[string]bool),
+		sessions:              make(map[string]*sessionEntry),
+		diagSeen:              make(map[string]struct{}),
+		authPending:           make(map[string]chan *cloudlinkv1.UserAuthResponse),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -400,6 +453,47 @@ func (a *Adapter) entry(sessionID string) *sessionEntry {
 	return a.sessions[sessionID]
 }
 
+// algunaSesionOperable responde la pregunta de ALCANCE DAEMON «¿este Edge está autorizado a operar
+// ahora mismo?», que es la que gatea la inferencia (Plan 044 · Ola 1.6 · T1.6-2). Devuelve dos cosas:
+//
+//   - hayGate: si ALGUNA sesión tiene Validator de lease. Con `false` no hay gate que aplicar (el Edge
+//     corre sin clave pública de lease, o todavía no ha registrado ninguna sesión) y el llamante debe
+//     dejar pasar — es el mismo criterio que `e.validator == nil` en handleSendText, y el mismo que
+//     distingue «no revocado» de «aún no existe».
+//   - operable: si al menos una de esas sesiones puede operar (CanOperate con su propio hasDEK).
+//
+// 🔴 «AL MENOS UNA» Y NO «TODAS», y la diferencia importa. Lo que este gate tiene que impedir es el
+// escenario del kill-switch: un clon del disco cuyo lease se REVOCÓ no puede seguir quemando el LLM del
+// dueño legítimo, y ahí TODAS las sesiones están revocadas a la vez (la revocación es del Edge, no de un
+// número). Exigir que todas puedan operar, en cambio, dejaría sin inferencia a un Edge sano por culpa de
+// UNA sesión que acaba de registrarse y aún no ha recibido su primer LeaseUpdate — convirtiendo cada alta
+// de teléfono en un corte del servicio de inferencia.
+//
+// Cada sesión aporta SU hasDEK, así que el gate sigue siendo el 2-de-2 del ADR-0007 por sesión; lo que
+// se agrega es el resultado, no las llaves.
+func (a *Adapter) algunaSesionOperable() (hayGate, operable bool) {
+	a.mu.Lock()
+	entradas := make([]*sessionEntry, 0, len(a.sessions))
+	for _, e := range a.sessions {
+		entradas = append(entradas, e)
+	}
+	a.mu.Unlock()
+
+	// CanOperate y hasDEK se llaman FUERA del lock del Adapter: hasDEK es un callback del wiring que
+	// puede tocar disco (custody.Exists), y sostener el mutex que protege el registro de sesiones
+	// mientras se hace I/O bloquearía Register/Unregister y, con ellos, el alta de un teléfono.
+	for _, e := range entradas {
+		if e.validator == nil {
+			continue
+		}
+		hayGate = true
+		if e.validator.CanOperate(e.hasDEK()) {
+			return true, true
+		}
+	}
+	return hayGate, false
+}
+
 // sessionSink implementa app.InboundSink para UNA sesión: etiqueta cada entrega con su session_id y la
 // escribe al único stream del Adapter (mux de salida).
 type sessionSink struct {
@@ -415,6 +509,13 @@ var _ app.InboundSink = (*sessionSink)(nil)
 // stream vivo o el envío falla, con outbox durable configurado (Plan 027 T2) el evento se ENCOLA y se
 // reenvía en orden al reconectar; sin outbox conserva el best-effort previo (se registra y descarta).
 // Devuelve nil siempre (nunca tumba el socket de WhatsApp).
+//
+// 🔴 YA NO SE ADJUNTA NINGUNA INTENCIÓN (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045 · D-044.31 · REQ-35).
+// Hasta el 2026-08-24 este método rellenaba `IncomingMessage.Intent` con lo que el Edge hubiera
+// clasificado — el modelo PUSH. El ADR-0045 lo invirtió: el Edge entrega y punto, y es el Cloud quien
+// PIDE la inferencia por `inference_request` cuando la necesita. El campo se retiró del proto (11 en
+// `IncomingMessage`, 5 en `SensitivePayload`, ambos `reserved`), así que hoy no hay ni dónde ponerla.
+// El SELLADO DE LOS DEMÁS SENSIBLES NO CAMBIA NI UN BYTE: sigue siendo el mismo `SealFor` de siempre.
 //
 // CIFRADO EN TRÁNSITO (Plan 011 §6.3/§10.E): si hay pública de cifrado de la nube (s.cloudEncPub),
 // los campos SENSIBLES (text/push_name/from_pn/from_lid) se serializan como un SensitivePayload proto,
@@ -435,7 +536,6 @@ func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error 
 		FromPn:         fromPN,
 		FromLid:        fromLID,
 		AddressingMode: evt.AddressingMode,
-		Intent:         classifiedIntentToProto(evt.Intent),
 	}
 	s.sealSensitive(in)
 	msg := &cloudlinkv1.EdgeToCloud{
@@ -461,9 +561,6 @@ func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
 		PushName: in.GetPushName(),
 		FromPn:   in.GetFromPn(),
 		FromLid:  in.GetFromLid(),
-		// La intención LLM (Plan 029) es SENSIBLE: sus params pueden llevar texto literal del cliente. Con
-		// sellado activo viaja DENTRO del sobre; el espejo claro (in.Intent) se vacía abajo.
-		Intent: in.GetIntent(),
 	}
 	raw, err := proto.Marshal(sp)
 	if err != nil {
@@ -477,22 +574,6 @@ func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
 	}
 	in.EncPayload = sealed
 	in.Text, in.PushName, in.FromPn, in.FromLid = "", "", "", "" // no viajan en claro
-	in.Intent = nil                                              // la intención va sellada, no en el espejo claro
-}
-
-// classifiedIntentToProto mapea la intención de dominio (Plan 029) al tipo del contrato CloudLink. Devuelve
-// nil si no hay intención (el caso normal: la mayoría de mensajes no clasifican), de modo que el campo del
-// proto queda vacío. Confidence pasa de float64 (dominio) a float32 (proto).
-func classifiedIntentToProto(ci *domain.ClassifiedIntent) *cloudlinkv1.ClassifiedIntent {
-	if ci == nil {
-		return nil
-	}
-	return &cloudlinkv1.ClassifiedIntent{
-		Intent:        ci.Name,
-		Params:        ci.Params,
-		Confidence:    float32(ci.Confidence),
-		ConfigVersion: ci.ConfigVersion,
-	}
 }
 
 // SendReceipt sube al cloud un ACUSE (delivered/read) de un mensaje SALIENTE por el ÚNICO stream del
@@ -647,6 +728,13 @@ func (a *Adapter) runOnce(ctx context.Context) (bool, error) {
 	disp := newCommandDispatcher(ctx, a, cl, a.cmdTimeout, a.cmdQueueSize)
 	defer disp.shutdown()
 
+	// CARRIL PROPIO PARA LA INFERENCIA (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045). Nace y muere con el
+	// stream, igual que el dispatcher. El porqué de que no pase por el dispatcher —su deadline de 30 s no
+	// cabe en una inferencia de 36 s, y el session_id vacío del frame las pondría a TODAS en la misma cola
+	// serial— está entero en el encabezado de inferencia.go.
+	inf := nuevoCarrilInferencia(ctx, a, cl, a.inferenciaMaxInflight)
+	defer inf.shutdown()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -654,6 +742,13 @@ func (a *Adapter) runOnce(ctx context.Context) (bool, error) {
 		case c2e, ok := <-cl.Received():
 			if !ok {
 				return true, errors.New("cloudlink: stream cerrado por el servidor")
+			}
+			// 🔴 EL DESVÍO VA ANTES DEL dispatch, no dentro de handleCommand: meterlo abajo significaría
+			// que la petición YA pasó por la cola serial de su session_id y por el deadline de 30 s del
+			// dispatcher, que son las dos cosas exactas que este carril existe para esquivar.
+			if c2e.GetInferenceRequest() != nil {
+				inf.despachar(c2e)
+				continue
 			}
 			disp.dispatch(c2e)
 		}

@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/cajero"
 )
 
 func writeTempYAML(t *testing.T, content string) string {
@@ -859,111 +861,116 @@ func TestLoad_WorkerDataDirs(t *testing.T) {
 	})
 }
 
-// TestLoad_InferenceTimeout_NoEsElPresupuestoDelDespachador es el arreglo de la calibración del worker,
-// aseverado.
+// TestLoad_InferenceTimeout_SigueVivoTrasElRetiroDelPush: el plazo de UNA inferencia
+// (WAPP_WORKER_INFERENCE_TIMEOUT_MS, 15 s) NO se fue con el push.
 //
-// El plazo de UNA inferencia del cajero (WAPP_WORKER_INFERENCE_TIMEOUT_MS, 15 s) y el presupuesto de
-// espera del DESPACHADOR (WAPP_AGENT_INTENT_WAIT_MS, 4 s) son dos números de dos caminos distintos, y
-// el segundo NO puede gobernar al primero: la O0 midió p95 = 3.736 ms, así que un plazo de 4 s aborta
-// buena parte de las inferencias del worker, abre el breaker y deja la cola dando vueltas sin
-// progresar. Este test vigila las TRES mitades del contrato: el default, que son números distintos, y
-// que mover el del despachador no mueve el del worker.
-//
-// (Antes este test miraba WAPP_AGENT_INTENT_TIMEOUT_MS, el plazo del camino inline; esa variable se
-// RETIRÓ en T3.1 y su sitio en el contrato lo ocupa ahora el presupuesto del despachador.)
-func TestLoad_InferenceTimeout_NoEsElPresupuestoDelDespachador(t *testing.T) {
-	if DefaultWorkerInferenceTimeoutMS == DefaultIntentWaitMS {
-		t.Fatal("el plazo del worker y el presupuesto del despachador NO pueden ser el mismo número")
+// Su gemelo —el presupuesto de espera del despachador, WAPP_AGENT_INTENT_WAIT_MS— se retiró en T1.6-5
+// con el ADR-0045, y el riesgo al retirarlo era arrastrar a éste por parecido de nombre. Son dos
+// caminos distintos y sólo uno murió: bajo pull el Edge deja de RETENER mensajes, pero sigue habiendo
+// una inferencia que acotar — la que el Edge SIRVE al Cloud (ADR-0045 §Decisión.2). El 15000 es ≈4× la
+// p95 medida en la O0 (3.736 ms) y se clava aquí porque bajarlo aborta inferencias y abre el breaker.
+func TestLoad_InferenceTimeout_SigueVivoTrasElRetiroDelPush(t *testing.T) {
+	// 🔧 ERA 15000 HASTA EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-2). Aquel número se eligió como «≈4× la
+	// p95 de la O0», y la O0 se midió CON EL VPS VACÍO; la muestra de campo que lo habría corregido está
+	// CENSURADA por el propio techo (máximo 15,6 s contra un techo de 15,0 s). El argumento entero, con la
+	// tabla de contención del VPS real que fija el 45.000, está en cajero.DefaultInferenceTimeoutMS.
+	if DefaultWorkerInferenceTimeoutMS != 45000 {
+		t.Fatalf("el default del worker es 45000 ms (cubre los máximos MEDIDOS en el VPS: 25,6 s / 36,5 s / "+
+			"45,6 s): got %d", DefaultWorkerInferenceTimeoutMS)
 	}
-	if DefaultWorkerInferenceTimeoutMS != 15000 {
-		t.Fatalf("el default del worker es 15000 ms (≈4× la p95 de la O0): got %d", DefaultWorkerInferenceTimeoutMS)
-	}
-
-	// Mover el del despachador no debe arrastrar al del worker.
-	t.Setenv(EnvPrefix+"INTENT_WAIT_MS", "1500")
 	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
 	if err != nil {
 		t.Fatalf("Load devolvió error inesperado: %v", err)
-	}
-	if cfg.Intent.WaitMS != 1500 {
-		t.Fatalf("el presupuesto del despachador debe ser configurable: got %d", cfg.Intent.WaitMS)
 	}
 	if cfg.Worker.InferenceTimeoutMS != DefaultWorkerInferenceTimeoutMS {
-		t.Fatalf("WAPP_AGENT_INTENT_WAIT_MS NO gobierna al worker: got %d, want %d",
+		t.Fatalf("plazo de inferencia por defecto: got %d, want %d",
 			cfg.Worker.InferenceTimeoutMS, DefaultWorkerInferenceTimeoutMS)
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// 🔴 LA RELACIÓN QUE EL NÚMERO TIENE QUE SOSTENER, Y QUE ES POR LO QUE SE MOVIÓ
+	// ─────────────────────────────────────────────────────────────────────────
+	// El plazo no es un número suelto: de él DERIVA el umbral de lentitud del breaker
+	// (cajero.FraccionLentitud, ADR-0042 · MP-09), y el MP-09 lo calibró para que ese umbral quedara a un
+	// factor ~4,6 del p50 SANO. Con el techo viejo (15 s ⇒ umbral 12 s) y el p50 REAL de campo (8,1 s) ese
+	// factor había caído a 1,48, y el p90 de campo —12,8 s— YA SUPERABA el umbral: más de una de cada diez
+	// inferencias sanas castigaba al breaker, justo lo contrario de lo que el MP-09 quería.
+	//
+	// Esto NO es tautológico: no compara una constante consigo misma, sino DOS constantes independientes
+	// (el plazo y la fracción) contra un TERCER número que no está en el código —el p50 medido en campo—.
+	// Si alguien mueve el plazo sin mirar, este test dice cuál es el criterio que rompió.
+	const p50DeCampoMS = 8100 // 430 inferencias en el VPS de UAT, 2026-08-23
+	umbralLentoMS := int(float64(DefaultWorkerInferenceTimeoutMS) * cajero.FraccionLentitud)
+	if factor := float64(umbralLentoMS) / p50DeCampoMS; factor < 4.0 {
+		t.Errorf("el umbral de lentitud (%d ms) queda a %.2fx del p50 de campo (%d ms); el MP-09 lo calibró "+
+			"a ~4,6x, y por debajo de 4x el criterio empieza a marcar como enfermo el tráfico SANO",
+			umbralLentoMS, factor, p50DeCampoMS)
 	}
 }
 
-// TestLoad_IntentWaitMS_Default: sin fichero ni entorno, el presupuesto de espera del despachador vale
-// 4000 ms. NO es un número redondo cualquiera: lo fijó la medición de la O0 en el VPS AMD real
-// (ADR-0038 Enmienda 1 §(d)). Con los 3000 que decía el ADR original y num_thread=4, el 55 % de los
-// mensajes se habría despachado SIN INTENT Y EN SILENCIO — un default que degrada la mitad del tráfico
-// sin un solo log no es un default, es un fallo. De ahí que el número se clave en un test.
-func TestLoad_IntentWaitMS_Default(t *testing.T) {
+// TestLoad_IntentWaitMS_YaNoSeLee vigila que la variable retirada NO gobierne nada (T1.6-5, ADR-0045).
+//
+// 🔴 POR QUÉ ESTE TEST NO ES REDUNDANTE CON EL AVISO DE VariablesRetiradas: aquél comprueba que el
+// operador se ENTERA; éste comprueba que la variable no COLARÍA un valor por ninguna puerta. Son dos
+// fallos distintos y el segundo es el silencioso — un `loader.GetInt` olvidado en Load seguiría leyendo
+// la variable hacia un campo que ya nadie usa, y nada se pondría rojo.
+//
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO: devolver el campo `WaitMS` a `IntentConfig` y su
+// `cfg.Intent.WaitMS = loader.GetInt("INTENT_WAIT_MS", …)` a Load ⇒ el tipo vuelve a tener el campo y
+// este test deja de compilar, que es la forma más ruidosa de fallar.
+func TestLoad_IntentWaitMS_YaNoSeLee(t *testing.T) {
 	t.Setenv(EnvPrefix+"DATA_DIR", t.TempDir()) // hermético: Load lee estado bajo data_dir
+	t.Setenv(EnvPrefix+"INTENT_WAIT_MS", "1234")
 
 	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
 	if err != nil {
 		t.Fatalf("Load devolvió error inesperado: %v", err)
 	}
-	if DefaultIntentWaitMS != 4000 {
-		t.Fatalf("el default del presupuesto de espera es 4000 ms (fijado por la O0): got %d", DefaultIntentWaitMS)
+	// El tipo ya no tiene dónde guardarlo: se comprueba lo ÚNICO que se puede comprobar sin campo, que es
+	// que el resto de la config del clasificador sigue en pie y que Load no falla por la variable presente.
+	if cfg.Intent.Model != DefaultIntentModel {
+		t.Fatalf("con la variable retirada presente, el resto del bloque intent debe cargar normal: got %q", cfg.Intent.Model)
 	}
-	if cfg.Intent.WaitMS != DefaultIntentWaitMS {
-		t.Fatalf("presupuesto de espera por defecto: got %d, want %d", cfg.Intent.WaitMS, DefaultIntentWaitMS)
+	// Y que NO se ha colado hacia el plazo del worker, que es el sitio al que un copiar-pegar la mandaría.
+	if cfg.Worker.InferenceTimeoutMS != DefaultWorkerInferenceTimeoutMS {
+		t.Fatalf("WAPP_AGENT_INTENT_WAIT_MS no debe gobernar NADA, y menos el plazo del worker: got %d",
+			cfg.Worker.InferenceTimeoutMS)
 	}
 }
 
-// TestLoad_IntentWaitMS_Override: la variable se lee del entorno, y un valor no positivo cae al default
-// (un 0 significaría no esperar nunca: todo el tráfico saldría sin intent y el cajero clasificaría para
-// nadie, que es justo el modo de fallo silencioso que la O0 destapó).
-func TestLoad_IntentWaitMS_Override(t *testing.T) {
-	t.Run("valor explícito", func(t *testing.T) {
-		t.Setenv(EnvPrefix+"INTENT_WAIT_MS", "1234")
-		cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
-		if cfg.Intent.WaitMS != 1234 {
-			t.Fatalf("WAPP_AGENT_INTENT_WAIT_MS no se leyó: got %d, want 1234", cfg.Intent.WaitMS)
-		}
-	})
-	t.Run("cero y negativo caen al default", func(t *testing.T) {
-		for _, valor := range []string{"0", "-1"} {
-			t.Setenv(EnvPrefix+"INTENT_WAIT_MS", valor)
-			cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
-			if err != nil {
-				t.Fatalf("Load con %q: %v", valor, err)
-			}
-			if cfg.Intent.WaitMS != DefaultIntentWaitMS {
-				t.Fatalf("con %q el presupuesto debe caer al default: got %d, want %d",
-					valor, cfg.Intent.WaitMS, DefaultIntentWaitMS)
-			}
-		}
-	})
-}
-
-// TestVariablesRetiradas_IntentTimeoutMS vigila el aviso que evita el fallo silencioso de T3.1.
+// TestVariablesRetiradas vigila los avisos que evitan el fallo silencioso de retirar una variable.
 //
 // Retirar una variable de entorno no rompe nada visible: el operador la deja puesta en su unidad, el
 // proceso arranca sin quejarse y el número que él cree haber fijado no gobierna nada. Este test asevera
-// las dos mitades del contrato —hay aviso cuando está puesta, NO hay ruido cuando no lo está— y que el
-// texto nombra literalmente la retirada y la sustituta, para que el operador sepa qué escribir en su
-// lugar sin abrir el plan.
-func TestVariablesRetiradas_IntentTimeoutMS(t *testing.T) {
-	t.Run("sin la variable no hay aviso", func(t *testing.T) {
-		// Se fuerza la AUSENCIA: t.Setenv + Unsetenv deja el entorno restaurado al salir del test aunque
-		// quien ejecute la suite la tuviera puesta de verdad en su shell.
-		t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "")
-		if err := os.Unsetenv(EnvPrefix + "INTENT_TIMEOUT_MS"); err != nil {
-			t.Fatalf("Unsetenv: %v", err)
+// las dos mitades del contrato —hay aviso cuando está puesta, NO hay ruido cuando no lo está— para las
+// DOS variables retiradas de hoy, y que el texto nombra literalmente lo que el operador tiene escrito.
+//
+// 🔴 LA SEGUNDA (WAPP_AGENT_INTENT_WAIT_MS, T1.6-5) NO TIENE SUSTITUTA, Y ESO SE ASEVERA. Es el caso que
+// el tipo AvisoRetirada contempla con `Sustituta == ""`, y el único de los dos. Ofrecerle al operador
+// una variable «parecida» le haría girar una palanca desconectada, que es exactamente el fallo que estos
+// avisos existen para cerrar.
+func TestVariablesRetiradas(t *testing.T) {
+	// sinRetiradas deja el entorno SIN NINGUNA de las dos variables retiradas. t.Setenv + Unsetenv
+	// restaura al salir del test aunque quien ejecute la suite las tuviera puestas de verdad en su shell.
+	sinRetiradas := func(t *testing.T) {
+		t.Helper()
+		for _, v := range []string{EnvPrefix + "INTENT_TIMEOUT_MS", EnvPrefix + "INTENT_WAIT_MS"} {
+			t.Setenv(v, "")
+			if err := os.Unsetenv(v); err != nil {
+				t.Fatalf("Unsetenv %s: %v", v, err)
+			}
 		}
+	}
+
+	t.Run("sin ninguna variable retirada no hay aviso", func(t *testing.T) {
+		sinRetiradas(t)
 		if avisos := VariablesRetiradas(); len(avisos) != 0 {
 			t.Fatalf("sin variables retiradas puestas no debe haber ningún aviso: got %+v", avisos)
 		}
 	})
 
-	t.Run("con la variable puesta hay UN aviso que nombra a las dos", func(t *testing.T) {
+	t.Run("INTENT_TIMEOUT_MS avisa y manda al timeout de inferencia", func(t *testing.T) {
+		sinRetiradas(t)
 		t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "3000")
 		avisos := VariablesRetiradas()
 		if len(avisos) != 1 {
@@ -982,13 +989,40 @@ func TestVariablesRetiradas_IntentTimeoutMS(t *testing.T) {
 		if !strings.Contains(aviso.Motivo, WorkerEnvPrefix+"INFERENCE_TIMEOUT_MS") {
 			t.Fatalf("el motivo debe nombrar el timeout de INFERENCIA vigente: got %q", aviso.Motivo)
 		}
-		if !strings.Contains(aviso.Motivo, EnvPrefix+"INTENT_WAIT_MS") {
-			t.Fatalf("el motivo debe nombrar el presupuesto de ESPERA vigente: got %q", aviso.Motivo)
+	})
+
+	t.Run("INTENT_WAIT_MS avisa SIN sustituta y explica el pull", func(t *testing.T) {
+		sinRetiradas(t)
+		t.Setenv(EnvPrefix+"INTENT_WAIT_MS", "4000")
+		avisos := VariablesRetiradas()
+		if len(avisos) != 1 {
+			t.Fatalf("se esperaba exactamente 1 aviso: got %d (%+v)", len(avisos), avisos)
+		}
+		aviso := avisos[0]
+		if aviso.Variable != EnvPrefix+"INTENT_WAIT_MS" {
+			t.Fatalf("el aviso debe nombrar LITERALMENTE la variable retirada: got %q", aviso.Variable)
+		}
+		// 🔴 LA MITAD QUE IMPORTA: sin sustituta. Un nombre aquí sería una palanca desconectada.
+		if aviso.Sustituta != "" {
+			t.Fatalf("WAPP_AGENT_INTENT_WAIT_MS NO tiene sustituta (la espera se disolvió, no se mudó): got %q", aviso.Sustituta)
+		}
+		if !strings.Contains(aviso.Motivo, "PULL") {
+			t.Fatalf("el motivo debe decir por qué desapareció (el paso a pull): got %q", aviso.Motivo)
+		}
+	})
+
+	t.Run("las dos a la vez dan DOS avisos", func(t *testing.T) {
+		sinRetiradas(t)
+		t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "3000")
+		t.Setenv(EnvPrefix+"INTENT_WAIT_MS", "4000")
+		if avisos := VariablesRetiradas(); len(avisos) != 2 {
+			t.Fatalf("cada variable retirada presente tiene su propio aviso: got %d (%+v)", len(avisos), avisos)
 		}
 	})
 
 	t.Run("puesta a vacío también avisa", func(t *testing.T) {
 		// Se mira la PRESENCIA, no el valor: quien la escribió tenía una intención y ya no se cumple.
+		sinRetiradas(t)
 		t.Setenv(EnvPrefix+"INTENT_TIMEOUT_MS", "")
 		if avisos := VariablesRetiradas(); len(avisos) != 1 {
 			t.Fatalf("una variable retirada presente-pero-vacía también se avisa: got %d", len(avisos))

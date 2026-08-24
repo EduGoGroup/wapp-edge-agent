@@ -92,9 +92,6 @@ func TestInyectarEntrante_CarreraConLaReconexion_SoloDosDesenlaces(t *testing.T)
 	l := NewListener(quietLogger(),
 		WithCola(cola),
 		WithSessionID("sess-1"),
-		// fastLane determinista: que la fila nazca `nuevo` no puede depender del léxico real del
-		// clasificador ni de la frase que traiga el molde.
-		WithFastLane(func(string) bool { return false }),
 	)
 	g.setLiveListener(l)
 

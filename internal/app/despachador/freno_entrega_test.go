@@ -8,16 +8,22 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 )
 
-// freno_entrega_test.go — EL FRENO DE LA RE-ENTREGA Y LA CABEZA ATASCADA (Plan 051 Ola 3, barrido CLI
-// del 2026-08-17).
+// freno_entrega_test.go — EL FRENO DE LA RE-ENTREGA (Plan 051 Ola 3, barrido CLI del 2026-08-17).
 //
-// Los dos casos que cubre este fichero nacieron de un code review, no del desglose de la ola, y los dos
-// son degradaciones que el sistema sufría EN SILENCIO:
+// El caso que cubre este fichero nació de un code review, no del desglose de la ola, y es una degradación
+// que el sistema sufría EN SILENCIO: una fila cuyo `Deliver` falla siempre se re-entregaba cada 500 ms
+// para siempre — el patrón exacto del «lote venenoso» que congeló la cola en la Ola 2.
 //
-//   - una fila cuyo `Deliver` falla siempre se re-entregaba cada 500 ms para siempre (el patrón exacto
-//     del «lote venenoso» que congeló la cola en la Ola 2);
-//   - una cabeza en estado desconocido paraba la sesión entera sin que subiera un solo contador, así que
-//     la telemetría de la Ola 4 la habría publicado como una sesión ociosa (contra INV-051.3).
+// 🔴 ERAN DOS CASOS. El otro era LA CABEZA ATASCADA —una fila en un estado desconocido paraba la sesión
+// entera— y se DISOLVIÓ el 2026-08-24 con el push (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045): al dejar el
+// despachador de mirar el estado para decidir si entrega, un estado imprevisto ya no puede retener nada.
+// Su test se sustituyó por el contrario, `TestCabezaEnEstadoImprevistoSaleTambien` (despachador_test.go),
+// que asevera que esa fila SALE. Los dos contadores que aquel test custodiaba (`cabezas_atascadas`,
+// `polls_cabeza_atascada`) se quedaron sin productor.
+//
+// ⚠️ EL FRENO DE ABAJO ES HOY LA ÚNICA FORMA DE QUE UNA CABEZA RETENGA A SU SESIÓN, y por eso importa
+// más que antes que no abandone: la retención es ahora siempre por un fallo de entrega, nunca por una
+// espera de diseño.
 
 // fallarCon fija el error que devolverá el sink, con el mismo lock que usa Deliver.
 func (s *sinkFake) fallarCon(err error) {
@@ -73,10 +79,9 @@ func TestEsperaTrasFallo(t *testing.T) {
 // abandonar aquí sería perder el mensaje —y la invariante del plan es «se retrasa, nunca se pierde»—.
 func TestReintentoDeEntregaSeEspaciaYNoAbandonaNunca(t *testing.T) {
 	cola := nuevaColaFake(&app.ColaCabeza{
-		ID: 1, Seq: 1, Estado: app.EstadoClasificado,
-		WAMessageID: "wa-1", IntentJSON: app.SobreOmitido(app.MotivoFastlane), TieneIntent: true,
+		ID: 1, Seq: 1, Estado: app.EstadoNuevo, WAMessageID: "wa-1",
 	})
-	a := arrancar(t, cola, 4*time.Second)
+	a := arrancar(t, cola)
 
 	fallo := errors.New("el sink lo rechaza siempre")
 	a.sink.fallarCon(fallo)
@@ -120,54 +125,5 @@ func TestReintentoDeEntregaSeEspaciaYNoAbandonaNunca(t *testing.T) {
 	a.sincronizar(t)
 	if got := a.d.Despachados(); got != 1 {
 		t.Fatalf("despachados = %d, se esperaba 1: la fila debía acabar saliendo, nunca abandonarse", got)
-	}
-}
-
-// TestCabezaAtascadaSeCuenta vigila INV-051.3 en el peor caso del despachador: una cabeza en un estado
-// que esta versión no conoce deja la sesión SIN DRENAR para siempre. Hasta el 2026-08-17 toda la señal
-// era un único Warn y ningún contador, así que la Ola 4 habría publicado una sesión muerta como ociosa.
-func TestCabezaAtascadaSeCuenta(t *testing.T) {
-	// El estado no es ninguno de los cuatro conocidos: simula una fila escrita por un binario más nuevo
-	// (o a mano). El doble replica el predicado real (`estado IN ('nuevo','tomado')`), así que el sello
-	// por presupuesto NO la mueve — igual que en SQLite.
-	cola := nuevaColaFake(&app.ColaCabeza{
-		ID: 1, Seq: 1, Estado: "estado_de_una_version_mas_nueva", WAMessageID: "wa-zombi",
-	})
-	a := arrancar(t, cola, time.Second)
-
-	a.esperarParada(t)
-	// Primera vuelta: la ve, arranca su presupuesto.
-	a.despertar(t)
-	a.esperarLectura(t)
-	// Vence el presupuesto y se dispara el sello, que no la mueve.
-	a.reloj.avanzar(2 * time.Second)
-	a.despertar(t)
-	a.esperarLectura(t)
-	// Tercera vuelta: ya con `disparado`, entra en la rama del atasco.
-	a.despertar(t)
-	a.esperarLectura(t)
-	a.sincronizar(t)
-
-	if got := a.d.CabezasAtascadas(); got != 1 {
-		t.Fatalf("cabezas_atascadas = %d, se esperaba 1: una sesión que dejó de drenar TIENE que contarse "+
-			"(INV-051.3), no sólo avisarse una vez", got)
-	}
-	polls := a.d.PollsCabezaAtascada()
-	if polls < 1 {
-		t.Fatalf("polls_cabeza_atascada = %d, se esperaba al menos 1", polls)
-	}
-
-	// LA SEGUNDA SERIE DEBE SEGUIR CRECIENDO: es la que distingue «pasó una vez hace horas» de «esta
-	// sesión está muerta ahora mismo», y sin ella el operador no puede saber cuál de las dos mira.
-	a.despertar(t)
-	a.esperarLectura(t)
-	a.sincronizar(t)
-	if got := a.d.PollsCabezaAtascada(); got <= polls {
-		t.Fatalf("polls_cabeza_atascada se quedó en %d tras otra vuelta bloqueada (antes %d): "+
-			"no se puede distinguir un atasco pasado de uno en curso", got, polls)
-	}
-	// Y el aviso sigue siendo UNO SOLO: contar por poll no debe convertirse en gritar por poll.
-	if got := a.d.CabezasAtascadas(); got != 1 {
-		t.Fatalf("cabezas_atascadas = %d tras varias vueltas, se esperaba 1: se cuenta por FILA, no por poll", got)
 	}
 }

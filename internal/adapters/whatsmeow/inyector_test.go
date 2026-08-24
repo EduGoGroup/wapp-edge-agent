@@ -333,9 +333,10 @@ func TestInyectarEntrante_SoltarElListenerAlSalirDeServe(t *testing.T) {
 //     lo caza el AST de abajo, que es la razón de que exista.
 func TestInyectarEntrante_DejaFilaConLasDosMarcas(t *testing.T) {
 	cola := &spyCola{calls: &callLog{}}
-	// fastLane determinista: el default es el léxico real del clasificador, y que la fila nazca `nuevo` no
-	// puede depender de qué frase se eligió en el molde.
-	l := listenerConCola(cola, WithFastLane(func(string) bool { return false }))
+	// (Aquí se inyectaba un fastLane determinista, para que el estado de nacimiento de la fila no dependiera
+	// del léxico real del clasificador. Ya no hace falta: desde T1.6-5 TODA fila nace `nuevo` — el listener
+	// no consulta ningún carril rápido.)
+	l := listenerConCola(cola)
 	g := gatewayDePrueba()
 	g.setLiveListener(l)
 

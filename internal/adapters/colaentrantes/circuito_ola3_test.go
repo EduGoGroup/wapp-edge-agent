@@ -17,9 +17,9 @@ package colaentrantes
 // ─── DETERMINISMO: LAS DOS COSTURAS, Y CERO time.Sleep COMO SINCRONÍA ───
 //
 //  1. EL RELOJ es uno solo y es INYECTADO EN LOS DOS LADOS: `WithClock(reloj.ahora)` en el store (que es
-//     quien escribe `despachado_en` y quien corta la poda) y `Deps.Ahora` en el despachador (que es quien
-//     mide el presupuesto). Que sea el MISMO reloj es lo que permite escribir un test que avanza 25 h y
-//     significa lo mismo para ambos.
+//     quien escribe `despachado_en` y quien corta la poda) y `Deps.Ahora` en el despachador (que desde
+//     T1.6-5 sólo mide el espaciado de las re-entregas). Que sea el MISMO reloj es lo que permite escribir
+//     un test que avanza 25 h y significa lo mismo para ambos.
 //
 //     ⚠️ NO SE REUSA `fakeClock` (colaentrantes_test.go), y no es capricho: ese struct es `{t time.Time}`
 //     SIN candado, y sus tests lo mutan en el mismo hilo. Aquí el despachador LEE el reloj desde OTRA
@@ -176,7 +176,7 @@ type o3Arnes struct {
 
 // arrancarDespachador cablea el despachador REAL contra la cola REAL. `ahora` es el mismo reloj que se le
 // pasó al store con WithClock: ver la cabecera del fichero.
-func arrancarDespachador(t *testing.T, cola app.ColaDespachador, sessionID string, ahora func() time.Time, presupuesto time.Duration) *o3Arnes {
+func arrancarDespachador(t *testing.T, cola app.ColaDespachador, sessionID string, ahora func() time.Time) *o3Arnes {
 	t.Helper()
 	sink := nuevoO3Sink()
 	desp := nuevoO3Despertador()
@@ -186,7 +186,6 @@ func arrancarDespachador(t *testing.T, cola app.ColaDespachador, sessionID strin
 		SessionID:   sessionID,
 		Log:         testLogger(),
 		Ahora:       ahora,
-		Presupuesto: presupuesto,
 		Despertador: desp,
 	})
 	if err != nil {
@@ -271,124 +270,91 @@ func o3ItemConMeta(session, chat, waID, texto string) app.ColaItem {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (a) FIFO — la fila lista NO adelanta a la que espera a un worker LENTO
+// (a) FIFO Y CERO RETENCIÓN — las dos filas salen EN ORDEN y EN LA PRIMERA RÁFAGA
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestCircuitoFIFOLaFilaListaNoAdelantaALaQueEsperaAlWorkerLento es LA INVARIANTE QUE COMPRA LA OLA
-// (REQ-051.18), ejercitada de punta a punta contra la BD real.
+// TestCircuitoDosFilasSalenEnOrdenYSinRetencion cubre a la vez la invariante que compra la Ola 3
+// (REQ-051.18: la fila N+1 no sale antes que la N) y el cambio que trae T1.6-5 (ADR-0045, REQ-35: no se
+// retiene NADA), ejercitados de punta a punta contra la BD real.
 //
-// El escenario es EXACTAMENTE el que la rompería si el FIFO no existiera:
-//   - la fila 1 (seq menor) es un texto normal: nace `nuevo` y el WORKER LENTO se la lleva a `tomado` y no
-//     la cierra — está «infiriendo»;
-//   - la fila 2 es POSTERIOR y ya nació `clasificado` (el fastlane la resolvió en µs, que es el camino más
-//     rápido que existe en el Edge).
+// 🔴 ESTE TEST AFIRMABA ALGO CASI OPUESTO HASTA EL 2026-08-24. Se llamaba
+// `…LaFilaListaNoAdelantaALaQueEsperaAlWorkerLento` y montaba este escenario: la fila 1 la reclamaba un
+// worker lento y se quedaba `tomado` «infiriendo»; la fila 2, posterior, ya nacía `clasificado` porque el
+// fastlane la había resuelto en µs. La afirmación era que la 2 **esperaba detrás** de la 1 —tres vueltas
+// del bucle sin una sola entrega— hasta que el worker cerrara con `MarcarClasificado`.
 //
-// Sin FIFO, la 2 saldría primero y la conversación llegaría al cliente final del revés. Con FIFO, la 2
-// espera detrás de la 1 aunque esté lista, y las dos salen EN ORDEN cuando el worker por fin cierra.
+// Bajo pull no hay a quién esperar, así que la mitad «espera» desapareció y la mitad «orden» se quedó. El
+// escenario se conserva casi entero A PROPÓSITO —la fila 1 SIGUE estando `tomado` cuando el bucle la mira—
+// porque es el que demuestra la parte menos obvia del ADR-0045 §Decisión.4: el claim con fencing se
+// conserva, pero NUNCA fue un derecho de retención sobre la entrega. Antes daba igual (la fila esperaba de
+// todos modos); ahora es la diferencia entre entregar y no entregar.
 //
-// El worker lento se simula con `Reclamar` SIN `MarcarClasificado`: no es una imitación del cajero, es el
-// cajero de verdad a medio trabajo. Y no hace falta dormir para que sea «lento» — el reloj del test no
-// avanza, así que el presupuesto (un minuto) no puede vencer y la única razón por la que la fila 2 no sale
-// es el orden.
-//
-// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (leído del SQL y del bucle, no supuesto):
+// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO (leídas del SQL y del bucle, no supuestas):
 //   - quitar el `ORDER BY seq` de `sqlCabezaDeSesion` ⇒ la cabeza deja de ser la de menor seq y el orden de
 //     salida pasa a depender del plan del motor: FALLA en la aserción de orden;
-//   - cambiar el `estado <> ?` de `sqlCabezaDeSesion` por `estado = 'clasificado'` ⇒ la fila 1, que está
-//     `tomado`, se vuelve INVISIBLE y la 2 sale la primera: FALLA en la aserción de «cero entregas» del
-//     primer tramo;
-//   - en `Despachador.vuelta`, sustituir el `correrPresupuesto` de la rama no-clasificada por un
-//     `return false` que saltase a la fila siguiente ⇒ mismo fallo.
-func TestCircuitoFIFOLaFilaListaNoAdelantaALaQueEsperaAlWorkerLento(t *testing.T) {
+//   - devolver a `Despachador.vuelta` cualquier condición sobre `cabeza.Estado` antes de entregar ⇒ la
+//     fila 1, que está `tomado`, no sale: FALLA en la primera entrega;
+//   - devolver el fence `estado = 'clasificado'` a `sqlMarcarDespachada` ⇒ ninguna de las dos se sella,
+//     las dos se re-entregan en cada poll y el TTL no puede podarlas: FALLA en las aserciones de disco.
+func TestCircuitoDosFilasSalenEnOrdenYSinRetencion(t *testing.T) {
 	ctx := context.Background()
 	db := openDB(t)
 	reloj := nuevoO3Reloj()
 	s := newStore(t, db, newFakeCrypterFor().fn, 100, 24, WithClock(reloj.ahora))
 
-	// Fila 1 (seq 1): texto normal ⇒ nace `nuevo`, reclamable por el cajero.
 	if err := s.Enqueue(ctx, o3ItemConMeta("A", "chat-1@s", "wa-1", "quiero dos empanadas")); err != nil {
-		t.Fatalf("Enqueue de la fila lenta: %v", err)
+		t.Fatalf("Enqueue de la fila 1: %v", err)
 	}
-	// Fila 2 (seq 2, POSTERIOR): el fastlane la resolvió al nacer ⇒ ya `clasificado`, lista para salir.
-	// Es el camino literal del listener (ver enqueueCola: Estado + SobreOmitido).
-	rapida := o3ItemConMeta("A", "chat-2@s", "wa-2", "2")
-	rapida.Estado = app.EstadoClasificado
-	rapida.IntentJSON = app.SobreOmitido(app.MotivoFastlane)
-	if err := s.Enqueue(ctx, rapida); err != nil {
-		t.Fatalf("Enqueue de la fila rápida: %v", err)
+	if err := s.Enqueue(ctx, o3ItemConMeta("A", "chat-2@s", "wa-2", "2")); err != nil {
+		t.Fatalf("Enqueue de la fila 2: %v", err)
 	}
 
-	// EL WORKER LENTO: reclama la fila 1 y NO la cierra. `Reclamar` elige la conversación con el `nuevo` de
-	// menor seq, que es chat-1; la fila 2 no es candidata porque ya está `clasificado`.
+	// EL CLAIM SOBRE LA CABEZA: el worker se lleva la fila 1 a `tomado` y no la cierra. No es una imitación
+	// del cajero, es el cajero de verdad a medio trabajo. `Reclamar` elige la conversación con el `nuevo` de
+	// menor seq, que es chat-1.
 	lote, err := s.Reclamar(ctx, 0)
 	if err != nil || lote == nil || len(lote.Mensajes) != 1 {
-		t.Fatalf("Reclamar (worker lento): lote=%s err=%v", resumenLote(lote), err)
+		t.Fatalf("Reclamar: lote=%s err=%v", resumenLote(lote), err)
 	}
 	if lote.Mensajes[0].WAMessageID != "wa-1" {
 		t.Fatalf("el worker debía llevarse wa-1, se llevó %s", resumenLote(lote))
 	}
-
-	// Presupuesto de un minuto con el reloj PARADO: en este test el presupuesto no puede entrar en juego, y
-	// eso es a propósito — lo único que puede retener a la fila 2 es el orden.
-	a := arrancarDespachador(t, s, "A", reloj.ahora, time.Minute)
-
-	// Vuelta 1 (la que hace el bucle nada más arrancar) + tres más: ni una entrega, ni un sello.
-	a.esperarParada(t)
-	for i := 0; i < 3; i++ {
-		a.vuelta(t)
-	}
-	if n := a.sink.cuantos(); n != 0 {
-		t.Fatalf("SE ROMPIÓ EL FIFO: salieron %d mensajes (%v) con la cabeza aún en `tomado`. "+
-			"La fila 2 estaba lista, pero la 1 la precede por seq", n, a.sink.ids())
-	}
 	if got := estadoDe(t, db, lote.Mensajes[0].ID); got != app.EstadoTomado {
-		t.Fatalf("la cabeza cambió de estado sola: %q (el worker sigue con ella)", got)
+		t.Fatalf("la fila 1 no quedó `tomado` tras el claim: %q — el escenario no es el que el test cree", got)
 	}
 
-	// EL WORKER TERMINA. A partir de aquí salen las dos, y en orden.
-	const intentReal = `{"intent":"crear_pedido","params":{"producto":"empanada","cantidad":"2"},"confidence":0.93,"config_version":"v7"}`
-	if err := s.MarcarClasificado(ctx, lote, intentReal); err != nil {
-		t.Fatalf("MarcarClasificado (el worker cierra): %v", err)
-	}
-	a.despertar(t)
+	// 🔴 EL RELOJ NO SE TOCA EN TODO EL TEST hasta el tramo del TTL: si hiciera falta avanzarlo para que
+	// algo saliera, es que algo sigue reteniendo.
+	a := arrancarDespachador(t, s, "A", reloj.ahora)
 
 	primera := a.esperarEntrega(t)
 	segunda := a.esperarEntrega(t)
 	if primera.MessageID != "wa-1" || segunda.MessageID != "wa-2" {
 		t.Fatalf("ORDEN ROTO: salieron %q y luego %q (esperado wa-1, wa-2)", primera.MessageID, segunda.MessageID)
 	}
-	// La fila 1 sale CON la intención que el worker le puso: el viaje entero por disco (JSON → columna →
-	// lectura → app.LeerSobreClasificado → domain.ClassifiedIntent) sin perder una clave.
-	if primera.Intent == nil {
-		t.Fatal("la fila 1 salió SIN intención pese a que el worker la clasificó: el sobre se perdió en el viaje por disco")
-	}
-	if primera.Intent.Name != "crear_pedido" || primera.Intent.Confidence != 0.93 || primera.Intent.ConfigVersion != "v7" {
-		t.Fatalf("intención mal reconstruida: name=%q confidence=%v config_version=%q",
-			primera.Intent.Name, primera.Intent.Confidence, primera.Intent.ConfigVersion)
-	}
-	if primera.Intent.Params["producto"] != "empanada" || primera.Intent.Params["cantidad"] != "2" {
-		t.Fatalf("params mal reconstruidos: %d claves", len(primera.Intent.Params))
-	}
-	// Y el `meta_enc` sobrevivió al sellado con la DEK, al disco y al Decode.
+	// El `meta_enc` sobrevivió al sellado con la DEK, al disco y al Decode: es el contrato por claves JSON
+	// que sigue vivo tras el retiro del sobre de intención.
 	if primera.Sender != "593999123456@s.whatsapp.net" || primera.PushName != "Ana" ||
 		primera.Type != "text" || primera.AddressingMode != "pn" || primera.SenderAlt != "111@lid" {
 		t.Fatalf("meta mal reconstruida tras el viaje por disco (wa_id=%s): sender_vacio=%t push_vacio=%t type=%q mode=%q",
 			primera.MessageID, primera.Sender == "", primera.PushName == "", primera.Type, primera.AddressingMode)
 	}
+	if primera.Text != "quiero dos empanadas" {
+		t.Fatalf("el texto no sobrevivió al cifrado/descifrado (wa_id=%s)", primera.MessageID)
+	}
 	if primera.Timestamp.Unix() == 0 {
 		t.Fatalf("la fila perdió su ts_whatsapp en el viaje (wa_id=%s)", primera.MessageID)
 	}
-	// El sobre de OMISIÓN de la fila 2 muere en el Edge: no viaja como intención (ADR-0038 §(e)).
-	if segunda.Intent != nil {
-		t.Fatalf("un sobre de omisión viajó como intención (wa_id=%s)", segunda.MessageID)
-	}
 
-	// Y las dos quedan selladas en disco: es lo que hace que la poda tenga algo que borrar.
+	// Y las dos quedan selladas en disco: es lo que hace que la poda tenga algo que borrar. 🔴 Es la mitad
+	// del cambio de fence de `MarcarDespachada`: con el fence viejo (`= 'clasificado'`) ninguna de estas dos
+	// —`tomado` y `nuevo`— habría llegado nunca a `despachado`.
 	a.esperarParada(t)
 	for _, waID := range []string{"wa-1", "wa-2"} {
 		id := idDeWaID(t, db, waID)
 		if got := estadoDe(t, db, id); got != app.EstadoDespachado {
-			t.Fatalf("%s quedó en %q tras entregarse: sin el sello, el despachador la re-entregaría en cada poll", waID, got)
+			t.Fatalf("%s quedó en %q tras entregarse: sin el sello, el despachador la re-entregaría en cada poll "+
+				"PARA SIEMPRE y el TTL no podría podarla nunca", waID, got)
 		}
 		if sello := despachadoEnDe(t, db, id); !sello.Valid {
 			t.Fatalf("%s se entregó sin sellar despachado_en: el TTL no podría podarla nunca", waID)
@@ -396,6 +362,25 @@ func TestCircuitoFIFOLaFilaListaNoAdelantaALaQueEsperaAlWorkerLento(t *testing.T
 	}
 	if cab, err := s.CabezaDeSesion(ctx, "A"); err != nil || cab != nil {
 		t.Fatalf("la sesión debía quedar al día, got cabeza=%s err=%v", resumenCabeza(cab), err)
+	}
+
+	// Y NO SALE NADA MÁS. Tres vueltas completas del bucle sobre una sesión al día: si aquí apareciera una
+	// tercera entrega sería una RE-ENTREGA —la fila que no se selló bien volviendo a salir en cada poll—,
+	// que es exactamente el modo de fallo que el cambio de fence de `MarcarDespachada` podía introducir y
+	// que ningún contador delataría (el cable deduplica por `wa_message_id`, así que en campo se vería como
+	// tráfico de más y nada más).
+	for i := 0; i < 3; i++ {
+		a.vuelta(t)
+	}
+	if got := a.sink.cuantos(); got != 2 {
+		t.Fatalf("entregas = %d tras tres vueltas sobre una sesión al día, se esperaban 2: alguna fila se "+
+			"está RE-ENTREGANDO, así que su sello no aterrizó (%v)", got, a.sink.ids())
+	}
+	if got := a.d.Despachados(); got != 2 {
+		t.Fatalf("despachados = %d, se esperaban 2", got)
+	}
+	if got := a.d.IntentsDescartados(); got != 0 {
+		t.Fatalf("intents_descartados = %d: ninguna de las dos filas traía sobre", got)
 	}
 }
 
@@ -411,197 +396,114 @@ func idDeWaID(t *testing.T, db *sql.DB, waID string) int64 {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (b) Presupuesto — vence, se entrega sin intent, se cuenta y la fila queda sellada
+// (b) LA MIGRACIÓN — una fila ANTIGUA `clasificado` se drena, se sella y se poda
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestCircuitoPresupuestoVencidoEntregaSinIntentYDejaLaFilaSellada cierra el bloque (b) ENTERO en un solo
-// test, que es justamente lo que faltaba: hasta ahora la mitad del hecho vivía en el test del bucle (se
-// entrega sin intent, se cuenta) y la otra mitad en el del SQL (la fila queda con su sobre y su sello), sin
-// que nada comprobase que las dos mitades son la misma historia.
+// TestCircuitoFilaAntiguaClasificadaSeDrenaSeSellaYSePoda es el test que sustituye al del PRESUPUESTO, y
+// es hoy el más importante de este fichero: cubre EL ÚNICO RIESGO REAL DE T1.6-5 en campo.
 //
-// Las CUATRO afirmaciones del criterio, sobre el mismo mensaje:
-//  1. el presupuesto VENCE (el reloj cruza el umbral y no antes: el borde es un `<`);
-//  2. el mensaje se ENTREGA, sin intención;
-//  3. se CUENTA — y en los dos contadores, que NO miden lo mismo: `PresupuestosVencidos` cuenta el DISPARO
-//     y `OmitidosPorMotivo[presupuesto]` cuenta la ENTREGA resultante (ver el comentario de `entregar`);
-//  4. la fila queda en disco con el LITERAL `{"omitido":"presupuesto"}` y `estado='despachado'`.
+// 🔴 QUÉ CUBRÍA ANTES, Y POR QUÉ SE SUSTITUYE ENTERO. Se llamaba
+// `…PresupuestoVencidoEntregaSinIntentYDejaLaFilaSellada` y cerraba el bloque (b) de la Ola 3: el reloj
+// cruzaba los 4 s, `DespacharSinIntent` escribía `{"omitido":"presupuesto"}`, el bucle releía, entregaba
+// sin intención y sellaba. Nació ROJO el 2026-08-17 y destapó un bug de PÉRDIDA DE MENSAJES que ninguna de
+// las dos mitades veía por separado (el doble del bucle mentía sobre el estado destino de la sentencia).
+// Todo ese mecanismo —variable, reloj, sentencia y motivo— se retiró el 2026-08-24 con el ADR-0045.
 //
-// Y de propina el bloque (e): con el sello puesto, +25 h y un Enqueue cualquiera, la poda por fin se la
-// lleva. Ese tramo importa porque comprueba que la fila que llegó al sello POR EL CAMINO DEL PRESUPUESTO
-// —dos sentencias: primero el sobre, luego el sello tras la entrega— es exactamente igual de podable que
-// la que llegó por el camino del cajero.
+// 🔴 EL RIESGO QUE OCUPA SU SITIO. Cuando este binario llegue a un equipo de campo se encontrará una
+// `cola_entrantes.db` YA ESCRITA por el binario anterior, con filas en `clasificado` y con sus sobres. Ese
+// estado ya no existe en el ciclo. Si el despachador no las entregara —o si `MarcarDespachada` no pudiera
+// sellarlas— esas filas se quedarían en disco para siempre: mensajes reales de clientes reales que nunca
+// llegan a la nube, y una cola que sólo crece hasta chocar con su tope. Es exactamente la misma FAMILIA de
+// fallo que el bug del 2026-08-17, por eso hereda su sitio.
 //
-// 🔴🔴 ESTE TEST NACIÓ EN ROJO, Y ESA FUE SU RAZÓN DE SER (hallazgo de T3.5, 2026-08-17). El circuito real
-// PERDÍA el mensaje cuando vencía el presupuesto, y ninguna de las dos mitades lo veía por separado:
-//
-//   - PRODUCCIÓN: `sqlDespacharSinIntent` dejaba la fila en `estado='despachado'`, y `sqlCabezaDeSesion`
-//     filtra con `estado <> 'despachado'`. La RELECTURA que `correrPresupuesto` hace tras sellar (su
-//     `return true`) ya no encontraba la fila, y `entregar` —la única puerta al sink, en la rama
-//     `EstadoClasificado` de `vuelta`— no se ejecutaba jamás. La fila quedaba sellada en disco, el TTL se
-//     la llevaba a las 24 h y el mensaje NUNCA llegaba a la nube. Exactamente lo contrario de REQ-051.19.
-//   - EL TEST DEL BUCLE no lo veía porque su doble (`colaFake.DespacharSinIntent`, despachador_test.go)
-//     dejaba la fila en `clasificado`: el fake modelaba la INTENCIÓN del bucle, no la sentencia del store.
-//   - EL TEST DEL SQL no lo veía porque no hay bucle: comprueba que la sentencia escribe lo que dice.
-//
-// EL ARREGLO ELEGIDO (decisión de Jhoan, 2026-08-17): `DespacharSinIntent` deja la fila `clasificado` con
-// su sobre y suelta el claim, y la entrega + el sello los hace el camino NORMAL. Es la opción crash-safe
-// —si el proceso muere entre el sobre y la entrega, la fila sigue pendiente y se reintenta— y la que
-// respeta «entrega antes de sello». Las aserciones de abajo no cambiaron con el arreglo: siguen exigiendo
-// que la fila acabe `despachado`, con su sobre y su sello en epoch-segundos. Lo que cambió es CUÁNDO:
-// tras la entrega, no en el instante del vencimiento.
+// LAS TRES AFIRMACIONES, sobre la misma fila vieja:
+//  1. se ENTREGA, con su contenido íntegro (el mensaje es lo que no se puede perder);
+//  2. su clasificación se TIRA y se CUENTA en `intents_descartados` — la única pérdida que la migración
+//     admite, y no ocurre en silencio;
+//  3. queda `despachado` con su `despachado_en` en EPOCH-SEGUNDOS, así que la poda por TTL se la lleva.
 //
 // ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO:
-//   - volver a poner `estado = 'despachado'` (o añadir `despachado_en = ?`) en `sqlDespacharSinIntent` ⇒
-//     el bug original: FALLA en «el mensaje se perdió» con 0 entregas al sink;
-//   - cambiar el `<` de `correrPresupuesto` por `<=` (o mover el umbral) ⇒ el tramo de 3999 ms resuelve
-//     antes de tiempo: FALLA en «venció antes de tiempo»;
-//   - quitar `intent_json = ?` del SET de `sqlDespacharSinIntent` ⇒ la fila queda `clasificado` con NULL,
-//     que en disco es la forma de un FRAGMENTO de lote: FALLA en la aserción del literal y en
-//     `fragmentos_de_lote = 0`;
-//   - quitar `tomado_en = NULL` / `claim_token = NULL` del mismo SET ⇒ FALLA en las dos aserciones del
-//     claim (y, peor, dejaría vivo el fence contra el cierre tardío del cajero);
+//   - devolver el fence `estado = 'clasificado'` a `sqlMarcarDespachada` ⇒ ESTE test seguiría verde (la
+//     fila SÍ está `clasificado`) y el de arriba se pondría rojo. Es a propósito que se necesiten los dos:
+//     el fence tiene que valer para los dos mundos a la vez, y ningún test solo lo demuestra;
+//   - hacer que `evento` cuente la clasificación descartada como `omitido` o como `ilegible` ⇒ FALLA la
+//     aserción de la serie;
 //   - quitar `despachado_en = ?` de `sqlMarcarDespachada`, o escribirlo con `UnixMilli()` en vez de
 //     `Unix()` ⇒ FALLA en la aserción de epoch-segundos Y en el tramo de la poda (con milis el corte no
-//     alcanza a la fila jamás);
-//   - hacer que `evento` rellene `evt.Intent` para un sobre de omisión ⇒ FALLA en «llevó intención»;
-//   - contar el disparo en el contador de omitidos (o al revés) ⇒ FALLA en uno de los dos contadores.
-func TestCircuitoPresupuestoVencidoEntregaSinIntentYDejaLaFilaSellada(t *testing.T) {
+//     alcanza a la fila jamás).
+func TestCircuitoFilaAntiguaClasificadaSeDrenaSeSellaYSePoda(t *testing.T) {
 	ctx := context.Background()
 	db := openDB(t)
 	reloj := nuevoO3Reloj()
 	s := newStore(t, db, newFakeCrypterFor().fn, 100, 24, WithClock(reloj.ahora)) // TTL de 24 h, el de producción
 
-	if err := s.Enqueue(ctx, o3ItemConMeta("A", "chat-1@s", "wa-lenta", "quiero dos empanadas")); err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	// LA FILA VIEJA, escrita como la escribía el binario anterior: `clasificado` y con el sobre del cajero.
+	// Se pasa por `Enqueue` —no por un INSERT a mano— para que el cifrado, el sellado con la DEK y el
+	// esquema sean EXACTAMENTE los de producción (reglas T2.17/T2.18: ningún DDL ni escritura transcritos).
+	vieja := o3ItemConMeta("A", "chat-1@s", "wa-vieja", "quiero dos empanadas")
+	vieja.Estado = app.EstadoClasificado
+	vieja.IntentJSON = `{"intent":"crear_pedido","params":{"producto":"empanada","cantidad":"2"},"confidence":0.93,"config_version":"v7"}`
+	if err := s.Enqueue(ctx, vieja); err != nil {
+		t.Fatalf("Enqueue de la fila vieja: %v", err)
 	}
-	// El cajero se la lleva y se queda «infiriendo» para siempre: es el caso para el que existe el
-	// presupuesto (un Ollama atascado no puede detener la conversación de un cliente).
-	lote, err := s.Reclamar(ctx, 0)
-	if err != nil || lote == nil || len(lote.Mensajes) != 1 {
-		t.Fatalf("Reclamar: lote=%s err=%v", resumenLote(lote), err)
-	}
-	id := lote.Mensajes[0].ID
-
-	const presupuesto = 4 * time.Second // WAPP_AGENT_INTENT_WAIT_MS = 4000, el default de producción
-	a := arrancarDespachador(t, s, "A", reloj.ahora, presupuesto)
-
-	// Vuelta 1: se ve la cabeza por primera vez ⇒ arranca SU reloj (no el del encolado: ver cabezaEnCurso).
-	a.esperarParada(t)
-	if got := estadoDe(t, db, id); got != app.EstadoTomado {
-		t.Fatalf("la primera vuelta ya selló la fila (estado %q): el presupuesto no había empezado a correr siquiera", got)
+	id := idDeWaID(t, db, "wa-vieja")
+	if got := estadoDe(t, db, id); got != app.EstadoClasificado {
+		t.Fatalf("la fila no quedó `clasificado` en disco (%q): el escenario no es el que el test cree", got)
 	}
 
-	// Justo por debajo del umbral: NO vence. El borde importa — es un `<`, no un `<=`.
-	reloj.avanzar(presupuesto - time.Millisecond)
-	a.vuelta(t)
-	if got := estadoDe(t, db, id); got != app.EstadoTomado {
-		t.Fatalf("venció antes de tiempo: a %v del arranque la fila ya estaba en %q", presupuesto-time.Millisecond, got)
-	}
-	if n := a.sink.cuantos(); n != 0 {
-		t.Fatalf("se entregó algo antes de que venciera el presupuesto: %v", a.sink.ids())
-	}
-
-	// Se cruza el umbral. El sobre de omisión muerde sobre `tomado`, que es donde está esta fila; la deja
-	// `clasificado` y el bucle —sin pagar poll, porque hubo progreso— la relee, la entrega y la sella. Tres
-	// vueltas encadenadas hasta que la sesión queda al día.
-	//
-	// EL RELOJ NO SE MUEVE ENTRE EL VENCIMIENTO Y EL SELLO, y por eso `vencimiento.Unix()` sirve abajo para
-	// afirmar `despachado_en`: no es que el sello sea simultáneo al vencimiento (no lo es, ocurre dos
-	// vueltas después), es que este reloj es manual y el test no lo adelanta en medio.
-	reloj.avanzar(2 * time.Millisecond)
-	vencimiento := reloj.ahora()
-	a.despertar(t)
-	// Se espera a que el bucle APARQUE (cola al día) antes de mirar el sink: así el «no se entregó» de
-	// abajo es un hecho, no una carrera. Y falla con un mensaje que explica QUÉ pasó, en vez de colgarse
-	// tres segundos esperando una entrega que no va a llegar.
-	a.esperarParada(t)
-
-	if n := a.sink.cuantos(); n != 1 {
-		t.Fatalf("🔴 EL MENSAJE SE PERDIÓ AL VENCER EL PRESUPUESTO: hubo %d entregas al sink (se esperaba 1). "+
-			"REQ-051.19 promete que un cajero atascado RETRASA el mensaje, nunca lo pierde. "+
-			"El camino correcto es: `DespacharSinIntent` deja la fila en estado='clasificado' con su sobre "+
-			"(sqlDespacharSinIntent), `sqlCabezaDeSesion` SÍ la ve (solo excluye 'despachado'), la relectura "+
-			"de `correrPresupuesto` la reencuentra y `entregar` —única puerta al sink, rama EstadoClasificado "+
-			"de `vuelta`— la manda y solo entonces la sella. Si aquí hay 0, revisa si esa sentencia ha vuelto "+
-			"a sellar 'despachado' (el bug del 2026-08-17). Entregas registradas: %v", n, a.sink.ids())
-	}
+	a := arrancarDespachador(t, s, "A", reloj.ahora)
 
 	evt := a.esperarEntrega(t)
-	if evt.MessageID != "wa-lenta" {
+	if evt.MessageID != "wa-vieja" {
 		t.Fatalf("se entregó otra fila: %q", evt.MessageID)
 	}
-	if evt.Intent != nil {
-		t.Fatalf("un despacho por presupuesto llevó intención (wa_id=%s): el cajero nunca la calculó", evt.MessageID)
-	}
-	// El mensaje sale ÍNTEGRO: lo que se pierde es la clasificación, jamás el mensaje.
-	if evt.Text != "quiero dos empanadas" || evt.PushName != "Ana" {
-		t.Fatalf("el mensaje salió mutilado (wa_id=%s): texto_vacio=%t push_vacio=%t",
-			evt.MessageID, evt.Text == "", evt.PushName == "")
+	// (1) EL MENSAJE SALE ÍNTEGRO: lo que se pierde es la etiqueta, jamás el mensaje.
+	if evt.Text != "quiero dos empanadas" || evt.PushName != "Ana" || evt.Sender == "" {
+		t.Fatalf("el mensaje salió mutilado (wa_id=%s): texto_vacio=%t push_vacio=%t sender_vacio=%t",
+			evt.MessageID, evt.Text == "", evt.PushName == "", evt.Sender == "")
 	}
 
-	// Los contadores ya están escritos: el `esperarParada` de arriba es la barrera (el bucle no aparca hasta
-	// haber terminado la vuelta, y los contadores se incrementan DESPUÉS de que Deliver retorne). No se
-	// vuelve a esperar una parada aquí porque el bucle solo aparca UNA vez en este tramo: sella (progreso),
-	// entrega (progreso) y solo entonces se encuentra la sesión al día.
-	if got := a.d.PresupuestosVencidos(); got != 1 {
-		t.Fatalf("presupuestos_vencidos = %d, se esperaba 1 (cuenta el DISPARO del sello)", got)
+	a.esperarParada(t)
+	// (2) LA CLASIFICACIÓN SE TIRA, Y SE CUENTA.
+	if got := a.d.IntentsDescartados(); got != 1 {
+		t.Fatalf("intents_descartados = %d, se esperaba 1: la clasificación de una fila vieja ya no tiene "+
+			"por dónde viajar (el ADR-0045 retiró ClassifiedIntent del proto), pero perderla NO puede ser "+
+			"silencioso — es la serie con la que se vigila que las colas viejas se vacían", got)
 	}
-	if got := a.d.OmitidosPorMotivo()[app.MotivoPresupuesto]; got != 1 {
-		t.Fatalf("omitido_presupuesto = %d, se esperaba 1 (cuenta la ENTREGA sin intención)", got)
+	if got := a.d.Omitidos(); got != 0 {
+		t.Fatalf("omitidos = %d: un sobre de CLASIFICACIÓN no es un sobre de omisión", got)
 	}
-	if got := a.d.ConIntent(); got != 0 {
-		t.Fatalf("con_intent = %d, se esperaba 0: no hubo ninguna intención que entregar", got)
-	}
-	if got := a.d.FragmentosDeLote(); got != 0 {
-		t.Fatalf("fragmentos_de_lote = %d: un despacho por presupuesto SÍ deja sobre, así que no es un fragmento", got)
-	}
-	// Este NO se movió: el sello sí aterrizó (la fila estaba `tomado`, no `clasificado`).
-	if got := s.DespachosSinIntentNoAplicados(); got != 0 {
-		t.Fatalf("DespachosSinIntentNoAplicados = %d, se esperaba 0: el sello aterrizó", got)
+	if got := a.d.SobresIlegibles(); got != 0 {
+		t.Fatalf("sobres_ilegibles = %d: el sobre era perfectamente legible, sólo que ya no tiene destino", got)
 	}
 
-	// ─── LA FILA EN DISCO ───
+	// (3) LA FILA EN DISCO, y el sello que la hace podable.
+	sellado := reloj.ahora()
 	if got := estadoDe(t, db, id); got != app.EstadoDespachado {
-		t.Fatalf("estado en disco = %q, want %q", got, app.EstadoDespachado)
-	}
-	// 🔴 LITERAL A PROPÓSITO, no app.SobreOmitido(app.MotivoPresupuesto): este test fija el FORMATO que
-	// queda escrito en la columna. Afirmarlo contra la misma función que lo produce no probaría nada — un
-	// cambio de formato arrastraría el test consigo y pasaría verde (mismo criterio que los tests del
-	// listener con `{"omitido":"sin_texto"}`).
-	if got := intentDe(t, db, id); !got.Valid || got.String != `{"omitido":"presupuesto"}` {
-		t.Fatalf("intent_json en disco = %+v, want el literal {\"omitido\":\"presupuesto\"}", got)
+		t.Fatalf("estado en disco = %q, want %q: una fila `clasificado` de un binario viejo TIENE que poder "+
+			"sellarse, o se queda en el disco del cliente para siempre", got, app.EstadoDespachado)
 	}
 	sello := despachadoEnDe(t, db, id)
 	if !sello.Valid {
 		t.Fatal("despachado_en quedó NULL: la poda exige el sello ADEMÁS del estado, así que esta fila no se podaría jamás")
 	}
-	if sello.Int64 != vencimiento.Unix() {
+	if sello.Int64 != sellado.Unix() {
 		t.Fatalf("despachado_en = %d, want %d (EPOCH-SEGUNDOS, la unidad que compara pruneTTLLocked; "+
-			"en milis serían %d y el corte no la alcanzaría nunca)", sello.Int64, vencimiento.Unix(), vencimiento.UnixMilli())
-	}
-	// Una fila despachada no puede seguir diciendo «me tiene el cajero X».
-	if got := tomadoEnDe(t, db, id); got.Valid {
-		t.Fatalf("tomado_en quedó en %d sobre una fila ya despachada", got.Int64)
-	}
-	if got := claimTokenDe(t, db, id); got.Valid {
-		t.Fatalf("claim_token sobrevivió al despacho (%q): la fila ya no pertenece a ningún claim", got.String)
+			"en milis serían %d y el corte no la alcanzaría nunca)", sello.Int64, sellado.Unix(), sellado.UnixMilli())
 	}
 
-	// ─── (e) EL TTL, SOBRE UNA FILA QUE LLEGÓ AL SELLO POR EL CAMINO DEL PRESUPUESTO ───
-	// `pruneTTLLocked` corre en cada Enqueue; hasta la Ola 3 no podía borrar nada porque nadie escribía
-	// `estado='despachado'` NI `despachado_en`. Lo que este tramo añade sobre el test del TTL de
-	// despacho_test.go es la PROCEDENCIA de la fila: no llegó al sello por el camino del cajero
-	// (Reclamar → MarcarClasificado → entrega → MarcarDespachada) sino por el del presupuesto vencido
-	// (DespacharSinIntent → entrega → MarcarDespachada). El sello es el mismo y la poda no distingue,
-	// que es justamente lo que hay que demostrar.
+	// ─── EL TTL, SOBRE UNA FILA HEREDADA ───
+	// `pruneTTLLocked` corre en cada Enqueue y sólo borra `estado='despachado'` CON `despachado_en`. Lo que
+	// este tramo añade es la PROCEDENCIA: una fila que nació bajo el modelo push y se selló bajo el pull es
+	// igual de podable que cualquier otra. Si no lo fuera, la migración dejaría basura permanente.
 	reloj.avanzar(25 * time.Hour)
 	if err := s.Enqueue(ctx, item("A", "chat-9@s", "wa-disparador", "hola")); err != nil {
 		t.Fatalf("Enqueue disparador de la poda: %v", err)
 	}
-	if existe(t, db, "wa-lenta") {
-		t.Fatal("EL TTL SIGUE INERTE para el camino del presupuesto: la fila que se resolvió por " +
-			"DespacharSinIntent y se selló al entregarse sobrevivió a las 25 h. Revisa que MarcarDespachada " +
-			"escriba estado='despachado' Y despachado_en en EPOCH-SEGUNDOS, y que la entrega llegue a ocurrir")
+	if existe(t, db, "wa-vieja") {
+		t.Fatal("EL TTL NO ALCANZA A LAS FILAS HEREDADAS: la que venía `clasificado` de un binario anterior " +
+			"sobrevivió a las 25 h. Revisa que MarcarDespachada escriba estado='despachado' Y despachado_en " +
+			"en EPOCH-SEGUNDOS")
 	}
 	if !existe(t, db, "wa-disparador") {
 		t.Fatal("la poda se llevó una fila JAMÁS despachada (REQ-051.7): eso es perder un mensaje")
@@ -649,14 +551,16 @@ func TestCircuitoCierreLimpioTresSesionesConcurrentes(t *testing.T) {
 	sesiones := []string{"A", "B", "C"}
 	const porSesion = 12
 
-	// Todo nace ya `clasificado` (el camino del fastlane): aquí no se prueba la clasificación, se prueba el
-	// DRENADO concurrente. Así el test no depende de ningún worker y el trabajo está disponible desde el
-	// primer poll.
+	// Todo nace `nuevo` y sin sobre, que es lo ÚNICO que produce el listener desde T1.6-5. Aquí no se prueba
+	// ninguna clasificación: se prueba el DRENADO concurrente, y el trabajo está disponible desde el primer
+	// poll sin depender de ningún worker.
+	//
+	// (Hasta el 2026-08-24 estas filas se sembraban ya `clasificado` con el sobre `{"omitido":"fastlane"}`,
+	// porque ése era entonces el único camino que garantizaba «lista para salir sin esperar a nadie». Hoy lo
+	// garantiza cualquier fila.)
 	for _, sid := range sesiones {
 		for i := 0; i < porSesion; i++ {
 			it := o3ItemConMeta(sid, "chat@s", fmt.Sprintf("%s-wa-%02d", sid, i), "hola")
-			it.Estado = app.EstadoClasificado
-			it.IntentJSON = app.SobreOmitido(app.MotivoFastlane)
 			if err := s.Enqueue(ctx, it); err != nil {
 				t.Fatalf("Enqueue %s/%d: %v", sid, i, err)
 			}
@@ -677,9 +581,6 @@ func TestCircuitoCierreLimpioTresSesionesConcurrentes(t *testing.T) {
 			SessionID: sid,
 			Log:       testLogger(),
 			Ahora:     reloj.ahora,
-			// Presupuesto amplio: no hay nada que esperar (todo nace clasificado), y si algo lo hubiera,
-			// que fuera el orden y no el reloj quien lo explicara.
-			Presupuesto: time.Minute,
 			// El despertador de PRODUCCIÓN, corto: ver la cabecera de este test.
 			Despertador: despachador.NewPollFijo(time.Millisecond),
 		})

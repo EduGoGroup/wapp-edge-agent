@@ -209,7 +209,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		health.WithFiltersVersion(perfiles.Version))
 	diagBuilder := diagnostics.NewBuilder(d.sink, healthCollector, cfg.DiagLogLines)
 
-	mux, authRelay := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder)
+	// SERVICIO DE INFERENCIA (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045 · REQ-34): el puerto por el que este
+	// proceso consigue una inferencia sin hablar con Ollama (REQ-051.10 lo prohíbe). Detrás hay un socket
+	// unix al proceso `agent cajero`; ver wiring.BuildInferenciaCliente para por qué se construye siempre,
+	// incluso con la feature apagada o el cajero sin arrancar.
+	inferencia := wiring.BuildInferenciaCliente(layout, log)
+
+	mux, authRelay := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder, inferencia)
 
 	authMgr := wiring.BuildAuthManager(cfg, log, authKeyStore, authRelay)
 	authMgr.StartProactiveRefresh(ctx)
@@ -244,14 +250,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// por el mismo motivo que `lat.opt`: `Run` no lo mira ningún test, y una negación invertida en esta
 		// línea apagaría la entrega de entrantes en TODOS los Edge sin que nada se pusiera rojo.
 		opcionPalancaDespachador(cfg),
-		// Presupuesto de espera al cajero (WAPP_AGENT_INTENT_WAIT_MS, 4000 ms): el techo de latencia que la
-		// cola añade al camino de un mensaje. config.Load ya garantiza un valor > 0.
-		sessionmgr.WithPresupuestoIntent(time.Duration(cfg.Intent.WaitMS)*time.Millisecond),
-		// Interruptor del clasificador (Plan 051 Ola 2, T2.12): con la feature apagada, el entrante nace en
-		// la cola YA resuelto (marca `apagado`) en vez de que el cajero gaste una plaza del semáforo para
-		// descartarlo igual. Tras T3.0 el stack ya no tiene decorador y este predicado lee el flag de config
-		// directamente — que es lo que `MotivoApagado` siempre significó.
-		sessionmgr.WithClasificadorActivo(intentStack.ClasificadorActivoFunc()),
 		// Perfiles de sesión (Plan 046 · Ola 2 · T2.2): con este predicado, el listener de una sesión marcada
 		// PASIVA descarta su entrante en la puerta —no se encola, no se persiste, no se entrega (REQ-07)— y
 		// lo cuenta. El mapa lo empuja la nube (kind:"filters") y `perfiles` lo mantiene al día en caliente;

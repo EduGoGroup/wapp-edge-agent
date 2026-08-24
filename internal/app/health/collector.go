@@ -112,23 +112,34 @@ type Report struct {
 	// IntentOmittedByReason es el desglose de despachos SIN intención de ESTA sesión, motivo a motivo, con
 	// las OCHO claves de app.MotivosOmitido() SIEMPRE presentes (un motivo a 0 es un dato, no un hueco).
 	//
-	// 🔴 NUNCA AGREGADO ENTRE MOTIVOS (INV-051.3): `fastlane` es el camino SANO y `presupuesto`/`breaker`
-	// son fallos; sumarlos borra la única pregunta que este desglose responde («¿hay que mirar Ollama?»).
+	// 🔴 NUNCA AGREGADO ENTRE MOTIVOS (INV-051.3): `fastlane` era el camino SANO y `presupuesto`/`breaker`
+	// fallos; sumarlos borra la única pregunta que este desglose responde («¿hay que mirar Ollama?»).
 	// Sumar el MISMO motivo entre sesiones sí es legítimo (es lo que hace el agregado del daemon).
+	//
+	// ⚠️ DESDE T1.6-5 (ADR-0045) NINGUNO DE LOS OCHO TIENE PRODUCTOR VIVO en el Edge: sólo se mueven al
+	// drenar filas escritas por un binario anterior. Las ocho claves se siguen publicando —un motivo a 0
+	// sigue siendo un dato, y el contrato del heartbeat las espera— y son la señal con la que se vigila que
+	// las colas de campo se vacían. Ver app.MotivoOmitido.
 	IntentOmittedByReason map[string]int64
-	// StuckHeads es cuántas filas quedaron de cabeza en un estado que esta versión no conoce. 🔴 CERO ES EL
-	// ÚNICO VALOR SANO: cada una es una sesión que dejó de drenar y no vuelve sola.
-	StuckHeads int64
-	// StuckHeadPolls dice si el atasco es HISTORIA o es AHORA: sigue creciendo mientras la sesión siga
-	// bloqueada.
+	// StuckHeads y StuckHeadPolls contaban las filas que quedaban de cabeza en un estado que esta versión
+	// no conocía, y si el atasco era HISTORIA o AHORA.
+	//
+	// 🔴 CLAVADOS A 0 DESDE EL 2026-08-24 (T1.6-5, ADR-0045), Y NO ES QUE VAYA TODO BIEN: es que el atasco
+	// DEJÓ DE SER POSIBLE. El despachador ya no mira el estado para decidir si entrega, así que ninguna
+	// fila puede retener a su sesión por estar en un estado imprevisto — se entrega como cualquier otra.
+	// Se conservan porque son CAMPOS DE PROTO (`stuck_heads`, `stuck_head_polls`) y retirarlos es un
+	// cambio de contrato; quien los mire en un dashboard debe saber que su 0 no mide nada.
+	StuckHeads     int64
 	StuckHeadPolls int64
 	// FailedSealDispatch: falló `MarcarDespachada` tras una entrega CON ÉXITO. 🔴 Cada uno es un DUPLICADO
 	// en la nube. Es el número que se mira.
 	FailedSealDispatch int64
-	// FailedSealBudget: falló `DespacharSinIntent`. La fila se reintenta y nada sale mal aguas arriba.
+	// FailedSealBudget contaba los fallos de `DespacharSinIntent`. 🔴 CLAVADO A 0 desde el 2026-08-24
+	// (T1.6-5, ADR-0045): esa sentencia se retiró con el presupuesto y ya no hay una segunda escritura que
+	// pueda fallar. Se conserva por contrato de proto, igual que los dos de arriba.
 	//
-	// 🔴 SEPARADO DE FailedSealDispatch A PROPÓSITO (T3.12): sólo UNO de los dos implica mensajes duplicados.
-	// Sumarlos deshace esa distinción y convierte ruido operativo en un incidente (o al revés).
+	// (Estaba SEPARADO de FailedSealDispatch a propósito —T3.12— porque sólo uno de los dos implicaba
+	// mensajes duplicados. Hoy sólo queda ese uno, que es justamente el que importaba.)
 	FailedSealBudget int64
 }
 

@@ -49,7 +49,6 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/latencia"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
-	"github.com/EduGoGroup/wapp-edge-intent/classifier"
 	"github.com/EduGoGroup/wapp-shared/logger"
 )
 
@@ -143,12 +142,6 @@ type Listener struct {
 	// por eso NewListener desactiva la cola (ruidosamente) si falta esta.
 	sessionID string
 
-	// fastLane decide si un texto se salta el LLM (carril rápido, µs). Default classifier.FastLane. Es
-	// inyectable para poder probar el nacimiento de la fila en EstadoClasificado sin depender del léxico
-	// concreto del clasificador. OJO SEMÁNTICO: true significa «entrega SIN intención», no «ya
-	// clasificado con X» — por eso el IntentJSON que se persiste es una marca de omisión, no un intent.
-	fastLane func(string) bool
-
 	// latencia es el CRONÓMETRO del handler de entrantes (Plan 051 Ola 3 · T3.13). Es lo único que hace
 	// MEDIBLE el criterio de cierre de la ola —«handler < 50 ms p99», INV-051.2—, que hasta esta tarea
 	// existía sobre el papel y no tenía instrumento.
@@ -166,17 +159,6 @@ type Listener struct {
 	// 🔴 INV-051.1: aquí no entra nada del contenido. El histograma solo ve duraciones.
 	latencia *latencia.Histograma
 
-	// clasificadorActivo dice si el CLASIFICADOR de intenciones está encendido en este Edge (Plan 051 Ola 2,
-	// T2.12). Se lee FRESCO en cada mensaje —no se cachea un bool al construir— porque la feature puede
-	// apagarse/encenderse en caliente y una copia congelada mentiría el resto de la vida del proceso.
-	//
-	// 🔴 nil ⇒ SE CONSIDERA ACTIVO (no filtra). El default NO es simetría estética: los dos fallos posibles
-	// no cuestan lo mismo. Un cableado incompleto que cayera hacia «apagado» dejaría de clasificar TODO el
-	// tráfico del Edge en silencio, y el síntoma (nadie recibe intenciones) no apunta a su causa; cayendo
-	// hacia «activo», lo peor que pasa es que el cajero gaste Ollama de más — visible al instante en la
-	// telemetría y sin pérdida de negocio. Se falla hacia el lado ruidoso y barato.
-	clasificadorActivo func() bool
-
 	// sesionPasiva dice si la sesión que se le pase está marcada como PASIVA en la config de perfiles que
 	// la nube empuja (kind:"filters", Plan 046 · Ola 2 · T2.2 / ADR-0027). Con `true`, el entrante se
 	// descarta EN LA PUERTA: no se encola, no se persiste y no se entrega (REQ-07, «nada local»).
@@ -186,12 +168,12 @@ type Listener struct {
 	// sin reiniciar el Edge. Un bool capturado al construir el Listener congelaría la foto del arranque.
 	//
 	// RECIBE EL session_id EN VEZ DE CERRARSE SOBRE ÉL porque el consultor es COMPARTIDO por todas las
-	// sesiones del Edge (un solo mapa por tenant, igual que el cronómetro o el interruptor del
-	// clasificador): una closure por sesión obligaría a construir N predicados y a que el cableado no se
-	// equivocara de sesión en ninguno. El Listener ya sabe cuál es la suya (l.sessionID).
+	// sesiones del Edge (un solo mapa por tenant, igual que el cronómetro): una closure por sesión
+	// obligaría a construir N predicados y a que el cableado no se equivocara de sesión en ninguno. El
+	// Listener ya sabe cuál es la suya (l.sessionID).
 	//
-	// 🔴 nil ⇒ NINGUNA SESIÓN ES PASIVA (fail-open, D-046.2), y la asimetría es la misma que la de
-	// clasificadorActivo: de los dos fallos posibles, un cableado incompleto que cayera hacia «pasiva»
+	// 🔴 nil ⇒ NINGUNA SESIÓN ES PASIVA (fail-open, D-046.2), y la asimetría es deliberada: de los dos
+	// fallos posibles, un cableado incompleto que cayera hacia «pasiva»
 	// dejaría al Edge SORDO —el cliente escribe y no pasa nada, sin un solo error en el log— mientras que
 	// caer hacia «activa» solo sube tráfico que la nube ya sabe ignorar (`reactiveBlocked`, D-046.7). Se
 	// falla hacia el lado que no pierde mensajes.
@@ -220,31 +202,6 @@ func WithSessionID(id string) ListenerOption {
 	return func(l *Listener) {
 		if id != "" {
 			l.sessionID = id
-		}
-	}
-}
-
-// WithFastLane sustituye el carril rápido por defecto (classifier.FastLane). nil se ignora. Existe
-// para los tests: el default es el bueno en producción.
-func WithFastLane(fn func(string) bool) ListenerOption {
-	return func(l *Listener) {
-		if fn != nil {
-			l.fastLane = fn
-		}
-	}
-}
-
-// WithClasificadorActivo inyecta el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
-// T2.12): un predicado que se consulta por mensaje para decidir si la fila puede nacer `nuevo` (reclamable
-// por el cajero) o debe nacer ya resuelta con la marca `apagado`.
-//
-// Se pide un `func() bool` y NO un bool porque el estado es del SISTEMA y puede cambiar en caliente: un bool
-// capturado al construir el Listener congelaría para siempre la foto del arranque. nil se ignora y el
-// Listener queda en su default (ACTIVO): ver el porqué de esa asimetría en el campo clasificadorActivo.
-func WithClasificadorActivo(fn func() bool) ListenerOption {
-	return func(l *Listener) {
-		if fn != nil {
-			l.clasificadorActivo = fn
 		}
 	}
 }
@@ -334,7 +291,6 @@ func NewListener(log logger.Logger, opts ...ListenerOption) *Listener {
 		state:    StateDisconnected,
 		brackets: newBracketObserver(log),
 		margin:   defaultConnectMargin,
-		fastLane: classifier.FastLane,
 	}
 	for _, o := range opts {
 		o(l)
@@ -553,12 +509,17 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) (acusar bool) {
 //	                                                el tráfico de cada grupo en una ráfaga perpetua de
 //	                                                reofrecimientos (D-044.30, detalle 1).
 //	ACUSA (true)  · SIN HORA UTILIZABLE           — encola: el acuse lo decide su INSERT, como el normal.
-//	ACUSA (true)  · SIN TEXTO / APAGADO /
-//	                FASTLANE                      — ⚠️ NO SON DESCARTES: los tres DEJAN FILA (nacen en
-//	                                                EstadoClasificado con su marca de omisión). Acusan
-//	                                                porque el mensaje está en disco, no por indulgencia.
-//	                                                Eran CUATRO hasta el Plan 044 · T1.5-3: GRUPO se fue de
-//	                                                aquí a la familia de arriba, y ya no deja fila.
+//	ACUSA (true)  · SIN TEXTO                     — ⚠️ NO ES UN DESCARTE: una imagen, un audio o un sticker
+//	                                                se encolan y se entregan EXACTAMENTE IGUAL que un
+//	                                                texto. Acusa porque el mensaje está en disco, no por
+//	                                                indulgencia.
+//	                                                🔴 ESTA LÍNEA ERAN TRES CASOS (SIN TEXTO / APAGADO /
+//	                                                FASTLANE) hasta el Plan 044 · T1.6-5 (ADR-0045), y
+//	                                                cuatro hasta T1.5-3 (GRUPO se fue arriba). Los tres
+//	                                                dejaban fila naciendo `clasificado` con su marca de
+//	                                                omisión; hoy nacen `nuevo` y sin sobre, como todo lo
+//	                                                demás, así que ya no son casos aparte — sólo queda
+//	                                                nombrado el que sigue sorprendiendo a quien lo lee.
 //	NO ACUSA (false) · el INSERT falló, entró en
 //	                   pánico, o no hay cola       — el mensaje NO está en ningún sitio. Acusarlo es
 //	                                                perderlo en silencio; no acusarlo lo deja en manos de
@@ -570,7 +531,8 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 	//
 	// `camino` decide en qué SERIE cae la medida y se reasigna en cada salida temprana; el `defer` es lo que
 	// garantiza que se anota pase lo que pase, incluido el recover de enqueueCola. Sale por `Encolado` por
-	// defecto porque los caminos que encolan son tres (normal, fastlane y el del entrante sin hora) y los
+	// defecto porque los caminos que encolan son dos (el normal y el del entrante sin hora — eran tres con
+	// el del fastlane, que desde T1.6-5 ya no se distingue del normal) y los
 	// que descartan son CUATRO (eco propio, perfil pasivo, fuera de ventana y —desde el Plan 044 · T1.5-3—
 	// grupo): el default cubre el caso mayoritario —el mensaje que entra— y cada descarte lo dice
 	// explícitamente.
@@ -765,8 +727,9 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 	//
 	// 🔴 AQUÍ NO SE ENTREGA, Y REINTRODUCIR UNA ENTREGA VIOLA INV-051.2. Quien entrega este mensaje al cable
 	// es el DESPACHADOR de esta sesión (internal/app/despachador, cableado en sessionmgr/despacho.go): lee la
-	// cola en orden de `seq`, espera —con presupuesto acotado— a que el cajero le ponga la intención, y hace
-	// el `Deliver` desde SU goroutine. Hasta el 2026-08-17 aquí abajo había un `l.sink.Deliver` en escritura
+	// cola en orden de `seq` y hace el `Deliver` desde SU goroutine, al instante. (Hasta T1.6-5 esperaba
+	// además, con presupuesto acotado, a que el cajero le pusiera una intención; el ADR-0045 disolvió esa
+	// espera.) Hasta el 2026-08-17 aquí abajo había un `l.sink.Deliver` en escritura
 	// doble con este mismo INSERT; era el camino INLINE, y era transitorio por diseño.
 	//
 	// Por qué no puede volver, aunque parezca un atajo inofensivo:
@@ -860,73 +823,38 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 		Meta:        l.colaMeta(e),
 		Estado:      app.EstadoNuevo,
 	}
-	// Las TRES MARCAS DE OMISIÓN que el LISTENER puede escribir en la columna intent al NACER la fila
-	// (las otras tres las escriben el cajero —breaker, desconocido— y el despachador —presupuesto—).
-	// Ninguna es una intención: las tres dicen «el cajero no debe reclamar esta fila (nace en
-	// EstadoClasificado)» y se diferencian en el PORQUÉ, que es justo lo que el desglose de INV-051.3
-	// necesita distinguir.
+	// 🔴 AQUÍ VIVÍAN LAS TRES MARCAS DE OMISIÓN QUE ESTE LISTENER ESCRIBÍA AL NACER LA FILA
+	// (`sin_texto`, `apagado`, `fastlane`), RETIRADAS EL 2026-08-24 — Plan 044 · Ola 1.6 · T1.6-5 ·
+	// ADR-0045 · D-044.31 · REQ-35. Con ellas se va el último `switch` de esta función: hoy TODA fila
+	// nace `nuevo`, sin sobre, y se entrega.
 	//
-	// 🔴 ERAN CUATRO HASTA EL PLAN 044 · T1.5-3 (REQ-36). La cuarta era `no_elegible` —el mensaje viene de un
-	// GRUPO— y no se ha reescrito: se ha MUDADO. Hoy el grupo se descarta en la puerta (paso 5 de onMessage),
-	// sin fila y sin entrega, así que aquí abajo ya no llega ninguno y una rama para él sería código muerto.
-	// `app.MotivoNoElegible` sigue existiendo en el enum porque hay filas ANTIGUAS en disco y en la nube que
-	// la llevan y hay que poder decodificarlas; lo que ya no existe es quien la escriba.
+	// QUÉ DECIDÍAN DE VERDAD, porque es fácil recordarlo mal: NO decidían si el mensaje se encolaba —los
+	// tres casos se encolaban y se entregaban igual, y lo siguen haciendo—, sino en qué ESTADO NACÍA la
+	// fila. Naciendo `clasificado` el worker-cajero no la reclamaba, y así no gastaba en ella una plaza de
+	// su semáforo de un hueco. Era una optimización del PUSH, y el orden entre las tres ramas existía sólo
+	// para que la telemetría dijera la verdad sobre cuál de los tres motivos había ganado.
 	//
-	// 🔴 POR QUÉ SE FILTRA AQUÍ Y NO EN EL CAJERO (T2.12). Una fila que el cajero descarta YA HA COSTADO:
-	// ocupó una plaza del semáforo de 1 hueco, consumió un claim (UPDATE + lease) y desplazó a un mensaje
-	// que sí había que clasificar — a ~45 msg/min por caja, ese hueco es el recurso escaso que este plan
-	// entero existe para gobernar. Filtrada aquí, la fila jamás nace `nuevo` y el cajero ni la ve: se
-	// filtra donde es GRATIS. Por eso la puerta vive en el listener, antes del Enqueue.
+	// POR QUÉ NINGUNA SOBREVIVE. El ADR-0045 pasó la clasificación a PULL: este Edge ya no clasifica por
+	// iniciativa propia, así que no hay ningún cajero al que ahorrarle una plaza ni ninguna omisión que
+	// justificar. Un sobre escrito aquí hoy sería un dato que nadie volvería a mirar.
 	//
-	// 🔴 EL ORDEN DE LAS RAMAS ES PARTE DEL CONTRATO, no una casualidad de escritura. Primero la propiedad
-	// del MENSAJE (no hay texto), después el estado del SISTEMA (la feature está apagada) y al final la
-	// OPTIMIZACIÓN (el léxico lo resolvió sin LLM):
+	// DÓNDE FUE A PARAR CADA UNA:
+	//   - `sin_texto`  — a ninguna parte, y no hace falta: un entrante sin cuerpo textual (imagen, audio,
+	//                    sticker, ubicación) se encola y se entrega exactamente igual que uno con texto.
+	//                    Quien no le pide inferencia es el Cloud, que ya sabe qué tipo de mensaje es.
+	//   - `apagado`    — al Cloud, como decisión, y al Edge, como respuesta: el entitlement `llm_intent`
+	//                    sigue mandando, pero se ejerce al SERVIR inferencia (T1.6-2), no al encolar.
+	//   - `fastlane`   — al motor de flujos del Cloud (ADR-0044 §1.B): el carril rápido vive donde vive la
+	//                    pregunta, y bajo pull la pregunta «¿hace falta el LLM?» se la hace quien va a
+	//                    llamarlo. Ver `MotivoFastlane`.
 	//
-	//   1. MotivoSinTexto — NO HABÍA TEXTO que clasificar (imagen, audio, sticker, ubicación, …). El
-	//      fastlane devuelve true para la cadena vacía, así que sin esta rama por delante todo el tráfico
-	//      no textual se contaría como "fastlane" y la métrica mentiría sobre cuánto LLM ahorra el léxico.
-	//   2. MotivoApagado — el clasificador está apagado en este Edge. Va ANTES del fastlane a propósito:
-	//      si el fastlane fuera primero, con la feature apagada la telemetría mostraría una MEZCLA de
-	//      `fastlane` y `apagado` en vez del 100 % de `apagado` que explica de verdad lo que está pasando.
-	//   3. MotivoFastlane — había texto, la feature está viva, y el CARRIL RÁPIDO (regex léxico, µs) lo
-	//      resolvió sin tocar el LLM ni el circuito — p.ej. "2", una opción de menú.
+	// 🔴 LOS VALORES DEL ENUM SIGUEN VIVOS (`internal/app/cola.go`) para poder decodificar las filas que ya
+	// están escritas en los discos de los clientes. Lo que desaparece es el escritor, no el vocabulario —
+	// mismo trato que recibió `no_elegible` en T1.5-3.
 	//
-	// Los cuatro caminos (los tres de arriba más el `nuevo` del resto) terminan con el mensaje entregado
-	// SIN intención; lo único que cambia entre ellos es QUÉ SE APRENDE al mirarlos, y de eso va INV-051.3.
-	//
-	// ⚠️ EL SOLAPE QUE YA NO SE DIRIME AQUÍ: una IMAGEN RECIBIDA EN UN GRUPO. Hasta T1.5-3 caía en la rama 1
-	// (`sin_texto` ganaba a `no_elegible`, y así lo fijaba un test) porque las dos ramas la reclamaban.
-	// Desde T1.5-3 ni siquiera llega: el filtro de grupo la corta antes, en la puerta, y se cuenta como
-	// descarte de GRUPO. Quien mire la serie `sin_texto` verá caer el tráfico no textual de grupos — no
-	// porque haya menos, sino porque ya no se guarda.
-	//
-	// ✅ LA DUPLICACIÓN YA NO EXISTE (T3.0, 2026-08-17). Estos filtros vivieron un tiempo en DOS sitios:
-	// aquí y en `intent.Decorator.eligible`, la puerta del camino inline. Aquella copia murió con el
-	// decorador, tal como este comentario anunciaba: ESTA rama es ahora la ÚNICA puerta de elegibilidad del
-	// Edge, y lo que decide es en qué estado NACE la fila. Si alguien vuelve a necesitar el criterio en otro
-	// punto, que lo lea de aquí; una segunda copia volvería a divergir en silencio.
-	//
-	// EL VOCABULARIO YA NO VIVE AQUÍ (2026-08-16, Plan 051 Ola 2): los literales JSON que este fichero
-	// declaraba a mano se sustituyeron por el enum canónico `app.MotivoOmitido` (internal/app/cola.go),
-	// que es la fuente de verdad única —la misma que recorre la telemetría de la Ola 4—. Quien añada un
-	// motivo lo añade ALLÍ, no aquí; un motivo suelto en este fichero sería otra vez dos sitios que
-	// divergen en silencio. Coste nulo en caliente: app.SobreOmitido es un lookup a un mapa de sobres
-	// YA serializados al cargar el paquete, no un json.Marshal por mensaje.
-	switch {
-	case text == "":
-		item.Estado = app.EstadoClasificado
-		item.IntentJSON = app.SobreOmitido(app.MotivoSinTexto)
-	case !l.clasificadorEstaActivo():
-		// Estado del SISTEMA: con la feature apagada no hay nadie a quien preguntar, así que la fila nace
-		// resuelta en vez de esperar a un cajero que la descartaría después de haber gastado su plaza.
-		item.Estado = app.EstadoClasificado
-		item.IntentJSON = app.SobreOmitido(app.MotivoApagado)
-	case l.fastLane != nil && l.fastLane(text):
-		// Carril rápido (µs, sin tocar el LLM ni el circuito): la fila NACE resuelta y el cajero no la
-		// reclamará nunca. No se inventa una intención: se anota la marca de omisión.
-		item.Estado = app.EstadoClasificado
-		item.IntentJSON = app.SobreOmitido(app.MotivoFastlane)
-	}
+	// ✅ SE MANTIENE INTACTA LA PUERTA QUE SÍ ES UNA PUERTA: el descarte de GRUPOS del paso 5 de
+	// `onMessage` (T1.5-3) y el filtro de SESIÓN PASIVA (Plan 046). Aquéllos deciden si hay fila; éstas
+	// decidían quién la tocaba después.
 	if err := l.cola.Enqueue(ctx, item); err != nil {
 		// INV-051.3: el fallo se CUENTA siempre, se grite o no (un log se pierde; el acumulado no).
 		l.brackets.countColaEnqueueError()
@@ -945,17 +873,6 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 		return false
 	}
 	return true
-}
-
-// clasificadorEstaActivo consulta el interruptor del clasificador con el DEFAULT SEGURO aplicado: sin
-// predicado cableado se responde ACTIVO, de modo que un arranque al que le falte la opción clasifique de
-// más (ruidoso, medible, sin pérdida) en vez de dejar de clasificar en silencio. Se llama una vez por
-// mensaje encolado, no se cachea: la feature se enciende y se apaga en caliente.
-func (l *Listener) clasificadorEstaActivo() bool {
-	if l.clasificadorActivo == nil {
-		return true
-	}
-	return l.clasificadorActivo()
 }
 
 // sesionEsPasiva consulta el perfil de ESTA sesión con el DEFAULT FAIL-OPEN aplicado (Plan 046 · T2.2):

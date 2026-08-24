@@ -31,9 +31,6 @@ type colaMuda struct{}
 
 func (colaMuda) CabezaDeSesion(context.Context, string) (*app.ColaCabeza, error) { return nil, nil }
 func (colaMuda) MarcarDespachada(context.Context, int64) error                   { return nil }
-func (colaMuda) DespacharSinIntent(context.Context, int64, app.MotivoOmitido) error {
-	return nil
-}
 
 // sinkMudo satisface app.InboundSink; tampoco se ejercita.
 type sinkMudo struct{}
@@ -155,6 +152,8 @@ func TestManager_DespachoStatsVivas_ToleraSesionSinDespachador(t *testing.T) {
 	if st.CabezasAtascadas != 0 || st.FallosSelloDespacho != 0 || st.FallosSelloPresupuesto != 0 {
 		t.Errorf("el agregado se ensució con una sesión sin despachador: %+v", st)
 	}
+	// ⚠️ `CabezasAtascadas` y `FallosSelloPresupuesto` se comprueban aquí a 0 porque el agregado los SIGUE
+	// sumando (son campos de proto), aunque desde T1.6-5 ningún despachador pueda moverlos. Ver `statsDe`.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -176,24 +175,36 @@ func TestManager_DespachoStatsVivas_ToleraSesionSinDespachador(t *testing.T) {
 // ceros otra vez, que es justo el fallo que viene a cerrar.)
 
 // cuentasGuion describe un guion EN EL IDIOMA DE LOS CONTADORES, que es como se lee este test. Los valores
-// son primos pequeños y distintos entre sí a propósito: si el agregado cruzara dos campos (sumar los polls
-// en las cabezas, o un sello en el otro), con 1 y 1 pasaría desapercibido y con 3 y 5 no.
+// son primos pequeños y distintos entre sí a propósito: si el agregado cruzara dos campos, con 1 y 1
+// pasaría desapercibido y con 3 y 5 no.
+//
+// 🔴 ERAN CUATRO CAMPOS HASTA EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045). Los dos que se
+// fueron —`fallosSelloPresupuesto` y `pollsCabezaAtascada`— no se podían seguir guionando porque sus
+// PRODUCTORES desaparecieron con el push: el primero contaba fallos de `DespacharSinIntent` (método
+// retirado) y el segundo, polls con la cabeza atascada (situación disuelta: ver
+// `TestCabezaEnEstadoImprevistoSaleTambien`). Sus campos siguen en el DTO y en el proto, clavados a 0.
+//
+// ⚠️ EL TEST NO SE DEBILITÓ POR PERDERLOS: la propiedad que prueba —`+=` y no `=`, y ningún cruce de
+// campos— se sostiene con dos series distintas. Lo que sí hubo que reponer es la segunda dimensión que
+// aportaba el par de sellos: por eso el desglose de omisiones se guiona ahora con DOS motivos distintos,
+// que además ejercita el «nunca agregado entre motivos» de INV-051.3.
 type cuentasGuion struct {
-	omitidosPresupuesto    int
-	fallosSelloDespacho    int
-	fallosSelloPresupuesto int
-	pollsCabezaAtascada    int
+	// omitidosFastlane y omitidosBreaker mueven DOS entradas distintas del desglose. Se eligen esos dos
+	// porque son el par que el ADR contrapone: `fastlane` era el camino SANO y `breaker` un FALLO que manda
+	// a mirar Ollama. Si alguien los agregara, este test lo dice.
+	omitidosFastlane    int
+	omitidosBreaker     int
+	fallosSelloDespacho int
 }
 
 // colaGuionada sirve el guion: una cabeza por cada `CabezaDeSesion`, y sella (o falla al sellar) según el
 // id. Agotado el guion cancela el contexto, que es lo que para el bucle de forma determinista.
 type colaGuionada struct {
-	mu             sync.Mutex
-	pasos          []*app.ColaCabeza
-	i              int
-	selloFalla     map[int64]bool
-	sinIntentFalla map[int64]bool
-	cancel         context.CancelFunc
+	mu         sync.Mutex
+	pasos      []*app.ColaCabeza
+	i          int
+	selloFalla map[int64]bool
+	cancel     context.CancelFunc
 }
 
 var _ app.ColaDespachador = (*colaGuionada)(nil)
@@ -223,15 +234,6 @@ func (c *colaGuionada) MarcarDespachada(_ context.Context, id int64) error {
 	return nil
 }
 
-func (c *colaGuionada) DespacharSinIntent(_ context.Context, id int64, _ app.MotivoOmitido) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.sinIntentFalla[id] {
-		return errors.New("cola guionada: DespacharSinIntent falla para esta fila")
-	}
-	return nil
-}
-
 // cabezaGuion arma una fila mínima: el despachador sólo mira id/seq/estado/sobre. `Meta` nil es legal
 // (DecodeColaMeta devuelve el cero sin error), así que el evento sale sin remitente y nada se ensucia.
 func cabezaGuion(id int64, estado, intentJSON string) *app.ColaCabeza {
@@ -245,55 +247,44 @@ func cabezaGuion(id int64, estado, intentJSON string) *app.ColaCabeza {
 	}
 }
 
-// nuevaColaGuionada traduce las cuentas pedidas a la lista de cabezas que las produce. Las cuatro fases van
-// en este orden y cada una explica QUÉ camino del bucle recorre.
+// nuevaColaGuionada traduce las cuentas pedidas a la lista de cabezas que las produce. Las fases van en
+// este orden y cada una explica QUÉ camino del bucle recorre.
+//
+// 🔴 TODAS LAS CABEZAS DEL GUION LLEVAN UN SOBRE ESCRITO, y eso las hace filas ANTIGUAS por definición
+// (bajo pull nadie escribe `intent_json`). Es deliberado: es la única forma de mover el desglose por
+// motivo, y de paso el guion documenta que ese desglose sólo puede moverse drenando colas viejas.
 func nuevaColaGuionada(q cuentasGuion, cancel context.CancelFunc) *colaGuionada {
-	c := &colaGuionada{
-		selloFalla:     map[int64]bool{},
-		sinIntentFalla: map[int64]bool{},
-		cancel:         cancel,
-	}
+	c := &colaGuionada{selloFalla: map[int64]bool{}, cancel: cancel}
 	var id int64
 
-	// (1) OMISIONES POR PRESUPUESTO — una vuelta por fila. Fila ya `clasificado` con el sobre
-	// `{"omitido":"presupuesto"}`: el bucle la entrega SIN intención, cuenta el motivo y la sella bien.
-	for i := 0; i < q.omitidosPresupuesto; i++ {
-		id++
-		c.pasos = append(c.pasos, cabezaGuion(id, app.EstadoClasificado, app.SobreOmitido(app.MotivoPresupuesto)))
+	// (1) OMISIONES POR MOTIVO — una vuelta por fila, dos motivos distintos. El bucle entrega la fila,
+	// cuenta SU motivo y la sella bien.
+	for _, f := range []struct {
+		n      int
+		motivo app.MotivoOmitido
+	}{
+		{q.omitidosFastlane, app.MotivoFastlane},
+		{q.omitidosBreaker, app.MotivoBreaker},
+	} {
+		for i := 0; i < f.n; i++ {
+			id++
+			c.pasos = append(c.pasos, cabezaGuion(id, app.EstadoNuevo, app.SobreOmitido(f.motivo)))
+		}
 	}
 
-	// (2) FALLOS DE SELLO DE DESPACHO — una vuelta por fila. Fila `clasificado` SIN sobre (un fragmento de
-	// lote, tráfico sano) cuyo `MarcarDespachada` falla: se entregó y no se pudo sellar ⇒ el contador de los
-	// DUPLICADOS. Se usa el fragmento y no el sobre de omisión para no ensuciar el desglose por motivo.
+	// (2) FALLOS DE SELLO DE DESPACHO — una vuelta por fila. Fila SIN sobre cuyo `MarcarDespachada` falla:
+	// se entregó y no se pudo sellar ⇒ el contador de los DUPLICADOS. Se usa la fila sin sobre y no una con
+	// motivo para no ensuciar el desglose de la fase (1).
 	for i := 0; i < q.fallosSelloDespacho; i++ {
 		id++
-		c.pasos = append(c.pasos, cabezaGuion(id, app.EstadoClasificado, ""))
+		c.pasos = append(c.pasos, cabezaGuion(id, app.EstadoNuevo, ""))
 		c.selloFalla[id] = true
 	}
 
-	// (3) FALLOS DE SELLO POR PRESUPUESTO — UNA fila `nuevo` servida 1+N veces. La primera vuelta sólo
-	// ARRANCA su reloj (cabeza nueva); en cada una de las N siguientes el presupuesto —1 ns, ver el
-	// arrancador— ya venció y `DespacharSinIntent` falla, que es N fallos exactos. La fila no cambia de id
-	// entre vueltas a propósito: el presupuesto se cuenta por (id, seq).
-	if q.fallosSelloPresupuesto > 0 {
-		id++
-		c.sinIntentFalla[id] = true
-		for i := 0; i < 1+q.fallosSelloPresupuesto; i++ {
-			c.pasos = append(c.pasos, cabezaGuion(id, app.EstadoNuevo, ""))
-		}
-	}
-
-	// (4) CABEZA ATASCADA — UNA fila en un estado que esta versión NO CONOCE, servida 2+N veces: la primera
-	// arranca el reloj, la segunda vence y sella CON ÉXITO, y de la tercera en adelante la fila sigue sin
-	// estar `clasificado` ⇒ es el atasco. `cabezasAtascadas` sube UNA sola vez (el aviso es por fila) y
-	// `pollsCabezaAtascada` una por vuelta: exactamente N. Es el par que distingue «esto pasó una vez» de
-	// «esta sesión lleva horas sin drenar», y por eso se prueban por separado.
-	if q.pollsCabezaAtascada > 0 {
-		id++
-		for i := 0; i < 2+q.pollsCabezaAtascada; i++ {
-			c.pasos = append(c.pasos, cabezaGuion(id, "estado-de-un-binario-mas-nuevo", ""))
-		}
-	}
+	// 🔴 HABÍA DOS FASES MÁS y se fueron con el push (T1.6-5): (3) fallos de sello por PRESUPUESTO —una
+	// fila `nuevo` servida 1+N veces con `DespacharSinIntent` fallando— y (4) la CABEZA ATASCADA —una fila
+	// en un estado desconocido servida 2+N veces—. Las dos guionaban mecanismos que ya no existen; ver el
+	// doc de `cuentasGuion`.
 	return c
 }
 
@@ -309,10 +300,9 @@ func arrancaDespachadorGuionado(t *testing.T, sessionID string, q cuentasGuion) 
 		Sink:      sinkMudo{},
 		SessionID: sessionID,
 		Log:       testLogger(),
-		// Presupuesto MÍNIMO y poll MÍNIMO: aquí no se mide latencia, se cuentan vueltas. Con 1 ns de
-		// presupuesto, la segunda vez que el bucle mira la MISMA cabeza el reloj ya venció siempre (entre
-		// dos vueltas sin progreso hay un poll de por medio), y eso es lo que hace exacto el guion.
-		Presupuesto: time.Nanosecond,
+		// Poll MÍNIMO: aquí no se mide latencia, se cuentan vueltas. (Aquí iba también un `Presupuesto` de
+		// 1 ns, que era lo que hacía vencer el reloj entre dos vueltas sobre la misma cabeza; el presupuesto
+		// se retiró en T1.6-5 y con él las dos fases del guion que dependían de él.)
 		Despertador: despachador.NewPollFijo(time.Millisecond),
 	})
 	if err != nil {
@@ -339,21 +329,14 @@ func arrancaDespachadorGuionado(t *testing.T, sessionID string, q cuentasGuion) 
 // que este test degenere en el que vino a sustituir (uno que suma ceros).
 func comprobarGuion(t *testing.T, etiqueta string, d *despachador.Despachador, q cuentasGuion) {
 	t.Helper()
-	if got, want := d.OmitidosPorMotivo()[app.MotivoPresupuesto], int64(q.omitidosPresupuesto); got != want {
-		t.Errorf("sesión %s: omitidos[presupuesto] = %d, el guion pedía %d", etiqueta, got, want)
+	if got, want := d.OmitidosPorMotivo()[app.MotivoFastlane], int64(q.omitidosFastlane); got != want {
+		t.Errorf("sesión %s: omitidos[fastlane] = %d, el guion pedía %d", etiqueta, got, want)
+	}
+	if got, want := d.OmitidosPorMotivo()[app.MotivoBreaker], int64(q.omitidosBreaker); got != want {
+		t.Errorf("sesión %s: omitidos[breaker] = %d, el guion pedía %d", etiqueta, got, want)
 	}
 	if got, want := d.FallosSelloDespacho(), int64(q.fallosSelloDespacho); got != want {
 		t.Errorf("sesión %s: fallos de sello de DESPACHO = %d, el guion pedía %d", etiqueta, got, want)
-	}
-	if got, want := d.FallosSelloPresupuesto(), int64(q.fallosSelloPresupuesto); got != want {
-		t.Errorf("sesión %s: fallos de sello por PRESUPUESTO = %d, el guion pedía %d", etiqueta, got, want)
-	}
-	if got, want := d.PollsCabezaAtascada(), int64(q.pollsCabezaAtascada); got != want {
-		t.Errorf("sesión %s: polls con la cabeza atascada = %d, el guion pedía %d", etiqueta, got, want)
-	}
-	// UNA cabeza atascada por fila, no una por poll: el aviso es por fila y el contador lo acompaña.
-	if got := d.CabezasAtascadas(); got != 1 {
-		t.Errorf("sesión %s: cabezas atascadas = %d, want 1 (el guion atasca UNA fila)", etiqueta, got)
 	}
 }
 
@@ -363,11 +346,14 @@ func comprobarGuion(t *testing.T, etiqueta string, d *despachador.Despachador, q
 // LAS MUTACIONES QUE CAZA, y ninguna la cazaban los tres tests de arriba:
 //   - `total.X = st.X` en vez de `+=` ⇒ el agregado valdría el de UNA sesión (y, con el recorrido de un
 //     mapa, cuál de las dos sería una lotería distinta en cada ejecución).
+//
+// ⚠️ SUS DOS SERIES SE REDUJERON A DOS MOTIVOS + UN SELLO en T1.6-5 (ver `cuentasGuion`): las otras dos
+// perdieron su productor con el push. La propiedad probada es la misma.
 //   - un contador que se olvide en el agregado ⇒ se queda en 0 mientras las dos sesiones traen valores.
-//   - un cruce de campos (sumar los polls en las cabezas, o un sello en el otro) ⇒ los primos no cuadran.
+//   - un cruce de campos (sumar un motivo en otro, o un sello donde no toca) ⇒ los primos no cuadran.
 func TestManager_DespachoStatsVivas_SumaDeVerdad(t *testing.T) {
-	qA := cuentasGuion{omitidosPresupuesto: 3, fallosSelloDespacho: 5, fallosSelloPresupuesto: 7, pollsCabezaAtascada: 2}
-	qB := cuentasGuion{omitidosPresupuesto: 11, fallosSelloDespacho: 2, fallosSelloPresupuesto: 13, pollsCabezaAtascada: 3}
+	qA := cuentasGuion{omitidosFastlane: 3, omitidosBreaker: 5, fallosSelloDespacho: 7}
+	qB := cuentasGuion{omitidosFastlane: 11, omitidosBreaker: 2, fallosSelloDespacho: 13}
 
 	dA := arrancaDespachadorGuionado(t, uuidA, qA)
 	dB := arrancaDespachadorGuionado(t, uuidB, qB)
@@ -385,35 +371,36 @@ func TestManager_DespachoStatsVivas_SumaDeVerdad(t *testing.T) {
 
 	st := m.DespachoStatsVivas()
 
-	if got, want := st.OmitidosPorMotivo[string(app.MotivoPresupuesto)], int64(qA.omitidosPresupuesto+qB.omitidosPresupuesto); got != want {
-		t.Errorf("agregado[presupuesto] = %d, want %d (%d de A + %d de B): el MISMO motivo sí se suma entre "+
+	if got, want := st.OmitidosPorMotivo[string(app.MotivoFastlane)], int64(qA.omitidosFastlane+qB.omitidosFastlane); got != want {
+		t.Errorf("agregado[fastlane] = %d, want %d (%d de A + %d de B): el MISMO motivo sí se suma entre "+
 			"sesiones, y esto es lo que un `=` en vez de un `+=` rompería en silencio",
-			got, want, qA.omitidosPresupuesto, qB.omitidosPresupuesto)
+			got, want, qA.omitidosFastlane, qB.omitidosFastlane)
+	}
+	if got, want := st.OmitidosPorMotivo[string(app.MotivoBreaker)], int64(qA.omitidosBreaker+qB.omitidosBreaker); got != want {
+		t.Errorf("agregado[breaker] = %d, want %d", got, want)
+	}
+	// 🔴 Y NUNCA ENTRE MOTIVOS DISTINTOS (INV-051.3): `fastlane` era el camino SANO y `breaker` un FALLO que
+	// manda a mirar Ollama. El guion los puso en números distintos para que agregarlos se note.
+	if st.OmitidosPorMotivo[string(app.MotivoFastlane)] == st.OmitidosPorMotivo[string(app.MotivoBreaker)] {
+		t.Errorf("fastlane y breaker salieron con el mismo valor (%d): el guion los puso distintos a "+
+			"propósito, así que o se han cruzado o se han agregado",
+			st.OmitidosPorMotivo[string(app.MotivoFastlane)])
 	}
 	if got, want := st.FallosSelloDespacho, int64(qA.fallosSelloDespacho+qB.fallosSelloDespacho); got != want {
 		t.Errorf("agregado de fallos de sello de DESPACHO = %d, want %d", got, want)
 	}
-	if got, want := st.FallosSelloPresupuesto, int64(qA.fallosSelloPresupuesto+qB.fallosSelloPresupuesto); got != want {
-		t.Errorf("agregado de fallos de sello por PRESUPUESTO = %d, want %d", got, want)
-	}
-	// 🔴 Y SIGUEN SEPARADOS: nada en el agregado suma los dos sellos en un solo número (T3.12). Sólo el de
-	// despacho implica duplicados publicados en la nube.
-	if st.FallosSelloDespacho == st.FallosSelloPresupuesto {
-		t.Errorf("los dos sellos salieron con el mismo valor (%d): el guion los puso distintos a propósito, "+
-			"así que o se han cruzado o se han agregado", st.FallosSelloDespacho)
-	}
-	if got, want := st.PollsCabezaAtascada, int64(qA.pollsCabezaAtascada+qB.pollsCabezaAtascada); got != want {
-		t.Errorf("agregado de polls con la cabeza atascada = %d, want %d", got, want)
-	}
-	if got := st.CabezasAtascadas; got != 2 {
-		t.Errorf("agregado de cabezas atascadas = %d, want 2 (una por sesión): con un `=` en vez de un `+=` "+
-			"aquí saldría 1, y 1 es un número perfectamente creíble", got)
+	// Los campos SIN productor vivo siguen sumándose (son de proto) y por tanto tienen que salir en 0: si
+	// alguno trajera un número, es que un contador se está cruzando con otro.
+	if st.FallosSelloPresupuesto != 0 || st.CabezasAtascadas != 0 || st.PollsCabezaAtascada != 0 {
+		t.Errorf("un campo sin productor vivo trajo valor (sello_presupuesto=%d cabezas=%d polls=%d): "+
+			"desde T1.6-5 nada puede moverlos, así que sólo pueden venir de un cruce",
+			st.FallosSelloPresupuesto, st.CabezasAtascadas, st.PollsCabezaAtascada)
 	}
 
-	// Los otros SIETE motivos siguen a 0 y presentes: el guion sólo tocó `presupuesto`, y ningún motivo se
-	// agrega con otro (INV-051.3). La lista se RECORRE, jamás se transcribe.
+	// Los otros SEIS motivos siguen a 0 y presentes: el guion sólo tocó dos, y ningún motivo se agrega con
+	// otro. La lista se RECORRE, jamás se transcribe.
 	for _, motivo := range app.MotivosOmitido() {
-		if motivo == app.MotivoPresupuesto {
+		if motivo == app.MotivoFastlane || motivo == app.MotivoBreaker {
 			continue
 		}
 		n, presente := st.OmitidosPorMotivo[string(motivo)]
