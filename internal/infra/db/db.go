@@ -352,9 +352,10 @@ func MigrateMeta(ctx context.Context, database *sql.DB) error {
 // Idempotente.
 //
 // Tras los .sql aplica, igual que MigrateStore, las migraciones GUARDADAS de columnas nuevas que un ALTER
-// pelado no puede hacer idempotentes: ver ensureColaClaimToken (columna `claim_token`, T2.18) y
-// ensureColaIntentos (columna `intentos`, T2.19). Esos pasos son los que hacen que una cola YA CREADA por
-// un binario anterior se ponga al día en vez de quedarse coja en silencio.
+// pelado no puede hacer idempotentes: ver ensureColaClaimToken (columna `claim_token`, T2.18),
+// ensureColaIntentos (columna `intentos`, T2.19) y ensureParteInferencia (las seis del reparto de la
+// inferencia sobre `parte_worker`, Plan 044 · T1.7-5). Esos pasos son los que hacen que una cola YA CREADA
+// por un binario anterior se ponga al día en vez de quedarse coja en silencio.
 //
 // 🔴 ESTE MIGRADOR ES **SQLite-ONLY**, y a diferencia de Migrate() no admite Postgres ni con el build-tag.
 // No es una limitación temporal que se pueda quitar cambiando el DSN: los pasos guardados leen
@@ -397,7 +398,132 @@ func MigrateCola(ctx context.Context, database *sql.DB) error {
 	// CREATE TABLE del 0001 sería un no-op silencioso sobre las colas que ya existen en disco. El orden
 	// entre los dos pasos guardados es indiferente —columnas distintas, sin dependencia—, pero se dejan en
 	// orden cronológico para que la lista se lea como la historia del esquema.
-	return ensureColaIntentos(ctx, database)
+	if err := ensureColaIntentos(ctx, database); err != nil {
+		return err
+	}
+	// Y el cuarto: las seis columnas del reparto de la inferencia sobre `parte_worker` (T1.7-5). Éste SÍ
+	// depende del orden —la tabla la crea el 0002, y `applyMigrations` acaba de correr arriba—, al revés
+	// que los dos de la cola, que son independientes entre sí.
+	return ensureParteInferencia(ctx, database)
+}
+
+// columnasDe devuelve el conjunto de columnas de `tabla` según `PRAGMA table_info`.
+//
+// 🔴 NACE PORQUE LLEGÓ EL CUARTO, que es literalmente la condición que ensureColaIntentos dejó escrita
+// («la duplicación es deliberada … Cuando aparezca el cuarto»). Los tres primeros pasos guardados
+// —ensureDeviceMetadataColumns, ensureColaClaimToken, ensureColaIntentos— repetían este bloque de veinte
+// líneas; T1.7-5 añade un cuarto, y a la cuarta copia el argumento de «no reescribir lo que ya está
+// probado» se da la vuelta: lo que hay que evitar es que un quinto sitio escanee las columnas de una forma
+// ligeramente distinta.
+//
+// UN CONJUNTO VACÍO NO ES UN ERROR AQUÍ, y por eso lo devuelve sin protestar: `PRAGMA table_info` de una
+// tabla que NO EXISTE no falla, devuelve CERO FILAS. Quién interpreta ese vacío es el llamante, porque el
+// mensaje útil («el set de migraciones no se aplicó») depende de qué tabla esperaba encontrar. Traducirlo
+// a un error genérico aquí borraría esa pista.
+//
+// ⚠️ SQLite-ONLY por el `PRAGMA`: el porqué y qué habría que cambiar para portarlo, en el doc de
+// MigrateCola.
+func columnasDe(ctx context.Context, database *sql.DB, tabla string) (map[string]struct{}, error) {
+	// Nombre de tabla que viene de una constante en código, nunca de entrada externa: SQLite no admite
+	// placeholder para identificadores, así que la interpolación es necesaria y aquí es segura.
+	rows, err := database.QueryContext(ctx, fmt.Sprintf(`PRAGMA table_info(%s)`, tabla))
+	if err != nil {
+		return nil, fmt.Errorf("db: leer columnas de %s: %w", tabla, err)
+	}
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid       int
+			name      string
+			colType   string
+			notNull   int
+			dfltValue sql.NullString
+			pk        int
+		)
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("db: escanear PRAGMA table_info(%s): %w", tabla, err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("db: recorrer PRAGMA table_info(%s): %w", tabla, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("db: cerrar PRAGMA table_info(%s): %w", tabla, err)
+	}
+	return existing, nil
+}
+
+// parteInferenciaColumnas son las SEIS columnas que el reparto de la inferencia añade a `parte_worker`
+// (Plan 044 · Ola 1.7 · T1.7-5). El DDL va al lado del nombre para que no haya dos listas que sincronizar.
+//
+// 🔴 CUATRO ENTEROS Y DOS JSON, Y LA ASIMETRÍA ES DELIBERADA. Los cuatro enteros son DOS PAREJAS CERRADAS
+// (un p50 y su `n`): el contrato del heartbeat las transporta como un sub-mensaje justamente para que sea
+// imposible leer el cuantil sin su muestra, y una pareja no puede crecer. Los dos repartos, en cambio, son
+// mapas ABIERTOS: los umbrales que definen los regímenes son política del EMISOR y se mueven con el
+// hardware del cliente, así que una categoría nueva tiene que poder aparecer sin migrar esta tabla, sin
+// cortar versión del contrato y sin bumpear dos consumidores. Como JSON en una columna, el único sitio de
+// todo el recorrido que enumera las claves es el cajero, que es quien las inventa.
+//
+// TODAS `NOT NULL DEFAULT`, y eso es lo que las hace seguras en caliente: SQLite exige un DEFAULT no nulo
+// para un `ADD COLUMN` con `NOT NULL`, y ese default rellena la fila preexistente en el propio ALTER. Un
+// cajero que aún no haya publicado su primer parte T1.7-5 deja el parte viejo con ceros y JSON vacío, que
+// es exactamente «no medible» — nunca un NULL que reventaría el Scan del lector.
+var parteInferenciaColumnas = []struct{ nombre, ddl string }{
+	{"prefill_p50_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"prefill_muestras", "INTEGER NOT NULL DEFAULT 0"},
+	{"generacion_p50_ms", "INTEGER NOT NULL DEFAULT 0"},
+	{"generacion_muestras", "INTEGER NOT NULL DEFAULT 0"},
+	{"regimenes_json", "TEXT NOT NULL DEFAULT ''"},
+	{"clases_json", "TEXT NOT NULL DEFAULT ''"},
+}
+
+// ensureParteInferencia añade de forma IDEMPOTENTE las columnas de parteInferenciaColumnas a
+// `parte_worker`. Es el CUARTO paso guardado del repo y existe por la misma razón mecánica que los tres
+// anteriores: el runner (applyMigrations) NO lleva tabla de versión y RE-EJECUTA cada .sql en cada
+// arranque, así que un `ALTER TABLE … ADD COLUMN` pelado dentro de un .sql reventaría en el 2.º arranque
+// con «duplicate column» (y modernc SQLite sin CGO no soporta `ADD COLUMN IF NOT EXISTS`).
+//
+// 🔴 POR QUÉ NO SE EDITA EL `CREATE TABLE` DEL 0002, que es la tentación obvia y aquí especialmente
+// tentadora porque esa tabla es RECIENTE: `CREATE TABLE IF NOT EXISTS` es un NO-OP sobre una BD donde la
+// tabla YA existe, y `parte_worker` existe en toda cola que haya arrancado con un binario desde T4.5 —el
+// VPS de UAT incluido—. Sobre una de ellas las columnas editadas no aparecerían nunca: el arranque no
+// falla, el cajero sigue barriendo leases… y el primer `PublicarParte` muere con `no such column:
+// prefill_p50_ms`, dejando al daemon publicando `intent_circuit` VACÍO a los 90 s. Fallo mudo al arrancar,
+// pérdida de la señal de salud al cabo de minuto y medio.
+//
+// LAS SEIS SE EMITEN EN UN BUCLE Y CADA UNA SE COMPRUEBA POR SEPARADO. No se hace «si falta la primera,
+// añádelas todas»: un arranque interrumpido a mitad del bucle (SIGKILL entre dos ALTER) dejaría la tabla
+// con tres columnas, y el atajo la daría por completa para siempre.
+//
+// ⚠️ SQLite-ONLY por el `PRAGMA table_info` de columnasDe: ver el doc de MigrateCola, su único llamante.
+func ensureParteInferencia(ctx context.Context, database *sql.DB) error {
+	existing, err := columnasDe(ctx, database, "parte_worker")
+	if err != nil {
+		return err
+	}
+	// TABLA AUSENTE ⇒ ERROR EXPLÍCITO, igual que en los tres pasos guardados de la cola: `PRAGMA
+	// table_info` de una tabla inexistente devuelve cero filas sin fallar, y sin esta guarda el operador
+	// recibiría un `no such table` envuelto en un mensaje que habla de añadir columnas — apuntando al sitio
+	// equivocado cuando el fallo real es que el 0002 no se aplicó.
+	if len(existing) == 0 {
+		return fmt.Errorf("db: la tabla parte_worker no existe en esta BD; el set de migraciones %q no se aplicó "+
+			"(¿es esta la BD de la cola, <data_dir>/cola_entrantes.db?)", colaMigrationsDir)
+	}
+	for _, col := range parteInferenciaColumnas {
+		if _, ok := existing[col.nombre]; ok {
+			continue // ya existe (BD nueva o 2.º arranque): no reemitir el ALTER.
+		}
+		// Identificadores y DDL de una constante en código (no vienen de entrada externa): SQLite no admite
+		// placeholder para nombres de columna, así que la interpolación es necesaria y aquí es segura.
+		stmt := fmt.Sprintf(`ALTER TABLE parte_worker ADD COLUMN %s %s`, col.nombre, col.ddl)
+		if _, err := database.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("db: añadir columna %q a parte_worker: %w", col.nombre, err)
+		}
+	}
+	return nil
 }
 
 // colaClaimTokenColumn es la columna de FENCING del claim del cajero (Plan 051 Ola 2): identifica al
@@ -432,32 +558,9 @@ const colaClaimTokenColumn = "claim_token"
 // ⚠️ SQLite-ONLY por el `PRAGMA table_info`: el porqué y qué habría que cambiar para portarlo, en el doc de
 // MigrateCola (su único llamante).
 func ensureColaClaimToken(ctx context.Context, database *sql.DB) error {
-	rows, err := database.QueryContext(ctx, `PRAGMA table_info(cola_entrantes)`)
+	existing, err := columnasDe(ctx, database, "cola_entrantes")
 	if err != nil {
-		return fmt.Errorf("db: leer columnas de cola_entrantes: %w", err)
-	}
-	existing := make(map[string]struct{})
-	for rows.Next() {
-		var (
-			cid       int
-			name      string
-			colType   string
-			notNull   int
-			dfltValue sql.NullString
-			pk        int
-		)
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("db: escanear PRAGMA table_info(cola_entrantes): %w", err)
-		}
-		existing[name] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("db: recorrer PRAGMA table_info(cola_entrantes): %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("db: cerrar PRAGMA table_info(cola_entrantes): %w", err)
+		return err
 	}
 
 	// TABLA AUSENTE ⇒ ERROR EXPLÍCITO, y esta guarda no es defensiva por gusto: `PRAGMA table_info` de una
@@ -516,32 +619,9 @@ const colaIntentosColumn = "intentos"
 // ⚠️ SQLite-ONLY por el `PRAGMA table_info`: el porqué y qué habría que cambiar para portarlo, en el doc de
 // MigrateCola (su único llamante).
 func ensureColaIntentos(ctx context.Context, database *sql.DB) error {
-	rows, err := database.QueryContext(ctx, `PRAGMA table_info(cola_entrantes)`)
+	existing, err := columnasDe(ctx, database, "cola_entrantes")
 	if err != nil {
-		return fmt.Errorf("db: leer columnas de cola_entrantes: %w", err)
-	}
-	existing := make(map[string]struct{})
-	for rows.Next() {
-		var (
-			cid       int
-			name      string
-			colType   string
-			notNull   int
-			dfltValue sql.NullString
-			pk        int
-		)
-		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
-			_ = rows.Close()
-			return fmt.Errorf("db: escanear PRAGMA table_info(cola_entrantes): %w", err)
-		}
-		existing[name] = struct{}{}
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return fmt.Errorf("db: recorrer PRAGMA table_info(cola_entrantes): %w", err)
-	}
-	if err := rows.Close(); err != nil {
-		return fmt.Errorf("db: cerrar PRAGMA table_info(cola_entrantes): %w", err)
+		return err
 	}
 
 	// TABLA AUSENTE ⇒ ERROR EXPLÍCITO, por la MISMA razón que en ensureColaClaimToken: `PRAGMA table_info`

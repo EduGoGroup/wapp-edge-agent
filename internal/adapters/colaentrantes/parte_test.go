@@ -15,6 +15,7 @@ package colaentrantes
 
 import (
 	"context"
+	"reflect"
 	"testing"
 	"time"
 
@@ -85,7 +86,10 @@ func TestParte_SinPublicar_NoEsError(t *testing.T) {
 	if hay {
 		t.Fatal("nadie ha publicado: hay debía ser false")
 	}
-	if p != (app.ParteWorker{}) {
+	// reflect.DeepEqual y no `!=`: desde T1.7-5 el parte lleva dos mapas dentro, y una struct con mapas no
+	// es comparable con `==` (no compila). La promesa que se comprueba es la misma: el CERO de la struct,
+	// mapas nil incluidos.
+	if !reflect.DeepEqual(p, app.ParteWorker{}) {
 		t.Fatalf("sin parte, el valor devuelto es el cero de la struct; es: %+v", p)
 	}
 }
@@ -171,5 +175,72 @@ func TestParte_TSCero_CaeAlRelojDelStore(t *testing.T) {
 	}
 	if tengo.TS.Unix() != reloj.Unix() {
 		t.Errorf("un TS a cero cae al reloj del Store: quiero %d, tengo %d", reloj.Unix(), tengo.TS.Unix())
+	}
+}
+
+// TestParte_ElRepartoDeLaInferenciaSobreviveElViaje (Plan 044 · Ola 1.7 · T1.7-5): los cuatro enteros y
+// los DOS MAPAS cruzan la BD y vuelven iguales.
+//
+// 🔴 LOS MAPAS SON EL SUJETO. Los cuatro enteros son columnas y no tienen misterio; los repartos viajan
+// como JSON en una columna TEXT, y esa decisión es la que permite que una categoría nueva —el día que los
+// umbrales del calor de prefijo se recalibren en la máquina de un cliente— aparezca en el heartbeat sin
+// migrar esta tabla, sin cortar versión del contrato y sin bumpear dos consumidores. Si la serialización
+// se rompiera, el síntoma sería un heartbeat con el reparto SIEMPRE vacío: un silencio, no un error.
+func TestParte_ElRepartoDeLaInferenciaSobreviveElViaje(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, openDB(t), newFakeCrypterFor().fn, 100, 0)
+
+	quiero := app.ParteWorker{
+		TS:                 time.Unix(1_700_000_000, 0),
+		Circuito:           "closed",
+		Taskset:            "disjunta",
+		P50ms:              8100,
+		PrefillP50ms:       1200,
+		PrefillMuestras:    44,
+		GeneracionP50ms:    6500,
+		GeneracionMuestras: 44,
+		PorRegimen:         map[string]int64{"frio": 3, "templado": 0, "caliente": 41},
+		PorClase:           map[string]int64{"interactivo": 44, "lote": 0},
+	}
+	if err := s.PublicarParte(ctx, quiero); err != nil {
+		t.Fatalf("PublicarParte: %v", err)
+	}
+
+	got, hay, err := s.LeerParte(ctx)
+	if err != nil || !hay {
+		t.Fatalf("LeerParte: hay=%v err=%v", hay, err)
+	}
+	if !reflect.DeepEqual(got, quiero) {
+		t.Errorf("el parte no sobrevivió el viaje:\n got  %+v\n want %+v", got, quiero)
+	}
+}
+
+// TestParte_SinRepartoLosMapasVuelvenNil: un cajero que no mide el reparto (o un parte escrito por un
+// binario anterior a T1.7-5, cuya columna quedó en su DEFAULT ”) deja los mapas en NIL y no en un mapa
+// vacío.
+//
+// 🔴 LA DISTINCIÓN ES LA SEMÁNTICA ENTERA. `nil` significa «este Edge no lo mide»; un mapa PRESENTE con
+// una clave a 0 significa «lo mide y no ha visto ninguno». Traduciendo el vacío a `{}` los dos casos
+// llegarían al heartbeat como lo mismo, y el consumidor tendría que adivinar cuál está mirando.
+func TestParte_SinRepartoLosMapasVuelvenNil(t *testing.T) {
+	ctx := context.Background()
+	s := newStore(t, openDB(t), newFakeCrypterFor().fn, 100, 0)
+
+	if err := s.PublicarParte(ctx, app.ParteWorker{
+		TS:       time.Unix(1_700_000_000, 0),
+		Circuito: "closed",
+	}); err != nil {
+		t.Fatalf("PublicarParte: %v", err)
+	}
+
+	got, _, err := s.LeerParte(ctx)
+	if err != nil {
+		t.Fatalf("LeerParte: %v", err)
+	}
+	if got.PorRegimen != nil {
+		t.Errorf("PorRegimen: got %v want nil («no lo mido» no puede leerse como «lo mido y da 0»)", got.PorRegimen)
+	}
+	if got.PorClase != nil {
+		t.Errorf("PorClase: got %v want nil", got.PorClase)
 	}
 }

@@ -139,10 +139,18 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 			"num_predict": cfg.Worker.NumPredict,
 			"num_ctx":     cfg.Worker.NumCtx,
 		},
-		Despertador:   cajero.NewPollFijo(time.Duration(cfg.Worker.PollMS) * time.Millisecond),
-		Log:           log,
-		MaxConcurrent: cfg.Worker.MaxConcurrent,
-		Lease:         time.Duration(cfg.ColaLeaseSeconds) * time.Second,
+		// EL `keep_alive` DE CADA PETICIÓN (T1.7-4). Va aparte de Opciones y tiene que ir aparte: es un campo
+		// de PRIMER NIVEL de /api/chat, y metido en `options` Ollama lo ignora EN SILENCIO — el runner
+		// seguiría muriéndose a los 5 min, llevándose la caché de prefijos, sin que nada lo delatara.
+		KeepAlive: ollama.KeepAliveSeconds(cfg.Worker.KeepAliveSeconds),
+		// Los DOS bordes del calor del prefijo (T1.7-5). Van a la vez porque sólo significan algo en pareja
+		// —y el cajero rechaza una pareja incoherente cayendo los dos al default, con aviso—.
+		PrefillCaliente: time.Duration(cfg.Worker.PrefillCalienteMS) * time.Millisecond,
+		PrefillFrio:     time.Duration(cfg.Worker.PrefillFrioMS) * time.Millisecond,
+		Despertador:     cajero.NewPollFijo(time.Duration(cfg.Worker.PollMS) * time.Millisecond),
+		Log:             log,
+		MaxConcurrent:   cfg.Worker.MaxConcurrent,
+		Lease:           time.Duration(cfg.ColaLeaseSeconds) * time.Second,
 		// El plazo por DEFECTO de una inferencia (cuando el Cloud manda `timeout_ms=0`). El argumento del
 		// número —y por qué el 15 s anterior estaba calibrado contra una muestra CENSURADA por él mismo—
 		// está en cajero.DefaultInferenceTimeoutMS.

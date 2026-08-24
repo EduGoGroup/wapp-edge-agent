@@ -44,6 +44,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/breaker"
 	"github.com/EduGoGroup/wapp-edge-intent/classifier"
+	"github.com/EduGoGroup/wapp-edge-intent/ollama"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
@@ -185,16 +186,25 @@ const DefaultInferenceTimeoutMS = 45_000
 // campo, que es la relación con la que se calibró. La constante NO se ha tocado: lo que estaba mal era
 // el número del que se deriva.
 //
-// LO QUE ESTA CONSTANTE NO ES: no es una perilla. Se deriva del plazo —que sí es configurable
-// (WAPP_WORKER_INFERENCE_TIMEOUT_MS)—, así que quien mueva el presupuesto mueve el umbral con él y la
-// relación entre los dos números no se puede desincronizar a mano. Si algún día hace falta afinarla en
-// campo sin recompilar, hacerla configurable es un cambio de una línea; hasta que la medición lo pida,
-// una perilla más es una forma de romper esta calibración por descuido.
+// LO QUE ESTA CONSTANTE NO ES: no es una perilla. Se deriva de un plazo, así que quien mueva el
+// presupuesto mueve el umbral con él y la relación entre los dos números no se puede desincronizar a
+// mano. Si algún día hace falta afinarla en campo sin recompilar, hacerla configurable es un cambio de
+// una línea; hasta que la medición lo pida, una perilla más es una forma de romper esta calibración por
+// descuido.
 //
-// CON EL PLAZO DESACTIVADO (Deps.Timeout <= 0, manda el ctx del proceso) NO HAY PRESUPUESTO del que
-// derivar nada y el criterio se apaga entero: el breaker vuelve exactamente a la conducta de antes del
-// MP-09. Es la única lectura honesta —sin plazo, «tardar demasiado» no está definido—, y además es la
-// que mantiene intacta la promesa de Deps.Timeout <= 0.
+// 🔴 DE QUÉ PLAZO, Y ES LO QUE ARREGLÓ T1.7-2 (Plan 044 · Ola 1.7). Del plazo de CADA PETICIÓN, no del
+// default del proceso. Todo lo de arriba se escribió cuando el Edge decidía el presupuesto y había UNO
+// solo; desde el ADR-0045 lo fija el Cloud petición a petición, y desde el ADR-0044 conviven dos vías con
+// plazos de un orden de magnitud de diferencia (interactiva y lote). Contra un umbral único, la relación
+// «~4,6× el p50 sano» que esta constante protege sólo podía cumplirse para UNA de las dos: la otra
+// quedaba o inmune al criterio (una interactiva de 9,9 s sobre 10 s contada como sana) o marcada como
+// enferma yendo holgada (una de lote de 40 s sobre 90 s). Derivándolo del plazo de cada una, la relación
+// se cumple en las dos a la vez y sin tocar este número.
+//
+// SIN PLAZO EFECTIVO NO HAY PRESUPUESTO del que derivar nada y el criterio se apaga: el breaker vuelve
+// exactamente a la conducta de antes del MP-09. Es la única lectura honesta —sin plazo, «tardar
+// demasiado» no está definido—. Hoy eso exige las dos cosas a la vez: que el Cloud no fije `timeout_ms` Y
+// que el Edge tenga Deps.Timeout desactivado, que es como se mantiene intacta esa promesa.
 const FraccionLentitud = 0.8
 
 // DefaultMaxIntentos es cuántas veces se RECLAMA un lote antes de abandonarlo con
@@ -312,7 +322,38 @@ type Deps struct {
 	// Opciones son las opciones de modelo que el Edge le pasa al proveedor (num_thread / num_ctx /
 	// num_predict), calibradas en la O0 sobre la máquina real. nil ⇒ se mandan sólo las que el proveedor
 	// tenga por defecto.
+	//
+	// ⚠️ `num_predict` DE AQUÍ ES UN DEFAULT, NO EL TECHO: desde T1.7-3 el Cloud puede fijarlo por petición
+	// (InferenceRequest.max_output_tokens) y entonces manda el suyo. Ver el bloque de `num_predict` en
+	// servidor.go · chat().
 	Opciones map[string]any
+	// PrefillCaliente y PrefillFrio son los DOS BORDES con los que se clasifica el calor del prefijo
+	// (T1.7-5). <=0 ⇒ el default de cada uno; `PrefillCaliente >= PrefillFrio` ⇒ los DOS al default, con
+	// aviso (ver nuevosUmbralesRegimen).
+	//
+	// 🔴 SON CONFIGURACIÓN Y NO CONSTANTES A PROPÓSITO: el conteo del régimen `templado` existe para decir
+	// «estos dos números ya no parten bien la población de esta máquina», y si recalibrarlos exigiera
+	// recompilar, la respuesta llegaría semanas después de la señal. El valor EFECTIVO se publica en la
+	// línea `cajero: arrancando` — el `.env` de la máquina pisa al default del código, y eso ya costó una
+	// ola entera (el techo de 45 s que nunca llegó a producción porque el VPS traía 15 s).
+	PrefillCaliente time.Duration
+	PrefillFrio     time.Duration
+	// KeepAlive son los SEGUNDOS que Ollama debe mantener el modelo cargado tras responder, y viaja en el
+	// primer nivel de cada /api/chat (T1.7-4). Negativo = para siempre (ollama.KeepAliveForever).
+	// nil ⇒ ollama.DefaultKeepAliveSeconds (hoy -1).
+	//
+	// 🔴 ES PUNTERO Y EL NIL ES EL LADO SEGURO, al revés que casi todos los guardarraíles de este struct
+	// (que son `<=0 ⇒ default`). Aquí ese patrón sería un desastre silencioso: para Ollama el CERO
+	// significa «descarga el modelo en cuanto respondas», o sea lo contrario de lo que queremos, y el cero
+	// es a la vez el cero-valor de un `int`. Con `<=0 ⇒ default` no se podría pedir 0 nunca; con un `int`
+	// desnudo, un Deps a medio poblar pediría descarga inmediata en cada petición. Con puntero, el
+	// cero-valor del struct da el default (para siempre) y el 0 explícito sigue siendo expresable.
+	//
+	// POR QUÉ IMPORTA: cuando el runner de Ollama muere por silencio se lleva LA CACHÉ DE PREFIJOS con él,
+	// y el siguiente mensaje paga carga del modelo (39 s medidos) más el prefill en frío del prompt
+	// entero. En UAT eso lo tapa `OLLAMA_KEEP_ALIVE=-1` en el env de la unidad; en la máquina de un
+	// cliente no hay quien lo ponga.
+	KeepAlive *int
 	// Breaker es el circuito compartido. nil ⇒ se construye uno con la calibración por defecto.
 	Breaker Interruptor
 	// Despertador es cómo se espera cuando la cola está vacía. nil ⇒ PollFijo(DefaultPollMS).
@@ -345,8 +386,9 @@ type Deps struct {
 	// —y por qué el 15 s anterior estaba calibrado contra una muestra CENSURADA— está en
 	// DefaultInferenceTimeoutMS.
 	//
-	// ⚠️ De él se DERIVA el umbral de lentitud del breaker (FraccionLentitud): mover este número mueve
-	// aquél, y esa dependencia es deliberada (los dos no se pueden desincronizar a mano).
+	// ⚠️ De él se DERIVA el umbral de lentitud del breaker (FraccionLentitud) SÓLO PARA LAS PETICIONES QUE
+	// LLEGUEN SIN PLAZO. Desde T1.7-2 el umbral es de cada petición y sale del plazo de ella, así que mover
+	// este número mueve el umbral de las que caen en el default y de ninguna más (ver registrarAcierto).
 	Timeout time.Duration
 	// TimeoutMax es el TECHO de lo que el Cloud puede pedir en `timeout_ms`. <=0 ⇒ DefaultMaxTimeoutMS.
 	// Un plazo por encima se RECORTA y se avisa (nunca se rechaza la petición): ver Cajero.plazoDe.
@@ -397,6 +439,9 @@ type Cajero struct {
 	modelo      string
 	temperatura float64
 	opciones    map[string]any
+	// keepAlive son los segundos de `keep_alive` que van en CADA petición a Ollama (T1.7-4). Nunca es nil
+	// después de New: el default se resuelve allí.
+	keepAlive   *int
 	breaker     Interruptor
 	despertador Despertador
 	log         sharedlogger.Logger
@@ -404,10 +449,6 @@ type Cajero struct {
 	lease       time.Duration
 	timeout     time.Duration
 	timeoutMax  time.Duration
-	// umbralLento es el plazo por encima del cual un ACIERTO deja de contar como éxito para el breaker
-	// (MP-09). Se DERIVA de timeout en New —timeout × FraccionLentitud— y vale 0 cuando no hay plazo
-	// propio (Deps.Timeout <= 0), que es como se apaga el criterio entero. Ver FraccionLentitud.
-	umbralLento time.Duration
 	statsEvery  time.Duration
 	ollamaURL   string
 	numThread   int
@@ -438,9 +479,33 @@ type Cajero struct {
 	// devolviendo ""— es exactamente la semántica que hace falta: vacío = «no se sabe» (ver Taskset).
 	veredictoTaskset atomic.Value // string
 
-	// inferencia es el histograma de latencia de la inferencia (T4.5), del que sale el p50 del parte. Va
-	// por VALOR y no por puntero: es un array de atómicos, no necesita construcción, y el cero funciona.
+	// inferencia es el histograma de latencia TOTAL de la inferencia (T4.5), del que sale el p50 del
+	// parte. Va por VALOR y no por puntero: es un array de atómicos, no necesita construcción, y el cero
+	// funciona.
 	inferencia histogramaInferencia
+
+	// ─── T1.7-5 · las DOS FASES, por separado ────────────────────────────────
+	//
+	// 🔴 NO SUSTITUYEN A `inferencia`, LA COMPLETAN, y las tres tienen que convivir. El total es el único
+	// que mide lo que el Cloud ESPERA (incluye el fallo, y el fallo también ocupó la plaza); estas dos
+	// miden en qué se fue ese tiempo cuando hubo respuesta. Publicar sólo las dos fases dejaría sin
+	// respuesta «¿cuánto tarda esto?», y publicar sólo el total es exactamente el número mezclado que dejó
+	// dos p50 irreconciliables en el repo (ver el bloque de la ⑨ en servidor.go).
+	prefill    histogramaInferencia
+	generacion histogramaInferencia
+
+	// porRegimen y porClase son los DOS REPARTOS acumulados del proceso (T1.7-5). Punteros porque el tipo
+	// lleva un mapa que hay que construir (ver nuevoContador), al revés que los histogramas.
+	//
+	// ⚠️ VENTANAS DISTINTAS A LAS DE LOS HISTOGRAMAS, y está escrito también en el .proto: los cuantiles
+	// son una foto de la ventana del emisor y estos son acumulados monótonos. Dividir uno por otro da un
+	// número absurdo con muy buena pinta.
+	porRegimen *contadorEtiquetado
+	porClase   *contadorEtiquetado
+
+	// umbrales son los dos bordes YA VALIDADOS con los que se clasifica el calor del prefijo. Van juntos en
+	// un tipo porque sólo significan algo en pareja (ver umbralesRegimen).
+	umbrales umbralesRegimen
 
 	fallos           atomic.Int64
 	rescatados       atomic.Int64
@@ -574,12 +639,24 @@ func New(deps Deps) (*Cajero, error) {
 		numThread = DefaultNumThread
 	}
 
+	// El default del keep_alive lo pone el MÓDULO DEL PROVEEDOR (ollama.DefaultKeepAliveSeconds) y no una
+	// constante nuestra: quién decide cuánto vive el runner es una política del proveedor, y copiar aquí el
+	// -1 lo dejaría caducar en silencio el día que esa recomendación cambie.
+	keepAlive := deps.KeepAlive
+	if keepAlive == nil {
+		keepAlive = ollama.KeepAliveSeconds(ollama.DefaultKeepAliveSeconds)
+	}
+
 	return &Cajero{
 		colas:       colas,
 		ollama:      deps.Ollama,
 		modelo:      deps.Modelo,
 		temperatura: temperatura,
 		opciones:    deps.Opciones,
+		keepAlive:   keepAlive,
+		umbrales:    nuevosUmbralesRegimen(deps.PrefillCaliente, deps.PrefillFrio, log),
+		porRegimen:  nuevoContador(RegimenesInferencia...),
+		porClase:    nuevoContador(app.ClasesInferencia...),
 		breaker:     br,
 		despertador: desp,
 		log:         log,
@@ -587,7 +664,6 @@ func New(deps Deps) (*Cajero, error) {
 		lease:       lease,
 		timeout:     deps.Timeout,
 		timeoutMax:  timeoutMax,
-		umbralLento: umbralLentoDe(deps.Timeout),
 		statsEvery:  deps.StatsEvery,
 		ollamaURL:   deps.OllamaURL,
 		numThread:   numThread,
@@ -621,8 +697,34 @@ func (c *Cajero) Run(ctx context.Context) error {
 		"lease_s", int(c.lease.Seconds()),
 		"inferencia_timeout_ms", c.timeout.Milliseconds(),
 		"inferencia_timeout_max_ms", c.timeoutMax.Milliseconds(),
-		"umbral_lento_ms", c.umbralLento.Milliseconds(),
+		// 🔴 «_default_» EN EL NOMBRE, Y NO ES COSMÉTICA (T1.7-2): desde esta tarea el umbral de lentitud NO
+		// es del proceso sino DE CADA PETICIÓN —se deriva del plazo de ella, ver registrarAcierto—. Éste es
+		// sólo el que le tocará a las que lleguen SIN plazo, y llamarlo `umbral_lento_ms` haría creer a quien
+		// lea el arranque que todas se juzgan contra este número.
+		"umbral_lento_default_ms", umbralLentoDe(c.timeout).Milliseconds(),
 		"stats_cada_ms", c.statsEvery.Milliseconds(),
+		// ─── Plan 044 · Ola 1.7 · LO QUE ESTA OLA INTRODUCE, EN VALOR EFECTIVO ──
+		//
+		// 🔴 POR QUÉ AQUÍ Y NO EN EL LOG DEL CABLEADO (cmd/agent/cajero.go), que también publica config: esa
+		// línea imprime lo que dice `cfg`, ANTES de que New aplique sus guardarraíles. Ésta imprime lo que el
+		// Cajero VA A USAR de verdad. Cuando los dos números difieren —un umbral inválido que cayó al
+		// default, una pareja invertida— el único que dice la verdad es éste.
+		//
+		// 🔴 Y POR QUÉ SE PUBLICAN: el `.env` de la máquina PISA al default del código, y eso no lo puede ver
+		// ningún test. En la Ola 1.6 el techo de inferencia se subió a 45 s en el binario, el VPS traía
+		// `WAPP_WORKER_INFERENCE_TIMEOUT_MS=15000` y el arreglo NUNCA llegó a producción — con el agravante
+		// de que ese número envenenaba al breaker, porque el umbral de lentitud DERIVA de él. La única forma
+		// de cazarlo es desplegar y leer esta línea. Si un valor de esta ola no se puede confirmar aquí, el
+		// cambio no está terminado.
+		"keep_alive_s", *c.keepAlive,
+		"prefill_caliente_ms", c.umbrales.calienteMS,
+		"prefill_frio_ms", c.umbrales.frioMS,
+		// EL DEFAULT DE `num_predict` SE LEE DEL MAPA QUE DE VERDAD SE MANDA (c.opciones), no de una copia
+		// del número: es lo que le tocará a toda petición que llegue sin `max_output_tokens`. 0 significa
+		// «el Edge NO fija ninguno y manda el default del proveedor» — imposible desde el cableado real (el
+		// guardarraíl de config fuerza <=0 al default), así que un 0 aquí delata un cajero armado sin
+		// Opciones.
+		"num_predict_default", c.numPredictPorDefecto(),
 	)
 
 	// T4.5 · EL PRIMER PARTE VA AQUÍ, ANTES DEL BUCLE, y no se deja para el primer tick. Sin esto habría
@@ -820,8 +922,28 @@ const (
 // ella. Por eso `lentas` es un contador aparte y NO suma en `fallos` —que gobierna el freno del lote
 // venenoso (DefaultMaxIntentos)—: castigar los intentos de un lote por la lentitud de Ollama abandonaría
 // mensajes ajenos al problema.
-func (c *Cajero) registrarAcierto(transcurrido time.Duration) bool {
-	if c.umbralLento <= 0 || transcurrido < c.umbralLento {
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 EL UMBRAL ES DE LA PETICIÓN, NO DEL PROCESO (T1.7-2, Plan 044 · Ola 1.7)
+// ─────────────────────────────────────────────────────────────────────────────
+// `plazo` es el plazo EFECTIVO de ESTA inferencia —el que ya calculó `plazoDe` para ella, default y techo
+// aplicados—, y el umbral se deriva de él en cada llamada. Antes se derivaba UNA vez en New, del default
+// del proceso, y esa versión mentía en las dos direcciones desde que el ADR-0045 le dio el plazo al Cloud:
+//
+//   - MENTÍA POR ARRIBA, y es el defecto que cerró esta tarea: una petición interactiva con
+//     `timeout_ms = 10 s` que tardaba 9,9 s se le contaba al circuito como ÉXITO —9,9 s < 36 s, el umbral
+//     del default— cuando se había quedado a 100 ms de morir. El breaker no podía ver enferma la vía
+//     estrecha por muy mal que fuese.
+//   - MENTÍA POR ABAJO en la vía de lote: una petición con `timeout_ms = 90 s` que responde en 40 s va
+//     holgadísima dentro de SU presupuesto, y el umbral del proceso la marcaba como lenta y castigaba al
+//     circuito por ella.
+//
+// LA FÓRMULA NO CAMBIA (ADR-0042 §4: × FraccionLentitud). Cambia DE QUÉ PLAZO SE DERIVA, que es donde
+// estaba el error: un umbral derivado hereda el error de su fuente sin dar ninguna señal, y con dos vías
+// conviviendo (ADR-0044) no hay UN plazo del proceso que pueda representarlas a las dos.
+func (c *Cajero) registrarAcierto(transcurrido, plazo time.Duration) bool {
+	umbral := umbralLentoDe(plazo)
+	if umbral <= 0 || transcurrido < umbral {
 		c.breaker.RecordSuccess()
 		return false
 	}
@@ -837,8 +959,11 @@ func (c *Cajero) registrarAcierto(transcurrido time.Duration) bool {
 	c.log.Warn("cajero: inferencia LENTA; respondió, pero se comió casi todo su plazo y cuenta como fallo "+
 		"para el circuit breaker (el lote se cierra con su intent, no se pierde)",
 		"latencia_ms", transcurrido.Milliseconds(),
-		"umbral_lento_ms", c.umbralLento.Milliseconds(),
-		"timeout_ms", c.timeout.Milliseconds(),
+		"umbral_lento_ms", umbral.Milliseconds(),
+		// EL PLAZO DE ESTA PETICIÓN, no el default del proceso: es lo único que hace legible el `umbral_lento_ms`
+		// de al lado. Con dos vías conviviendo (interactiva y lote, ADR-0044) el mismo `latencia_ms` es sano en
+		// una y enfermo en la otra, y sin este número las dos líneas serían indistinguibles en el log.
+		"plazo_ms", plazo.Milliseconds(),
 		"lentas", n,
 		"circuito", c.breaker.State(),
 	)
@@ -861,9 +986,19 @@ func (c *Cajero) anotarApertura(abrio bool, causa string) {
 		"causa", causa, "aperturas", n, "abierto_por_s", int(breaker.DefaultOpenFor.Seconds()))
 }
 
-// umbralLentoDe deriva el umbral de lentitud del presupuesto de inferencia (ver FraccionLentitud). Un
-// presupuesto <= 0 —Deps.Timeout desactivado, manda el ctx del proceso— devuelve 0, que APAGA el
-// criterio: sin plazo no hay «demasiado tarde» que definir.
+// umbralLentoDe deriva el umbral de lentitud de UN plazo de inferencia (ver FraccionLentitud). Un plazo
+// <= 0 devuelve 0, que APAGA el criterio: sin plazo no hay «demasiado tarde» que definir.
+//
+// 🔴 SIGUE SIENDO EL ÚNICO SITIO DONDE VIVE LA FÓRMULA, y por eso T1.7-2 no la movió: lo que cambió es
+// QUIÉN la llama y CON QUÉ. Su llamante de producción es `registrarAcierto`, una vez por petición y con
+// el plazo de ella; `Run` la usa además para poder anunciar en el arranque el umbral que le tocará a las
+// peticiones que lleguen sin plazo (`umbral_lento_default_ms`), que es un dato informativo y no un
+// criterio. Si algún día hace falta afinar la fracción, se afina aquí y las dos vías se mueven juntas.
+//
+// EL CERO SIGUE SIENDO ALCANZABLE, sólo que ahora exige las DOS cosas a la vez: que el Cloud no fije
+// plazo Y que el Edge tenga Deps.Timeout desactivado (`plazoDe` devuelve el default cuando el pedido es
+// 0). Es la lectura honesta: con un plazo real encima, «tardar demasiado» SÍ está definido, venga de
+// donde venga el número.
 func umbralLentoDe(timeout time.Duration) time.Duration {
 	if timeout <= 0 {
 		return 0
@@ -917,6 +1052,22 @@ func (c *Cajero) publicarParte(ctx context.Context) {
 		Circuito: c.Circuito(),
 		Taskset:  c.Taskset(),
 		P50ms:    c.inferencia.p50MS(),
+		// ─── T1.7-5 · el reparto de la inferencia ──────────────────────────────
+		//
+		// 🔴 EL CUANTIL VIAJA ATADO A SU `n`, y no es cosmética: un p50 sobre n=3 es un MÁXIMO disfrazado, y
+		// comparar cuantiles de n distinto ya fabricó aquí una conclusión falsa. El contrato lo impone en el
+		// wire (InferenceLatency es UN mensaje con los dos campos, no dos campos sueltos) y este parte lo
+		// respeta escribiendo siempre la pareja: el lector decide «no medible» mirando las muestras, jamás
+		// el p50 —que vale 0 tanto sin muestras como con ellas si el reloj no avanzó—.
+		PrefillP50ms:       c.prefill.p50MS(),
+		PrefillMuestras:    int64(c.prefill.muestras()),
+		GeneracionP50ms:    c.generacion.p50MS(),
+		GeneracionMuestras: int64(c.generacion.muestras()),
+		// Las FOTOS de los dos repartos. Se copian aquí (foto() devuelve copia) y el mismo mapa se escribe
+		// en las N colas: es sólo lectura a partir de este punto, así que compartirlo entre los N UPSERT es
+		// seguro y ahorra N copias de un mapa de tres claves.
+		PorRegimen: c.porRegimen.foto(),
+		PorClase:   c.porClase.foto(),
 	}
 	for _, cm := range c.colas {
 		if cm.parte == nil {

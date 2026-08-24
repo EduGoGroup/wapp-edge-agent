@@ -105,7 +105,37 @@ type Report struct {
 	WorkerTaskset string
 	// IntentP50Ms es el p50 de la INFERENCIA del clasificador en ms, medido por el cajero. 0 = sin muestras
 	// (o parte ausente/rancio): NO significa «inferencia instantánea».
+	//
+	// ⚠️ ES EL TOTAL Y MEZCLA DOS REGÍMENES. Desde T1.7-5 las dos fases viajan aparte (ver los cuatro campos
+	// de abajo): este número junta PREFILL y GENERACIÓN, que se diferencian en un orden de magnitud según
+	// el calor de la caché de prefijo, y esa mezcla es la que dejó dos p50 irreconciliables en el repo.
 	IntentP50Ms int64
+
+	// ─── Plan 044 · Ola 1.7 · T1.7-5 · el reparto de la inferencia ───────────
+	//
+	// Salen del MISMO parte que los tres de arriba y CAEN CON ELLOS: parte rancio o ilegible ⇒ los dos
+	// punteros a nil y los dos mapas a nil. Nunca un valor heredado de un cajero muerto.
+
+	// InferPrefill e InferGeneracion son cada fase con su cuantil ATADO A SU MUESTRA. 🔴 nil = NO MEDIBLE,
+	// y esa es toda la semántica: un p50 de 0 con muestras es un dato, un p50 de 0 sin muestras es un
+	// hueco, y sólo la presencia los distingue. Es deliberadamente DISTINTO de IntentP50Ms, que gasta el
+	// valor 0 en «no medible» y tiene que advertirlo por escrito para que nadie lo lea como «instantáneo».
+	InferPrefill    *LatenciaInferencia
+	InferGeneracion *LatenciaInferencia
+
+	// InferPorRegimen es el reparto por calor del prefijo ("frio"/"templado"/"caliente") y InferPorClase el
+	// reparto por la `class` de la petición. nil = este Edge no lo mide (o parte rancio); una clave a 0 SÍ
+	// es un dato («no ha pagado ni un arranque en frío»).
+	//
+	// 🔴 SE PASAN TAL CUAL, SIN ENUMERAR SUS CLAVES. Los umbrales que definen los regímenes son política
+	// del cajero y se mueven con el hardware del cliente: filtrar o reordenar aquí sería transcribir esa
+	// lista por la puerta de atrás, y una categoría nueva se perdería en silencio. Mismo criterio que
+	// IntentOmittedByReason.
+	//
+	// ⚠️ SON ACUMULADOS MONÓTONOS DEL PROCESO DEL CAJERO, mientras que los dos punteros de arriba son una
+	// foto de su ventana. Las ventanas NO coinciden: no se divide un cuantil entre uno de estos contadores.
+	InferPorRegimen map[string]int64
+	InferPorClase   map[string]int64
 
 	// ─── Plan 051 Ola 4 · T4.0 · los OCHO motivos, distinguibles (INV-051.3) ───
 
@@ -291,14 +321,14 @@ func (c *Collector) Collect(ctx context.Context, sessionID string) (Report, bool
 		return Report{}, false
 	}
 	now := c.now()
-	circuito, taskset, p50 := c.parteDelWorker(ctx, now)
+	parte, hayParte := c.parteDelWorker(ctx, now)
 	r := Report{
 		SocketState:       string(snap.SocketState),
 		DegradedReason:    snap.DegradedReason,
 		DEKLoadDurationMs: snap.DEKLoadDuration.Milliseconds(),
-		IntentCircuit:     circuito,
-		WorkerTaskset:     taskset,
-		IntentP50Ms:       p50,
+		IntentCircuit:     parte.Circuito,
+		WorkerTaskset:     parte.Taskset,
+		IntentP50Ms:       parte.P50ms,
 		BinaryVersion:     c.version,
 		DaemonUptimeS:     c.uptimeS(now),
 		// Plan 046 · T2.3: sale del MISMO Snapshot que el resto de la salud de runtime, tal cual. No se
@@ -318,8 +348,49 @@ func (c *Collector) Collect(ctx context.Context, sessionID string) (Report, bool
 			r.OutboxDepth = depth
 		}
 	}
+	if hayParte {
+		poblarInferencia(&r, parte)
+	}
 	c.poblarDespacho(&r, sessionID)
 	return r, true
+}
+
+// LatenciaInferencia es un cuantil JUNTO AL TAMAÑO DE SU MUESTRA.
+//
+// 🔴 LOS DOS NÚMEROS VAN EN UN TIPO Y NO COMO DOS CAMPOS SUELTOS DEL REPORT, y es la misma decisión que el
+// contrato toma en el wire (`InferenceLatency` es un sub-mensaje): un cuantil sobre `n` pequeño es un
+// MÁXIMO DISFRAZADO, y comparar cuantiles de `n` distinto ya fabricó aquí una conclusión falsa. Con dos
+// campos sueltos, publicar el p50 y olvidar la muestra compila; con un tipo, no existe la forma de hacerlo.
+type LatenciaInferencia struct {
+	// P50Ms es el p50 en milisegundos. NO significa nada si Muestras es 0 — pero ese caso no debería
+	// existir: quien construye este tipo sólo lo hace cuando hay muestras (ver poblarInferencia).
+	P50Ms int64
+	// Muestras es el tamaño de la población que produjo ese p50.
+	Muestras int64
+}
+
+// poblarInferencia vuelca en el Report el reparto de la inferencia que trae el parte (T1.7-5).
+//
+// 🔴 LA PRESENCIA ES LA SEMÁNTICA, Y SE DECIDE POR LAS MUESTRAS, NUNCA POR EL p50. Un p50 de 0 con
+// muestras significa «todas por debajo de la resolución de la rejilla», que es un dato; un p50 de 0 sin
+// muestras significa «no lo mido». Decidir por el p50 (`if p50 > 0`) los colapsaría en el mismo hueco y
+// haría desaparecer del heartbeat justo a la máquina que va rápida.
+//
+// SÓLO SE LLAMA CON UN PARTE FRESCO: los campos caen JUNTOS con el circuito y el taskset, que es la regla
+// de rancidez de parteDelWorker. Un parte viejo deja los cuatro a nil, que es la ausencia honesta.
+func poblarInferencia(r *Report, p app.ParteWorker) {
+	if p.PrefillMuestras > 0 {
+		r.InferPrefill = &LatenciaInferencia{P50Ms: p.PrefillP50ms, Muestras: p.PrefillMuestras}
+	}
+	if p.GeneracionMuestras > 0 {
+		r.InferGeneracion = &LatenciaInferencia{P50Ms: p.GeneracionP50ms, Muestras: p.GeneracionMuestras}
+	}
+	// Los mapas se pasan TAL CUAL, incluido el nil: no se sustituye un nil por un mapa vacío (serían dos
+	// formas de decir lo mismo y el consumidor tendría que comprobar las dos) ni se siembran claves aquí
+	// —quien conoce las categorías es el cajero, y sembrarlas en este lado inventaría un cero para una
+	// máquina que no las mide—.
+	r.InferPorRegimen = p.PorRegimen
+	r.InferPorClase = p.PorClase
 }
 
 // poblarDespacho vuelca en el Report los contadores del despachador de ESTA sesión (T4.0). El desglose por
@@ -402,9 +473,9 @@ func (c *Collector) Version() string {
 	return c.version
 }
 
-// parteDelWorker lee el parte que el worker-cajero deja en la BD de la cola y devuelve los TRES campos que
-// de él dependen: circuito, taskset y p50 de inferencia. Es la única puerta por la que este proceso se
-// entera de lo que pasa en el otro (Plan 051 Ola 4 · T4.3).
+// parteDelWorker lee el parte que el worker-cajero deja en la BD de la cola. Es la única puerta por la que
+// este proceso se entera de lo que pasa en el otro (Plan 051 Ola 4 · T4.3). El bool es «hay parte y es
+// FRESCO»: con `false`, el llamante no debe publicar NADA de lo que venga del cajero.
 //
 // 🔴 LA REGLA DE RANCIDEZ, QUE ES EL CORAZÓN DE ESTA FUNCIÓN. Si el parte se aparta del ahora más de
 // `app.ParteRancio` —viejo por detrás O adelantado por delante, la ventana es SIMÉTRICA (ver abajo)—,
@@ -413,8 +484,10 @@ func (c *Collector) Version() string {
 // latido, y una salud inventada es peor que la ausencia del dato — el operador la cree, y `intent_circuit`
 // vacío al menos le dice la verdad («este Edge no sabe»). El umbral se usa POR NOMBRE, nunca un literal.
 //
-// LOS TRES CAEN JUNTOS, y también es deliberado: vienen del mismo instante del mismo proceso. Conservar el
-// p50 y tirar el circuito daría una foto mitad viva mitad muerta que nadie sabría interpretar.
+// TODOS CAEN JUNTOS, y también es deliberado: vienen del mismo instante del mismo proceso. Conservar el
+// p50 y tirar el circuito daría una foto mitad viva mitad muerta que nadie sabría interpretar. Desde
+// T1.7-5 «todos» son once campos y no tres, y por eso lo que se devuelve es el parte entero: ver el
+// bloque del `return` de abajo.
 //
 // ⚠️ UN ERROR DE LECTURA (BD bloqueada por el cajero, fichero movido) TAMPOCO TUMBA NADA: se avisa a warn
 // y los tres quedan a cero. Este código corre en el camino del HEARTBEAT; que la telemetría de un
@@ -422,18 +495,19 @@ func (c *Collector) Version() string {
 //
 // La ausencia de parte (el cajero nunca escribió: ok=false) NO es un error y NO se loguea: es el estado
 // normal de un Edge recién arrancado, y avisar por cada sesión en cada latido sería ruido perpetuo.
-func (c *Collector) parteDelWorker(ctx context.Context, now time.Time) (circuito, taskset string, p50 int64) {
+func (c *Collector) parteDelWorker(ctx context.Context, now time.Time) (app.ParteWorker, bool) {
 	if c.parte == nil {
-		return "", "", 0
+		return app.ParteWorker{}, false
 	}
 	p, ok, err := c.parte.LeerParte(ctx)
 	if err != nil {
 		c.log.Warn("health: no se pudo leer el parte del worker-cajero; intent_circuit/worker_taskset/"+
-			"intent_p50_ms viajan VACÍOS en este latido (nunca un valor heredado)", "error", err)
-		return "", "", 0
+			"intent_p50_ms y el reparto de la inferencia viajan VACÍOS en este latido (nunca un valor "+
+			"heredado)", "error", err)
+		return app.ParteWorker{}, false
 	}
 	if !ok {
-		return "", "", 0
+		return app.ParteWorker{}, false
 	}
 	// 🔴 LA VENTANA ES SIMÉTRICA, Y EL LADO DEL FUTURO NO ES PARANOIA DE LIBRO. Con la comparación en un
 	// solo sentido (`now.Sub(p.TS) > ParteRancio`), un parte con TS EN EL FUTURO da una edad NEGATIVA, que
@@ -455,11 +529,18 @@ func (c *Collector) parteDelWorker(ctx context.Context, now time.Time) (circuito
 	if edad > app.ParteRancio || edad < -app.ParteRancio {
 		// Sin log: un cajero parado a propósito (o aún arrancando) haría de esto una línea por sesión y por
 		// latido. El hecho ya viaja —y de forma más útil— como `intent_circuit` vacío en el propio Report.
-		return "", "", 0
+		return app.ParteWorker{}, false
 	}
 	// Normaliza al contrato del wire ("half-open" → "half_open"): el endpoint /v1/intent/status conserva la
 	// forma con guion, el heartbeat y el bundle usan la del contrato SessionHealth (ADR-0023).
-	return strings.ReplaceAll(p.Circuito, "-", "_"), p.Taskset, p.P50ms
+	//
+	// 🔴 SE DEVUELVE EL PARTE ENTERO Y NO SUS CAMPOS SUELTOS (T1.7-5). Con tres valores de retorno la firma
+	// ya era el límite; con once habría sido ilegible, y —peor— la regla «todos caen juntos» dejaría de
+	// estar escrita en el tipo para pasar a depender de que quien añada un campo se acuerde de ponerlo a su
+	// cero en los CUATRO `return` de arriba. Devolviendo el parte, un campo nuevo hereda la regla gratis:
+	// el `false` lo tira entero.
+	p.Circuito = strings.ReplaceAll(p.Circuito, "-", "_")
+	return p, true
 }
 
 // versionDeFiltros lee la versión del mapa de perfiles vigente, con el 0 como respuesta cuando no hay lector

@@ -703,6 +703,28 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 		t.Fatalf("latido de contadores por defecto: got %d, want %d",
 			cfg.Worker.StatsEveryMS, DefaultWorkerStatsEveryMS)
 	}
+	// 🔴 EL DEFAULT DEL keep_alive ES NEGATIVO, y por eso se comprueba aparte de sus vecinos: es el único
+	// número de este bloque al que NO se le puede aplicar el guardarraíl `<=0 ⇒ default` (para Ollama el 0
+	// significa «descarga el modelo en cuanto respondas»). Si alguien se lo pusiera «por consistencia», el
+	// default -1 se convertiría en sí mismo y el fallo sería invisible aquí — pero el override de abajo,
+	// con un finito, sí lo caza.
+	// Los dos bordes del calor del prefijo (T1.7-5): configurables porque el conteo del régimen `templado`
+	// es justo la señal de que hay que recalibrarlos, y recalibrar recompilando es lo que hizo que esto
+	// tardara. ⚠️ La coherencia de la PAREJA no se juzga aquí sino en el cajero (nuevosUmbralesRegimen):
+	// duplicar la validación en dos capas es el par que diverge.
+	if cfg.Worker.PrefillFrioMS != DefaultWorkerPrefillFrioMS {
+		t.Fatalf("umbral de prefill FRÍO por defecto: got %d, want %d",
+			cfg.Worker.PrefillFrioMS, DefaultWorkerPrefillFrioMS)
+	}
+	if cfg.Worker.PrefillCalienteMS != DefaultWorkerPrefillCalienteMS {
+		t.Fatalf("umbral de prefill CALIENTE por defecto: got %d, want %d",
+			cfg.Worker.PrefillCalienteMS, DefaultWorkerPrefillCalienteMS)
+	}
+	if cfg.Worker.KeepAliveSeconds != DefaultWorkerKeepAliveSeconds {
+		t.Fatalf("keep_alive por defecto: got %d, want %d (para siempre: sin él, el runner de Ollama muere "+
+			"a los 5 min y se lleva la caché de prefijos)",
+			cfg.Worker.KeepAliveSeconds, DefaultWorkerKeepAliveSeconds)
+	}
 
 	// El prefijo BUENO aplica.
 	t.Setenv(WorkerEnvPrefix+"MAX_CONCURRENT", "2")
@@ -711,6 +733,9 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	t.Setenv(WorkerEnvPrefix+"NUM_THREAD", "3")
 	t.Setenv(WorkerEnvPrefix+"NUM_PREDICT", "64")
 	t.Setenv(WorkerEnvPrefix+"NUM_CTX", "2048")
+	t.Setenv(WorkerEnvPrefix+"KEEP_ALIVE_SECONDS", "900")
+	t.Setenv(WorkerEnvPrefix+"PREFILL_FRIO_MS", "12000")
+	t.Setenv(WorkerEnvPrefix+"PREFILL_CALIENTE_MS", "3000")
 	t.Setenv(WorkerEnvPrefix+"MAX_INTENTOS", "5")
 	t.Setenv(WorkerEnvPrefix+"INFERENCE_TIMEOUT_MS", "9000")
 	t.Setenv(WorkerEnvPrefix+"STATS_EVERY_MS", "60000")
@@ -720,7 +745,9 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	}
 	esperado := WorkerConfig{
 		MaxConcurrent: 2, PollMS: 250, MaxRunes: 1500, NumThread: 3, NumPredict: 64, NumCtx: 2048,
-		MaxIntentos: 5, InferenceTimeoutMS: 9000, StatsEveryMS: 60000,
+		PrefillFrioMS: 12000, PrefillCalienteMS: 3000,
+		KeepAliveSeconds: 900,
+		MaxIntentos:      5, InferenceTimeoutMS: 9000, StatsEveryMS: 60000,
 		// La lista de colas del round-robin (T4.1) no se toca en este test, así que vale su default: el
 		// data_dir único de siempre, ya absolutizado.
 		DataDirs: []string{cfg.DataDir},
@@ -899,6 +926,12 @@ func TestLoad_InferenceTimeout_SigueVivoTrasElRetiroDelPush(t *testing.T) {
 	// Esto NO es tautológico: no compara una constante consigo misma, sino DOS constantes independientes
 	// (el plazo y la fracción) contra un TERCER número que no está en el código —el p50 medido en campo—.
 	// Si alguien mueve el plazo sin mirar, este test dice cuál es el criterio que rompió.
+	//
+	// ⚠️ SU ALCANCE SE ESTRECHÓ CON T1.7-2 (Plan 044 · Ola 1.7), y la relación que vigila sigue siendo la
+	// misma: desde entonces el umbral de lentitud sale del plazo de CADA PETICIÓN, así que este default
+	// gobierna a las que lleguen sin `timeout_ms` y a ninguna más. Lo que se comprueba aquí es que ESE
+	// caso —el de la petición sin plazo— siga calibrado; que la relación se cumpla también en las otras la
+	// garantiza la fórmula, no un número (ver cajero.registrarAcierto).
 	const p50DeCampoMS = 8100 // 430 inferencias en el VPS de UAT, 2026-08-23
 	umbralLentoMS := int(float64(DefaultWorkerInferenceTimeoutMS) * cajero.FraccionLentitud)
 	if factor := float64(umbralLentoMS) / p50DeCampoMS; factor < 4.0 {

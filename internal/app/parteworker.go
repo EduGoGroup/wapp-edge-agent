@@ -36,7 +36,49 @@ type ParteWorker struct {
 	// "solapada" | "cajero_sin_confinar". Vacío = no se sabe (no-Linux, o /proc ilegible).
 	Taskset string
 	// P50ms es el p50 de la INFERENCIA en ms; 0 = sin muestras.
+	//
+	// ⚠️ ES EL TOTAL, y desde T1.7-5 ya no es el único número de latencia que viaja: mezcla PREFILL y
+	// GENERACIÓN, dos regímenes que se diferencian en un orden de magnitud. Se conserva porque es lo que
+	// publica `SessionHealth.intent_p50_ms` (campo 10) y porque responde una pregunta que las fases no
+	// responden —cuánto espera de verdad quien pidió la inferencia, fallos incluidos—, pero para saber
+	// POR QUÉ tarda hay que mirar los cuatro campos de abajo.
 	P50ms int64
+
+	// ─── Plan 044 · Ola 1.7 · T1.7-5 · el reparto de la inferencia ───────────
+	//
+	// 🔴 EL CUANTIL Y SU `n` VIAJAN EN PAREJA Y SE LEEN EN PAREJA. Un p50 sobre una muestra pequeña es un
+	// MÁXIMO DISFRAZADO, y comparar cuantiles de `n` distinto ya fabricó aquí una conclusión falsa. El
+	// contrato del heartbeat lo impone en el wire (`InferenceLatency` es UN mensaje con los dos campos, y
+	// su AUSENCIA significa «no medible»); este canal lo respeta con la única regla que un par de enteros
+	// permite: EL QUE DECIDE ES `…Muestras`. Con `…Muestras == 0` el p50 NO SIGNIFICA NADA y el lector no
+	// debe publicarlo — ni siquiera como cero, que se leería como «instantáneo».
+
+	// PrefillP50ms es el p50 del PREFILL (digerir el prompt de entrada) en ms.
+	PrefillP50ms int64
+	// PrefillMuestras es cuántos prefills se midieron. 0 ⇒ no medible ⇒ PrefillP50ms no significa nada.
+	PrefillMuestras int64
+	// GeneracionP50ms es el p50 de la GENERACIÓN (producir los tokens de salida) en ms.
+	GeneracionP50ms int64
+	// GeneracionMuestras es cuántas generaciones se midieron. 0 ⇒ no medible.
+	GeneracionMuestras int64
+
+	// PorRegimen es el reparto ACUMULADO por calor del prefijo (cajero.RegimenesInferencia: frio /
+	// templado / caliente). PorClase, el reparto por `class` (app.ClasesInferencia).
+	//
+	// 🔴 SON MAPAS Y NO UN CAMPO POR CATEGORÍA, y esa es toda la gracia: los umbrales que definen los
+	// regímenes son POLÍTICA DEL EMISOR y se mueven con el hardware del cliente, así que una categoría
+	// nueva tiene que poder aparecer sin tocar el contrato del heartbeat ni el esquema de este canal. Por
+	// eso cruzan la BD como JSON en una sola columna y llegan al wire tal cual: en todo el recorrido
+	// cajero→daemon→nube NADIE enumera las claves más que el cajero, que es quien las inventa.
+	//
+	// ⚠️ SON ACUMULADOS MONÓTONOS DEL PROCESO, mientras que los dos p50 de arriba son una foto. Las
+	// ventanas NO coinciden y dividir un cuantil entre uno de estos contadores da un número absurdo con
+	// buena pinta.
+	//
+	// nil ⇒ «este cajero no lo mide» (o el parte está rancio). Un mapa presente con una clave a 0 es un
+	// DATO: «esta máquina no ha pagado ni un arranque en frío».
+	PorRegimen map[string]int64
+	PorClase   map[string]int64
 }
 
 // ParteWorkerEscritor lo usa el CAJERO.
@@ -67,7 +109,7 @@ type ParteWorkerLector interface {
 //     verbosidad del log apagaría el heartbeat. Un mando de LOG no puede gobernar una señal de SALUD.
 //
 // 30 s es el compromiso: 20 escrituras por hora y por instalación contra un SQLite local (un UPSERT de
-// cuatro columnas, sin BLOB) es ruido comparado con el tráfico de la propia cola, y deja la detección
+// once columnas desde T1.7-5, sin BLOB) es ruido comparado con el tráfico de la propia cola, y deja la detección
 // de un cajero muerto por debajo del minuto y medio.
 const ParteCada = 30 * time.Second
 

@@ -260,6 +260,19 @@ func (c *carrilInferencia) atender(c2e *cloudlinkv1.CloudToEdge) {
 		Format:      req.GetFormat(),
 		Temperature: req.Temperature,
 		Timeout:     time.Duration(req.GetTimeoutMs()) * time.Millisecond,
+		// 🔴 EL PUNTERO SE PASA TAL CUAL, IGUAL QUE Temperature Y POR LO MISMO (T1.7-3). `GetMaxOutputTokens()`
+		// devolvería 0 tanto para «no lo mandó» como para «pidió 0 explícitamente», y el contrato lo declara
+		// `optional` justo para que esos dos casos no sean el mismo byte. Quien lo desreferencie es el cajero,
+		// que es quien sabe cuál es el default del Edge.
+		MaxOutputTokens: req.MaxOutputTokens,
+		// La clase viaja SIN normalizar: normalizarla aquí y otra vez en el cajero serían dos criterios para
+		// el mismo hecho esperando a divergir. El único dueño de la regla es app.NormalizarClase, y lo aplica
+		// quien la usa para etiquetar.
+		Clase: req.GetClass(),
+		// ✅ LA COSTURA DE T1.7-2, CERRADA (T1.7-4). Aquí es donde el campo 10 del frame se convierte en la
+		// marca que el breaker mira ANTES de evaluar nada. `GetWarmup()` y no el puntero porque el contrato lo
+		// declara `bool` a secas: ausente y `false` significan lo MISMO a propósito (inferencia normal).
+		Calentamiento: req.GetWarmup(),
 	})
 	transcurrido := time.Since(inicio)
 
