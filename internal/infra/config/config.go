@@ -279,6 +279,22 @@ const DefaultWorkerNumCtx = cajero.DefaultNumCtx
 // es una propiedad de ESA máquina: en el equipo de un cliente no hay quien la ponga.
 const DefaultWorkerKeepAliveSeconds = ollama.DefaultKeepAliveSeconds
 
+// DefaultWorkerPrefillFrioMS y DefaultWorkerPrefillCalienteMS son los DOS BORDES con los que el cajero
+// clasifica el calor del prefijo (Plan 044 · Ola 1.7 · T1.7-5). Los números no son literales de este
+// fichero: salen de cajero.DefaultPrefillFrioMS / DefaultPrefillCalienteMS, que es donde está la medición
+// que los justifica.
+//
+// 🔴 SON CONFIGURABLES Y NO CONSTANTES POR UNA RAZÓN OPERATIVA. El reparto del heartbeat publica un tercer
+// régimen, `templado`, para la franja entre los dos; su conteo es exactamente la señal de que estos
+// números ya no parten bien la población de ESA máquina. Si recalibrarlos exigiera recompilar y
+// redesplegar, la respuesta llegaría semanas después de la pregunta — que es lo que hizo que este problema
+// tardara tanto en verse. Configurables por WAPP_WORKER_PREFILL_FRIO_MS y WAPP_WORKER_PREFILL_CALIENTE_MS;
+// <=0 cae al default, y una pareja invertida (caliente >= frio) cae ENTERA al default con aviso.
+const (
+	DefaultWorkerPrefillFrioMS     = cajero.DefaultPrefillFrioMS
+	DefaultWorkerPrefillCalienteMS = cajero.DefaultPrefillCalienteMS
+)
+
 // WorkerConfig agrupa los parámetros del worker-cajero (Plan 051 Ola 2). Se leen del bloque `worker:`
 // del YAML y del entorno con prefijo WAPP_WORKER_ (ver WorkerEnvPrefix).
 type WorkerConfig struct {
@@ -295,6 +311,12 @@ type WorkerConfig struct {
 	NumPredict int `yaml:"num_predict"`
 	// NumCtx es la ventana de contexto en tokens (T2.5). Default 4096.
 	NumCtx int `yaml:"num_ctx"`
+	// PrefillFrioMS y PrefillCalienteMS son los bordes del calor del prefijo (T1.7-5). Defaults 5000 y
+	// 2000. <=0 cae al default; caliente >= frio cae ENTERA al default con aviso. El valor EFECTIVO se lee
+	// en la línea `cajero: arrancando` (`prefill_frio_ms` / `prefill_caliente_ms`), no aquí: el `.env` de
+	// la máquina pisa a este default.
+	PrefillFrioMS     int `yaml:"prefill_frio_ms"`
+	PrefillCalienteMS int `yaml:"prefill_caliente_ms"`
 	// KeepAliveSeconds es el `keep_alive` que viaja en cada petición a Ollama (T1.7-4). Default
 	// DefaultWorkerKeepAliveSeconds (-1 = para siempre). ⚠️ SIN guardarraíl: el 0 y los negativos son
 	// valores con significado propio para Ollama. Ver la constante.
@@ -676,6 +698,8 @@ func defaults() Config {
 			NumThread:          DefaultWorkerNumThread,
 			NumPredict:         DefaultWorkerNumPredict,
 			NumCtx:             DefaultWorkerNumCtx,
+			PrefillFrioMS:      DefaultWorkerPrefillFrioMS,
+			PrefillCalienteMS:  DefaultWorkerPrefillCalienteMS,
 			KeepAliveSeconds:   DefaultWorkerKeepAliveSeconds,
 			MaxIntentos:        DefaultWorkerMaxIntentos,
 			InferenceTimeoutMS: DefaultWorkerInferenceTimeoutMS,
@@ -782,6 +806,8 @@ func Load(path string) (Config, error) {
 	// Sin normalización posterior a propósito: cualquier entero es un keep_alive legítimo (ver
 	// DefaultWorkerKeepAliveSeconds). El default llega sembrado desde Default(), no corregido aquí.
 	cfg.Worker.KeepAliveSeconds = workerLoader.GetInt("KEEP_ALIVE_SECONDS", cfg.Worker.KeepAliveSeconds)
+	cfg.Worker.PrefillFrioMS = workerLoader.GetInt("PREFILL_FRIO_MS", cfg.Worker.PrefillFrioMS)
+	cfg.Worker.PrefillCalienteMS = workerLoader.GetInt("PREFILL_CALIENTE_MS", cfg.Worker.PrefillCalienteMS)
 	cfg.Worker.MaxIntentos = workerLoader.GetInt("MAX_INTENTOS", cfg.Worker.MaxIntentos)
 	cfg.Worker.InferenceTimeoutMS = workerLoader.GetInt("INFERENCE_TIMEOUT_MS", cfg.Worker.InferenceTimeoutMS)
 	cfg.Worker.StatsEveryMS = workerLoader.GetInt("STATS_EVERY_MS", cfg.Worker.StatsEveryMS)
@@ -880,6 +906,17 @@ func Load(path string) (Config, error) {
 	}
 	if cfg.Worker.NumPredict <= 0 {
 		cfg.Worker.NumPredict = DefaultWorkerNumPredict
+	}
+	// ⚠️ AQUÍ SÓLO SE APLICA EL `<=0 ⇒ default`, Y LA COHERENCIA DE LA PAREJA NO SE MIRA. La comprobación
+	// «caliente < frio» vive en el CAJERO (nuevosUmbralesRegimen) y no se duplica aquí: dos validaciones
+	// del mismo hecho en dos capas es exactamente el par que diverge, y la del cajero es la que manda
+	// porque es la que produce el número que sale en el latido. Este bloque sólo evita que un campo sin
+	// poblar llegue allí como cero.
+	if cfg.Worker.PrefillFrioMS <= 0 {
+		cfg.Worker.PrefillFrioMS = DefaultWorkerPrefillFrioMS
+	}
+	if cfg.Worker.PrefillCalienteMS <= 0 {
+		cfg.Worker.PrefillCalienteMS = DefaultWorkerPrefillCalienteMS
 	}
 	if cfg.Worker.NumCtx <= 0 {
 		cfg.Worker.NumCtx = DefaultWorkerNumCtx

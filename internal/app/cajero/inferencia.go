@@ -36,6 +36,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
 // numBucketsInferencia es el tamaño de la rejilla. Dieciséis, como en internal/app/latencia y por el
@@ -237,32 +239,82 @@ func (h *histogramaInferencia) muestras() uint64 {
 // EL CALOR DEL PREFIJO (Plan 044 · Ola 1.7 · T1.7-5)
 // ─────────────────────────────────────────────────────────────────────────────
 //
-// 🔴 LOS UMBRALES SON POLÍTICA DEL EMISOR Y VIVEN AQUÍ, NO EN EL PROTO. El contrato transporta el reparto
-// YA HECHO (`SessionHealth.inference_by_regime`, un mapa) precisamente para que estos dos números se
-// puedan mover con el hardware del cliente sin cortar una versión del contrato ni bumpear dos
-// consumidores. Quien los cambie, los cambia aquí y en ningún otro sitio.
+// 🔴 LOS UMBRALES SON POLÍTICA DEL EMISOR Y NO VIAJAN EN EL PROTO. El contrato transporta el reparto YA
+// HECHO (`SessionHealth.inference_by_regime`, un mapa) precisamente para que estos dos números se puedan
+// mover con el hardware del cliente sin cortar una versión del contrato ni bumpear dos consumidores.
+//
+// 🔴 Y SON CONFIGURACIÓN, NO CONSTANTES (WAPP_WORKER_PREFILL_FRIO_MS / _CALIENTE_MS). El conteo del
+// régimen `templado` existe justamente para decir «estos dos números ya no parten bien la población de
+// ESTA máquina»; si recalibrarlos exigiera recompilar y redesplegar, la señal llegaría semanas después de
+// la pregunta — que es lo que hizo que este problema tardara tanto en verse. Los valores de abajo son sólo
+// el DEFAULT, y el efectivo se lee en la línea `cajero: arrancando`.
 
 const (
-	// PrefillFrioMS es el borde por encima del cual un prefill se considera FRÍO: la caché de prefijos del
-	// runner no tenía nada aprovechable y hubo que digerir el prompt entero.
+	// DefaultPrefillFrioMS es el borde por encima del cual un prefill se considera FRÍO: la caché de
+	// prefijos del runner no tenía nada aprovechable y hubo que digerir el prompt entero.
 	//
 	// 5 s SALE DE LA MEDICIÓN, no de un número redondo: con el prefijo frío el prefill cuesta ~21,6 ms por
 	// token, así que 5 s son ~230 tokens — por debajo del prompt más pequeño que el Cloud construye. Un
 	// prefill que pasa de ahí no puede haber tenido un acierto de caché apreciable.
-	PrefillFrioMS = 5_000
-	// PrefillCalienteMS es el borde por debajo del cual un prefill se considera CALIENTE: la caché tenía el
-	// prefijo y sólo hubo que digerir la cola del prompt.
+	//
+	// ⚠️ MEDIDO CONTRA UNA MÁQUINA (el VPS de UAT, agosto de 2026). En el equipo de un cliente —otra CPU,
+	// otro modelo, otro tamaño de prompt— la frontera cae en otro sitio, y por eso es configurable.
+	DefaultPrefillFrioMS = 5_000
+	// DefaultPrefillCalienteMS es el borde por debajo del cual un prefill se considera CALIENTE: la caché
+	// tenía el prefijo y sólo hubo que digerir la cola del prompt.
 	//
 	// 2 s ES EL TECHO MEDIDO DEL CASO CALIENTE (0,1-1,2 s el prompt entero), con margen: por debajo de ahí
 	// no cabe un prefill frío de un prompt real.
-	PrefillCalienteMS = 2_000
+	DefaultPrefillCalienteMS = 2_000
 )
+
+// umbralesRegimen es LA PAREJA de bordes con la que se clasifica el calor del prefijo.
+//
+// 🔴 LOS DOS EN UN TIPO Y NO COMO DOS CAMPOS SUELTOS DEL CAJERO, por la misma razón por la que el cuantil
+// viaja pegado a su muestra: sólo significan algo JUNTOS. Sueltos, nada impide construir un cajero con
+// `caliente = 5 s` y `frio = 2 s` —una configuración INVERTIDA que no da error y hace desaparecer el
+// régimen `templado` entero, dejando el reparto mintiendo en silencio—. Con un tipo, la única forma de
+// obtener una pareja es su constructor, y ahí vive la validación.
+type umbralesRegimen struct {
+	calienteMS int64
+	frioMS     int64
+}
+
+// nuevosUmbralesRegimen resuelve los defaults y RECHAZA una pareja inconsistente.
+//
+// LOS DOS GUARDARRAÍLES, y el segundo es el que importa:
+//
+//   - `<=0 ⇒ default`, como el resto de los números de Deps. Un umbral de cero o negativo no es una
+//     política, es un campo sin poblar.
+//   - CALIENTE < FRÍO, o los DOS caen al default. No se «arregla» uno solo: con `caliente >= frio` la
+//     franja del medio no existe y `regimenDe` clasificaría todo lo que pasa de `frio` como frío y el
+//     resto como caliente — el reparto seguiría saliendo, con tres claves, y una de ellas clavada a 0
+//     para siempre. Corregir sólo un borde dejaría una tercera configuración que nadie ha revisado; caer
+//     los dos al default deja al operador con la que sí está medida, y el WARN le dice por qué.
+func nuevosUmbralesRegimen(caliente, frio time.Duration, log sharedlogger.Logger) umbralesRegimen {
+	calienteMS, frioMS := caliente.Milliseconds(), frio.Milliseconds()
+	if calienteMS <= 0 {
+		calienteMS = DefaultPrefillCalienteMS
+	}
+	if frioMS <= 0 {
+		frioMS = DefaultPrefillFrioMS
+	}
+	if calienteMS >= frioMS {
+		log.Warn("cajero: los umbrales de régimen del prefijo están INVERTIDOS o pegados "+
+			"(caliente >= frio); se usan los DOS defaults. Con esa pareja el régimen `templado` no puede "+
+			"darse nunca y el reparto del heartbeat publicaría una clave clavada a 0 sin decir por qué",
+			"prefill_caliente_ms_pedido", calienteMS, "prefill_frio_ms_pedido", frioMS,
+			"prefill_caliente_ms", DefaultPrefillCalienteMS, "prefill_frio_ms", DefaultPrefillFrioMS)
+		return umbralesRegimen{calienteMS: DefaultPrefillCalienteMS, frioMS: DefaultPrefillFrioMS}
+	}
+	return umbralesRegimen{calienteMS: calienteMS, frioMS: frioMS}
+}
 
 const (
 	// RegimenFrio: prefill > PrefillFrioMS. Se pagó el arranque en frío entero.
 	RegimenFrio = "frio"
-	// RegimenTemplado: prefill en [PrefillCalienteMS, PrefillFrioMS]. LA FRANJA QUE LOS UMBRALES DEL PLAN
-	// NO CUBRÍAN, y por eso tiene nombre propio en vez de repartirse entre las otras dos.
+	// RegimenTemplado: prefill en [caliente, frio]. LA FRANJA QUE LOS UMBRALES DEL PLAN NO CUBRÍAN, y por
+	// eso tiene nombre propio en vez de repartirse entre las otras dos.
 	//
 	// 🔴 SU CONTADOR ES LA SEÑAL DE QUE ESTOS UMBRALES PIDEN RECALIBRARSE, y es la razón de que exista.
 	// Los dos bordes de arriba están calibrados contra UNA máquina (el VPS de UAT, agosto de 2026); en el
@@ -270,7 +322,8 @@ const (
 	// caliente» y «caché fría» cae en otro sitio. Mientras `templado` sea residual, los bordes describen
 	// bien esa máquina. En cuanto se lleve una fracción apreciable del tráfico, lo que hay que mover son
 	// PrefillFrioMS y PrefillCalienteMS — no es que haya aparecido un tercer fenómeno físico, es que los
-	// dos números de arriba dejaron de partir la población donde de verdad se parte.
+	// dos números dejaron de partir la población donde de verdad se parte — y por eso son CONFIGURABLES:
+	// la respuesta a esa señal es mover los bordes en el `.env` de esa máquina, no recompilar.
 	//
 	// ⚠️ NO ES «no se sabe»: un prefill de 3 s ES un dato medido, y describe un acierto PARCIAL de caché
 	// (el prefijo estaba, la cola del prompt no). Lo que no se sabe no se cuenta en ningún régimen — ver
@@ -286,18 +339,18 @@ const (
 // no lo mide.
 var RegimenesInferencia = []string{RegimenFrio, RegimenTemplado, RegimenCaliente}
 
-// regimenDe clasifica un prefill medido en ms. Los bordes son ESTRICTOS por los dos lados, así que
-// exactamente PrefillCalienteMS y exactamente PrefillFrioMS caen en `templado`: la franja del medio es
-// CERRADA a propósito, para que ningún valor pueda quedar sin régimen por un `>=` mal puesto.
+// regimenDe clasifica un prefill medido en ms. Los bordes son ESTRICTOS por los dos lados, así que el
+// valor exacto de cualquiera de los dos umbrales cae en `templado`: la franja del medio es CERRADA a
+// propósito, para que ningún valor pueda quedar sin régimen por un `>=` mal puesto.
 //
 // ⚠️ NO SE LLAMA CON UN PREFILL <= 0. Ese caso es «no medible» y se descarta antes (observarFases): darle
 // aquí un régimen lo metería en `caliente`, que es la mentira más cómoda de creer — un Ollama que dejara
 // de devolver `prompt_eval_duration` se vería como una máquina con la caché siempre caliente.
-func regimenDe(prefillMS int64) string {
+func (u umbralesRegimen) regimenDe(prefillMS int64) string {
 	switch {
-	case prefillMS > PrefillFrioMS:
+	case prefillMS > u.frioMS:
 		return RegimenFrio
-	case prefillMS < PrefillCalienteMS:
+	case prefillMS < u.calienteMS:
 		return RegimenCaliente
 	default:
 		return RegimenTemplado
@@ -333,7 +386,7 @@ func (c *Cajero) observarFases(prefillMS, generacionMS int64) string {
 	var regimen string
 	if prefillMS > 0 {
 		c.prefill.observarMS(prefillMS)
-		regimen = regimenDe(prefillMS)
+		regimen = c.umbrales.regimenDe(prefillMS)
 		c.porRegimen.contar(regimen)
 	}
 	// LA GENERACIÓN SE JUZGA POR SU CUENTA y no dentro del `if` de arriba: son dos números independientes
@@ -419,4 +472,26 @@ func (c *contadorEtiquetado) foto() map[string]int64 {
 		copia[k] = v
 	}
 	return copia
+}
+
+// numPredictPorDefecto es el tope de tokens de salida que el Edge aplica cuando el Cloud no manda
+// `max_output_tokens`. Se lee del MAPA DE OPCIONES que de verdad viaja al proveedor y no de un campo
+// aparte: un segundo sitio con el mismo número es un sitio donde el latido puede decir 256 mientras la
+// petición manda otra cosa, que es justo la clase de divergencia que este latido existe para descartar.
+//
+// 0 = el Edge no fija ninguno (mapa sin la clave, o con un valor de un tipo que no es entero) y manda el
+// default del proveedor. No es un valor alcanzable desde el cableado real.
+func (c *Cajero) numPredictPorDefecto() int {
+	if c == nil {
+		return 0
+	}
+	v, ok := c.opciones["num_predict"]
+	if !ok {
+		return 0
+	}
+	n, ok := v.(int)
+	if !ok {
+		return 0
+	}
+	return n
 }

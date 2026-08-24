@@ -17,6 +17,7 @@ package cajero
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-intent/ollama"
@@ -63,21 +64,89 @@ func servirConFases(ctx context.Context, t *testing.T, prefillMS, generacionMS i
 // existe para limpiar. `templado` es esa franja, y los dos casos de borde exacto son los que garantizan
 // que ningún valor puede quedarse sin régimen por un `>=` mal puesto.
 func TestRegimenDe_LosTresTramosYSusBordes(t *testing.T) {
+	u := nuevosUmbralesRegimen(0, 0, &logCaptura{}) // los defaults, resueltos por el constructor
 	casos := []struct {
 		prefillMS int64
 		quiero    string
 	}{
 		{1, RegimenCaliente},
-		{PrefillCalienteMS - 1, RegimenCaliente},
-		{PrefillCalienteMS, RegimenTemplado}, // borde inferior: la franja es CERRADA
-		{3_000, RegimenTemplado},             // el centro de la franja que no estaba cubierta
-		{PrefillFrioMS, RegimenTemplado},     // borde superior: también cerrado
-		{PrefillFrioMS + 1, RegimenFrio},     //
-		{50_000, RegimenFrio},                // el prefill de un calentamiento en UAT
+		{DefaultPrefillCalienteMS - 1, RegimenCaliente},
+		{DefaultPrefillCalienteMS, RegimenTemplado}, // borde inferior: la franja es CERRADA
+		{3_000, RegimenTemplado},                    // el centro de la franja que no estaba cubierta
+		{DefaultPrefillFrioMS, RegimenTemplado},     // borde superior: también cerrado
+		{DefaultPrefillFrioMS + 1, RegimenFrio},     //
+		{50_000, RegimenFrio},                       // el prefill de un calentamiento en UAT
 	}
 	for _, c := range casos {
-		if got := regimenDe(c.prefillMS); got != c.quiero {
+		if got := u.regimenDe(c.prefillMS); got != c.quiero {
 			t.Errorf("regimenDe(%d ms) = %q, want %q", c.prefillMS, got, c.quiero)
+		}
+	}
+}
+
+// TestUmbralesRegimen_SonConfiguracionYNoConstante es el criterio operativo de la ola: los bordes se
+// mueven SIN RECOMPILAR. El conteo de `templado` existe para decir «estos dos números ya no parten bien la
+// población de esta máquina», y si la respuesta a esa señal exigiera un binario nuevo, llegaría semanas
+// después de la pregunta.
+//
+// El caso es real: en una máquina más lenta, un prefill de 3 s puede ser perfectamente CALIENTE.
+func TestUmbralesRegimen_SonConfiguracionYNoConstante(t *testing.T) {
+	ctx := context.Background()
+
+	c, s := servidorDe(t, Deps{
+		Ollama:          &chateadorEspia{resp: respuestaConFases(3_000, 500)},
+		Opciones:        opcionesDelEdge(),
+		PrefillCaliente: 4 * time.Second, // con los defaults (2 s/5 s) esto sería `templado`
+		PrefillFrio:     20 * time.Second,
+		MaxConcurrent:   1,
+		Timeout:         timeoutDeLaMedicion,
+	})
+	if _, err := s.Inferir(ctx, peticionDe("hola", timeoutDeLaMedicion)); err != nil {
+		t.Fatalf("Inferir: %v", err)
+	}
+
+	if got := c.porRegimen.foto()[RegimenCaliente]; got != 1 {
+		t.Errorf("con umbrales recalibrados (caliente < 4 s) un prefill de 3 s es CALIENTE; "+
+			"porRegimen[caliente]=%d, foto=%v", got, c.porRegimen.foto())
+	}
+	if got := c.umbrales.calienteMS; got != 4_000 {
+		t.Errorf("el umbral efectivo no es el configurado: got %d want 4000", got)
+	}
+}
+
+// TestUmbralesRegimen_UnaParejaInvertidaCaeENTERAAlDefault es el guardarraíl que impide una configuración
+// que MIENTE EN SILENCIO.
+//
+// 🔴 Con `caliente >= frio` la franja del medio no existe: `regimenDe` clasificaría como frío todo lo que
+// pase de `frio` y como caliente todo lo demás, y el reparto del heartbeat seguiría saliendo con sus TRES
+// claves, una de ellas clavada a 0 para siempre. Nadie leería eso como «la config está mal»; lo leería
+// como «esta máquina nunca está templada», que es una conclusión falsa sobre el hardware del cliente.
+//
+// Y CAEN LOS DOS, no sólo el que sobra: corregir un borde dejaría una tercera pareja que nadie ha
+// revisado. El operador se queda con la que sí está medida, y el WARN le dice qué pidió y qué se aplicó.
+func TestUmbralesRegimen_UnaParejaInvertidaCaeENTERAAlDefault(t *testing.T) {
+	log := &logCaptura{}
+
+	u := nuevosUmbralesRegimen(9*time.Second, 3*time.Second, log)
+
+	if u.calienteMS != DefaultPrefillCalienteMS || u.frioMS != DefaultPrefillFrioMS {
+		t.Errorf("una pareja invertida debía caer ENTERA al default; got %+v", u)
+	}
+	e, ok := log.buscar("umbrales de régimen del prefijo están INVERTIDOS")
+	if !ok {
+		t.Fatal("una config rechazada tiene que dejar rastro: sin el WARN, el operador ve el default y no " +
+			"sabe que lo suyo se descartó")
+	}
+	if e.nivel != "warn" {
+		t.Errorf("nivel: got %q want warn", e.nivel)
+	}
+	// LOS DOS PARES EN LA MISMA LÍNEA: lo que se pidió y lo que se aplicó. Con sólo uno de ellos, el
+	// operador tendría que ir a buscar el otro a otro sitio para entender qué pasó.
+	claves := clavesDe(e)
+	for _, k := range []string{"prefill_caliente_ms_pedido", "prefill_frio_ms_pedido",
+		"prefill_caliente_ms", "prefill_frio_ms"} {
+		if !claves[k] {
+			t.Errorf("el WARN no lleva %q: %v", k, claves)
 		}
 	}
 }
@@ -246,7 +315,7 @@ func TestParte_LlevaElRepartoDeLaInferencia(t *testing.T) {
 		t.Errorf("PrefillP50ms: got %d, se midió un prefill de 6 s", parte.PrefillP50ms)
 	}
 	if got := parte.PorRegimen[RegimenFrio]; got != 1 {
-		t.Errorf("PorRegimen[%q]: got %d want 1 (6 s > %d ms)", RegimenFrio, got, PrefillFrioMS)
+		t.Errorf("PorRegimen[%q]: got %d want 1 (6 s > %d ms)", RegimenFrio, got, DefaultPrefillFrioMS)
 	}
 	if got := parte.PorClase[app.ClaseLote]; got != 1 {
 		t.Errorf("PorClase[%q]: got %d want 1", app.ClaseLote, got)

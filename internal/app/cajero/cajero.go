@@ -327,6 +327,17 @@ type Deps struct {
 	// (InferenceRequest.max_output_tokens) y entonces manda el suyo. Ver el bloque de `num_predict` en
 	// servidor.go · chat().
 	Opciones map[string]any
+	// PrefillCaliente y PrefillFrio son los DOS BORDES con los que se clasifica el calor del prefijo
+	// (T1.7-5). <=0 ⇒ el default de cada uno; `PrefillCaliente >= PrefillFrio` ⇒ los DOS al default, con
+	// aviso (ver nuevosUmbralesRegimen).
+	//
+	// 🔴 SON CONFIGURACIÓN Y NO CONSTANTES A PROPÓSITO: el conteo del régimen `templado` existe para decir
+	// «estos dos números ya no parten bien la población de esta máquina», y si recalibrarlos exigiera
+	// recompilar, la respuesta llegaría semanas después de la señal. El valor EFECTIVO se publica en la
+	// línea `cajero: arrancando` — el `.env` de la máquina pisa al default del código, y eso ya costó una
+	// ola entera (el techo de 45 s que nunca llegó a producción porque el VPS traía 15 s).
+	PrefillCaliente time.Duration
+	PrefillFrio     time.Duration
 	// KeepAlive son los SEGUNDOS que Ollama debe mantener el modelo cargado tras responder, y viaja en el
 	// primer nivel de cada /api/chat (T1.7-4). Negativo = para siempre (ollama.KeepAliveForever).
 	// nil ⇒ ollama.DefaultKeepAliveSeconds (hoy -1).
@@ -492,6 +503,10 @@ type Cajero struct {
 	porRegimen *contadorEtiquetado
 	porClase   *contadorEtiquetado
 
+	// umbrales son los dos bordes YA VALIDADOS con los que se clasifica el calor del prefijo. Van juntos en
+	// un tipo porque sólo significan algo en pareja (ver umbralesRegimen).
+	umbrales umbralesRegimen
+
 	fallos           atomic.Int64
 	rescatados       atomic.Int64
 	aperturasBreaker atomic.Int64
@@ -639,6 +654,7 @@ func New(deps Deps) (*Cajero, error) {
 		temperatura: temperatura,
 		opciones:    deps.Opciones,
 		keepAlive:   keepAlive,
+		umbrales:    nuevosUmbralesRegimen(deps.PrefillCaliente, deps.PrefillFrio, log),
 		porRegimen:  nuevoContador(RegimenesInferencia...),
 		porClase:    nuevoContador(app.ClasesInferencia...),
 		breaker:     br,
@@ -687,6 +703,28 @@ func (c *Cajero) Run(ctx context.Context) error {
 		// lea el arranque que todas se juzgan contra este número.
 		"umbral_lento_default_ms", umbralLentoDe(c.timeout).Milliseconds(),
 		"stats_cada_ms", c.statsEvery.Milliseconds(),
+		// ─── Plan 044 · Ola 1.7 · LO QUE ESTA OLA INTRODUCE, EN VALOR EFECTIVO ──
+		//
+		// 🔴 POR QUÉ AQUÍ Y NO EN EL LOG DEL CABLEADO (cmd/agent/cajero.go), que también publica config: esa
+		// línea imprime lo que dice `cfg`, ANTES de que New aplique sus guardarraíles. Ésta imprime lo que el
+		// Cajero VA A USAR de verdad. Cuando los dos números difieren —un umbral inválido que cayó al
+		// default, una pareja invertida— el único que dice la verdad es éste.
+		//
+		// 🔴 Y POR QUÉ SE PUBLICAN: el `.env` de la máquina PISA al default del código, y eso no lo puede ver
+		// ningún test. En la Ola 1.6 el techo de inferencia se subió a 45 s en el binario, el VPS traía
+		// `WAPP_WORKER_INFERENCE_TIMEOUT_MS=15000` y el arreglo NUNCA llegó a producción — con el agravante
+		// de que ese número envenenaba al breaker, porque el umbral de lentitud DERIVA de él. La única forma
+		// de cazarlo es desplegar y leer esta línea. Si un valor de esta ola no se puede confirmar aquí, el
+		// cambio no está terminado.
+		"keep_alive_s", *c.keepAlive,
+		"prefill_caliente_ms", c.umbrales.calienteMS,
+		"prefill_frio_ms", c.umbrales.frioMS,
+		// EL DEFAULT DE `num_predict` SE LEE DEL MAPA QUE DE VERDAD SE MANDA (c.opciones), no de una copia
+		// del número: es lo que le tocará a toda petición que llegue sin `max_output_tokens`. 0 significa
+		// «el Edge NO fija ninguno y manda el default del proveedor» — imposible desde el cableado real (el
+		// guardarraíl de config fuerza <=0 al default), así que un 0 aquí delata un cajero armado sin
+		// Opciones.
+		"num_predict_default", c.numPredictPorDefecto(),
 	)
 
 	// T4.5 · EL PRIMER PARTE VA AQUÍ, ANTES DEL BUCLE, y no se deja para el primer tick. Sin esto habría

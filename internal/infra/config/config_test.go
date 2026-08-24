@@ -708,6 +708,18 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	// significa «descarga el modelo en cuanto respondas»). Si alguien se lo pusiera «por consistencia», el
 	// default -1 se convertiría en sí mismo y el fallo sería invisible aquí — pero el override de abajo,
 	// con un finito, sí lo caza.
+	// Los dos bordes del calor del prefijo (T1.7-5): configurables porque el conteo del régimen `templado`
+	// es justo la señal de que hay que recalibrarlos, y recalibrar recompilando es lo que hizo que esto
+	// tardara. ⚠️ La coherencia de la PAREJA no se juzga aquí sino en el cajero (nuevosUmbralesRegimen):
+	// duplicar la validación en dos capas es el par que diverge.
+	if cfg.Worker.PrefillFrioMS != DefaultWorkerPrefillFrioMS {
+		t.Fatalf("umbral de prefill FRÍO por defecto: got %d, want %d",
+			cfg.Worker.PrefillFrioMS, DefaultWorkerPrefillFrioMS)
+	}
+	if cfg.Worker.PrefillCalienteMS != DefaultWorkerPrefillCalienteMS {
+		t.Fatalf("umbral de prefill CALIENTE por defecto: got %d, want %d",
+			cfg.Worker.PrefillCalienteMS, DefaultWorkerPrefillCalienteMS)
+	}
 	if cfg.Worker.KeepAliveSeconds != DefaultWorkerKeepAliveSeconds {
 		t.Fatalf("keep_alive por defecto: got %d, want %d (para siempre: sin él, el runner de Ollama muere "+
 			"a los 5 min y se lleva la caché de prefijos)",
@@ -722,6 +734,8 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	t.Setenv(WorkerEnvPrefix+"NUM_PREDICT", "64")
 	t.Setenv(WorkerEnvPrefix+"NUM_CTX", "2048")
 	t.Setenv(WorkerEnvPrefix+"KEEP_ALIVE_SECONDS", "900")
+	t.Setenv(WorkerEnvPrefix+"PREFILL_FRIO_MS", "12000")
+	t.Setenv(WorkerEnvPrefix+"PREFILL_CALIENTE_MS", "3000")
 	t.Setenv(WorkerEnvPrefix+"MAX_INTENTOS", "5")
 	t.Setenv(WorkerEnvPrefix+"INFERENCE_TIMEOUT_MS", "9000")
 	t.Setenv(WorkerEnvPrefix+"STATS_EVERY_MS", "60000")
@@ -731,6 +745,7 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	}
 	esperado := WorkerConfig{
 		MaxConcurrent: 2, PollMS: 250, MaxRunes: 1500, NumThread: 3, NumPredict: 64, NumCtx: 2048,
+		PrefillFrioMS: 12000, PrefillCalienteMS: 3000,
 		KeepAliveSeconds: 900,
 		MaxIntentos:      5, InferenceTimeoutMS: 9000, StatsEveryMS: 60000,
 		// La lista de colas del round-robin (T4.1) no se toca en este test, así que vale su default: el
