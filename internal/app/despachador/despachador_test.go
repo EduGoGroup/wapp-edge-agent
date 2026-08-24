@@ -442,8 +442,12 @@ func TestCabezaEnEstadoImprevistoSaleTambien(t *testing.T) {
 // Sin FIFO, la 2 saldría mientras la 1 se reintenta, y la conversación llegaría al cliente del revés —
 // que es un daño que no se arregla aguas arriba.
 //
-// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): que `vuelta` se salte la cabeza cuando su entrega viene
-// fallando (en vez de devolver «sin progreso») ⇒ sale wamid-2 primero.
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada, y el rojo NO es el que uno esperaría): que el freno de
+// `vuelta` devuelva «progreso» en vez de «sin progreso» cuando la entrega viene fallando. El test cae en
+// `el bucle no llegó a esperar (¿se quedó entregando?)`, no en la aserción de orden — con «progreso» el
+// bucle no aparca nunca y la guardia anti-cuelgue muerde antes. Se anota tal cual en vez de prometer el
+// mensaje bonito: un docstring que promete un rojo que no ocurre miente igual que un test verde que no
+// mira.
 func TestFIFONoAdelantaALaCabezaQueNoSeHaPodidoEntregar(t *testing.T) {
 	cola := nuevaColaFake(filaNueva(1, 10), filaNueva(2, 20))
 	a := arrancar(t, cola)
