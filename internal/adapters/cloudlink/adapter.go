@@ -416,6 +416,13 @@ var _ app.InboundSink = (*sessionSink)(nil)
 // reenvía en orden al reconectar; sin outbox conserva el best-effort previo (se registra y descarta).
 // Devuelve nil siempre (nunca tumba el socket de WhatsApp).
 //
+// 🔴 YA NO SE ADJUNTA NINGUNA INTENCIÓN (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045 · D-044.31 · REQ-35).
+// Hasta el 2026-08-24 este método rellenaba `IncomingMessage.Intent` con lo que el Edge hubiera
+// clasificado — el modelo PUSH. El ADR-0045 lo invirtió: el Edge entrega y punto, y es el Cloud quien
+// PIDE la inferencia por `inference_request` cuando la necesita. El campo se retiró del proto (11 en
+// `IncomingMessage`, 5 en `SensitivePayload`, ambos `reserved`), así que hoy no hay ni dónde ponerla.
+// El SELLADO DE LOS DEMÁS SENSIBLES NO CAMBIA NI UN BYTE: sigue siendo el mismo `SealFor` de siempre.
+//
 // CIFRADO EN TRÁNSITO (Plan 011 §6.3/§10.E): si hay pública de cifrado de la nube (s.cloudEncPub),
 // los campos SENSIBLES (text/push_name/from_pn/from_lid) se serializan como un SensitivePayload proto,
 // se sellan con SealFor (X25519 anónimo) y viajan en EncPayload; los planos se vacían. Si no hay
@@ -435,7 +442,6 @@ func (s *sessionSink) Deliver(_ context.Context, evt domain.InboundEvent) error 
 		FromPn:         fromPN,
 		FromLid:        fromLID,
 		AddressingMode: evt.AddressingMode,
-		Intent:         classifiedIntentToProto(evt.Intent),
 	}
 	s.sealSensitive(in)
 	msg := &cloudlinkv1.EdgeToCloud{
@@ -461,9 +467,6 @@ func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
 		PushName: in.GetPushName(),
 		FromPn:   in.GetFromPn(),
 		FromLid:  in.GetFromLid(),
-		// La intención LLM (Plan 029) es SENSIBLE: sus params pueden llevar texto literal del cliente. Con
-		// sellado activo viaja DENTRO del sobre; el espejo claro (in.Intent) se vacía abajo.
-		Intent: in.GetIntent(),
 	}
 	raw, err := proto.Marshal(sp)
 	if err != nil {
@@ -477,22 +480,6 @@ func (s *sessionSink) sealSensitive(in *cloudlinkv1.IncomingMessage) {
 	}
 	in.EncPayload = sealed
 	in.Text, in.PushName, in.FromPn, in.FromLid = "", "", "", "" // no viajan en claro
-	in.Intent = nil                                              // la intención va sellada, no en el espejo claro
-}
-
-// classifiedIntentToProto mapea la intención de dominio (Plan 029) al tipo del contrato CloudLink. Devuelve
-// nil si no hay intención (el caso normal: la mayoría de mensajes no clasifican), de modo que el campo del
-// proto queda vacío. Confidence pasa de float64 (dominio) a float32 (proto).
-func classifiedIntentToProto(ci *domain.ClassifiedIntent) *cloudlinkv1.ClassifiedIntent {
-	if ci == nil {
-		return nil
-	}
-	return &cloudlinkv1.ClassifiedIntent{
-		Intent:        ci.Name,
-		Params:        ci.Params,
-		Confidence:    float32(ci.Confidence),
-		ConfigVersion: ci.ConfigVersion,
-	}
 }
 
 // SendReceipt sube al cloud un ACUSE (delivered/read) de un mensaje SALIENTE por el ÚNICO stream del

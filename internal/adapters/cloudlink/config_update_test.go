@@ -1,12 +1,20 @@
 package cloudlink
 
-// intent_transport_test.go — Plan 029 · T12/T10: mapeo de la intención LLM al proto y demux del ConfigUpdate.
+// config_update_test.go — Plan 029 · T10: demux del ConfigUpdate.
 //
-//   - T12 Deliver: la intención de dominio (evt.Intent) se mapea a ClassifiedIntent. CON sellado activo va
-//     DENTRO del SensitivePayload (el espejo claro in.Intent queda nil); SIN sellado va en el espejo claro
-//     IncomingMessage.Intent. Sin intención, el campo queda nil en ambos caminos (mismo criterio que text).
-//   - T10 handleConfigUpdate: un CloudToEdge{ConfigUpdate} se atiende ANTES de resolver la sesión, delega en
-//     el ConfigApplier y responde Ack{ok} según el resultado. Sin applier ⇒ Ack tolerante.
+// handleConfigUpdate: un CloudToEdge{ConfigUpdate} se atiende ANTES de resolver la sesión, delega en el
+// ConfigApplier y responde Ack{ok} según el resultado. Sin applier ⇒ Ack tolerante.
+//
+// 🔴 ESTE FICHERO SE LLAMABA `intent_transport_test.go` Y TENÍA OTRA MITAD (Plan 029 · T12): tres tests
+// que comprobaban que `evt.Intent` se mapeaba a `ClassifiedIntent`, sellado dentro del SensitivePayload
+// o en el espejo claro según hubiera pública de cifrado. Se BORRARON el 2026-08-24 con el push (Plan 044
+// · Ola 1.6 · T1.6-5 · ADR-0045): no había que ajustarlos, porque el hecho que aseveraban dejó de existir
+// —el proto no tiene campo `ClassifiedIntent` y `domain.InboundEvent` no tiene campo `Intent`—.
+//
+// Lo que aquellos tests cuidaban de verdad —que el SELLADO no se rompa— sigue cubierto, y por quien
+// corresponde: `sealing_test.go` asevera los cuatro campos sensibles (text/push_name/from_pn/from_lid)
+// en sus dos caminos. Y que el push no vuelva por la puerta de atrás lo custodia
+// `internal/domain/inbound_sin_intent_test.go`, que mira el TIPO en vez de un camino concreto.
 
 import (
 	"context"
@@ -15,118 +23,7 @@ import (
 	"time"
 
 	cloudlinkv1 "github.com/EduGoGroup/wapp-cloudlink/gen/wapp/cloudlink/v1"
-	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
-	"github.com/EduGoGroup/wapp-shared/envelope"
-	"google.golang.org/protobuf/proto"
 )
-
-// intentEvent es el evento de referencia con una intención accionable anotada.
-func intentEvent() domain.InboundEvent {
-	return domain.InboundEvent{
-		MessageID: "WAMID-INTENT",
-		Chat:      "593999@s.whatsapp.net",
-		Sender:    "593999@s.whatsapp.net",
-		Timestamp: time.Unix(1_700_000_000, 0),
-		Text:      "quiero 2 hamburguesas",
-		Intent: &domain.ClassifiedIntent{
-			Name:          "crear_pedido",
-			Params:        map[string]string{"producto": "hamburguesas", "cantidad": "2"},
-			Confidence:    0.92,
-			ConfigVersion: "v-abc123",
-		},
-	}
-}
-
-func assertProtoIntent(t *testing.T, ci *cloudlinkv1.ClassifiedIntent) {
-	t.Helper()
-	if ci == nil {
-		t.Fatalf("ClassifiedIntent nil: se esperaba la intención mapeada")
-	}
-	if ci.GetIntent() != "crear_pedido" {
-		t.Errorf("intent: got %q want crear_pedido", ci.GetIntent())
-	}
-	if ci.GetParams()["producto"] != "hamburguesas" || ci.GetParams()["cantidad"] != "2" {
-		t.Errorf("params mal mapeados: %v", ci.GetParams())
-	}
-	if ci.GetConfigVersion() != "v-abc123" {
-		t.Errorf("config_version: got %q want v-abc123", ci.GetConfigVersion())
-	}
-	if d := ci.GetConfidence() - 0.92; d > 1e-6 || d < -1e-6 {
-		t.Errorf("confidence: got %v want ~0.92", ci.GetConfidence())
-	}
-}
-
-// SIN sellado: la intención viaja en el espejo claro IncomingMessage.Intent.
-func TestDeliver_Intent_ClearMirror_WhenNoSeal(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	h := newSealHarness(t, ctx) // sin WithCloudEncPubKey => fallback claro
-	if err := h.adapter.SinkFor(sealSessionID).Deliver(ctx, intentEvent()); err != nil {
-		t.Fatalf("Deliver: %v", err)
-	}
-	msg := recvKind(t, ctx, h.srv, "IncomingMessage", func(m *cloudlinkv1.EdgeToCloud) bool {
-		return m.GetIncoming() != nil
-	})
-	in := msg.GetIncoming()
-	if len(in.GetEncPayload()) != 0 {
-		t.Fatalf("EncPayload no vacío en fallback claro")
-	}
-	assertProtoIntent(t, in.GetIntent())
-}
-
-// CON sellado: la intención viaja DENTRO del SensitivePayload; el espejo claro queda nil.
-func TestDeliver_Intent_Sealed_WhenCloudPubPresent(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	pub, priv, err := envelope.GenerateKeyPair()
-	if err != nil {
-		t.Fatalf("GenerateKeyPair: %v", err)
-	}
-	h := newSealHarness(t, ctx, WithCloudEncPubKey(pub))
-	if err := h.adapter.SinkFor(sealSessionID).Deliver(ctx, intentEvent()); err != nil {
-		t.Fatalf("Deliver: %v", err)
-	}
-	msg := recvKind(t, ctx, h.srv, "IncomingMessage", func(m *cloudlinkv1.EdgeToCloud) bool {
-		return m.GetIncoming() != nil
-	})
-	in := msg.GetIncoming()
-	if in.GetIntent() != nil {
-		t.Errorf("intent NO debe viajar en el espejo claro cuando hay sellado")
-	}
-	if len(in.GetEncPayload()) == 0 {
-		t.Fatalf("EncPayload vacío: se esperaba el SensitivePayload sellado")
-	}
-	raw, err := envelope.OpenWith(priv, in.GetEncPayload())
-	if err != nil {
-		t.Fatalf("OpenWith: %v", err)
-	}
-	var sp cloudlinkv1.SensitivePayload
-	if err := proto.Unmarshal(raw, &sp); err != nil {
-		t.Fatalf("Unmarshal SensitivePayload: %v", err)
-	}
-	assertProtoIntent(t, sp.GetIntent())
-}
-
-// Sin intención anotada, el campo queda nil (no se inventa) — camino claro.
-func TestDeliver_NoIntent_LeavesFieldNil(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	h := newSealHarness(t, ctx)
-	evt := intentEvent()
-	evt.Intent = nil
-	if err := h.adapter.SinkFor(sealSessionID).Deliver(ctx, evt); err != nil {
-		t.Fatalf("Deliver: %v", err)
-	}
-	msg := recvKind(t, ctx, h.srv, "IncomingMessage", func(m *cloudlinkv1.EdgeToCloud) bool {
-		return m.GetIncoming() != nil
-	})
-	if msg.GetIncoming().GetIntent() != nil {
-		t.Errorf("intent debe ser nil cuando el evento no trae intención")
-	}
-}
 
 // fakeApplier registra las llamadas Apply y devuelve un error configurable.
 type fakeApplier struct {
