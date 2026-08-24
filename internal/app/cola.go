@@ -93,17 +93,19 @@ const (
 	// EL VALOR SE CONSERVA POR DOS RAZONES DISTINTAS, Y SÓLO LA SEGUNDA ES PARA SIEMPRE
 	// ─────────────────────────────────────────────────────────────────────────────
 	//
-	//  (1) TEMPORAL — TODAVÍA HAY UN ESCRITOR, Y NO ES DE ESTA TAREA. `Store.MarcarClasificado`
-	//      (colaentrantes/claim.go) sigue escribiéndolo: es el cierre de lote del worker-cajero, que
-	//      seguirá clasificando por iniciativa propia hasta que **T1.6-2** le cambie el oficio a servir
-	//      inferencia. Es decir: el escritor no muere con T1.6-5, muere con T1.6-2. Hasta entonces éste
-	//      es un estado TRANSITORIO DE LA RAMA `feat/044-o1.6` —que no se despliega hasta que la ola
-	//      cierre— y no un defecto. El detalle de qué le pasa a ese cierre está en `MarcarClasificado`.
+	//  (1) ✅ RESUELTA EL 2026-08-24 POR T1.6-2 — YA NO HAY ESCRITOR. Esta entrada decía que
+	//      `Store.MarcarClasificado` (colaentrantes/claim.go) seguía escribiéndolo, porque el cajero
+	//      clasificaba por iniciativa propia «hasta que T1.6-2 le cambie el oficio a servir inferencia».
+	//      Eso ya ocurrió: el bucle del cajero dejó de reclamar y `MarcarClasificado` se quedó SIN UN SOLO
+	//      LLAMANTE en producción. El método y su fencing se CONSERVAN —siguen en el puerto app.ColaCajero
+	//      y en el Store— porque retirarlos es una amputación del adaptador con su propia migración, no un
+	//      efecto colateral de esta tarea; pero nadie los invoca, así que desde hoy NINGUNA fila nueva
+	//      nace con esta etiqueta.
 	//
 	//  (2) PERMANENTE — HAY FILAS YA PERSISTIDAS QUE HAY QUE PODER DECODIFICAR. En las colas
 	//      (`<data_dir>/cola_entrantes.db`) de equipos de clientes hay filas escritas con esta etiqueta
 	//      por binarios anteriores, y el Edge tiene que seguir sabiendo LEERLAS mientras se vacían. Ésta
-	//      es la razón que impide borrar el valor NUNCA, aunque (1) se resuelva mañana: es el precedente
+	//      es la razón que impide borrar el valor NUNCA, y ahora que (1) está resuelta es la ÚNICA: es el precedente
 	//      exacto de `MotivoNoElegible`, que lleva huérfano desde T1.5-3 y sigue aquí por lo mismo.
 	//
 	// LOS DOS LECTORES QUE SEGUIRÁN VIVOS CUANDO (1) SE RESUELVA:

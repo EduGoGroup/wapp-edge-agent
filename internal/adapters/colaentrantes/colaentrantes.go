@@ -425,14 +425,14 @@ func (s *Store) RescatadasPorLease() int64 { return s.rescatadasPorLease.Load() 
 // (estado `tomado` + mismo `claim_token`) ya no mordía: el lote había dejado de ser de ese cajero. Cuenta
 // LOTES, no filas — es el número de inferencias pagadas y tiradas—. Acumulado monotónico, sin PII.
 //
-// ⏳ EN LA RAMA `feat/044-o1.6` ESTE NÚMERO SUBE EN CADA LOTE, Y NO ES UN INCIDENTE. Desde T1.6-5
-// (ADR-0045) el despachador entrega la cabeza al instante y la sella, así que el cierre del cajero llega
-// siempre tarde y su fence nunca casa. Es el hueco entre T1.6-5 y T1.6-2, está explicado paso a paso en
-// `MarcarClasificado` (claim.go) y desaparece cuando T1.6-2 retire el bucle de clasificación. Nada de
-// esto alcanza producción: la rama no se despliega hasta que la ola cierre.
+// ✅ EL HUECO DE LA RAMA SE CERRÓ EL 2026-08-24 (T1.6-2). Entre T1.6-5 y T1.6-2 este número subía EN CADA
+// LOTE y no era un incidente: el despachador ya entregaba la cabeza al instante y la sellaba, así que el
+// cierre del cajero llegaba siempre tarde y su fence no casaba nunca. T1.6-2 retiró el bucle de
+// clasificación, así que hoy NADIE llama a `MarcarClasificado` y este contador vuelve a ser lo que era.
 //
-// 🔴 SIGUE SIENDO CERO EL VALOR SANO EN `main`, y por eso conviene mirarlo con la rama en mente: ahí un
-// número que crece significa lo de siempre —lease corto o cajeros relevándose—, no esto.
+// 🔴 CERO ES EL VALOR SANO, otra vez y para todas las ramas: un número que crece significa lo de siempre
+// —lease corto o cajeros relevándose—. Y mientras `MarcarClasificado` no tenga llamante, un número que
+// crezca significa además que ALGUIEN VOLVIÓ A CERRAR LOTES, que es una pregunta por derecho propio.
 func (s *Store) CierresDescartadosPorFence() int64 { return s.cierresDescartadosPorFence.Load() }
 
 // pruneTTLLocked borra las filas YA DESPACHADAS más viejas que el TTL. Debe llamarse bajo s.mu.
