@@ -9,14 +9,26 @@ package cajero
 // breaker hace exactamente lo que promete. El defecto que el MP-09 persigue no está en ninguna de las
 // tres piezas por separado —todas verdes hoy y verdes con el defecto puesto— sino en su INTERACCIÓN:
 //
-//	contador de fallos consecutivos + umbral  ·  el plazo de UNA inferencia  ·  el semáforo de una plaza
+//	contador de fallos consecutivos + umbral  ·  el plazo de UNA inferencia  ·  el aforo de una plaza
 //
 // Viven en tres sitios distintos y ningún test los juntaba. Estos tests los juntan: breaker REAL (no el
-// doble), plazo de inferencia real, semáforo de una plaza y un guion de latencias MEDIDO EN CAMPO.
+// doble), plazo de inferencia real, aforo de una plaza y un guion de latencias MEDIDO EN CAMPO.
 //
 // 🔴 EL CASO QUE MANDA ES EL DEL ACIERTO INTERCALADO, que ningún test de hoy ejercitaba y que es el que
 // impedía la apertura PARA SIEMPRE: un solo éxito pone `failures` a cero, y un Ollama lento acierta de
 // vez en cuando. Ver FraccionLentitud para la medición completa.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 QUÉ CAMBIÓ EN T1.6-2 (Plan 044 · Ola 1.6, ADR-0045) Y QUÉ NO
+// ─────────────────────────────────────────────────────────────────────────────
+// NO CAMBIÓ EL SUJETO: `registrarAcierto` sigue vivo, sigue siendo donde vive el criterio del MP-09 y
+// sigue teniendo la última palabra sobre lo que el breaker aprende de una inferencia que RESPONDIÓ.
+//
+// CAMBIÓ QUIÉN LO LLAMA: era el bucle, que clasificaba por iniciativa propia; hoy es el SERVIDOR DE
+// INFERENCIA, que atiende peticiones del Cloud. Por eso el guion ya no se le da de comer a la cola en
+// forma de lotes, sino al servidor en forma de `PeticionInferencia` — un cambio de cableado del test que
+// deja la propiedad medida intacta y que además la mide más cerca: sin el bucle en medio, lo que se
+// ejercita es exactamente la ruta que el ADR-0045 dejó en pie.
 //
 // VERIFICADO POR MUTACIÓN (criterio del MP-09): con FraccionLentitud devuelta al comportamiento anterior
 // —o sea, sin criterio de lentitud— TestLentitud_LaSecuenciaMedidaEnCampo y
@@ -25,6 +37,7 @@ package cajero
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -34,13 +47,14 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/breaker"
-	"github.com/EduGoGroup/wapp-edge-intent/classifier"
+	"github.com/EduGoGroup/wapp-edge-intent/ollama"
 )
 
-// timeoutDeLaMedicion es el plazo con el que se midió en campo (y el default del worker). Se escribe
-// aquí explícito y no como DefaultInferenceTimeoutMS porque el guion de latencias de abajo SÓLO tiene
-// sentido contra este número: si el default cambiara algún día, el guion habría que remedirlo, no
-// reajustarlo solo.
+// timeoutDeLaMedicion es el plazo con el que se midió en campo el episodio del MP-09 (2026-08-20). Se
+// escribe aquí explícito y NO como DefaultInferenceTimeoutMS —que hoy vale 45 s, no 15— porque el guion
+// de latencias de abajo sólo tiene sentido contra ESTE número: las latencias son las que aquella máquina
+// produjo con este presupuesto encima, y un guion re-escalado a otro plazo sería un ejemplo inventado.
+// Si algún día hay que probar el criterio con el plazo nuevo, lo que hace falta es REMEDIR, no reajustar.
 const timeoutDeLaMedicion = 15 * time.Second
 
 // relojFalso es un reloj que sólo avanza cuando el guion lo dice. Lo comparten el cajero (Deps.Ahora) y
@@ -59,28 +73,36 @@ func (r *relojFalso) avanzar(d time.Duration) { r.nanos.Add(int64(d)) }
 
 // pasoGuion es UNA inferencia del guion: cuánto tarda y si acaba en error.
 //
-// `falla: true` con dur = el plazo entero es como se escribe un TIMEOUT, y es fiel a lo que el cajero ve
-// de uno: un error y el plazo consumido. No se puede provocar el timeout de verdad porque
-// context.WithTimeout usa el reloj del SISTEMA y no este; escribir el test con esperas reales costaría
-// 15 s por muestra y no probaría nada distinto.
+// 🔴 CÓMO ATERRIZA HOY UN PASO `falla: true`, y por qué el nombre del ayudante cambió. Con reloj falso no
+// se puede provocar un timeout de VERDAD: `context.WithTimeout` usa el reloj del SISTEMA y no éste, así
+// que el contexto de la inferencia nunca vence y `registrarFalloDeInferencia` clasifica el paso como
+// OLLAMA_DOWN, no como TIMEOUT. Para lo que estos tests miden da exactamente igual —los dos desenlaces
+// pasan por `registrarFallo`, que es lo único que el breaker ve—, pero el nombre viejo (`plazoAgotado`)
+// prometía un camino por el que el test ya no pasa, y un nombre que miente cuesta más que uno feo.
+// Escribir el test con esperas reales costaría 15 s por muestra y no probaría nada distinto.
 type pasoGuion struct {
 	dur   time.Duration
 	falla bool
 }
 
-func resp(ms int) pasoGuion   { return pasoGuion{dur: time.Duration(ms) * time.Millisecond} }
-func plazoAgotado() pasoGuion { return pasoGuion{dur: timeoutDeLaMedicion, falla: true} }
+func resp(ms int) pasoGuion { return pasoGuion{dur: time.Duration(ms) * time.Millisecond} }
 
-// clasificadorGuionado reproduce una secuencia de inferencias avanzando el reloj falso. Agotado el
-// guion responde instantáneo y bien, para que un lote de más no altere lo que el test mide.
-type clasificadorGuionado struct {
+// falloTrasElPlazo es una inferencia que consume el plazo entero y acaba en error: es como el cajero ve
+// un timeout —tiempo gastado y nada que servir— y cuenta lo mismo para el breaker (ver pasoGuion).
+func falloTrasElPlazo() pasoGuion { return pasoGuion{dur: timeoutDeLaMedicion, falla: true} }
+
+// chateadorGuionado reproduce una secuencia de inferencias avanzando el reloj falso. Agotado el guion
+// responde instantáneo y bien, para que una petición de más no altere lo que el test mide.
+type chateadorGuionado struct {
 	reloj *relojFalso
 	mu    sync.Mutex
 	pasos []pasoGuion
 	i     int
 }
 
-func (c *clasificadorGuionado) Classify(_ context.Context, _ string) (classifier.Classification, error) {
+var _ Chateador = (*chateadorGuionado)(nil)
+
+func (c *chateadorGuionado) Chat(_ context.Context, _ ollama.ChatRequest) (*ollama.ChatResponse, error) {
 	c.mu.Lock()
 	p := resp(1)
 	if c.i < len(c.pasos) {
@@ -91,37 +113,53 @@ func (c *clasificadorGuionado) Classify(_ context.Context, _ string) (classifier
 
 	c.reloj.avanzar(p.dur)
 	if p.falla {
-		return classifier.Classification{}, context.DeadlineExceeded
+		return nil, errors.New("el proveedor local no respondió")
 	}
-	return classifier.Classification{Intent: "crear_pedido", Confidence: 0.9}, nil
+	return &ollama.ChatResponse{
+		Message: ollama.Message{Role: "assistant", Content: `{"intent":"crear_pedido"}`},
+		Done:    true,
+	}, nil
 }
 
-// correrGuion monta el cajero con el breaker REAL, el semáforo en una plaza y el plazo de la medición, y
-// le da de comer tantos lotes como pasos tenga el guion. Devuelve el cajero y el log capturado.
-func correrGuion(t *testing.T, pasos []pasoGuion, timeout time.Duration) (*Cajero, *logCaptura) {
+func (c *chateadorGuionado) SupportsThinking(_ context.Context, _ string) bool { return false }
+
+// correrGuion monta el cajero con el breaker REAL, el aforo en una plaza y el presupuesto de la
+// medición, y le pide al servidor de inferencia tantas inferencias como pasos tenga el guion.
+//
+// 🔴 EL PLAZO DE CADA PETICIÓN LO PONE EL «CLOUD» (p.Timeout) Y NO Deps.Timeout, y esa separación es la
+// que hace que el último caso del fichero se pueda escribir: desde el ADR-0045 `Deps.Timeout` gobierna
+// SÓLO dos cosas —el default cuando el Cloud no fija plazo, y el umbral de lentitud que se deriva de
+// él—, así que se le puede pasar 0 para apagar el criterio del MP-09 sin dejar a las peticiones sin
+// presupuesto.
+//
+// Las inferencias se piden EN SERIE a propósito: el guion es una secuencia temporal (el orden de los
+// aciertos y los fallos es lo que decide si el circuito abre) y el reloj falso es compartido.
+func correrGuion(t *testing.T, pasos []pasoGuion, umbral time.Duration) (*Cajero, *logCaptura) {
 	t.Helper()
 
-	var lotes []*app.ColaLote
-	for i := range pasos {
-		lotes = append(lotes, loteDe(fmt.Sprintf("s%d", i), "quiero una pizza"))
-	}
 	reloj := nuevoRelojFalso()
 	log := &logCaptura{}
 
 	// Breaker: NIL a propósito ⇒ New construye el REAL con la calibración de producción (5 fallos
 	// consecutivos / 60 s) y con este mismo reloj. Con el doble (nuevoBreakerFake) este test no probaría
 	// nada: el defecto vive en la interacción con el breaker de verdad.
-	c, err := correr(t, Deps{
-		Cola:          &colaFake{pendientes: lotes},
-		Clasificador:  &clasificadorGuionado{reloj: reloj, pasos: pasos},
+	c, s := servidorDe(t, Deps{
+		Cola:          &colaFake{},
+		Ollama:        &chateadorGuionado{reloj: reloj, pasos: pasos},
 		Log:           log,
 		Ahora:         reloj.ahora,
-		MaxConcurrent: 1, // el semáforo, tercera pieza de la interacción
-		Timeout:       timeout,
-		MaxIntentos:   len(pasos) + 1, // que el freno del lote venenoso no se meta en medio
-	}, 3)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+		MaxConcurrent: 1, // el aforo, tercera pieza de la interacción
+		Timeout:       umbral,
+	})
+
+	for i := range pasos {
+		_, err := s.Inferir(context.Background(), peticionDe("clasifica esto", timeoutDeLaMedicion))
+		// El error se IGNORA a propósito y sólo aquí: el guion decide qué pasos fallan, y lo que el test
+		// mide es el estado en que quedan el circuito y los contadores, no el desenlace de cada llamada.
+		// Se comprueba, eso sí, que no sea uno que delate un test mal montado.
+		if errors.Is(err, app.ErrInferenciaSinCapacidad) {
+			t.Fatalf("el paso %d se quedó SIN PLAZA con el aforo libre: el guion no está midiendo lo que dice", i)
+		}
 	}
 	return c, log
 }
@@ -129,17 +167,17 @@ func correrGuion(t *testing.T, pasos []pasoGuion, timeout time.Duration) (*Cajer
 // TestLentitud_LaSecuenciaMedidaEnCampo es el test que da nombre al MP-09: la secuencia EXACTA que el
 // VPS de UAT produjo el 2026-08-20 con Ollama lento y un backlog de 240 entrantes.
 //
-// Hasta el MP-09 esta secuencia dejaba el circuito CERRADO para siempre —racha máxima de timeouts
+// Hasta el MP-09 esta secuencia dejaba el circuito CERRADO para siempre —racha máxima de fallos
 // consecutivos 2, umbral 5, y cada acierto intercalado borrando el contador—. El acierto de 12.190 ms y
 // el de 12.626 ms son los que lo borraban, y son los que ahora suman.
 func TestLentitud_LaSecuenciaMedidaEnCampo(t *testing.T) {
 	// El guion es la medición, no un ejemplo inventado. Ver FraccionLentitud.
 	c, log := correrGuion(t, []pasoGuion{
-		plazoAgotado(), // failures 1
-		resp(12_190),   // failures 2  ← ANTES: 0
-		resp(12_626),   // failures 3  ← ANTES: 0
-		plazoAgotado(), // failures 4
-		plazoAgotado(), // failures 5  ⇒ ABRE
+		falloTrasElPlazo(), // failures 1
+		resp(12_190),       // failures 2  ← ANTES: 0
+		resp(12_626),       // failures 3  ← ANTES: 0
+		falloTrasElPlazo(), // failures 4
+		falloTrasElPlazo(), // failures 5  ⇒ ABRE
 	}, timeoutDeLaMedicion)
 
 	if c.Circuito() != breaker.StateOpen {
@@ -153,11 +191,16 @@ func TestLentitud_LaSecuenciaMedidaEnCampo(t *testing.T) {
 	if c.Lentas() != 2 {
 		t.Errorf("Lentas: got %d want 2 (12.190 ms y 12.626 ms)", c.Lentas())
 	}
-	// 🔴 Y NO 5: los aciertos lentos castigan al breaker pero NO son fallos del lote. Si esto sube, el
-	// freno del lote venenoso (MaxIntentos) estaría abandonando mensajes por culpa de la lentitud de
-	// Ollama, que es un problema ajeno a ellos.
+	// 🔴 Y NO 5: los aciertos lentos castigan al breaker pero NO son fallos del proveedor. Mezclarlos
+	// haría imposible distinguir en el log un circuito abierto por LENTITUD de uno abierto por CAÍDA, que
+	// es la única razón por la que `lentas` es un contador aparte.
 	if c.Fallos() != 3 {
-		t.Errorf("Fallos: got %d want 3 (sólo los timeouts; un acierto lento NO es un fallo del lote)", c.Fallos())
+		t.Errorf("Fallos: got %d want 3 (sólo los fallos de verdad; un acierto lento NO lo es)", c.Fallos())
+	}
+	// Y las dos lentas SÍ se sirvieron: la salida subió al Cloud. La lentitud castiga al CIRCUITO, nunca
+	// a la respuesta que ya se pagó.
+	if c.Servidas() != 2 {
+		t.Errorf("Servidas: got %d want 2 (las dos inferencias lentas respondieron y se sirvieron)", c.Servidas())
 	}
 	if _, ok := log.buscar("inferencia LENTA"); !ok {
 		t.Error("una inferencia lenta debe dejar su propia línea de Warn antes de la apertura")
@@ -189,9 +232,9 @@ func TestLentitud_CincoAciertosLentosAbrenElCircuito_SinUnSoloFallo(t *testing.T
 	if !strings.Contains(fmt.Sprint(e.args...), causaLentitud) {
 		t.Errorf("la apertura debe declarar causa=%q, args: %v", causaLentitud, e.args)
 	}
-	// Los cinco lotes se clasificaron y se cerraron: la lentitud castiga al CIRCUITO, no a los mensajes.
-	if c.Clasificados() != 5 {
-		t.Errorf("Clasificados: got %d want 5 (un acierto lento se cierra con su intent)", c.Clasificados())
+	// Las cinco se sirvieron: la lentitud castiga al CIRCUITO, no a las respuestas.
+	if c.Servidas() != 5 {
+		t.Errorf("Servidas: got %d want 5 (un acierto lento se sirve igual)", c.Servidas())
 	}
 }
 
@@ -218,14 +261,19 @@ func TestLentitud_OllamaSano_NiUnPicoAisladoAbreElCircuito(t *testing.T) {
 	if c.Lentas() != 3 {
 		t.Errorf("Lentas: got %d want 3 — los picos SÍ se anotan, simplemente no bastan para abrir", c.Lentas())
 	}
-	if c.Clasificados() != 11 {
-		t.Errorf("Clasificados: got %d want 11", c.Clasificados())
+	if c.Servidas() != 11 {
+		t.Errorf("Servidas: got %d want 11", c.Servidas())
 	}
 }
 
-// TestLentitud_SinPresupuestoPropio_ElCriterioSeApaga protege la promesa de Deps.Timeout <= 0 («sin plazo
-// propio: manda el ctx del proceso»). Sin presupuesto no hay «demasiado tarde» que definir, así que el
-// criterio no puede inventarse uno: el breaker vuelve exactamente a la conducta de antes del MP-09.
+// TestLentitud_SinPresupuestoPropio_ElCriterioSeApaga protege la promesa de Deps.Timeout <= 0 en lo que
+// hoy gobierna: el UMBRAL DE LENTITUD. Sin presupuesto propio no hay «demasiado tarde» que definir, así
+// que el criterio no puede inventarse uno y el breaker vuelve exactamente a la conducta de antes del
+// MP-09.
+//
+// ⚠️ Las peticiones SÍ llevan plazo (se lo pone el Cloud, ver correrGuion): lo que se apaga con
+// `Deps.Timeout = 0` es el umbral derivado, no el presupuesto de cada inferencia. Los dos eran lo mismo
+// antes del ADR-0045 y desde entonces no lo son.
 func TestLentitud_SinPresupuestoPropio_ElCriterioSeApaga(t *testing.T) {
 	c, _ := correrGuion(t, []pasoGuion{
 		resp(13_000), resp(13_100), resp(12_400), resp(14_878), resp(13_500),
@@ -237,6 +285,9 @@ func TestLentitud_SinPresupuestoPropio_ElCriterioSeApaga(t *testing.T) {
 	if c.Lentas() != 0 {
 		t.Errorf("Lentas: got %d want 0", c.Lentas())
 	}
+	if c.Servidas() != 5 {
+		t.Errorf("Servidas: got %d want 5 (sin umbral las cinco son aciertos a secas)", c.Servidas())
+	}
 }
 
 // TestUmbralLentoDe_SeDerivaDelPresupuesto fija la aritmética por si alguien mueve el plazo: el umbral lo
@@ -246,8 +297,8 @@ func TestUmbralLentoDe_SeDerivaDelPresupuesto(t *testing.T) {
 		timeout time.Duration
 		want    time.Duration
 	}{
-		{15 * time.Second, 12 * time.Second}, // el default: 0,8 × 15 s
-		{30 * time.Second, 24 * time.Second}, // quien sube el plazo sube el umbral con él
+		{15 * time.Second, 12 * time.Second}, // el plazo de la medición del MP-09: 0,8 × 15 s
+		{45 * time.Second, 36 * time.Second}, // el default de hoy (DefaultInferenceTimeoutMS)
 		{0, 0},                               // sin plazo propio ⇒ criterio apagado
 		{-1, 0},                              // idem, defensivo
 	}
@@ -263,21 +314,21 @@ func TestUmbralLentoDe_SeDerivaDelPresupuesto(t *testing.T) {
 // tarda lo mismo que antes.
 //
 // 🔴 SIN ESTO EL ARREGLO SE DESHARÍA SOLO. RecordSuccess borra el contador Y la ventana, así que un
-// sondeo lento tratado como éxito cerraría el circuito entero, el cajero volvería a reclamar y el
-// episodio empezaría de cero cada minuto: la lentitud «curaría» al breaker una y otra vez. Con el
+// sondeo lento tratado como éxito cerraría el circuito entero, el Edge volvería a aceptar inferencias y
+// el episodio empezaría de cero cada minuto: la lentitud «curaría» al breaker una y otra vez. Con el
 // criterio puesto, el sondeo lento es un fallo y la ventana se REABRE, que es la conducta que ya tenía
 // con Ollama caído.
 //
-// Va contra registrarAcierto directamente y no por el bucle porque el medio-abierto exige que pasen 60 s
-// SIN inferencias, y el guion sólo puede avanzar el reloj clasificando.
+// Va contra registrarAcierto directamente y no por el servidor porque el medio-abierto exige que pasen
+// 60 s SIN inferencias, y el guion sólo puede avanzar el reloj sirviéndolas.
 func TestLentitud_ElSondeoLentoDelMedioAbierto_REABRE(t *testing.T) {
 	reloj := nuevoRelojFalso()
 	c, err := New(Deps{
-		Cola:         &colaFake{},
-		Clasificador: &clasificadorFake{},
-		Log:          &logCaptura{},
-		Ahora:        reloj.ahora,
-		Timeout:      timeoutDeLaMedicion,
+		Cola:    &colaFake{},
+		Ollama:  &chateadorFake{},
+		Log:     &logCaptura{},
+		Ahora:   reloj.ahora,
+		Timeout: timeoutDeLaMedicion,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
