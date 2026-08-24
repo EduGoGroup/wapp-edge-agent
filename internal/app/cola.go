@@ -84,28 +84,38 @@ const (
 	// ÚNICO estado terminal, y el único que el despachador excluye al buscar cabeza.
 	EstadoDespachado = "despachado"
 
-	// EstadoClasificado es HISTÓRICO desde el 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045
+	// EstadoClasificado salió del CICLO el 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045
 	// §Decisión.4): significaba «con intent resuelto, lista para entregarse» y era el único estado desde
-	// el que el despachador entregaba. Bajo pull el Edge no clasifica, así que ninguna fila puede llegar
-	// a estarlo por un camino nuevo.
+	// el que el despachador entregaba. Hoy el despachador entrega cualquier cabeza que no esté
+	// `despachado`, así que este estado ya no gobierna nada.
 	//
-	// 🔴 EL VALOR NO SE BORRA, POR EL PRECEDENTE EXACTO DE `MotivoNoElegible`: hay filas ya persistidas
-	// con esta etiqueta en las colas (`<data_dir>/cola_entrantes.db`) de los equipos de clientes, y el
-	// Edge tiene que seguir sabiendo LEERLAS mientras se vacían. Lo que se conserva es la capacidad de
-	// decodificar, no el estadio.
+	// ─────────────────────────────────────────────────────────────────────────────
+	// EL VALOR SE CONSERVA POR DOS RAZONES DISTINTAS, Y SÓLO LA SEGUNDA ES PARA SIEMPRE
+	// ─────────────────────────────────────────────────────────────────────────────
 	//
-	// LOS TRES SITIOS QUE TODAVÍA LO NOMBRAN, y por qué cada uno:
+	//  (1) TEMPORAL — TODAVÍA HAY UN ESCRITOR, Y NO ES DE ESTA TAREA. `Store.MarcarClasificado`
+	//      (colaentrantes/claim.go) sigue escribiéndolo: es el cierre de lote del worker-cajero, que
+	//      seguirá clasificando por iniciativa propia hasta que **T1.6-2** le cambie el oficio a servir
+	//      inferencia. Es decir: el escritor no muere con T1.6-5, muere con T1.6-2. Hasta entonces éste
+	//      es un estado TRANSITORIO DE LA RAMA `feat/044-o1.6` —que no se despliega hasta que la ola
+	//      cierre— y no un defecto. El detalle de qué le pasa a ese cierre está en `MarcarClasificado`.
 	//
-	//  1. `colaentrantes/pendientes.go` — el desglose por estado. Lo cuenta para poder VER vaciarse las
+	//  (2) PERMANENTE — HAY FILAS YA PERSISTIDAS QUE HAY QUE PODER DECODIFICAR. En las colas
+	//      (`<data_dir>/cola_entrantes.db`) de equipos de clientes hay filas escritas con esta etiqueta
+	//      por binarios anteriores, y el Edge tiene que seguir sabiendo LEERLAS mientras se vacían. Ésta
+	//      es la razón que impide borrar el valor NUNCA, aunque (1) se resuelva mañana: es el precedente
+	//      exacto de `MotivoNoElegible`, que lleva huérfano desde T1.5-3 y sigue aquí por lo mismo.
+	//
+	// LOS DOS LECTORES QUE SEGUIRÁN VIVOS CUANDO (1) SE RESUELVA:
+	//
+	//   - `colaentrantes/pendientes.go` — el desglose por estado. Lo cuenta para poder VER vaciarse las
 	//     colas antiguas (ver ColaPendientes.Clasificado).
-	//  2. `colaentrantes/colaentrantes.go` — la capa 2 del sacrificio por tope. Una fila vieja
+	//   - `colaentrantes/colaentrantes.go` — la capa 2 del sacrificio por tope. Una fila vieja
 	//     `clasificado` es la primera candidata a descartarse bajo presión, exactamente como antes.
-	//  3. ⚠️ `colaentrantes/claim.go` (`MarcarClasificado`) — el ÚNICO ESCRITOR VIVO que queda, y es
-	//     TRANSITORIO: es el cierre de lote del worker-cajero, que sigue clasificando hasta que T1.6-2 le
-	//     cambie el oficio a servir inferencia. Mientras tanto no rompe nada —el despachador entrega la
-	//     cabeza al instante, así que ese cierre llega tarde, su fence no casa y es no-op—, pero es la
-	//     última raíz del push en este repo. Cuando T1.6-2 cierre, ESTE ESCRITOR DEBE DESAPARECER y aquí
-	//     sólo quedan los dos lectores de arriba.
+	//
+	// Que el despachador las ENTREGUE lo custodian dos tests, uno por nivel: `TestCabezaClasificadaDeUn
+	// BinarioAnteriorSeEntrega` (bucle, internal/app/despachador) y
+	// `TestCircuitoFilaAntiguaClasificadaSeDrenaSeSellaYSePoda` (BD real, adapters/colaentrantes).
 	EstadoClasificado = "clasificado"
 )
 

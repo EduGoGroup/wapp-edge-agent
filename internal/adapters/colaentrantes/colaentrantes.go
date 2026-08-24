@@ -424,6 +424,15 @@ func (s *Store) RescatadasPorLease() int64 { return s.rescatadasPorLease.Load() 
 // CierresDescartadosPorFence devuelve cuántos CIERRES DE LOTE se han descartado enteros porque el fence
 // (estado `tomado` + mismo `claim_token`) ya no mordía: el lote había dejado de ser de ese cajero. Cuenta
 // LOTES, no filas — es el número de inferencias pagadas y tiradas—. Acumulado monotónico, sin PII.
+//
+// ⏳ EN LA RAMA `feat/044-o1.6` ESTE NÚMERO SUBE EN CADA LOTE, Y NO ES UN INCIDENTE. Desde T1.6-5
+// (ADR-0045) el despachador entrega la cabeza al instante y la sella, así que el cierre del cajero llega
+// siempre tarde y su fence nunca casa. Es el hueco entre T1.6-5 y T1.6-2, está explicado paso a paso en
+// `MarcarClasificado` (claim.go) y desaparece cuando T1.6-2 retire el bucle de clasificación. Nada de
+// esto alcanza producción: la rama no se despliega hasta que la ola cierre.
+//
+// 🔴 SIGUE SIENDO CERO EL VALOR SANO EN `main`, y por eso conviene mirarlo con la rama en mente: ahí un
+// número que crece significa lo de siempre —lease corto o cajeros relevándose—, no esto.
 func (s *Store) CierresDescartadosPorFence() int64 { return s.cierresDescartadosPorFence.Load() }
 
 // pruneTTLLocked borra las filas YA DESPACHADAS más viejas que el TTL. Debe llamarse bajo s.mu.

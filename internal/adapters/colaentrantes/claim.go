@@ -387,7 +387,40 @@ func (s *Store) Reclamar(ctx context.Context, maxFilas int) (*app.ColaLote, erro
 }
 
 // MarcarClasificado cierra un lote ya clasificado: escribe intentJSON en la ÚLTIMA fila (la de mayor
-// Seq) y deja TODAS las del lote en `clasificado`, listas para el despachador.
+// Seq) y deja TODAS las del lote en `clasificado`.
+//
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+// ⏳ ESTADO TRANSITORIO DE LA RAMA `feat/044-o1.6` — ESTE CIERRE YA NO GANA NUNCA (T1.6-5, ADR-0045)
+// ═════════════════════════════════════════════════════════════════════════════════════════════════════
+//
+// LÉELO ANTES DE ABRIR UN BUG. Desde el 2026-08-24 este método SIEMPRE llega tarde, y no es un defecto:
+// es el hueco que queda entre T1.6-5 (que retiró el push del despachador) y T1.6-2 (que le cambiará el
+// oficio al worker-cajero). La secuencia, paso a paso:
+//
+//  1. el cajero reclama el lote y se pone a inferir (p50 medido: ~8 s);
+//  2. el despachador, que desde T1.6-5 NO retiene nada, ve esa misma fila de cabeza —`tomado` se entrega
+//     igual que cualquier otro estado— y la entrega EN EL ACTO;
+//  3. `MarcarDespachada` la sella `despachado`;
+//  4. el cajero termina, llama aquí, y el fence `estado = 'tomado' AND claim_token = ?` NO CASA porque la
+//     fila ya no está `tomado`. Rollback, `app.ErrLoteRelevado`, y `CierresDescartadosPorFence` +1.
+//
+// LO QUE SE VE EN CAMPO: `CierresDescartadosPorFence` subiendo en CADA lote, y CPU de Ollama gastada en
+// inferencias que no se guardan en ninguna parte. 🔴 NO HAY PÉRDIDA DE MENSAJES —el mensaje ya salió, y
+// salió ANTES que con el modelo viejo—; lo que se tira es la clasificación, que bajo pull no tiene ya por
+// dónde viajar (el proto retiró `ClassifiedIntent`).
+//
+// POR QUÉ NO SE APAGA AQUÍ Y AHORA: apagar el bucle de clasificación del cajero es reescribir lo que
+// T1.6-2 va a reordenar de todos modos, con dos manos sobre el mismo fichero. Con el reparto elegido,
+// T1.6-2 se limita a BORRAR una puerta que ya existe. Y nada de esto alcanza producción: esta rama no se
+// despliega hasta que la ola entera cierre.
+//
+// ⚠️ CUANDO T1.6-2 RETIRE EL BUCLE DE CLASIFICACIÓN, ESTE MÉTODO SE VA CON ÉL. Es el ÚLTIMO ESCRITOR de
+// `app.EstadoClasificado` que queda en el repo (ver el doc de esa constante): detrás de él sólo quedan
+// dos LECTORES, que se conservan para siempre porque hay filas ya persistidas en los discos de clientes.
+//
+// ⚠️ Y EL FENCE NO SE TOCA MIENTRAS TANTO. Es tentador «arreglar» el ruido ampliando el predicado para que
+// el cierre tardío muerda igual: sería exactamente el bug que el fencing existe para impedir (ADR-0038),
+// y encima escribiría un intent en una fila YA ENTREGADA, que es un dato que nadie volvería a leer.
 //
 // TODO O NADA, y por eso aquí SÍ hay transacción (a diferencia del claim, que es una sola sentencia):
 // son DOS sentencias, y un lote medio cerrado deja filas en `tomado` que nadie mira hasta que el barrido

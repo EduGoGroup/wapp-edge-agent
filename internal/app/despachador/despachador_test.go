@@ -386,6 +386,60 @@ func TestCabezaNuevaSaleEnLaPRIMERAVuelta(t *testing.T) {
 	}
 }
 
+// TestCabezaClasificadaDeUnBinarioAnteriorSeEntrega es EL TEST DE LA MIGRACIÓN a nivel de bucle, y existe
+// aunque parezca redundante con los de arriba.
+//
+// 🔴 QUÉ CUBRE QUE NINGÚN OTRO CUBRE. `clasificado` era, hasta el 2026-08-24, EL ÚNICO estado desde el que
+// este bucle entregaba; hoy es el único que ya no puede producirse (ADR-0045 §Decisión.4). Esa inversión
+// deja un hueco fácil de no ver: alguien podría «limpiar» el estado del ciclo y dejar sin salida a las
+// filas que YA ESTÁN ESCRITAS en `<data_dir>/cola_entrantes.db` en los equipos de clientes. Esas filas no
+// se pueden migrar con un `.sql` —la cola es un fichero local por instalación— así que la única garantía
+// de que salgan es que el bucle las entregue, y la única garantía de eso es este test.
+//
+// LO QUE PASARÍA SIN ESTA GARANTÍA no es un error visible: son mensajes reales de clientes reales que se
+// quedan en disco para siempre, con la cola creciendo hasta chocar con su tope y empezar a sacrificar
+// conversaciones. Silencioso de principio a fin.
+//
+// ⚠️ SE COMPRUEBAN LAS DOS FORMAS QUE TIENE UNA FILA HEREDADA, porque el `intent_json` las separa y el
+// veredicto de `evento` no es el mismo: con sobre de omisión y con clasificación real. La tercera forma
+// —`clasificado` sin sobre, el fragmento intermedio de un lote— entra por el camino del NULL y la cubre
+// `TestFilaSinSobreNoCuentaEnNingunaSerie`.
+//
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): devolver a `vuelta` cualquier condición sobre
+// `cabeza.Estado` que excluya `clasificado`. Su gemelo contra la BD REAL —donde además se comprueba el
+// sello y la poda— es `TestCircuitoFilaAntiguaClasificadaSeDrenaSeSellaYSePoda`.
+func TestCabezaClasificadaDeUnBinarioAnteriorSeEntrega(t *testing.T) {
+	for _, c := range []struct {
+		nombre string
+		sobre  string
+	}{
+		{"con sobre de omisión", app.SobreOmitido(app.MotivoFastlane)},
+		{"con clasificación real", `{"intent":"crear_pedido","confidence":0.9,"config_version":"v7"}`},
+	} {
+		t.Run(c.nombre, func(t *testing.T) {
+			cola := nuevaColaFake(filaVieja(1, 10, c.sobre))
+			a := arrancar(t, cola)
+
+			// Sin tocar el reloj y sin despertar a nadie: una fila heredada sale igual de rápido que una nueva.
+			evt := a.esperarEntrega(t)
+			if evt.MessageID != "wamid-1" || evt.Text != "hola" {
+				t.Fatalf("la fila heredada no salió entera: %+v", evt)
+			}
+
+			a.sincronizar(t)
+			// Y QUEDA SELLADA. Es la mitad que se olvida: entregarla sin poder sellarla la dejaría
+			// re-entregándose en cada poll para siempre y fuera del alcance de la poda por TTL.
+			cola.mu.Lock()
+			estado := cola.filas[0].Estado
+			cola.mu.Unlock()
+			if estado != app.EstadoDespachado {
+				t.Fatalf("la fila heredada quedó en %q y debía quedar %q: se entregó pero no se pudo sellar, "+
+					"así que se re-entregará en cada poll y el TTL no podrá podarla nunca", estado, app.EstadoDespachado)
+			}
+		})
+	}
+}
+
 // TestCabezaTomadaSaleIgual: una fila con un claim vivo (`tomado`) se entrega como cualquier otra.
 //
 // 🔴 ES LA MITAD MENOS OBVIA DEL ADR-0045 §Decisión.4: el claim con fencing SE CONSERVA (ADR-0038) — es
