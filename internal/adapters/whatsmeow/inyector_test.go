@@ -46,7 +46,8 @@ func inyeccionValida() app.InyeccionEntrante {
 //	IsFromMe (listener.go:511)          — descarta en la puerta: ni fila ni camino.
 //	Timestamp cero (listener.go:525)    — NO descarta: toma la rama que SALTA la ventana. Handler más corto.
 //	Ventana ADR-0037 (listener.go:553)  — descarta: ni fila ni camino.
-//	IsGroup (listener.go:716)           — NO descarta: la fila nace `clasificado`/`no_elegible`.
+//	IsGroup (el filtro de GRUPO)        — DESCARTA en la puerta desde el Plan 044 · T1.5-3 (REQ-36): ni
+//	                                      fila ni camino. Antes solo desviaba a `clasificado`/`no_elegible`.
 //
 // ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO:
 //   - `IsFromMe: true` en FabricarEntranteSintetico ⇒ falla la primera aserción (y en el test de conducta
@@ -83,9 +84,9 @@ func TestFabricarEntranteSintetico_PasaLasCuatroGuardasDeLaPuerta(t *testing.T) 
 			evt.Info.Timestamp.Format(time.RFC3339Nano), umbral.Format(time.RFC3339Nano))
 	}
 	if evt.Info.IsGroup {
-		t.Errorf("IsGroup = true: la fila nacería ya `clasificado` con la marca `no_elegible` " +
-			"(listener.go:716) y el cajero no la reclamaría jamás; se mediría un camino que en campo solo " +
-			"recorre el tráfico de grupos")
+		t.Errorf("IsGroup = true: desde el Plan 044 · T1.5-3 (REQ-36) el entrante de grupo se DESCARTA en " +
+			"la puerta —ni fila, ni entrega—, así que el sintético no dejaría rastro y la población de la " +
+			"medida saldría en CERO sin un solo error. Hasta T1.5-3 al menos dejaba fila `no_elegible`")
 	}
 	// La quinta condición, que no es una guarda sino la validación de entrada: sin texto la fila nace
 	// `clasificado`/`sin_texto` (listener.go:713). El fabricante lo rechaza; aquí se comprueba que el

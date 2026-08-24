@@ -123,6 +123,18 @@ type InboundStats struct {
 	// ⚠️ LE QUITA CUENTA A `DroppedByWindow` (ver el aviso de aquel campo): el corte pasivo va ANTES de la
 	// ventana, así que lo que se suma aquí deja de sumarse allí.
 	DroppedByPassiveProfile uint64
+	// DroppedByGroup son los entrantes descartados en la puerta por venir de un GRUPO (Plan 044 · Ola 1.5 ·
+	// T1.5-3, REQ-36/D-044.30). No es del ADR-0037: es el filtro de ALCANCE —el Edge atiende conversaciones
+	// 1:1— que hasta esta tarea vivía en la puerta de ELEGIBILIDAD y dejaba fila.
+	//
+	// 🔴 LO QUE MIDE NO EXISTÍA ANTES, y por eso no hay serie histórica con la que comparar: hasta T1.5-3 el
+	// tráfico de grupos se encolaba (nacía `clasificado` con la marca `no_elegible`) y subía a la nube sin
+	// intención. Desde T1.5-3 no deja nada, y este contador es su única huella.
+	//
+	// ⚠️ VA DESPUÉS DE LA VENTANA (paso 5 de la puerta), así que —a diferencia del pasivo— NO le quita
+	// cuenta a `DroppedByWindow`: un entrante de grupo que además venía fuera de ventana se cuenta allí y
+	// no aquí. Lo que baja cuando este sube son las FILAS de la cola.
+	DroppedByGroup uint64
 	// ColaEnqueueErrors son los entrantes que NO pudieron anotarse en la cola durable porque Enqueue
 	// devolvió error (Plan 051 · INV-051.3). Se cuenta aparte del panic porque distinguir "la cola dijo
 	// que no" de "la cola explotó" es la diferencia entre un disco lleno o una DEK ausente y un bug del
@@ -424,6 +436,41 @@ func (b *bracketObserver) countPassiveDrop() {
 	if gritar {
 		b.log.Info(msgPasivaResumen, "descartados", n, "enfriamiento", passiveDropLogCooldown.String())
 	}
+}
+
+// countGroupDrop contabiliza un entrante descartado en la puerta por venir de un GRUPO (Plan 044 · Ola 1.5
+// · T1.5-3, REQ-36) y lo PUBLICA por sus dos bocas. Es el ÚNICO sitio del repo donde este hecho se registra
+// — misma lección que `countPassiveDrop` y que `countColaEnqueueError`: un incremento repartido entre el
+// llamante y el contador son dos puntos que alguien tiene que acordarse de tocar a la vez.
+//
+// LAS DOS BOCAS:
+//
+//	b.stats  → el acumulado por sesión (`Listener.InboundStats`). Es el que leen los tests del corte.
+//	b.puerta → el acumulado del EDGE, que sale en el bloque del latido como `descartes_grupo`. Contesta
+//	           «¿está pasando, y cuánto?» en la línea que el operador ya lee con grep.
+//
+// 🔴 POR QUÉ NO HAY TERCERA BOCA (la de `health.SessionReporter`, que el descarte pasivo sí tiene). Aquella
+// existe para contestar «¿a QUÉ SESIÓN?», y ahí la pregunta era obligada: el perfil pasivo es una propiedad
+// de LA SESIÓN, así que el contador del Edge no basta para saber quién está callado. Venir de un grupo es
+// una propiedad del MENSAJE y no dice nada de la sesión que lo recibe: publicar por sesión costaría tocar
+// `health.Registry`, su interfaz, el bundle de diagnóstico y `GET /v1/health` para responder una pregunta
+// que nadie hace. Si algún día se necesita, se añade allí y se cablea aquí — no en el llamante.
+//
+// NO se imputa a la reconciliación del corchete (igual que countPassiveDrop y a diferencia de
+// countWindowDrop): el corchete reconcilia «lo que el servidor anunció contra lo que la VENTANA descartó»,
+// y meter aquí un descarte de otro criterio haría que esa resta dejara de cuadrar.
+//
+// SIN LÍNEA DE RESUMEN PROPIA, y es deliberado: la del filtro pasivo (throttled, en Info) existe porque el
+// contador del Edge no puede nombrar la sesión callada. Aquí no hay nada que nombrar, el hecho ya sale en el
+// bloque del latido, y una sesión metida en grupos activos escribiría a ritmo de socket. La línea por-mensaje
+// del llamante va en Debug por esa misma razón. INV-6/ADR-0034: aquí no entra ni el JID ni una runa del texto.
+func (b *bracketObserver) countGroupDrop() {
+	b.mu.Lock()
+	b.stats.DroppedByGroup++
+	b.mu.Unlock()
+	// El acumulado del EDGE, fuera del candado a propósito: es un atómico y no tiene nada que hacer dentro
+	// del mutex del camino caliente. Nil-safe por método (ver latencia.Puerta).
+	b.puerta.AnotaDescarteGrupo()
 }
 
 // countNoTimestamp contabiliza un entrante ADMITIDO por no traer hora utilizable.

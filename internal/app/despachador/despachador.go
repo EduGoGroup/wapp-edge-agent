@@ -692,7 +692,12 @@ func (d *Despachador) evento(c *app.ColaCabeza) (domain.InboundEvent, veredicto)
 		// IsFromMe SIEMPRE false, y no es una suposición: el listener descarta el eco propio en la puerta,
 		// antes de encolar, así que no existe fila de la cola con un mensaje propio. Ver app.ColaMeta.
 		IsFromMe: false,
-		IsGroup:  meta.IsGroup,
+		// `meta.IsGroup` es CONSTANTEMENTE false en las filas NUEVAS desde el Plan 044 · Ola 1.5 · T1.5-3:
+		// el listener corta el grupo en la puerta y no deja fila. Se sigue leyendo —no se retira— porque
+		// las filas ANTIGUAS, las anotadas antes de esa tarea, lo llevan a `true` y tienen que decodificarse
+		// igual. Un `true` que salga por aquí es una fila vieja drenándose, no una señal viva de que el Edge
+		// esté atendiendo grupos.
+		IsGroup: meta.IsGroup,
 		// `meta.Sintetico` NO SE PROPAGA, y es una decisión (MP-10): domain.InboundEvent no tiene campo de
 		// metadatos, así que traerlo obligaría a tocar el contrato de dominio Y el adaptador de CloudLink por un
 		// dato que la nube YA recibe —el prefijo `SINTETICO-` del `WAMessageID`, que sí está en el proto—. Ver

@@ -510,8 +510,20 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) (acusar bool) {
 //     «3.5» que el plan proponía— porque ese paso también encola: ver el bloque del filtro.
 //  3. SIN HORA UTILIZABLE: se ADMITE explícitamente (ver abajo).
 //  4. VENTANA TEMPORAL (ADR-0037, criterio único): anterior a `inicioDeConexión − margen` ⇒ se descarta.
+//  5. GRUPO (Plan 044 · Ola 1.5 · T1.5-3, REQ-36/D-044.30): el entrante viene de un grupo o lista de
+//     difusión ⇒ se descarta SIN dejar fila, SIN entregar nada y CON acuse. Hasta esta tarea vivía en la
+//     puerta de ELEGIBILIDAD (el switch de enqueueCola, el «paso 6») y allí dejaba fila con la marca
+//     `no_elegible`; esa conducta queda DEROGADA. Es el ÚNICO filtro que domina los DOS caminos que
+//     encolan —el normal y el del entrante sin hora—, y por eso está donde está: ver su bloque.
 //
-// Lo ADMITIDO sigue el orden del Plan 051: ventana → PUERTA DE ELEGIBILIDAD (sin texto / grupo / feature
+// ⚠️ EL ORDEN ES POR COSTE CRECIENTE (D-044.30, detalle 2) Y EL PASO 5 ES LA EXCEPCIÓN CONSCIENTE. Leer
+// `e.Info.IsGroup` es un campo booleano ya materializado: cuesta MENOS que el paso 4, que llama a
+// `connectSeal()`, pide la hora y compara. Por coste puro iría justo detrás del eco propio. Se deja en el 5
+// porque lo fija el Plan 044 · T1.5-3, y porque el precio de la excepción es acotado y conocido: los
+// entrantes de grupo de una ráfaga offline se cuentan como descarte de VENTANA y no como descarte de GRUPO
+// (los dos son gratis y los dos acusan, así que el precio es de telemetría, no de conducta).
+//
+// Lo ADMITIDO sigue el orden del Plan 051: ventana → GRUPO → PUERTA DE ELEGIBILIDAD (sin texto / feature
 // apagada / fastlane, ver el switch de enqueueCola) → INSERT cifrado en la cola durable → fin. El INSERT es
 // lo que hace durable el mensaje ANTES de que WhatsApp reciba el acuse. La puerta de elegibilidad NO
 // descarta nada: decide si la fila nace reclamable por el cajero o ya resuelta con su marca de omisión.
@@ -535,11 +547,18 @@ func (l *Listener) handleEvent(ctx context.Context, evt any) (acusar bool) {
 //	ACUSA (true)  · FUERA DE VENTANA (ADR-0037)   — decisión deliberada y DETERMINISTA: el reenvío traería
 //	                                                el MISMO Info.Timestamp, volvería a caer fuera y
 //	                                                pediríamos otro reenvío. Bucle sin salida (REQ-051.5).
+//	ACUSA (true)  · GRUPO (Plan 044 · T1.5-3)     — decisión deliberada y DETERMINISTA sobre el JID: el
+//	                                                reenvío llegaría con el mismo `IsGroup`, se volvería a
+//	                                                descartar y pediríamos otro reenvío. Negarlo convertiría
+//	                                                el tráfico de cada grupo en una ráfaga perpetua de
+//	                                                reofrecimientos (D-044.30, detalle 1).
 //	ACUSA (true)  · SIN HORA UTILIZABLE           — encola: el acuse lo decide su INSERT, como el normal.
-//	ACUSA (true)  · SIN TEXTO / GRUPO / APAGADO /
-//	                FASTLANE                      — ⚠️ NO SON DESCARTES: los cuatro DEJAN FILA (nacen en
+//	ACUSA (true)  · SIN TEXTO / APAGADO /
+//	                FASTLANE                      — ⚠️ NO SON DESCARTES: los tres DEJAN FILA (nacen en
 //	                                                EstadoClasificado con su marca de omisión). Acusan
 //	                                                porque el mensaje está en disco, no por indulgencia.
+//	                                                Eran CUATRO hasta el Plan 044 · T1.5-3: GRUPO se fue de
+//	                                                aquí a la familia de arriba, y ya no deja fila.
 //	NO ACUSA (false) · el INSERT falló, entró en
 //	                   pánico, o no hay cola       — el mensaje NO está en ningún sitio. Acusarlo es
 //	                                                perderlo en silencio; no acusarlo lo deja en manos de
@@ -552,8 +571,9 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 	// `camino` decide en qué SERIE cae la medida y se reasigna en cada salida temprana; el `defer` es lo que
 	// garantiza que se anota pase lo que pase, incluido el recover de enqueueCola. Sale por `Encolado` por
 	// defecto porque los caminos que encolan son tres (normal, fastlane y el del entrante sin hora) y los
-	// que descartan son tres (eco propio, perfil pasivo y fuera de ventana): el default cubre el caso
-	// mayoritario —el mensaje que entra— y cada descarte lo dice explícitamente.
+	// que descartan son CUATRO (eco propio, perfil pasivo, fuera de ventana y —desde el Plan 044 · T1.5-3—
+	// grupo): el default cubre el caso mayoritario —el mensaje que entra— y cada descarte lo dice
+	// explícitamente.
 	//
 	// COSTE: una sola llamada extra al reloj (MarkInbound reusa `inicio`), más una búsqueda de 16
 	// comparaciones y un atomic.Add. Ver el análisis en la cabecera de internal/app/latencia.
@@ -634,6 +654,22 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 	// whatsmeow lo rechaza antes: UnixTime exige el atributo y parseMessageInfo corta en ag.OK().) Un cero
 	// es anterior a CUALQUIER umbral, así que dejarlo caer por la comparación lo descartaría en silencio —
 	// justo lo contrario de la asimetría del ADR: ante la duda, DEJAR PASAR.
+	//
+	// 🔴 EL SELLO DE LA FILA SE CALCULA AQUÍ Y SE USA ABAJO, y esa variable es lo que permite que el
+	// filtro de GRUPO (paso 5) sea UNO SOLO. Hasta el Plan 044 · T1.5-3 los dos caminos que ADMITEN —el del
+	// entrante SIN HORA UTILIZABLE y el normal— terminaban cada uno en su propio `return l.enqueueCola(...)`,
+	// así que un filtro colocado entre la ventana y el encolado NO habría dominado al primero: un entrante de
+	// grupo con `t="0"` se habría colado hasta la cola y, retirado ya el caso `grupo` de la puerta de
+	// elegibilidad, habría nacido `nuevo` — o sea tráfico de grupo mandado al cajero y a la nube, justo lo
+	// contrario de REQ-36. Con el sello en una variable los dos caminos convergen en UN encolado y el filtro
+	// de grupo los cubre a los dos con una sola rama.
+	//
+	// ⚠️ CONSECUENCIA PARA LOS TESTS: la mutación M12 que cita listener_acuse_test.go —tirar el retorno del
+	// INSERT en UNO de los dos `return l.enqueueCola`— deja de ser aplicable, porque solo queda uno. Lo que
+	// aquella mutación custodiaba no se pierde: se custodia ahora con el caso `t="0"` del mismo test, que
+	// sigue recorriendo un camino distinto hasta el encolado común.
+	var tsCola int64
+
 	if e.Info.Timestamp.IsZero() {
 		l.brackets.countNoTimestamp()
 		l.log.Warn("listener: entrante SIN hora utilizable; se admite por precaución (la ventana no puede juzgarlo)")
@@ -650,35 +686,78 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 		//
 		// ACUSE (T1.13): lo decide su INSERT, exactamente igual que el camino normal. Este mensaje se ADMITE,
 		// así que su durabilidad se exige como la de cualquier otro admitido.
-		return l.enqueueCola(ctx, e, time.Now().Unix())
+		// 🔴 YA NO RETORNA AQUÍ (Plan 044 · T1.5-3): fija el sello y sigue hasta el filtro de GRUPO y el
+		// encolado común de abajo. Lo de arriba —«este camino ENCOLA Y RETORNA»— sigue siendo cierto en lo que
+		// importa: encola, y lo que se retorna sigue siendo el veredicto de SU INSERT.
+		tsCola = time.Now().Unix()
+	} else {
+		// 3 · Ventana temporal (ADR-0037): el criterio ÚNICO. Info.Timestamp es el reloj del SERVIDOR del
+		// mensaje original (message.go:216); el umbral sale del inicio de la conexión, NO de time.Now(), para
+		// que nuestro propio atasco no cuente como antigüedad. Solo se loguean edad y umbral, nunca el mensaje.
+		var seal time.Time
+		if l.connectSeal != nil {
+			seal = l.connectSeal() // lectura FRESCA, sin cachear (ver Register y la cabecera de inbound_window.go)
+		}
+		now := time.Now()
+		threshold := resolveThreshold(seal, l.margin, now)
+		if e.Info.Timestamp.Before(threshold) {
+			// (T3.13) La ráfaga del ADR-0037 son miles de eventos que SÍ atan el hilo del socket, así que se
+			// miden; pero en su propia serie, porque cuestan microsegundos y mezclarlos con los encolados
+			// diluiría el p99 justo cuando hay ráfaga — es decir, mejoraría el número cuando el Edge va peor.
+			camino = latencia.Descartado
+			age := now.Sub(e.Info.Timestamp)
+			if age < 0 {
+				age = 0
+			}
+			l.brackets.countWindowDrop(age)
+			l.log.Warn("listener: entrante descartado por caer fuera de la ventana temporal (ADR-0037)",
+				"edad", age.Round(time.Second).String(), "margen", l.margin.String())
+			// SE ACUSA (T1.13), y es la decisión más delicada de esta función. El descarte es DELIBERADO y
+			// DETERMINISTA sobre un dato inmutable: Info.Timestamp es el reloj del servidor del mensaje ORIGINAL,
+			// así que un reenvío llegaría con el mismo sello, volvería a caer fuera de la ventana y volveríamos a
+			// pedir otro reenvío. Negar el acuse aquí no rescata ni un mensaje: convierte la ráfaga de miles de
+			// eventos del ADR-0037 en una ráfaga PERPETUA que se repite en cada reconexión.
+			return true
+		}
+		tsCola = e.Info.Timestamp.Unix()
 	}
 
-	// 3 · Ventana temporal (ADR-0037): el criterio ÚNICO. Info.Timestamp es el reloj del SERVIDOR del
-	// mensaje original (message.go:216); el umbral sale del inicio de la conexión, NO de time.Now(), para
-	// que nuestro propio atasco no cuente como antigüedad. Solo se loguean edad y umbral, nunca el mensaje.
-	var seal time.Time
-	if l.connectSeal != nil {
-		seal = l.connectSeal() // lectura FRESCA, sin cachear (ver Register y la cabecera de inbound_window.go)
-	}
-	now := time.Now()
-	threshold := resolveThreshold(seal, l.margin, now)
-	if e.Info.Timestamp.Before(threshold) {
-		// (T3.13) La ráfaga del ADR-0037 son miles de eventos que SÍ atan el hilo del socket, así que se
-		// miden; pero en su propia serie, porque cuestan microsegundos y mezclarlos con los encolados
-		// diluiría el p99 justo cuando hay ráfaga — es decir, mejoraría el número cuando el Edge va peor.
-		camino = latencia.Descartado
-		age := now.Sub(e.Info.Timestamp)
-		if age < 0 {
-			age = 0
-		}
-		l.brackets.countWindowDrop(age)
-		l.log.Warn("listener: entrante descartado por caer fuera de la ventana temporal (ADR-0037)",
-			"edad", age.Round(time.Second).String(), "margen", l.margin.String())
-		// SE ACUSA (T1.13), y es la decisión más delicada de esta función. El descarte es DELIBERADO y
-		// DETERMINISTA sobre un dato inmutable: Info.Timestamp es el reloj del servidor del mensaje ORIGINAL,
-		// así que un reenvío llegaría con el mismo sello, volvería a caer fuera de la ventana y volveríamos a
-		// pedir otro reenvío. Negar el acuse aquí no rescata ni un mensaje: convierte la ráfaga de miles de
-		// eventos del ADR-0037 en una ráfaga PERPETUA que se repite en cada reconexión.
+	// 3.5 · GRUPO — EL EDGE NO ATIENDE GRUPOS, Y SE CORTA AQUÍ (Plan 044 · Ola 1.5 · T1.5-3, REQ-36/D-044.30).
+	//
+	// Es el QUINTO filtro de la lista canónica del docstring; lleva el marcador «3.5» por el SITIO del fichero
+	// donde se inserta, exactamente igual que el «1.5» del perfil pasivo es el SEGUNDO de aquella lista. La
+	// lista manda; los marcadores solo dicen dónde está cada cosa.
+	//
+	// 🔴 QUÉ CONDUCTA DEROGA. Hasta esta tarea el grupo se juzgaba en la PUERTA DE ELEGIBILIDAD (el switch
+	// de enqueueCola, el paso 6): dejaba fila, la fila nacía `clasificado` con la marca `no_elegible` y el
+	// despachador la subía a la nube sin intención. Se pagaba el INSERT cifrado, el disco local, la entrega
+	// por el cable y el almacenamiento en la nube por un mensaje que el Edge nunca iba a atender. Desde
+	// REQ-36 no queda NADA: ni fila, ni entrega, ni un byte local.
+	//
+	// 🔴 SE ACUSA (true), y es el detalle 1 de D-044.30: negar el acuse sería un REENVÍO ETERNO. Venir de un
+	// grupo es una decisión DETERMINISTA sobre el JID del entrante — el reenvío llegaría con el mismo
+	// `IsGroup`, se volvería a descartar y volveríamos a pedir otro, en bucle y a ritmo de reconexión. Misma
+	// familia que ECO PROPIO, PERFIL PASIVO y FUERA DE VENTANA, y por la misma razón exacta.
+	//
+	// 🔴 FAIL-OPEN ante cableado incompleto (detalle 3 de D-044.30). Aquí no hay predicado que cablear ni
+	// opción que leer: `IsGroup` lo pone whatsmeow al parsear el JID del chat, así que el criterio no puede
+	// quedarse «a medio cablear» como sí podía el del perfil pasivo. Y si algún día el campo no viniera, el
+	// cero de un bool es `false` y el mensaje seguiría el camino NORMAL: se encola, se entrega y como mucho
+	// gastamos de más. Por omisión nunca se corta de más, que es la dirección cara.
+	//
+	// 🔴 Y SE MARCA `Descartado`: sin esta línea el p99 del handler contaría estos descartes de microsegundos
+	// como encolados y MEJORARÍA justo cuando el Edge más filtra (INV-051.2 se juzga contra la serie
+	// `Encolado`). Mismo razonamiento que el eco propio y el perfil pasivo.
+	if e.Info.IsGroup {
+		camino = latencia.Descartado // sale sin fila: su tiempo no es tiempo de encolar
+		l.brackets.countGroupDrop()
+		// Nivel DEBUG y no Warn a propósito, igual que el filtro pasivo: esto no es una anomalía, es el alcance
+		// del producto funcionando, y una sesión metida en grupos activos escribiría una línea por mensaje a
+		// ritmo de socket. La señal que se lee EN CAMPO es el contador (`descartes_grupo`, en el bloque del
+		// latido), no esta línea. ADR-0034 nivel 3: ni texto ni teléfono; solo el identificador del mensaje,
+		// que es lo único que permite correlacionar.
+		l.log.Debug("listener: entrante descartado en la puerta — viene de un GRUPO (Plan 044, REQ-36): no se encola, no se persiste y no se entrega",
+			"message_id", e.Info.ID)
 		return true
 	}
 
@@ -699,12 +778,14 @@ func (l *Listener) onMessage(ctx context.Context, e *events.Message) bool {
 	//   - Y NO AÑADE DURABILIDAD: la promesa «mensaje durable antes del acuse» la cumple el INSERT, no la
 	//     entrega.
 	//
-	// Un descartado por la ventana (paso 3) ya ha vuelto: no genera fila (REQ-051.5).
+	// Un descartado por la ventana (paso 3) ya ha vuelto: no genera fila (REQ-051.5). Y desde el Plan 044 ·
+	// T1.5-3, tampoco lo hace un entrante de GRUPO (paso 3.5): aquí abajo ya no llega ninguno, que es la
+	// razón por la que el `case e.Info.IsGroup` desapareció del switch de enqueueCola.
 	//
 	// Y AQUÍ SE DECIDE EL ACUSE (T1.13): lo que devuelva el INSERT es lo que whatsmeow usa para acusar —o no—
 	// a WhatsApp. Es lo que convierte «durable antes del acuse» de un orden de instrucciones en una GARANTÍA:
 	// sin fila no hay acuse, y sin acuse WhatsApp reenvía.
-	return l.enqueueCola(ctx, e, e.Info.Timestamp.Unix())
+	return l.enqueueCola(ctx, e, tsCola)
 }
 
 // enqueueCola anota el entrante en la cola durable. tsWhatsApp va en epoch-SEGUNDOS (no milis): es el
@@ -779,11 +860,17 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 		Meta:        l.colaMeta(e),
 		Estado:      app.EstadoNuevo,
 	}
-	// Las CUATRO MARCAS DE OMISIÓN que el LISTENER puede escribir en la columna intent al NACER la fila
+	// Las TRES MARCAS DE OMISIÓN que el LISTENER puede escribir en la columna intent al NACER la fila
 	// (las otras tres las escriben el cajero —breaker, desconocido— y el despachador —presupuesto—).
-	// Ninguna es una intención: las cuatro dicen «el cajero no debe reclamar esta fila (nace en
+	// Ninguna es una intención: las tres dicen «el cajero no debe reclamar esta fila (nace en
 	// EstadoClasificado)» y se diferencian en el PORQUÉ, que es justo lo que el desglose de INV-051.3
 	// necesita distinguir.
+	//
+	// 🔴 ERAN CUATRO HASTA EL PLAN 044 · T1.5-3 (REQ-36). La cuarta era `no_elegible` —el mensaje viene de un
+	// GRUPO— y no se ha reescrito: se ha MUDADO. Hoy el grupo se descarta en la puerta (paso 5 de onMessage),
+	// sin fila y sin entrega, así que aquí abajo ya no llega ninguno y una rama para él sería código muerto.
+	// `app.MotivoNoElegible` sigue existiendo en el enum porque hay filas ANTIGUAS en disco y en la nube que
+	// la llevan y hay que poder decodificarlas; lo que ya no existe es quien la escriba.
 	//
 	// 🔴 POR QUÉ SE FILTRA AQUÍ Y NO EN EL CAJERO (T2.12). Una fila que el cajero descarta YA HA COSTADO:
 	// ocupó una plaza del semáforo de 1 hueco, consumió un claim (UPDATE + lease) y desplazó a un mensaje
@@ -791,23 +878,27 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 	// entero existe para gobernar. Filtrada aquí, la fila jamás nace `nuevo` y el cajero ni la ve: se
 	// filtra donde es GRATIS. Por eso la puerta vive en el listener, antes del Enqueue.
 	//
-	// 🔴 EL ORDEN DE LAS RAMAS ES PARTE DEL CONTRATO, no una casualidad de escritura. Primero las
-	// propiedades del MENSAJE (no hay texto; viene de un grupo), después el estado del SISTEMA (la feature
-	// está apagada) y al final la OPTIMIZACIÓN (el léxico lo resolvió sin LLM):
+	// 🔴 EL ORDEN DE LAS RAMAS ES PARTE DEL CONTRATO, no una casualidad de escritura. Primero la propiedad
+	// del MENSAJE (no hay texto), después el estado del SISTEMA (la feature está apagada) y al final la
+	// OPTIMIZACIÓN (el léxico lo resolvió sin LLM):
 	//
 	//   1. MotivoSinTexto — NO HABÍA TEXTO que clasificar (imagen, audio, sticker, ubicación, …). El
 	//      fastlane devuelve true para la cadena vacía, así que sin esta rama por delante todo el tráfico
 	//      no textual se contaría como "fastlane" y la métrica mentiría sobre cuánto LLM ahorra el léxico.
-	//   2. MotivoNoElegible — el mensaje viene de un GRUPO. Es una propiedad inmutable del mensaje: no
-	//      cambia porque la feature esté encendida ni porque el léxico lo atrape, así que se juzga antes.
-	//   3. MotivoApagado — el clasificador está apagado en este Edge. Va ANTES del fastlane a propósito:
+	//   2. MotivoApagado — el clasificador está apagado en este Edge. Va ANTES del fastlane a propósito:
 	//      si el fastlane fuera primero, con la feature apagada la telemetría mostraría una MEZCLA de
 	//      `fastlane` y `apagado` en vez del 100 % de `apagado` que explica de verdad lo que está pasando.
-	//   4. MotivoFastlane — había texto, la feature está viva, y el CARRIL RÁPIDO (regex léxico, µs) lo
+	//   3. MotivoFastlane — había texto, la feature está viva, y el CARRIL RÁPIDO (regex léxico, µs) lo
 	//      resolvió sin tocar el LLM ni el circuito — p.ej. "2", una opción de menú.
 	//
-	// Los cinco caminos (los cuatro de arriba más el `nuevo` del resto) terminan con el mensaje entregado
+	// Los cuatro caminos (los tres de arriba más el `nuevo` del resto) terminan con el mensaje entregado
 	// SIN intención; lo único que cambia entre ellos es QUÉ SE APRENDE al mirarlos, y de eso va INV-051.3.
+	//
+	// ⚠️ EL SOLAPE QUE YA NO SE DIRIME AQUÍ: una IMAGEN RECIBIDA EN UN GRUPO. Hasta T1.5-3 caía en la rama 1
+	// (`sin_texto` ganaba a `no_elegible`, y así lo fijaba un test) porque las dos ramas la reclamaban.
+	// Desde T1.5-3 ni siquiera llega: el filtro de grupo la corta antes, en la puerta, y se cuenta como
+	// descarte de GRUPO. Quien mire la serie `sin_texto` verá caer el tráfico no textual de grupos — no
+	// porque haya menos, sino porque ya no se guarda.
 	//
 	// ✅ LA DUPLICACIÓN YA NO EXISTE (T3.0, 2026-08-17). Estos filtros vivieron un tiempo en DOS sitios:
 	// aquí y en `intent.Decorator.eligible`, la puerta del camino inline. Aquella copia murió con el
@@ -825,13 +916,6 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 	case text == "":
 		item.Estado = app.EstadoClasificado
 		item.IntentJSON = app.SobreOmitido(app.MotivoSinTexto)
-	case e.Info.IsGroup:
-		// Propiedad del MENSAJE: un grupo nunca fue elegible para el clasificador (era el mismo criterio
-		// que aplicaba intent.Decorator.eligible, retirado con el inline). Hasta T2.12 este tráfico nacía `nuevo`
-		// y el cajero lo mandaba a Ollama — carga que el Edge NUNCA ha clasificado, colándose por la
-		// puerta nueva de la cola.
-		item.Estado = app.EstadoClasificado
-		item.IntentJSON = app.SobreOmitido(app.MotivoNoElegible)
 	case !l.clasificadorEstaActivo():
 		// Estado del SISTEMA: con la feature apagada no hay nadie a quien preguntar, así que la fila nace
 		// resuelta en vez de esperar a un cajero que la descartaría después de haber gastado su plaza.
@@ -925,7 +1009,12 @@ func (l *Listener) colaMeta(e *events.Message) []byte {
 		AddressingMode: string(e.Info.AddressingMode),
 		PushName:       e.Info.PushName,
 		Type:           e.Info.Type,
-		IsGroup:        e.Info.IsGroup,
+		// 🔴 CONSTANTEMENTE `false` EN LAS FILAS NUEVAS desde el Plan 044 · Ola 1.5 · T1.5-3: el filtro de
+		// GRUPO corta en la puerta (paso 5 de onMessage) y aquí abajo no llega ni un entrante de grupo. NO
+		// es señal viva: para «cuánto grupo estamos filtrando» la serie es `descartes_grupo`, no este campo.
+		// Se sigue rellenando —y por eso el campo no se retira— porque las filas ANTIGUAS, las anotadas
+		// antes de T1.5-3, lo llevan a `true` y tienen que seguir decodificándose igual.
+		IsGroup: e.Info.IsGroup,
 		// MARCA LOCAL del inyector (MP-10 Parte A). Se DERIVA del wa_message_id en vez de venir por un
 		// campo aparte: la marca portante y la local salen así del MISMO dato y no pueden divergir.
 		// Coste en el camino caliente: un HasPrefix sobre una cadena corta (nanosegundos), y solo para los
@@ -1069,7 +1158,11 @@ func toInboundEvent(e *events.Message) domain.InboundEvent {
 		Type:           e.Info.Type,
 		Text:           messageText(e),
 		IsFromMe:       e.Info.IsFromMe,
-		IsGroup:        e.Info.IsGroup,
+		// 🔴 CONSTANTEMENTE `false` en lo que el Edge produce hoy (Plan 044 · Ola 1.5 · T1.5-3): el filtro
+		// de GRUPO corta en la puerta y ningún entrante de grupo llega a mapearse. Se mantiene en el mapeo
+		// porque esta función es la ESPECIFICACIÓN del sobre —su contra-parte en el despachador lee este
+		// mismo campo del `meta`— y el `meta` de las filas ANTIGUAS sí trae `true`.
+		IsGroup: e.Info.IsGroup,
 	}
 }
 

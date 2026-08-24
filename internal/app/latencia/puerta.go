@@ -36,8 +36,8 @@ package latencia
 // por sesión del listener —el que no publicaba nadie— pese a llamarse casi igual. Comparten prefijo y no
 // comparten nada: quien busque «InboundStats» en la config y deduzca que aquello se publica, deducirá mal.
 //
-// 🔴 INV-051.1: aquí no entra nada derivado del contenido. Tres cardinalidades (el Plan 046 · T2.3 sumó la
-// tercera: los descartes por perfil pasivo).
+// 🔴 INV-051.1: aquí no entra nada derivado del contenido. Cuatro cardinalidades (el Plan 046 · T2.3 sumó
+// la tercera —los descartes por perfil pasivo— y el Plan 044 · T1.5-3 la cuarta: los descartes de GRUPO).
 
 import "sync/atomic"
 
@@ -79,6 +79,27 @@ type PuertaStats struct {
 	// arrancado no dice «no descartó nada»: dice «este proceso acaba de nacer». `uptime_s` va en la misma
 	// línea justamente para poder distinguirlo.
 	DescartesPasivos uint64
+	// DescartesGrupo son los entrantes que la puerta descartó por venir de un GRUPO (Plan 044 · Ola 1.5 ·
+	// T1.5-3, REQ-36/D-044.30). Es el CUARTO contador de la puerta y el segundo que NO es una degradación:
+	// es, igual que el de arriba, el filtro funcionando.
+	//
+	// 🔴 QUÉ CAMBIÓ EL DÍA QUE NACIÓ ESTE CONTADOR, porque leer la serie sin saberlo lleva a la conclusión
+	// contraria. Hasta T1.5-3 un entrante de grupo SÍ dejaba fila: nacía `clasificado` con la marca
+	// `no_elegible` y viajaba a la nube como cualquier otro, solo que sin intención. Desde T1.5-3 no deja
+	// nada: ni fila, ni entrega, ni un byte en disco. Este número es la ÚNICA prueba de que ese tráfico
+	// existe — y su contrapartida es que la marca `no_elegible` deja de aparecer en filas nuevas.
+	//
+	// 🔴 SE ACUSA A WHATSAPP IGUAL (D-044.30, detalle 1), así que desde fuera el descarte es indistinguible
+	// de «a ese grupo no le escribió nadie». Misma lección que el descarte pasivo: sin este campo, un filtro
+	// roto (0 con tráfico de grupos) o un filtro que corta de más son invisibles.
+	//
+	// ⚠️ LE QUITA CUENTA A `DescartesPasivos` NO; le quita cuenta a las FILAS. El corte de grupo va DESPUÉS
+	// del pasivo y DESPUÉS de la ventana (paso 5 de la puerta), así que no roba cuenta a ninguna de las dos
+	// series de descarte: lo que baja cuando este sube es el volumen de la cola durable.
+	//
+	// ⚠️ ES DEL EDGE ENTERO y VIVE EN MEMORIA, como sus tres vecinos: un 0 recién arrancado dice «acabo de
+	// nacer», no «no descarté nada». `uptime_s` va en la misma línea para poder distinguirlo.
+	DescartesGrupo uint64
 }
 
 // Puerta lleva los contadores de degradación de la puerta de entrada, COMPARTIDOS por todas las sesiones
@@ -93,6 +114,7 @@ type Puerta struct {
 	enqueueErrors    atomic.Uint64
 	enqueuePanics    atomic.Uint64
 	descartesPasivos atomic.Uint64
+	descartesGrupo   atomic.Uint64
 }
 
 // AnotaEnqueueError suma un entrante que no dejó fila por error del Enqueue. Corre en el hilo de
@@ -123,7 +145,18 @@ func (p *Puerta) AnotaDescartePasivo() {
 	p.descartesPasivos.Add(1)
 }
 
-// Snapshot devuelve la foto acumulada. Las tres lecturas NO son atómicas ENTRE SÍ: se puede leer un error
+// AnotaDescarteGrupo suma un entrante descartado en la puerta por venir de un GRUPO (Plan 044 · Ola 1.5 ·
+// T1.5-3, REQ-36). Corre en el hilo de whatsmeow, igual que sus tres hermanas: un solo atomic.Add, sin
+// locks ni asignaciones. Nil-safe por el mismo criterio que el resto (un instrumento de medida jamás puede
+// ser la causa de que se caiga la escucha).
+func (p *Puerta) AnotaDescarteGrupo() {
+	if p == nil {
+		return
+	}
+	p.descartesGrupo.Add(1)
+}
+
+// Snapshot devuelve la foto acumulada. Las cuatro lecturas NO son atómicas ENTRE SÍ: se puede leer un error
 // contado y su pánico hermano aún no, si el snapshot cae justo en medio. Es aceptable y deliberado —son
 // series independientes que se leen cada minuto para decidir si hay que ir a mirar, no un balance que
 // tenga que cuadrar— y montar un candado para esto metería contención en el camino caliente a cambio de
@@ -136,5 +169,6 @@ func (p *Puerta) Snapshot() PuertaStats {
 		EnqueueErrors:    p.enqueueErrors.Load(),
 		EnqueuePanics:    p.enqueuePanics.Load(),
 		DescartesPasivos: p.descartesPasivos.Load(),
+		DescartesGrupo:   p.descartesGrupo.Load(),
 	}
 }
