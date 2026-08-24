@@ -179,6 +179,44 @@ const DefaultWorkerMaxIntentos = cajero.DefaultMaxIntentos
 // al default. Configurable por WAPP_WORKER_STATS_EVERY_MS.
 const DefaultWorkerStatsEveryMS = 5 * 60 * 1000
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EL SERVICIO DE INFERENCIA (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045, REQ-34)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Tres números que gobiernan el camino `inference_request` → carril del daemon → socket → cajero →
+// Ollama. Van con el prefijo WAPP_AGENT_ aunque el último lo aplique el cajero: ver el doc comment del
+// campo Config.Inference.
+
+// DefaultInferenceMaxInflight son las inferencias que el Edge acepta atender A LA VEZ (y los workers del
+// carril del adaptador de CloudLink). Configurable por WAPP_AGENT_INFERENCE_MAX_INFLIGHT; <=0 cae al
+// default. El porqué del 4 —y por qué NO copia el aforo de Ollama, que es 1— está en
+// cloudlink.defaultInferenceMaxInflight.
+const DefaultInferenceMaxInflight = 4
+
+// DefaultInferenceMaxTimeoutMS es el TECHO del `timeout_ms` que el Cloud puede pedir. Configurable por
+// WAPP_AGENT_INFERENCE_MAX_TIMEOUT_MS; <=0 cae al default. El número (120.000, ~2,6× el peor máximo
+// medido en el VPS real) y su justificación están en cajero.DefaultMaxTimeoutMS.
+const DefaultInferenceMaxTimeoutMS = cajero.DefaultMaxTimeoutMS
+
+// DefaultInferenceLeaseGraciaMS es cuánto espera el gate de lease de una inferencia a que alguna sesión
+// se vuelva operable antes de rechazar con LEASE_INVALID. Configurable por
+// WAPP_AGENT_INFERENCE_LEASE_GRACIA_MS; <=0 cae al default.
+//
+// EXISTE POR UNA VENTANA MEDIDA: el Validator de lease NACE CERRADO y no deja operar hasta que llega el
+// primer LeaseUpdate, 0,5-1,1 s después de registrar la sesión. 2.000 ms es ~2× ese peor caso, y sólo se
+// paga cuando el gate iba a rechazar. El argumento largo, en cloudlink.defaultInferenceLeaseGracia.
+const DefaultInferenceLeaseGraciaMS = 2000
+
+// InferenceConfig son los tres números del servicio de inferencia. Bloque YAML `inference:`.
+type InferenceConfig struct {
+	// MaxInflight son las inferencias simultáneas que el Edge acepta. Default DefaultInferenceMaxInflight.
+	MaxInflight int `yaml:"max_inflight"`
+	// MaxTimeoutMS es el techo del plazo que el Cloud puede pedir. Default DefaultInferenceMaxTimeoutMS.
+	MaxTimeoutMS int `yaml:"max_timeout_ms"`
+	// LeaseGraciaMS es la gracia del gate de lease. Default DefaultInferenceLeaseGraciaMS.
+	LeaseGraciaMS int `yaml:"lease_gracia_ms"`
+}
+
 // Los CUATRO números del modelo (techo de entrada, hilos, contexto y tokens de salida) se REEXPORTAN,
 // NO se teclean aquí: el número tiene un dueño y tenerlo escrito dos veces es la duplicación
 // silenciosa de siempre — alguien sube el techo en un sitio y el otro sigue mintiendo.
@@ -460,6 +498,12 @@ type Config struct {
 	// variables de entorno NO llevan el prefijo WAPP_AGENT_ sino WAPP_WORKER_ (ver WorkerEnvPrefix);
 	// el bloque YAML sí es `worker:` dentro del mismo config.yaml, porque el fichero es compartido.
 	Worker WorkerConfig `yaml:"worker"`
+	// Inference configura EL SERVICIO DE INFERENCIA que el Edge presta al Cloud (Plan 044 · Ola 1.6 ·
+	// T1.6-2, ADR-0045). Sus variables llevan el prefijo WAPP_AGENT_ y NO WAPP_WORKER_, aunque el techo
+	// del plazo lo aplique el cajero: los TRES números describen UN SOLO servicio que atraviesa los dos
+	// procesos, y partirlos entre dos prefijos obligaría a un operador a recordar cuál va en qué unidad
+	// de systemd — con el fallo silencioso de siempre si se equivoca (la variable no se lee y nadie avisa).
+	Inference InferenceConfig `yaml:"inference"`
 	// EnableAlphaTestAccounts activa el selector de usuarios de prueba (Alpha) en la UI de login. Default: false.
 	EnableAlphaTestAccounts bool `yaml:"enable_alpha_test_accounts"`
 	// PlatformAPIBaseURL es la URL base de la API PÚBLICA HTTP de la plataforma cloud (puerto 8103,
@@ -613,6 +657,11 @@ func defaults() Config {
 			InferenceTimeoutMS: DefaultWorkerInferenceTimeoutMS,
 			StatsEveryMS:       DefaultWorkerStatsEveryMS,
 		},
+		Inference: InferenceConfig{
+			MaxInflight:   DefaultInferenceMaxInflight,
+			MaxTimeoutMS:  DefaultInferenceMaxTimeoutMS,
+			LeaseGraciaMS: DefaultInferenceLeaseGraciaMS,
+		},
 		EnableAlphaTestAccounts: false,
 		PlatformAPIBaseURL:      DefaultPlatformAPIBaseURL,
 	}
@@ -689,6 +738,9 @@ func Load(path string) (Config, error) {
 	cfg.Intent.Enabled = loader.GetBool("INTENT_ENABLED", cfg.Intent.Enabled)
 	cfg.Intent.OllamaURL = loader.GetString("INTENT_OLLAMA_URL", cfg.Intent.OllamaURL)
 	cfg.Intent.Model = loader.GetString("INTENT_MODEL", cfg.Intent.Model)
+	cfg.Inference.MaxInflight = loader.GetInt("INFERENCE_MAX_INFLIGHT", cfg.Inference.MaxInflight)
+	cfg.Inference.MaxTimeoutMS = loader.GetInt("INFERENCE_MAX_TIMEOUT_MS", cfg.Inference.MaxTimeoutMS)
+	cfg.Inference.LeaseGraciaMS = loader.GetInt("INFERENCE_LEASE_GRACIA_MS", cfg.Inference.LeaseGraciaMS)
 	cfg.EnableAlphaTestAccounts = loader.GetBool("ALPHA_TEST_ACCOUNTS", loader.GetBool("ENABLE_ALPHA_LOGIN", cfg.EnableAlphaTestAccounts))
 	cfg.PlatformAPIBaseURL = loader.GetString("PLATFORM_API_BASE_URL", cfg.PlatformAPIBaseURL)
 
@@ -817,6 +869,24 @@ func Load(path string) (Config, error) {
 	if cfg.Worker.InferenceTimeoutMS <= 0 {
 		cfg.Worker.InferenceTimeoutMS = DefaultWorkerInferenceTimeoutMS
 	}
+	// SERVICIO DE INFERENCIA (Plan 044 · Ola 1.6 · T1.6-2): los TRES caen al default si son <=0, y
+	// ninguno admite el cero como valor legítimo — a diferencia de stats_every_ms, que sí. El porqué es el
+	// mismo para los tres y vale la pena decirlo: los tres ceros producen un Edge que SE COMPORTA MAL SIN
+	// DAR UN SOLO ERROR. Con max_inflight=0 el carril arranca sin un solo worker y rechaza toda inferencia
+	// con EDGE_SIN_CAPACIDAD; con max_timeout_ms=0 el techo desaparece y una petición mal calculada arriba
+	// ocupa la única plaza de Ollama el tiempo que diga; con lease_gracia_ms=0 se pierde la ventana que
+	// cubre el arranque del Validator y toda inferencia de ese primer segundo muere con LEASE_INVALID, que
+	// es el error que el Cloud degrada peor.
+	if cfg.Inference.MaxInflight <= 0 {
+		cfg.Inference.MaxInflight = DefaultInferenceMaxInflight
+	}
+	if cfg.Inference.MaxTimeoutMS <= 0 {
+		cfg.Inference.MaxTimeoutMS = DefaultInferenceMaxTimeoutMS
+	}
+	if cfg.Inference.LeaseGraciaMS <= 0 {
+		cfg.Inference.LeaseGraciaMS = DefaultInferenceLeaseGraciaMS
+	}
+
 	// 🔴 EL GUARDARRAÍL DE stats_every_ms ES DISTINTO Y A PROPÓSITO: el CERO es un valor legítimo que
 	// significa DESACTIVADO, no un dedazo. Sólo lo NEGATIVO —que no significa nada— cae al default.
 	if cfg.Worker.StatsEveryMS < 0 {

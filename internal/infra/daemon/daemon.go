@@ -209,7 +209,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		health.WithFiltersVersion(perfiles.Version))
 	diagBuilder := diagnostics.NewBuilder(d.sink, healthCollector, cfg.DiagLogLines)
 
-	mux, authRelay := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder)
+	// SERVICIO DE INFERENCIA (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045 · REQ-34): el puerto por el que este
+	// proceso consigue una inferencia sin hablar con Ollama (REQ-051.10 lo prohíbe). Detrás hay un socket
+	// unix al proceso `agent cajero`; ver wiring.BuildInferenciaCliente para por qué se construye siempre,
+	// incluso con la feature apagada o el cajero sin arrancar.
+	inferencia := wiring.BuildInferenciaCliente(layout, log)
+
+	mux, authRelay := wiring.BuildMux(ctx, cfg, log, outbox, intentStack, healthCollector, diagBuilder, inferencia)
 
 	authMgr := wiring.BuildAuthManager(cfg, log, authKeyStore, authRelay)
 	authMgr.StartProactiveRefresh(ctx)

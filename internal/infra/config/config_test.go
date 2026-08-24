@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/EduGoGroup/wapp-edge-agent/internal/app/cajero"
 )
 
 func writeTempYAML(t *testing.T, content string) string {
@@ -868,8 +870,13 @@ func TestLoad_WorkerDataDirs(t *testing.T) {
 // una inferencia que acotar — la que el Edge SIRVE al Cloud (ADR-0045 §Decisión.2). El 15000 es ≈4× la
 // p95 medida en la O0 (3.736 ms) y se clava aquí porque bajarlo aborta inferencias y abre el breaker.
 func TestLoad_InferenceTimeout_SigueVivoTrasElRetiroDelPush(t *testing.T) {
-	if DefaultWorkerInferenceTimeoutMS != 15000 {
-		t.Fatalf("el default del worker es 15000 ms (≈4× la p95 de la O0): got %d", DefaultWorkerInferenceTimeoutMS)
+	// 🔧 ERA 15000 HASTA EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-2). Aquel número se eligió como «≈4× la
+	// p95 de la O0», y la O0 se midió CON EL VPS VACÍO; la muestra de campo que lo habría corregido está
+	// CENSURADA por el propio techo (máximo 15,6 s contra un techo de 15,0 s). El argumento entero, con la
+	// tabla de contención del VPS real que fija el 45.000, está en cajero.DefaultInferenceTimeoutMS.
+	if DefaultWorkerInferenceTimeoutMS != 45000 {
+		t.Fatalf("el default del worker es 45000 ms (cubre los máximos MEDIDOS en el VPS: 25,6 s / 36,5 s / "+
+			"45,6 s): got %d", DefaultWorkerInferenceTimeoutMS)
 	}
 	cfg, err := Load(filepath.Join(t.TempDir(), "ausente.yaml"))
 	if err != nil {
@@ -878,6 +885,26 @@ func TestLoad_InferenceTimeout_SigueVivoTrasElRetiroDelPush(t *testing.T) {
 	if cfg.Worker.InferenceTimeoutMS != DefaultWorkerInferenceTimeoutMS {
 		t.Fatalf("plazo de inferencia por defecto: got %d, want %d",
 			cfg.Worker.InferenceTimeoutMS, DefaultWorkerInferenceTimeoutMS)
+	}
+
+	// ─────────────────────────────────────────────────────────────────────────
+	// 🔴 LA RELACIÓN QUE EL NÚMERO TIENE QUE SOSTENER, Y QUE ES POR LO QUE SE MOVIÓ
+	// ─────────────────────────────────────────────────────────────────────────
+	// El plazo no es un número suelto: de él DERIVA el umbral de lentitud del breaker
+	// (cajero.FraccionLentitud, ADR-0042 · MP-09), y el MP-09 lo calibró para que ese umbral quedara a un
+	// factor ~4,6 del p50 SANO. Con el techo viejo (15 s ⇒ umbral 12 s) y el p50 REAL de campo (8,1 s) ese
+	// factor había caído a 1,48, y el p90 de campo —12,8 s— YA SUPERABA el umbral: más de una de cada diez
+	// inferencias sanas castigaba al breaker, justo lo contrario de lo que el MP-09 quería.
+	//
+	// Esto NO es tautológico: no compara una constante consigo misma, sino DOS constantes independientes
+	// (el plazo y la fracción) contra un TERCER número que no está en el código —el p50 medido en campo—.
+	// Si alguien mueve el plazo sin mirar, este test dice cuál es el criterio que rompió.
+	const p50DeCampoMS = 8100 // 430 inferencias en el VPS de UAT, 2026-08-23
+	umbralLentoMS := int(float64(DefaultWorkerInferenceTimeoutMS) * cajero.FraccionLentitud)
+	if factor := float64(umbralLentoMS) / p50DeCampoMS; factor < 4.0 {
+		t.Errorf("el umbral de lentitud (%d ms) queda a %.2fx del p50 de campo (%d ms); el MP-09 lo calibró "+
+			"a ~4,6x, y por debajo de 4x el criterio empieza a marcar como enfermo el tráfico SANO",
+			umbralLentoMS, factor, p50DeCampoMS)
 	}
 }
 
