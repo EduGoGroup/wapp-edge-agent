@@ -703,6 +703,16 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 		t.Fatalf("latido de contadores por defecto: got %d, want %d",
 			cfg.Worker.StatsEveryMS, DefaultWorkerStatsEveryMS)
 	}
+	// 🔴 EL DEFAULT DEL keep_alive ES NEGATIVO, y por eso se comprueba aparte de sus vecinos: es el único
+	// número de este bloque al que NO se le puede aplicar el guardarraíl `<=0 ⇒ default` (para Ollama el 0
+	// significa «descarga el modelo en cuanto respondas»). Si alguien se lo pusiera «por consistencia», el
+	// default -1 se convertiría en sí mismo y el fallo sería invisible aquí — pero el override de abajo,
+	// con un finito, sí lo caza.
+	if cfg.Worker.KeepAliveSeconds != DefaultWorkerKeepAliveSeconds {
+		t.Fatalf("keep_alive por defecto: got %d, want %d (para siempre: sin él, el runner de Ollama muere "+
+			"a los 5 min y se lleva la caché de prefijos)",
+			cfg.Worker.KeepAliveSeconds, DefaultWorkerKeepAliveSeconds)
+	}
 
 	// El prefijo BUENO aplica.
 	t.Setenv(WorkerEnvPrefix+"MAX_CONCURRENT", "2")
@@ -711,6 +721,7 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	t.Setenv(WorkerEnvPrefix+"NUM_THREAD", "3")
 	t.Setenv(WorkerEnvPrefix+"NUM_PREDICT", "64")
 	t.Setenv(WorkerEnvPrefix+"NUM_CTX", "2048")
+	t.Setenv(WorkerEnvPrefix+"KEEP_ALIVE_SECONDS", "900")
 	t.Setenv(WorkerEnvPrefix+"MAX_INTENTOS", "5")
 	t.Setenv(WorkerEnvPrefix+"INFERENCE_TIMEOUT_MS", "9000")
 	t.Setenv(WorkerEnvPrefix+"STATS_EVERY_MS", "60000")
@@ -720,7 +731,8 @@ func TestLoad_Worker_DefaultsYPrefijoPropio(t *testing.T) {
 	}
 	esperado := WorkerConfig{
 		MaxConcurrent: 2, PollMS: 250, MaxRunes: 1500, NumThread: 3, NumPredict: 64, NumCtx: 2048,
-		MaxIntentos: 5, InferenceTimeoutMS: 9000, StatsEveryMS: 60000,
+		KeepAliveSeconds: 900,
+		MaxIntentos:      5, InferenceTimeoutMS: 9000, StatsEveryMS: 60000,
 		// La lista de colas del round-robin (T4.1) no se toca en este test, así que vale su default: el
 		// data_dir único de siempre, ya absolutizado.
 		DataDirs: []string{cfg.DataDir},

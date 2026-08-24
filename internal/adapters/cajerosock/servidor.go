@@ -79,6 +79,24 @@ type PeticionWire struct {
 	// TimeoutMS es el plazo YA RESUELTO por el daemon (el del Cloud, o 0 si no lo fijó). El cajero le
 	// aplica su default y su techo.
 	TimeoutMS int64 `json:"timeout_ms,omitempty"`
+	// ─── Plan 044 · Ola 1.7 · los TRES campos nuevos del frame (T1.7-3 / T1.7-4) ───
+	//
+	// 🔴 SIN ESTAS TRES LÍNEAS EL FRAME LLEGA AL DAEMON Y MUERE AQUÍ, y ese es exactamente el estado en el
+	// que estaba `Warmup` hasta T1.7-4: el campo existía en app.PeticionInferencia desde T1.7-2, el carril
+	// de CloudLink lo habría poblado… y este cable lo tiraba en silencio, porque el JSON no lo nombraba. No
+	// hay error, no hay log: el cajero recibía una petición con el campo a su cero y se comportaba como si
+	// el Cloud no hubiera dicho nada. Lo custodia ahora TestPeticionWireEspejaElPuertoDeInferencia, que
+	// compara los DOS structs campo a campo.
+	//
+	// MaxOutputTokens es PUNTERO también en el cable, por el mismo motivo que Temperature: con `omitempty`
+	// sobre un int32 desnudo, «quiero 0» y «no dije nada» serían el mismo JSON.
+	MaxOutputTokens *int32 `json:"max_output_tokens,omitempty"`
+	// Class viaja SIN normalizar (la normaliza el cajero al etiquetar, app.NormalizarClase): dos
+	// normalizaciones son dos criterios para el mismo hecho.
+	Class string `json:"class,omitempty"`
+	// Warmup es `bool` a secas —igual que en el contrato— porque ausente y `false` significan lo mismo a
+	// propósito: inferencia normal, que es el comportamiento de siempre.
+	Warmup bool `json:"warmup,omitempty"`
 }
 
 // RespuestaWire es la forma en el cable de la respuesta. Exactamente uno de los dos campos viene
@@ -215,6 +233,11 @@ func (s *Servidor) handler(puerto app.ServidorInferencia) http.HandlerFunc {
 			Format:      pet.Format,
 			Temperature: pet.Temperature,
 			Timeout:     time.Duration(pet.TimeoutMS) * time.Millisecond,
+			// Los tres del cable, sin tocar: el puntero se propaga como puntero (presencia), la clase se
+			// normaliza donde se usa y la marca de calentamiento llega al único sitio que la consulta.
+			MaxOutputTokens: pet.MaxOutputTokens,
+			Clase:           pet.Class,
+			Calentamiento:   pet.Warmup,
 		})
 		if err != nil {
 			canonico, ok := app.EsErrorInferencia(err)

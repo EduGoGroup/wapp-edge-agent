@@ -47,6 +47,33 @@ type PeticionInferencia struct {
 	// (determinismo para clasificar) y el cero del tipo, así que sin presencia explícita «quiero 0» y
 	// «no dije nada» serían el mismo byte.
 	Temperature *float32
+	// MaxOutputTokens es el presupuesto de SALIDA de esta inferencia, en tokens. El Edge lo aplica como
+	// `num_predict` en las opciones del proveedor. nil = «el Cloud no dijo nada» ⇒ el Edge aplica su
+	// default (hoy 256, de cfg.Worker.NumPredict), que es fail-closed hacia el lado BARATO: si el Cloud
+	// calla, se genera poco, no mucho.
+	//
+	// ES UN PUNTERO POR LA MISMA RAZÓN QUE Temperature: el contrato lo declara `optional` para que «quiero
+	// 0» y «no dije nada» no sean el mismo byte en el cable. Y el 0 aquí es un valor que alguien puede
+	// pedir de verdad —para Ollama `num_predict: 0` es «no generes nada»—, así que colapsarlo con la
+	// ausencia convertiría una petición explícita en el default de 256.
+	//
+	// ⚠️ ACOTA, NO CURA. Pone un techo a lo que una inferencia puede ocupar la plaza; no promete que la
+	// ocupe menos. Medido: una P3 de 293 tokens a 6-12 tok/s siguen siendo 25-50 s de generación, y ese
+	// tiempo no baja por escribir un número aquí.
+	MaxOutputTokens *int32
+	// Clase es la naturaleza declarada de la petición: ClaseInteractivo o ClaseLote. Vacía o desconocida
+	// ⇒ ClaseInteractivo (ver NormalizarClase), y eso es TODO lo que ocurre; nunca es un error.
+	//
+	// 🔴 ES SOLO TELEMETRÍA, Y LA PROHIBICIÓN ES DE DISEÑO, NO DE ESTILO. No elige a quién servir, no entra
+	// en el aforo y NO MUEVE EL UMBRAL DEL BREAKER. Con `class` el breaker tendría dos umbrales FIJOS en
+	// vez de uno, y seguiría contando como sana una petición con `timeout_ms = 10 s` que tardó 9,9 s —
+	// justo el fallo que existe para detectar. El mecanismo real es el umbral POR PETICIÓN, derivado del
+	// plazo de cada una (ADR-0042, T1.7-2 · cajero.registrarAcierto). Lo custodia un test ESTRUCTURAL
+	// sobre el AST del paquete cajero, no N tests de conducta.
+	//
+	// ⚠️ Y NO MARCA EL CALENTAMIENTO: para eso está Calentamiento, que es un campo propio precisamente
+	// porque éste tiene escrito que no decide nada. Fundirlos tira esa prohibición entera.
+	Clase string
 	// Timeout es el presupuesto de ESTA inferencia. 0 = «el Cloud no lo fijó» ⇒ default del Edge. El
 	// Edge además lo ACOTA por su techo (WAPP_AGENT_INFERENCE_MAX_TIMEOUT_MS): una petición que pida
 	// diez minutos ocuparía la única plaza de Ollama diez minutos.
@@ -64,11 +91,14 @@ type PeticionInferencia struct {
 	// petición real que llegase: el remedio provocando la enfermedad. Y al revés, un calentamiento rápido
 	// borraría la racha de fallos de un Ollama que sigue caído.
 	//
-	// ⏳ HOY NADIE LO PONE A `true`, Y ES DELIBERADO: esto es la COSTURA que T1.7-2 dejó abierta para
-	// T1.7-4, que es quien enseñará al Cloud a emitir calentamientos y quien decidirá cómo se marcan EN EL
-	// FRAME (`inference_request`). Hasta entonces el campo sólo lo pone el test que fija la conducta. El
-	// mecanismo de marcado NO está inventado aquí a propósito: lo único que esta tarea fija es DÓNDE se
-	// consulta la marca —antes de que el breaker evalúe nada— y QUÉ significa.
+	// ✅ DESDE T1.7-4 YA TIENE PRODUCTOR: lo llena `InferenceRequest.warmup` (campo 10 del contrato,
+	// wapp-cloudlink v0.16.0) y viaja hasta aquí por el socket del cajero (cajerosock.PeticionWire.Warmup).
+	// Hasta ese release la costura estaba abierta por los DOS extremos —ni el frame traía la marca, ni el
+	// cable daemon→cajero la transportaba—, así que el campo sólo lo ponía el test que fija la conducta.
+	//
+	// ⚠️ EXCLUIRLA DEL BREAKER NO ES GRATIS: sí ocupa la plaza única mientras corre y sí pasa por el aforo.
+	// Lo único que no hace es contar para la salud del proveedor. Corolario: una ráfaga de `ConfigUpdate`
+	// es una ráfaga de prefills fríos ocupando la plaza — molesto, legítimo, y NO una avería.
 	Calentamiento bool
 }
 
@@ -297,4 +327,43 @@ func citarJSON(s string) string {
 		}
 	}
 	return string(append(b, '"'))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LA CLASE DE LA PETICIÓN — UNA ETIQUETA, Y NADA MÁS (Plan 044 · Ola 1.7 · T1.7-3)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const (
+	// ClaseInteractivo es una petición que alguien está esperando al otro lado de un WhatsApp.
+	// Es también el valor al que cae todo lo demás (ver NormalizarClase).
+	ClaseInteractivo = "interactivo"
+	// ClaseLote es una petición de un trabajo en diferido: nadie mira el reloj mientras corre.
+	ClaseLote = "lote"
+)
+
+// ClasesInferencia es la lista de clases CONOCIDAS, en el orden en que se documentan. Existe para que
+// «las dos» sea algo que se pueda recorrer —el desglose del heartbeat las siembra a cero desde aquí, así
+// que una clase nueva aparece en la telemetría sin tocar el consumidor— y no una frase de un comentario.
+var ClasesInferencia = []string{ClaseInteractivo, ClaseLote}
+
+// NormalizarClase devuelve la etiqueta con la que se cuenta y se loguea esta petición.
+//
+// 🔴 VACÍO O DESCONOCIDO ⇒ ClaseInteractivo, Y NUNCA UN ERROR. El fail-closed va hacia el lado CARO en
+// esta decisión y es a propósito: si un Cloud más nuevo empieza a mandar una clase que este Edge no
+// conoce, tratarla como interactiva la deja en la etiqueta que un operador mira primero, mientras que
+// una etiqueta desconocida propagada tal cual abriría claves nuevas en el mapa del heartbeat cada vez
+// que alguien se equivoque escribiendo una constante — un mapa que crece con las erratas deja de ser
+// legible. La clase no decide nada, así que equivocarse aquí no cambia a quién se sirve: sólo cambia
+// dónde se cuenta.
+//
+// ⚠️ NO HAY UNA TERCERA CLASE «desconocida» a propósito. Sería una categoría que sólo puede poblarse por
+// un desajuste de versiones entre Cloud y Edge, y esa pregunta se responde comparando binarios, no
+// mirando un contador del heartbeat.
+func NormalizarClase(clase string) string {
+	for _, c := range ClasesInferencia {
+		if clase == c {
+			return c
+		}
+	}
+	return ClaseInteractivo
 }

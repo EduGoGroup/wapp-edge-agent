@@ -9,7 +9,7 @@ package colaentrantes
 // heartbeat (la deuda declarada en internal/infra/daemon/daemon.go). El contrato está en
 // internal/app/parteworker.go; esto es su única implementación.
 //
-// LOS DOS LADOS EN EL MISMO FICHERO, y no uno por proceso: son cinco columnas y un UPSERT contra su
+// LOS DOS LADOS EN EL MISMO FICHERO, y no uno por proceso: son once columnas y un UPSERT contra su
 // SELECT. Partirlos obligaría a mantener dos listas de columnas sincronizadas a mano en dos ficheros,
 // que es exactamente la clase de divergencia silenciosa (se escribe una columna que nadie lee) que este
 // canal no puede permitirse — su modo de fallo es la ausencia de datos, no un error.
@@ -27,6 +27,7 @@ package colaentrantes
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -58,19 +59,31 @@ const parteFilaID = 1
 // además BORRA la fila y la reinserta (perdería cualquier columna que se añada mañana y que este INSERT
 // no nombre).
 const sqlPublicarParte = `
-INSERT INTO parte_worker (id, ts_unix, circuito, taskset, p50_ms)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO parte_worker (
+    id, ts_unix, circuito, taskset, p50_ms,
+    prefill_p50_ms, prefill_muestras, generacion_p50_ms, generacion_muestras,
+    regimenes_json, clases_json
+)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-    ts_unix  = excluded.ts_unix,
-    circuito = excluded.circuito,
-    taskset  = excluded.taskset,
-    p50_ms   = excluded.p50_ms`
+    ts_unix             = excluded.ts_unix,
+    circuito            = excluded.circuito,
+    taskset             = excluded.taskset,
+    p50_ms              = excluded.p50_ms,
+    prefill_p50_ms      = excluded.prefill_p50_ms,
+    prefill_muestras    = excluded.prefill_muestras,
+    generacion_p50_ms   = excluded.generacion_p50_ms,
+    generacion_muestras = excluded.generacion_muestras,
+    regimenes_json      = excluded.regimenes_json,
+    clases_json         = excluded.clases_json`
 
 // sqlLeerParte lee EL parte. Por `id` y no por `ORDER BY ts_unix DESC LIMIT 1`: la fila es única por
 // construcción (el CHECK), y una consulta que ordenara estaría admitiendo que puede haber varias — con
 // lo que un día habría dos y nadie se enteraría.
 const sqlLeerParte = `
-SELECT ts_unix, circuito, taskset, p50_ms
+SELECT ts_unix, circuito, taskset, p50_ms,
+       prefill_p50_ms, prefill_muestras, generacion_p50_ms, generacion_muestras,
+       regimenes_json, clases_json
 FROM parte_worker
 WHERE id = ?`
 
@@ -91,10 +104,47 @@ func (s *Store) PublicarParte(ctx context.Context, p app.ParteWorker) error {
 		ts = s.now()
 	}
 	if _, err := s.db.ExecContext(ctx, sqlPublicarParte,
-		parteFilaID, ts.Unix(), p.Circuito, p.Taskset, p.P50ms); err != nil {
+		parteFilaID, ts.Unix(), p.Circuito, p.Taskset, p.P50ms,
+		p.PrefillP50ms, p.PrefillMuestras, p.GeneracionP50ms, p.GeneracionMuestras,
+		mapaAJSON(p.PorRegimen), mapaAJSON(p.PorClase)); err != nil {
 		return fmt.Errorf("colaentrantes: publicar el parte del worker: %w", err)
 	}
 	return nil
+}
+
+// mapaAJSON serializa un reparto para su columna TEXT. Un mapa nil o vacío se escribe como CADENA VACÍA y
+// no como `{}`, porque el lector distingue los dos casos y esa distinción es la que hace que «no lo mido»
+// no se lea como «lo mido y todo está a cero» (ver mapaDesdeJSON).
+//
+// 🔴 EL ERROR DE MARSHAL SE TRAGA Y SE ESCRIBE VACÍO, que aquí es lo correcto y no una dejadez. Un
+// map[string]int64 no puede fallar al serializar salvo por algo imposible, y si ocurriera, la única
+// alternativa —devolver error— haría que el parte ENTERO no se publicara: el daemon perdería también el
+// circuito y el taskset, y a los 90 s publicaría `intent_circuit` vacío. El parte es TELEMETRÍA; que un
+// reparto se pierda no puede llevarse por delante la señal de salud que sí funciona.
+func mapaAJSON(m map[string]int64) string {
+	if len(m) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
+// mapaDesdeJSON deshace lo anterior. Cadena vacía ⇒ nil («no medible»), y un JSON ROTO también ⇒ nil, por
+// el mismo motivo por el que el escritor se traga su error: este código corre en el camino del HEARTBEAT,
+// y que una columna de telemetría corrupta impida decir «sigo vivo» sería el peor cambio posible. La
+// ausencia honesta del dato es la degradación buena.
+func mapaDesdeJSON(s string) map[string]int64 {
+	if s == "" {
+		return nil
+	}
+	var m map[string]int64
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		return nil
+	}
+	return m
 }
 
 // LeerParte devuelve el parte que dejó el cajero. El bool es «había parte».
@@ -115,12 +165,19 @@ func (s *Store) PublicarParte(ctx context.Context, p app.ParteWorker) error {
 // «no hay parte» de «hay uno viejo» — que es justo lo que querrá loguear cuando el cajero se muera.
 func (s *Store) LeerParte(ctx context.Context) (app.ParteWorker, bool, error) {
 	var (
-		tsUnix   int64
-		circuito string
-		taskset  string
-		p50MS    int64
+		tsUnix             int64
+		circuito           string
+		taskset            string
+		p50MS              int64
+		prefillP50MS       int64
+		prefillMuestras    int64
+		generacionP50MS    int64
+		generacionMuestras int64
+		regimenesJSON      string
+		clasesJSON         string
 	)
-	err := s.db.QueryRowContext(ctx, sqlLeerParte, parteFilaID).Scan(&tsUnix, &circuito, &taskset, &p50MS)
+	err := s.db.QueryRowContext(ctx, sqlLeerParte, parteFilaID).Scan(&tsUnix, &circuito, &taskset, &p50MS,
+		&prefillP50MS, &prefillMuestras, &generacionP50MS, &generacionMuestras, &regimenesJSON, &clasesJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return app.ParteWorker{}, false, nil
 	}
@@ -128,9 +185,15 @@ func (s *Store) LeerParte(ctx context.Context) (app.ParteWorker, bool, error) {
 		return app.ParteWorker{}, false, fmt.Errorf("colaentrantes: leer el parte del worker: %w", err)
 	}
 	return app.ParteWorker{
-		TS:       time.Unix(tsUnix, 0),
-		Circuito: circuito,
-		Taskset:  taskset,
-		P50ms:    p50MS,
+		TS:                 time.Unix(tsUnix, 0),
+		Circuito:           circuito,
+		Taskset:            taskset,
+		P50ms:              p50MS,
+		PrefillP50ms:       prefillP50MS,
+		PrefillMuestras:    prefillMuestras,
+		GeneracionP50ms:    generacionP50MS,
+		GeneracionMuestras: generacionMuestras,
+		PorRegimen:         mapaDesdeJSON(regimenesJSON),
+		PorClase:           mapaDesdeJSON(clasesJSON),
 	}, true, nil
 }

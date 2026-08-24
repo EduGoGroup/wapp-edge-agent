@@ -100,6 +100,14 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	c := s.c
 	plazo := c.plazoDe(p.Timeout)
 
+	// LA CLASE SE NORMALIZA UNA VEZ, AQUÍ, Y DE AQUÍ NO SALE MÁS QUE A ETIQUETAS (T1.7-3). Vacía o
+	// desconocida ⇒ `interactivo` (app.NormalizarClase). Se resuelve al principio para que el log del
+	// camino de fallo y el del de éxito hablen de la MISMA etiqueta, no para que nadie decida con ella:
+	// por debajo de esta línea `clase` sólo aparece como argumento de un log o de un contador, y eso lo
+	// custodia un test estructural sobre el AST de este paquete
+	// (TestLaClaseNoGobiernaNingunaDecision), no una convención que alguien pueda olvidar.
+	clase := app.NormalizarClase(p.Clase)
+
 	// ─── ④bis ¿ESTA PETICIÓN LE ENSEÑA ALGO AL CIRCUITO? ─────────────────────
 	//
 	// 🔴 LA COSTURA DEL CALENTAMIENTO (T1.7-2, para T1.7-4). Se resuelve AQUÍ, en una sola variable y antes
@@ -204,6 +212,16 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	// mismo motivo (ver histogramaInferencia.observar): un timeout es latencia que el Edge PAGÓ —ocupó la
 	// única plaza todo ese tiempo—, y medir sólo los éxitos daría el número al revés de como hace falta.
 	c.inferencia.observar(transcurrido)
+	// EL REPARTO POR CLASE SE ALIMENTA EN LOS DOS CAMINOS, exactamente igual que el histograma de arriba y
+	// por el mismo motivo: la pregunta que responde es «¿qué mezcla de tráfico está atendiendo esta
+	// máquina?», y una petición de lote que se comió su plazo y murió ocupó la plaza igual que una que
+	// salió bien. Contando sólo los éxitos, un Cloud que mandara una ráfaga de lotes que todos revientan
+	// se vería como CERO lotes.
+	//
+	// ⚠️ POBLACIÓN DISTINTA A LA DEL REPARTO POR RÉGIMEN, y hay que saberlo para leerlos: el régimen sólo
+	// se puede clasificar cuando hubo respuesta con prefill medible, así que suma(por_clase) >= suma(por
+	// _régimen) SIEMPRE, y la diferencia son los fallos. No se dividen entre sí.
+	c.porClase.contar(clase)
 
 	if err != nil {
 		return app.RespuestaInferencia{}, s.registrarFalloDeInferencia(ctx, ictx, p, err, transcurrido, eraSondeo)
@@ -224,6 +242,19 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	}
 
 	m := resp.Metrics()
+	// ─── ⑨ PREFILL Y GENERACIÓN, POR SEPARADO (T1.7-5) ───────────────────────
+	//
+	// 🔴 POR QUÉ NO BASTA CON `transcurrido`, que es lo que se venía publicando: ese número mezcla DOS
+	// REGÍMENES QUE SE DIFERENCIAN EN UN ORDEN DE MAGNITUD. Con el prefijo FRÍO el prefill cuesta ~21,6 ms
+	// por token; con el prefijo CALIENTE baja a 0,1-1,2 s el prompt entero. Ese número mezclado es el que
+	// dejó DOS p50 IRRECONCILIABLES en este repo —~20 s en el informe de diseño contra 8,1 s en campo— y
+	// no era un error de medición: medían poblaciones con distinto CALOR DE PREFIJO. Con un solo número
+	// esa diferencia es invisible, y con ella la única palanca que de verdad mueve la latencia.
+	//
+	// LA GENERACIÓN SALE DE `resp.EvalDuration` Y NO DE `Metrics`, que no la expone en ms: es el gemelo de
+	// PromptMs y ninguno de los dos incluye LoadDuration (cargar el modelo del disco), que es una tercera
+	// cosa y se loguea aparte como `load_ms` desde siempre.
+	regimen := c.observarFases(m.PromptMs, resp.EvalDuration/int64(time.Millisecond))
 	salida := resp.Content()
 	// 🔴 INV-051.1: ni `p.Prompt` ni `salida`. Sólo tamaños, tiempos y el desenlace.
 	c.log.Info("cajero: inferencia SERVIDA",
@@ -243,6 +274,16 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 		"umbral_lento_ms", umbralLentoDe(plazo).Milliseconds(),
 		"lento", lento,
 		"calentamiento", p.Calentamiento,
+		// LAS DOS FASES AL LADO DEL TOTAL, y el régimen con el que se clasificó el prefill. Los tres juntos
+		// hacen que la línea se pueda auditar sola: un `regimen=frio` con `prefill_ms=120` delataría que los
+		// umbrales de esta máquina están mal puestos sin tener que ir a leer una constante.
+		//
+		// `regimen` VACÍO significa «no medible» —el proveedor no devolvió `prompt_eval_duration`—, nunca
+		// «templado». Es la misma semántica de presencia que el sub-mensaje del heartbeat.
+		"prefill_ms", m.PromptMs,
+		"generacion_ms", resp.EvalDuration/int64(time.Millisecond),
+		"regimen", regimen,
+		"class", clase,
 	)
 	c.servidas.Add(1)
 	return app.RespuestaInferencia{RawJSON: salida}, nil
@@ -280,6 +321,29 @@ func (s *servidorInferencia) chat(ctx context.Context, p app.PeticionInferencia)
 		opts["temperature"] = c.temperatura
 	}
 
+	// EL PRESUPUESTO DE SALIDA DEL CLOUD MANDA SOBRE EL DEL EDGE (T1.7-3). Mismo molde que la temperatura
+	// de dos líneas arriba y por la misma razón: el Cloud es quien conoce el esquema de la respuesta que
+	// espera (P1 ≈ 64, P2/P3 ≈ 512), y el Edge sólo pone el suelo cuando el Cloud calla.
+	//
+	// 🔴 AQUÍ NO HAY `else`, Y ESA ES LA DIFERENCIA CON LA TEMPERATURA. El default del Edge para
+	// `num_predict` YA VIAJA dentro de `c.opciones` (cmd/agent/cajero.go lo pone desde cfg.Worker.NumPredict)
+	// y el bucle de arriba acaba de copiarlo a `opts`. Un `else` que lo reescribiera necesitaría un segundo
+	// campo del Cajero con el mismo número dentro — dos verdades sobre el mismo default esperando a
+	// divergir. Con `Opciones` nil (cableado que no fija ninguna) el default es el del proveedor, que es la
+	// conducta anterior a esta tarea y sigue siendo la correcta: el Edge no inventa un techo que nadie pidió.
+	//
+	// ⚠️ SE APLICA VERBATIM, EL CERO INCLUIDO. Para Ollama `num_predict: 0` es «no generes nada», y el
+	// contrato declara el campo `optional` precisamente para que ese cero se pueda PEDIR. Recortarlo aquí
+	// («0 no tiene sentido, aplico el default») sería el Edge interpretando lo que el Cloud dijo (ADR-0045
+	// §1), y convertiría una petición explícita en 256 tokens de generación que nadie encargó.
+	//
+	// ⚠️ SE ESCRIBE EN LA COPIA, NUNCA EN `c.opciones`: el mapa se copió arriba a propósito para no
+	// compartirlo entre inferencias concurrentes, y escribir en el original devolvería esa carrera Y además
+	// dejaría el presupuesto de UNA petición pegado a todas las siguientes.
+	if p.MaxOutputTokens != nil {
+		opts["num_predict"] = int(*p.MaxOutputTokens)
+	}
+
 	// EL `format` SE NORMALIZA, NO SE INTERPRETA. Sin esto, un Cloud que mande la palabra `json` a secas
 	// produce `"format":json` en el cuerpo —JSON inválido—, el proveedor responde 400 y ese 400 se
 	// traduciría a OLLAMA_DOWN: culparíamos a la máquina del cliente de un error de serialización
@@ -302,6 +366,18 @@ func (s *servidorInferencia) chat(ctx context.Context, p app.PeticionInferencia)
 		Format:   format,
 		Think:    think,
 		Options:  opts,
+		// 🔴 `keep_alive` VA EN EL PRIMER NIVEL DE /api/chat, NUNCA DENTRO DE `Options` (T1.7-4). Metido en
+		// `options`, Ollama lo IGNORA EN SILENCIO —las claves desconocidas de `options` no dan error— y el
+		// runner seguiría muriéndose sin que nada lo delatara. Por eso es un campo propio de ChatRequest
+		// (wapp-edge-intent v0.3.0) y no una entrada más del mapa de arriba.
+		//
+		// POR QUÉ SE MANDA EN CADA PETICIÓN Y NO SE CONFIGURA LA MÁQUINA: cuando el runner de Ollama muere
+		// por silencio no se lleva sólo el modelo, se lleva LA CACHÉ DE PREFIJOS con él, y el siguiente
+		// mensaje paga carga del modelo (39 s MEDIDOS el 2026-08-23) más el prefill en frío del prompt
+		// entero. En el VPS de UAT eso lo tapa hoy `OLLAMA_KEEP_ALIVE=-1` en el env de la unidad, pero eso
+		// es una propiedad de ESA máquina: en el equipo de un cliente no hay quien la ponga, y este campo sí
+		// viaja con cada petición.
+		KeepAlive: c.keepAlive,
 	})
 }
 

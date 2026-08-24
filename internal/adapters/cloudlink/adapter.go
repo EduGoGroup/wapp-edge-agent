@@ -1103,7 +1103,34 @@ func (a *Adapter) collectHealth(sessionID string) *cloudlinkv1.SessionHealth {
 		// failed_seal_dispatch implica mensajes duplicados en la nube.
 		FailedSealDispatch: r.FailedSealDispatch,
 		FailedSealBudget:   r.FailedSealBudget,
+		// ─── Plan 044 · Ola 1.7 · T1.7-5 · el reparto de la inferencia ─────────
+		//
+		// 🔴 PRESENCIA = MEDIBLE. Un sub-mensaje AUSENTE significa «este Edge no lo mide» y NUNCA «midió
+		// cero», que es la distinción que `intent_p50_ms` (campo 10) no puede hacer porque gasta el valor 0
+		// en las dos cosas. El Report ya llega con la decisión tomada (health.poblarInferencia sólo
+		// construye el puntero cuando hubo muestras), así que aquí no se re-juzga nada: traducir un nil a un
+		// `&InferenceLatency{}` sería exactamente el error que la presencia existe para evitar.
+		InferencePrefill:    latenciaInferenciaAProto(r.InferPrefill),
+		InferenceGeneration: latenciaInferenciaAProto(r.InferGeneracion),
+		// Los dos repartos van TAL CUAL, sin filtrar ni reordenar ni completar claves: los umbrales que
+		// definen los regímenes son política del CAJERO y se mueven con el hardware del cliente, así que
+		// enumerarlos aquí sería transcribir su lista por la puerta de atrás y perder en silencio cualquier
+		// categoría nueva. Mismo criterio que IntentOmittedByReason.
+		//
+		// ⚠️ ESTOS DOS SON ACUMULADOS MONÓTONOS DEL PROCESO y los dos de arriba son una FOTO de la ventana
+		// del emisor. Las ventanas no coinciden: quien lea esto no debe dividir un cuantil entre un contador.
+		InferenceByRegime: r.InferPorRegimen,
+		InferenceByClass:  r.InferPorClase,
 	}
+}
+
+// latenciaInferenciaAProto traduce el par cuantil+muestra al sub-mensaje del contrato, conservando la
+// AUSENCIA. nil ⇒ nil: el campo no viaja, y el Cloud lo lee como «no medible».
+func latenciaInferenciaAProto(l *health.LatenciaInferencia) *cloudlinkv1.InferenceLatency {
+	if l == nil {
+		return nil
+	}
+	return &cloudlinkv1.InferenceLatency{P50Ms: l.P50Ms, Samples: l.Muestras}
 }
 
 // socketStateToProto mapea la etiqueta de prueba de vida del Registry T6 (health.SocketState como string)

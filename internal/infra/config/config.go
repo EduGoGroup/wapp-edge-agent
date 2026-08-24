@@ -13,6 +13,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/cajero"
+	"github.com/EduGoGroup/wapp-edge-intent/ollama"
 	sharedconfig "github.com/EduGoGroup/wapp-shared/config"
 )
 
@@ -260,6 +261,24 @@ const DefaultWorkerNumPredict = cajero.DefaultNumPredict
 // completo está en classifier.DefaultNumCtx. Configurable por WAPP_WORKER_NUM_CTX; <=0 cae al default.
 const DefaultWorkerNumCtx = cajero.DefaultNumCtx
 
+// DefaultWorkerKeepAliveSeconds son los segundos que Ollama debe mantener el modelo cargado tras
+// responder, y viaja en el `keep_alive` de CADA petición (Plan 044 · Ola 1.7 · T1.7-4). El valor no es un
+// literal de este fichero: lo recomienda el módulo del proveedor (ollama.DefaultKeepAliveSeconds, hoy -1 =
+// para siempre), que es quien sabe qué significa cada número para Ollama.
+//
+// 🔴 AQUÍ NO HAY GUARDARRAÍL `<=0 ⇒ default`, AL REVÉS QUE EN TODOS SUS VECINOS DE ESTE BLOQUE, y saltárselo
+// es la parte importante. Para Ollama los tres tramos significan cosas distintas y las TRES son legítimas:
+// negativo = «no lo descargues nunca», 0 = «descárgalo en cuanto respondas», positivo = segundos. Un
+// `<=0 ⇒ default` haría IMPOSIBLE pedir 0 —el operador que quiera liberar RAM entre mensajes escribiría 0 y
+// obtendría lo contrario, sin un solo aviso— y además taparía el default con su propio valor. El default se
+// aplica sembrándolo en el struct (ver Default()), no corrigiendo lo que el operador escribió.
+//
+// POR QUÉ IMPORTA EL -1: cuando el runner de Ollama muere por silencio se lleva LA CACHÉ DE PREFIJOS con
+// él, y el siguiente mensaje paga carga del modelo (39 s MEDIDOS el 2026-08-23) más el prefill en frío del
+// prompt entero. En el VPS de UAT eso lo tapa hoy `OLLAMA_KEEP_ALIVE=-1` en el env de la unidad, pero eso
+// es una propiedad de ESA máquina: en el equipo de un cliente no hay quien la ponga.
+const DefaultWorkerKeepAliveSeconds = ollama.DefaultKeepAliveSeconds
+
 // WorkerConfig agrupa los parámetros del worker-cajero (Plan 051 Ola 2). Se leen del bloque `worker:`
 // del YAML y del entorno con prefijo WAPP_WORKER_ (ver WorkerEnvPrefix).
 type WorkerConfig struct {
@@ -276,6 +295,10 @@ type WorkerConfig struct {
 	NumPredict int `yaml:"num_predict"`
 	// NumCtx es la ventana de contexto en tokens (T2.5). Default 4096.
 	NumCtx int `yaml:"num_ctx"`
+	// KeepAliveSeconds es el `keep_alive` que viaja en cada petición a Ollama (T1.7-4). Default
+	// DefaultWorkerKeepAliveSeconds (-1 = para siempre). ⚠️ SIN guardarraíl: el 0 y los negativos son
+	// valores con significado propio para Ollama. Ver la constante.
+	KeepAliveSeconds int `yaml:"keep_alive_seconds"`
 	// MaxIntentos es cuántos reclamos aguanta un lote antes de abandonarlo con `fallo_repetido` (T2.19).
 	// Default DefaultWorkerMaxIntentos (3). Es el freno del lote venenoso: ver la constante.
 	MaxIntentos int `yaml:"max_intentos"`
@@ -653,6 +676,7 @@ func defaults() Config {
 			NumThread:          DefaultWorkerNumThread,
 			NumPredict:         DefaultWorkerNumPredict,
 			NumCtx:             DefaultWorkerNumCtx,
+			KeepAliveSeconds:   DefaultWorkerKeepAliveSeconds,
 			MaxIntentos:        DefaultWorkerMaxIntentos,
 			InferenceTimeoutMS: DefaultWorkerInferenceTimeoutMS,
 			StatsEveryMS:       DefaultWorkerStatsEveryMS,
@@ -755,6 +779,9 @@ func Load(path string) (Config, error) {
 	cfg.Worker.NumThread = workerLoader.GetInt("NUM_THREAD", cfg.Worker.NumThread)
 	cfg.Worker.NumPredict = workerLoader.GetInt("NUM_PREDICT", cfg.Worker.NumPredict)
 	cfg.Worker.NumCtx = workerLoader.GetInt("NUM_CTX", cfg.Worker.NumCtx)
+	// Sin normalización posterior a propósito: cualquier entero es un keep_alive legítimo (ver
+	// DefaultWorkerKeepAliveSeconds). El default llega sembrado desde Default(), no corregido aquí.
+	cfg.Worker.KeepAliveSeconds = workerLoader.GetInt("KEEP_ALIVE_SECONDS", cfg.Worker.KeepAliveSeconds)
 	cfg.Worker.MaxIntentos = workerLoader.GetInt("MAX_INTENTOS", cfg.Worker.MaxIntentos)
 	cfg.Worker.InferenceTimeoutMS = workerLoader.GetInt("INFERENCE_TIMEOUT_MS", cfg.Worker.InferenceTimeoutMS)
 	cfg.Worker.StatsEveryMS = workerLoader.GetInt("STATS_EVERY_MS", cfg.Worker.StatsEveryMS)

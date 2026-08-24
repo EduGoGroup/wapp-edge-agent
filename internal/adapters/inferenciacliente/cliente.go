@@ -103,9 +103,15 @@ func (c *Cliente) Inferir(ctx context.Context, p app.PeticionInferencia) (app.Re
 		Format:      p.Format,
 		Temperature: p.Temperature,
 		TimeoutMS:   p.Timeout.Milliseconds(),
+		// Plan 044 · Ola 1.7: los tres campos nuevos cruzan el socket. Este lado es el ESCRITOR del cable, y
+		// olvidar uno aquí no da error — da una petición que llega al cajero con el campo a su cero (ver el
+		// bloque de cajerosock.PeticionWire).
+		MaxOutputTokens: p.MaxOutputTokens,
+		Class:           p.Clase,
+		Warmup:          p.Calentamiento,
 	})
 	if err != nil {
-		// Serializar cinco campos escalares no falla salvo por algo imposible. Se devuelve el error
+		// Serializar un puñado de escalares y dos punteros no falla salvo por algo imposible. Se devuelve el error
 		// genérico del proveedor porque el llamante necesita UNO de los cinco para responder al Cloud.
 		return app.RespuestaInferencia{}, fmt.Errorf("%w: no se pudo serializar la petición: %w",
 			app.ErrInferenciaOllamaCaido, err)

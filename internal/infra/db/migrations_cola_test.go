@@ -524,3 +524,124 @@ func TestMigrateColaCreaParteWorkerSobreColaPreexistente(t *testing.T) {
 		t.Fatalf("el 2.º arranque alteró el parte: got %q", circuito)
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plan 044 · Ola 1.7 · T1.7-5 — las SEIS columnas del reparto de la inferencia
+// ─────────────────────────────────────────────────────────────────────────────
+
+// parteWorkerSchemaViejo es `parte_worker` TAL COMO LA CREÓ EL 0002: cinco columnas, sin el reparto de la
+// inferencia. Se escribe a mano por el mismo motivo que colaSchemaViejo —el .sql de producción ya trae la
+// forma de hoy—, y es la ÚNICA manera de fabricar el estado que este test tiene que probar.
+//
+// 🔴 SIN ESTE DDL EL TEST SERÍA HUECO. Sobre una BD recién migrada las seis columnas están porque el
+// propio MigrateCola acaba de ponerlas: comprobarlas ahí demuestra que el paso corre, no que SIRVA. Lo
+// que hay que probar es el caso de campo —el VPS de UAT y cualquier instalación con un binario desde
+// T4.5— donde la tabla YA existe con cinco columnas y `CREATE TABLE IF NOT EXISTS` es un no-op.
+const parteWorkerSchemaViejo = `
+CREATE TABLE IF NOT EXISTS parte_worker (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    ts_unix  INTEGER NOT NULL,
+    circuito TEXT    NOT NULL DEFAULT '',
+    taskset  TEXT    NOT NULL DEFAULT '',
+    p50_ms   INTEGER NOT NULL DEFAULT 0
+);
+`
+
+// TestMigrateColaAniadeElRepartoSobreUnParteViejo es el test de campo: una cola con `parte_worker` de
+// CINCO columnas y una fila dentro, como la que tiene ahora mismo cualquier Edge desplegado.
+//
+// Lo que se comprueba en orden: que la premisa es cierta (las columnas NO están), que tras migrar SÍ
+// están, que la fila que ya existía SOBREVIVE con el default en las nuevas —el UPSERT del cajero no
+// reescribe datos— y que el UPSERT de once columnas funciona sobre ella.
+func TestMigrateColaAniadeElRepartoSobreUnParteViejo(t *testing.T) {
+	ctx := context.Background()
+	database := openColaDB(t)
+
+	if _, err := database.ExecContext(ctx, colaSchemaViejo+parteWorkerSchemaViejo); err != nil {
+		t.Fatalf("crear el esquema viejo: %v", err)
+	}
+	// Un parte que ya estaba publicado, con datos que NO se pueden perder al migrar.
+	if _, err := database.ExecContext(ctx,
+		`INSERT INTO parte_worker (id, ts_unix, circuito, taskset, p50_ms)
+		 VALUES (1, 1700000000, 'closed', 'disjunta', 8100)`); err != nil {
+		t.Fatalf("sembrar el parte viejo: %v", err)
+	}
+	for _, col := range parteInferenciaColumnas {
+		if tieneColumna(t, ctx, database, "parte_worker", col.nombre) {
+			t.Fatalf("premisa del test rota: el esquema viejo NO debía traer %q", col.nombre)
+		}
+	}
+
+	if err := MigrateCola(ctx, database); err != nil {
+		t.Fatalf("MigrateCola sobre un parte_worker preexistente: %v", err)
+	}
+
+	for _, col := range parteInferenciaColumnas {
+		if !tieneColumna(t, ctx, database, "parte_worker", col.nombre) {
+			t.Errorf("MigrateCola no añadió %q: el primer PublicarParte del cajero moriría con `no such "+
+				"column`, y el daemon publicaría intent_circuit VACÍO a los 90 s", col.nombre)
+		}
+	}
+
+	// La fila que ya estaba sigue ahí, con lo suyo intacto y las nuevas a su DEFAULT (nunca NULL: un NULL
+	// reventaría el Scan del lector, que no usa sql.NullString).
+	var (
+		circuito      string
+		p50           int64
+		prefillN      int64
+		regimenesJSON string
+	)
+	if err := database.QueryRowContext(ctx,
+		`SELECT circuito, p50_ms, prefill_muestras, regimenes_json FROM parte_worker WHERE id = 1`).
+		Scan(&circuito, &p50, &prefillN, &regimenesJSON); err != nil {
+		t.Fatalf("leer el parte migrado: %v", err)
+	}
+	if circuito != "closed" || p50 != 8100 {
+		t.Errorf("la migración pisó datos del parte viejo: circuito=%q p50=%d", circuito, p50)
+	}
+	if prefillN != 0 || regimenesJSON != "" {
+		t.Errorf("las columnas nuevas debían nacer a su cero: prefill_muestras=%d regimenes_json=%q",
+			prefillN, regimenesJSON)
+	}
+
+	// Y un segundo arranque no reemite los ALTER (el runner re-ejecuta los .sql SIEMPRE, y un `ADD COLUMN`
+	// repetido revienta con «duplicate column»: es la razón entera de que estos pasos sean guardados).
+	if err := MigrateCola(ctx, database); err != nil {
+		t.Fatalf("MigrateCola (2.º arranque) debía ser no-op y falló: %v", err)
+	}
+}
+
+// TestMigrateColaCreaElRepartoEnBaseVirgen: sobre una BD nueva las seis columnas también aparecen, aunque
+// el `CREATE TABLE` del 0002 no las declare. Es el gemelo del caso de arriba y el que garantiza que una
+// instalación NUEVA y una MIGRADA acaban con el mismo esquema — dos formas distintas serían un bug que
+// sólo se ve en producción.
+func TestMigrateColaCreaElRepartoEnBaseVirgen(t *testing.T) {
+	ctx := context.Background()
+	database := openColaDB(t)
+
+	if err := MigrateCola(ctx, database); err != nil {
+		t.Fatalf("MigrateCola: %v", err)
+	}
+	for _, col := range parteInferenciaColumnas {
+		if !tieneColumna(t, ctx, database, "parte_worker", col.nombre) {
+			t.Errorf("en base virgen falta %q", col.nombre)
+		}
+	}
+}
+
+// TestEnsureParteInferenciaSinLaTablaDaUnErrorQueApuntaALaCAUSA: `PRAGMA table_info` de una tabla que no
+// existe NO falla, devuelve cero filas. Sin la guarda, el operador recibiría un `no such table:
+// parte_worker` envuelto en un mensaje que habla de «añadir columna prefill_p50_ms» — apuntando al sitio
+// equivocado cuando el fallo real es que el 0002 no se aplicó.
+func TestEnsureParteInferenciaSinLaTablaDaUnErrorQueApuntaALaCAUSA(t *testing.T) {
+	ctx := context.Background()
+	database := openColaDB(t)
+
+	err := ensureParteInferencia(ctx, database)
+	if err == nil {
+		t.Fatal("sin la tabla parte_worker, ensureParteInferencia debía fallar")
+	}
+	if !strings.Contains(err.Error(), "no existe") {
+		t.Errorf("el error no apunta a la causa (la tabla ausente): %v", err)
+	}
+}

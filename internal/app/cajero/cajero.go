@@ -44,6 +44,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/breaker"
 	"github.com/EduGoGroup/wapp-edge-intent/classifier"
+	"github.com/EduGoGroup/wapp-edge-intent/ollama"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
 
@@ -321,7 +322,27 @@ type Deps struct {
 	// Opciones son las opciones de modelo que el Edge le pasa al proveedor (num_thread / num_ctx /
 	// num_predict), calibradas en la O0 sobre la máquina real. nil ⇒ se mandan sólo las que el proveedor
 	// tenga por defecto.
+	//
+	// ⚠️ `num_predict` DE AQUÍ ES UN DEFAULT, NO EL TECHO: desde T1.7-3 el Cloud puede fijarlo por petición
+	// (InferenceRequest.max_output_tokens) y entonces manda el suyo. Ver el bloque de `num_predict` en
+	// servidor.go · chat().
 	Opciones map[string]any
+	// KeepAlive son los SEGUNDOS que Ollama debe mantener el modelo cargado tras responder, y viaja en el
+	// primer nivel de cada /api/chat (T1.7-4). Negativo = para siempre (ollama.KeepAliveForever).
+	// nil ⇒ ollama.DefaultKeepAliveSeconds (hoy -1).
+	//
+	// 🔴 ES PUNTERO Y EL NIL ES EL LADO SEGURO, al revés que casi todos los guardarraíles de este struct
+	// (que son `<=0 ⇒ default`). Aquí ese patrón sería un desastre silencioso: para Ollama el CERO
+	// significa «descarga el modelo en cuanto respondas», o sea lo contrario de lo que queremos, y el cero
+	// es a la vez el cero-valor de un `int`. Con `<=0 ⇒ default` no se podría pedir 0 nunca; con un `int`
+	// desnudo, un Deps a medio poblar pediría descarga inmediata en cada petición. Con puntero, el
+	// cero-valor del struct da el default (para siempre) y el 0 explícito sigue siendo expresable.
+	//
+	// POR QUÉ IMPORTA: cuando el runner de Ollama muere por silencio se lleva LA CACHÉ DE PREFIJOS con él,
+	// y el siguiente mensaje paga carga del modelo (39 s medidos) más el prefill en frío del prompt
+	// entero. En UAT eso lo tapa `OLLAMA_KEEP_ALIVE=-1` en el env de la unidad; en la máquina de un
+	// cliente no hay quien lo ponga.
+	KeepAlive *int
 	// Breaker es el circuito compartido. nil ⇒ se construye uno con la calibración por defecto.
 	Breaker Interruptor
 	// Despertador es cómo se espera cuando la cola está vacía. nil ⇒ PollFijo(DefaultPollMS).
@@ -407,6 +428,9 @@ type Cajero struct {
 	modelo      string
 	temperatura float64
 	opciones    map[string]any
+	// keepAlive son los segundos de `keep_alive` que van en CADA petición a Ollama (T1.7-4). Nunca es nil
+	// después de New: el default se resuelve allí.
+	keepAlive   *int
 	breaker     Interruptor
 	despertador Despertador
 	log         sharedlogger.Logger
@@ -444,9 +468,29 @@ type Cajero struct {
 	// devolviendo ""— es exactamente la semántica que hace falta: vacío = «no se sabe» (ver Taskset).
 	veredictoTaskset atomic.Value // string
 
-	// inferencia es el histograma de latencia de la inferencia (T4.5), del que sale el p50 del parte. Va
-	// por VALOR y no por puntero: es un array de atómicos, no necesita construcción, y el cero funciona.
+	// inferencia es el histograma de latencia TOTAL de la inferencia (T4.5), del que sale el p50 del
+	// parte. Va por VALOR y no por puntero: es un array de atómicos, no necesita construcción, y el cero
+	// funciona.
 	inferencia histogramaInferencia
+
+	// ─── T1.7-5 · las DOS FASES, por separado ────────────────────────────────
+	//
+	// 🔴 NO SUSTITUYEN A `inferencia`, LA COMPLETAN, y las tres tienen que convivir. El total es el único
+	// que mide lo que el Cloud ESPERA (incluye el fallo, y el fallo también ocupó la plaza); estas dos
+	// miden en qué se fue ese tiempo cuando hubo respuesta. Publicar sólo las dos fases dejaría sin
+	// respuesta «¿cuánto tarda esto?», y publicar sólo el total es exactamente el número mezclado que dejó
+	// dos p50 irreconciliables en el repo (ver el bloque de la ⑨ en servidor.go).
+	prefill    histogramaInferencia
+	generacion histogramaInferencia
+
+	// porRegimen y porClase son los DOS REPARTOS acumulados del proceso (T1.7-5). Punteros porque el tipo
+	// lleva un mapa que hay que construir (ver nuevoContador), al revés que los histogramas.
+	//
+	// ⚠️ VENTANAS DISTINTAS A LAS DE LOS HISTOGRAMAS, y está escrito también en el .proto: los cuantiles
+	// son una foto de la ventana del emisor y estos son acumulados monótonos. Dividir uno por otro da un
+	// número absurdo con muy buena pinta.
+	porRegimen *contadorEtiquetado
+	porClase   *contadorEtiquetado
 
 	fallos           atomic.Int64
 	rescatados       atomic.Int64
@@ -580,12 +624,23 @@ func New(deps Deps) (*Cajero, error) {
 		numThread = DefaultNumThread
 	}
 
+	// El default del keep_alive lo pone el MÓDULO DEL PROVEEDOR (ollama.DefaultKeepAliveSeconds) y no una
+	// constante nuestra: quién decide cuánto vive el runner es una política del proveedor, y copiar aquí el
+	// -1 lo dejaría caducar en silencio el día que esa recomendación cambie.
+	keepAlive := deps.KeepAlive
+	if keepAlive == nil {
+		keepAlive = ollama.KeepAliveSeconds(ollama.DefaultKeepAliveSeconds)
+	}
+
 	return &Cajero{
 		colas:       colas,
 		ollama:      deps.Ollama,
 		modelo:      deps.Modelo,
 		temperatura: temperatura,
 		opciones:    deps.Opciones,
+		keepAlive:   keepAlive,
+		porRegimen:  nuevoContador(RegimenesInferencia...),
+		porClase:    nuevoContador(app.ClasesInferencia...),
 		breaker:     br,
 		despertador: desp,
 		log:         log,
@@ -959,6 +1014,22 @@ func (c *Cajero) publicarParte(ctx context.Context) {
 		Circuito: c.Circuito(),
 		Taskset:  c.Taskset(),
 		P50ms:    c.inferencia.p50MS(),
+		// ─── T1.7-5 · el reparto de la inferencia ──────────────────────────────
+		//
+		// 🔴 EL CUANTIL VIAJA ATADO A SU `n`, y no es cosmética: un p50 sobre n=3 es un MÁXIMO disfrazado, y
+		// comparar cuantiles de n distinto ya fabricó aquí una conclusión falsa. El contrato lo impone en el
+		// wire (InferenceLatency es UN mensaje con los dos campos, no dos campos sueltos) y este parte lo
+		// respeta escribiendo siempre la pareja: el lector decide «no medible» mirando las muestras, jamás
+		// el p50 —que vale 0 tanto sin muestras como con ellas si el reloj no avanzó—.
+		PrefillP50ms:       c.prefill.p50MS(),
+		PrefillMuestras:    int64(c.prefill.muestras()),
+		GeneracionP50ms:    c.generacion.p50MS(),
+		GeneracionMuestras: int64(c.generacion.muestras()),
+		// Las FOTOS de los dos repartos. Se copian aquí (foto() devuelve copia) y el mismo mapa se escribe
+		// en las N colas: es sólo lectura a partir de este punto, así que compartirlo entre los N UPSERT es
+		// seguro y ahorra N copias de un mapa de tres claves.
+		PorRegimen: c.porRegimen.foto(),
+		PorClase:   c.porClase.foto(),
 	}
 	for _, cm := range c.colas {
 		if cm.parte == nil {

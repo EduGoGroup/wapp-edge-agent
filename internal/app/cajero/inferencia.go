@@ -33,6 +33,7 @@ package cajero
 
 import (
 	"math"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -94,10 +95,17 @@ var bordesInferenciaMS = [numBucketsInferencia]int64{
 	math.MaxInt64,
 }
 
-// histogramaInferencia acumula las latencias de inferencia del proceso. UNA sola población: el breaker,
-// el semáforo y este histograma son POR PROCESO porque los tres describen a Ollama, que es uno por
-// máquina (ver Deps.Colas). Partirlo por cola daría N series de las que ninguna tendría muestras
-// suficientes para un percentil, midiendo además el mismo Ollama N veces.
+// histogramaInferencia acumula latencias de inferencia del proceso. POR PROCESO y nunca por cola: el
+// breaker, el semáforo y este histograma describen a Ollama, que es uno por máquina (ver Deps.Colas).
+// Partirlo por cola daría N series de las que ninguna tendría muestras suficientes para un percentil,
+// midiendo además el mismo Ollama N veces.
+//
+// ⚠️ DESDE T1.7-5 HAY TRES INSTANCIAS DE ESTE TIPO, NO UNA, Y NO SE MEZCLAN: el TOTAL (Cajero.inferencia,
+// que es el que viaja como `intent_p50_ms` desde T4.5), el PREFILL y la GENERACIÓN. La rejilla les sirve
+// a las tres —las tres viven en el mismo rango, de las décimas de segundo a los dos minutos— pero sus
+// poblaciones son distintas: el total se alimenta también en el camino de FALLO y las otras dos sólo en
+// el de éxito, así que sus `muestras()` NO tienen por qué cuadrar y restarlas no da «lo que fallaron».
+// El porqué de esa asimetría está en Cajero.observarFases.
 //
 // MONOTÓNICO Y SIN RESET, igual que internal/app/latencia: los contadores sólo suben. El patrón «leer y
 // poner a cero» tiene una ventana entre la lectura y el reset en la que las muestras se pierden, y
@@ -132,7 +140,19 @@ func (h *histogramaInferencia) observar(d time.Duration) {
 	if h == nil {
 		return
 	}
-	h.buckets[bucketInferenciaDe(d.Milliseconds())].Add(1)
+	h.observarMS(d.Milliseconds())
+}
+
+// observarMS es la misma anotación con la muestra YA en milisegundos. Existe porque desde T1.7-5 hay dos
+// poblaciones cuyo origen es un número de Ollama, no un cronómetro de Go: el prefill y la generación
+// llegan ya convertidos (ollama.Metrics.PromptMs y ChatResponse.EvalDuration), y envolverlos en un
+// time.Duration para que este método volviera a dividirlos sería una ida y vuelta que sólo puede perder
+// precisión.
+func (h *histogramaInferencia) observarMS(ms int64) {
+	if h == nil {
+		return
+	}
+	h.buckets[bucketInferenciaDe(ms)].Add(1)
 }
 
 // bucketInferenciaDe localiza el bucket de una muestra en milisegundos. Una muestra <= 0 (reloj
@@ -211,4 +231,192 @@ func (h *histogramaInferencia) muestras() uint64 {
 		total += h.buckets[i].Load()
 	}
 	return total
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EL CALOR DEL PREFIJO (Plan 044 · Ola 1.7 · T1.7-5)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// 🔴 LOS UMBRALES SON POLÍTICA DEL EMISOR Y VIVEN AQUÍ, NO EN EL PROTO. El contrato transporta el reparto
+// YA HECHO (`SessionHealth.inference_by_regime`, un mapa) precisamente para que estos dos números se
+// puedan mover con el hardware del cliente sin cortar una versión del contrato ni bumpear dos
+// consumidores. Quien los cambie, los cambia aquí y en ningún otro sitio.
+
+const (
+	// PrefillFrioMS es el borde por encima del cual un prefill se considera FRÍO: la caché de prefijos del
+	// runner no tenía nada aprovechable y hubo que digerir el prompt entero.
+	//
+	// 5 s SALE DE LA MEDICIÓN, no de un número redondo: con el prefijo frío el prefill cuesta ~21,6 ms por
+	// token, así que 5 s son ~230 tokens — por debajo del prompt más pequeño que el Cloud construye. Un
+	// prefill que pasa de ahí no puede haber tenido un acierto de caché apreciable.
+	PrefillFrioMS = 5_000
+	// PrefillCalienteMS es el borde por debajo del cual un prefill se considera CALIENTE: la caché tenía el
+	// prefijo y sólo hubo que digerir la cola del prompt.
+	//
+	// 2 s ES EL TECHO MEDIDO DEL CASO CALIENTE (0,1-1,2 s el prompt entero), con margen: por debajo de ahí
+	// no cabe un prefill frío de un prompt real.
+	PrefillCalienteMS = 2_000
+)
+
+const (
+	// RegimenFrio: prefill > PrefillFrioMS. Se pagó el arranque en frío entero.
+	RegimenFrio = "frio"
+	// RegimenTemplado: prefill en [PrefillCalienteMS, PrefillFrioMS]. LA FRANJA QUE LOS UMBRALES DEL PLAN
+	// NO CUBRÍAN, y por eso tiene nombre propio en vez de repartirse entre las otras dos.
+	//
+	// 🔴 SU CONTADOR ES LA SEÑAL DE QUE ESTOS UMBRALES PIDEN RECALIBRARSE, y es la razón de que exista.
+	// Los dos bordes de arriba están calibrados contra UNA máquina (el VPS de UAT, agosto de 2026); en el
+	// equipo de un cliente —otra CPU, otro modelo, otro tamaño de prompt— la frontera real entre «caché
+	// caliente» y «caché fría» cae en otro sitio. Mientras `templado` sea residual, los bordes describen
+	// bien esa máquina. En cuanto se lleve una fracción apreciable del tráfico, lo que hay que mover son
+	// PrefillFrioMS y PrefillCalienteMS — no es que haya aparecido un tercer fenómeno físico, es que los
+	// dos números de arriba dejaron de partir la población donde de verdad se parte.
+	//
+	// ⚠️ NO ES «no se sabe»: un prefill de 3 s ES un dato medido, y describe un acierto PARCIAL de caché
+	// (el prefijo estaba, la cola del prompt no). Lo que no se sabe no se cuenta en ningún régimen — ver
+	// Cajero.observarFases.
+	RegimenTemplado = "templado"
+	// RegimenCaliente: prefill < PrefillCalienteMS. La caché de prefijos tenía el prefijo del tenant.
+	RegimenCaliente = "caliente"
+)
+
+// RegimenesInferencia es la lista de regímenes CONOCIDOS, del más caro al más barato. La usa el desglose
+// del heartbeat para sembrar las tres claves a cero: un régimen a 0 es un DATO («esta hora no pagó ni un
+// arranque en frío»), y un hueco en el mapa obligaría al consumidor a adivinar si es cero o si este Edge
+// no lo mide.
+var RegimenesInferencia = []string{RegimenFrio, RegimenTemplado, RegimenCaliente}
+
+// regimenDe clasifica un prefill medido en ms. Los bordes son ESTRICTOS por los dos lados, así que
+// exactamente PrefillCalienteMS y exactamente PrefillFrioMS caen en `templado`: la franja del medio es
+// CERRADA a propósito, para que ningún valor pueda quedar sin régimen por un `>=` mal puesto.
+//
+// ⚠️ NO SE LLAMA CON UN PREFILL <= 0. Ese caso es «no medible» y se descarta antes (observarFases): darle
+// aquí un régimen lo metería en `caliente`, que es la mentira más cómoda de creer — un Ollama que dejara
+// de devolver `prompt_eval_duration` se vería como una máquina con la caché siempre caliente.
+func regimenDe(prefillMS int64) string {
+	switch {
+	case prefillMS > PrefillFrioMS:
+		return RegimenFrio
+	case prefillMS < PrefillCalienteMS:
+		return RegimenCaliente
+	default:
+		return RegimenTemplado
+	}
+}
+
+// observarFases anota las DOS fases de una inferencia que salió bien y devuelve el régimen con el que se
+// clasificó el prefill, o "" si no era medible (para el log).
+//
+// 🔴 SÓLO SE LLAMA EN EL CAMINO DE ÉXITO, y es la asimetría con `histogramaInferencia.observar`, que se
+// alimenta en los dos. No es una excepción de conveniencia: prefill y generación son NÚMEROS QUE DEVUELVE
+// EL PROVEEDOR EN SU RESPUESTA, y en el camino de fallo no hay respuesta de la que leerlos. Un timeout no
+// es «un prefill que tardó mucho»: es una petición de la que no sabemos NADA de su reparto interno.
+// Inventar ahí una muestra —imputarle todo el plazo al prefill, por ejemplo— envenenaría justo el número
+// que esta tarea existe para limpiar.
+//
+// 🔴 UN VALOR <= 0 NO ES UNA MUESTRA. `prompt_eval_duration` lo devuelve Ollama SIEMPRE, así que un cero
+// significa que la respuesta no lo traía (versión del proveedor, respuesta recortada) y no que el prefill
+// fuera instantáneo. Contarlo como 0 ms metería una muestra falsa en el bucket más bajo y, peor, sumaría
+// al régimen `caliente`: una máquina que perdió el dato se vería como una máquina que va de maravilla.
+// Descartándolo, la ausencia viaja como ausencia (`samples` sin crecer ⇒ el heartbeat publica «no
+// medible»), que es la única lectura honesta.
+//
+// LOS CALENTAMIENTOS SÍ ENTRAN AQUÍ, al revés que en el breaker. La regla del repo es que un calentamiento
+// se mide EXACTAMENTE IGUAL que todo lo demás y sólo se excluye de UNA cosa —la salud del proveedor—; una
+// segunda exclusión no escrita en ninguna parte sería peor que la consecuencia que tiene. Y la
+// consecuencia hay que saber leerla: un calentamiento paga prefill FRÍO POR DISEÑO, así que en una máquina
+// ociosa con calentamientos periódicos el contador de `frio` sube sin que ningún cliente haya esperado.
+func (c *Cajero) observarFases(prefillMS, generacionMS int64) string {
+	if c == nil {
+		return ""
+	}
+	var regimen string
+	if prefillMS > 0 {
+		c.prefill.observarMS(prefillMS)
+		regimen = regimenDe(prefillMS)
+		c.porRegimen.contar(regimen)
+	}
+	// LA GENERACIÓN SE JUZGA POR SU CUENTA y no dentro del `if` de arriba: son dos números independientes
+	// del proveedor y uno puede faltar sin el otro. Anidarlos haría que perder el prefill borrase también
+	// la generación, que sí se midió.
+	if generacionMS > 0 {
+		c.generacion.observarMS(generacionMS)
+	}
+	return regimen
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EL CONTADOR ETIQUETADO — un mapa acumulado y monótono
+// ─────────────────────────────────────────────────────────────────────────────
+
+// contadorEtiquetado cuenta sucesos por etiqueta. Es el gemelo abierto del histograma de arriba: donde
+// aquél tiene una rejilla fija de 16 buckets, éste tiene un mapa que puede crecer.
+//
+// POR QUÉ UN MUTEX Y NO ATÓMICOS, que es lo que usa todo lo demás de este fichero: porque el conjunto de
+// etiquetas tiene que poder CRECER sin recompilar a los consumidores —es la propiedad por la que el
+// contrato transporta un `map<string,int64>` y no un contador por categoría—, y un mapa que crece no se
+// puede leer sin candado. El precio es nulo aquí: se toca UNA VEZ POR INFERENCIA, y una inferencia son
+// segundos. Esto no es el camino caliente del socket de entrantes (INV-051.2), donde el mismo candado
+// habría sido inaceptable.
+//
+// MONÓTONO Y SIN RESET, igual que el histograma y por el mismo motivo: el patrón «leer y poner a cero»
+// pierde las muestras que caen entre la lectura y el reset, y miente a la baja justo cuando hay ráfaga.
+// Consecuencia honesta: lo que viaja en el parte es EL ACUMULADO DE TODA LA VIDA DEL PROCESO, y la
+// ventana la hace el consumidor con un `rate()`.
+//
+// El cero-valor NO sirve (el mapa sería nil): construir con nuevoContador. El NIL sí es utilizable —todos
+// los métodos son nil-safe—, para que un Cajero armado sin estos campos se comporte como antes de T1.7-5.
+type contadorEtiquetado struct {
+	mu sync.Mutex
+	n  map[string]int64
+}
+
+// nuevoContador construye el contador con las etiquetas conocidas SEMBRADAS A CERO.
+//
+// 🔴 LA SIEMBRA ES EL PUNTO. Sin ella, «este proceso no ha visto ni un arranque en frío» y «este Edge no
+// mide el régimen» llegarían al consumidor como la misma cosa: una clave ausente. Con ella, la ausencia
+// de la clave significa una sola cosa —el emisor no conoce esa categoría—, y el cero significa lo que
+// tiene que significar. Es el mismo criterio con el que el desglose por motivo publica sus ocho claves
+// siempre (INV-051.3).
+func nuevoContador(etiquetas ...string) *contadorEtiquetado {
+	c := &contadorEtiquetado{n: make(map[string]int64, len(etiquetas))}
+	for _, e := range etiquetas {
+		c.n[e] = 0
+	}
+	return c
+}
+
+// contar suma uno a la etiqueta. Una etiqueta que no se sembró se crea: el mapa es abierto a propósito
+// (ver el doc del tipo).
+func (c *contadorEtiquetado) contar(etiqueta string) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n == nil {
+		c.n = make(map[string]int64, 1)
+	}
+	c.n[etiqueta]++
+}
+
+// foto devuelve una COPIA del acumulado. Copia y no el mapa interno: lo que sale de aquí viaja a otro
+// proceso por el parte y se recorre mientras esta goroutine puede estar contando — devolver el mapa vivo
+// sería una carrera que `-race` caza el día que dos inferencias terminen a la vez.
+//
+// Devuelve nil si no hay contador (nil-safe), que el escritor del parte traduce a «no medible».
+func (c *contadorEtiquetado) foto() map[string]int64 {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.n == nil {
+		return nil
+	}
+	copia := make(map[string]int64, len(c.n))
+	for k, v := range c.n {
+		copia[k] = v
+	}
+	return copia
 }

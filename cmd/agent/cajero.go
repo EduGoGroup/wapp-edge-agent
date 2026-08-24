@@ -139,6 +139,10 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 			"num_predict": cfg.Worker.NumPredict,
 			"num_ctx":     cfg.Worker.NumCtx,
 		},
+		// EL `keep_alive` DE CADA PETICIÓN (T1.7-4). Va aparte de Opciones y tiene que ir aparte: es un campo
+		// de PRIMER NIVEL de /api/chat, y metido en `options` Ollama lo ignora EN SILENCIO — el runner
+		// seguiría muriéndose a los 5 min, llevándose la caché de prefijos, sin que nada lo delatara.
+		KeepAlive:     ollama.KeepAliveSeconds(cfg.Worker.KeepAliveSeconds),
 		Despertador:   cajero.NewPollFijo(time.Duration(cfg.Worker.PollMS) * time.Millisecond),
 		Log:           log,
 		MaxConcurrent: cfg.Worker.MaxConcurrent,
