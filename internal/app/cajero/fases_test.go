@@ -321,3 +321,51 @@ func TestParte_LlevaElRepartoDeLaInferencia(t *testing.T) {
 		t.Errorf("PorClase[%q]: got %d want 1", app.ClaseLote, got)
 	}
 }
+
+// TestLogServida_LlevaLasTRESFases custodia el dato sin el cual el A/B del precalentado saca la
+// conclusión AL REVÉS.
+//
+// 🔴 SON TRES FASES, NO DOS. `keep_alive` protege dos cosas que se enfrían juntas pero son distintas: el
+// MODELO cargado (`load_ms`) y la CACHÉ DE PREFIJOS (`prefill_ms`). Con `keep_alive=0` —el lado A del
+// A/B— se pierden las dos a la vez, así que esa inferencia llega con load ALTO **y** prefill FRÍO. Sin
+// `load_ms` en la línea, toda la diferencia contra el lado B se atribuiría al prefijo, cuando una parte
+// grande (39 s medidos) es recargar el modelo del disco: se mediría el precalentado y se publicaría un
+// número que en realidad mezcla dos efectos.
+//
+// ⚠️ ESTE TEST NACE DE UN COMENTARIO QUE MENTÍA. El bloque de la ⑨ afirmaba que `load_ms` «se loguea
+// aparte desde siempre» y NO se logueaba en ninguna parte del repo — la afirmación se escribió sin
+// ejecutarla. El comentario ya es verdad; esto es lo que impide que vuelva a dejar de serlo.
+func TestLogServida_LlevaLasTRESFases(t *testing.T) {
+	ctx := context.Background()
+	log := &logCaptura{}
+
+	_, s := servidorDe(t, Deps{
+		Ollama:        &chateadorEspia{resp: respuestaConFases(6_000, 1_500)},
+		Opciones:      opcionesDelEdge(),
+		Log:           log,
+		MaxConcurrent: 1,
+		Timeout:       timeoutDeLaMedicion,
+	})
+	if _, err := s.Inferir(ctx, peticionDe("dame un pedido", timeoutDeLaMedicion)); err != nil {
+		t.Fatalf("Inferir: %v", err)
+	}
+
+	e, ok := log.buscar("inferencia SERVIDA")
+	if !ok {
+		t.Fatal("no se emitió la línea `cajero: inferencia SERVIDA`")
+	}
+	claves := clavesDe(e)
+	for _, k := range []string{"load_ms", "prefill_ms", "generacion_ms", "regimen"} {
+		if !claves[k] {
+			t.Errorf("la línea de inferencia servida no lleva %q: sin las TRES fases, el A/B del "+
+				"precalentado atribuye al prefijo lo que fue recargar el modelo. Claves: %v", k, claves)
+		}
+	}
+
+	// 🔴 INV-051.1 de propina: la línea sigue sin llevar ni el prompt ni la salida.
+	for _, prohibida := range []string{"prompt", "salida", "texto"} {
+		if claves[prohibida] {
+			t.Errorf("la línea servida lleva %q: es contenido de negocio (INV-051.1)", prohibida)
+		}
+	}
+}
