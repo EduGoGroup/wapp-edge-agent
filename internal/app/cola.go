@@ -111,10 +111,16 @@ const (
 	// bug de ese corte o por un descifrado que devolvió cadena vacía; el motivo es el mismo porque el
 	// hecho es el mismo (no había qué clasificar), y así el contador de la Ola 4 no se parte en dos.
 	MotivoSinTexto MotivoOmitido = "sin_texto"
-	// MotivoNoElegible: el mensaje no cumple las condiciones de elegibilidad del clasificador — hoy, venir
-	// de un GRUPO. El criterio lo aplica el LISTENER, en el switch de `enqueueCola`, y desde el Plan 051
-	// Ola 3 · T3.0 ese es el ÚNICO sitio donde vive: la copia que tenía el decorador inline
-	// (`intent.Decorator.eligible`) murió con él. No se intentó clasificar.
+	// MotivoNoElegible: el mensaje no cumple las condiciones de elegibilidad del clasificador — venir de un
+	// GRUPO.
+	//
+	// 🔴 HISTÓRICO DESDE EL PLAN 044 · Ola 1.5 · T1.5-3 (REQ-36/D-044.30): YA NO LO ESCRIBE NADIE. Este era
+	// el motivo del tráfico de grupos, y desde T1.5-3 un entrante de grupo se DESCARTA en la puerta del
+	// listener (paso 5 de `onMessage`) sin dejar fila, así que no hay fila nueva que marcar. El valor se
+	// conserva —y sigue en la lista canónica— porque hay filas ANTIGUAS con esta marca en la cola local y
+	// en la nube, y borrarlo del enum las volvería indecodificables. Si un día vuelve a haber un criterio
+	// de elegibilidad que no sea el grupo, este es su sitio; hasta entonces, un `no_elegible` en una fila
+	// NUEVA es un defecto, no una condición de campo.
 	MotivoNoElegible MotivoOmitido = "no_elegible"
 	// MotivoPresupuesto: el despachador agotó su presupuesto de espera (WAPP_AGENT_INTENT_WAIT_MS,
 	// 4000 ms) sin que el cajero llegara a clasificar. Lo escribe el DESPACHADOR (Ola 3).

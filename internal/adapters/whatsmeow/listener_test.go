@@ -689,41 +689,25 @@ func grupoMessage(id, text string) *events.Message {
 	return msg
 }
 
-// grupoSinTexto es una imagen/sticker recibida EN UN GRUPO: el caso que solapa las dos primeras ramas del
-// switch y donde tiene que ganar `sin_texto` (ver TestOnMessage_Cola_OrdenDeLosMotivos).
+// grupoSinTexto es una imagen/sticker recibida EN UN GRUPO. Fue durante dos planes el caso que solapaba las
+// dos primeras ramas del switch de elegibilidad, y allí ganaba `sin_texto`; desde el Plan 044 · T1.5-3
+// (REQ-36) ya no llega al switch — se descarta en la puerta por ser de grupo. Su test vive ahora en
+// listener_grupo_test.go (TestOnMessage_Grupo_SinTexto_SeDescartaComoGrupo).
 func grupoSinTexto(id string) *events.Message {
 	msg := grupoMessage(id, "")
 	msg.Message = nil
 	return msg
 }
 
-// TestOnMessage_Cola_GrupoNaceNoElegible: T2.12 — el defecto que aquella tarea cerró. Antes, un mensaje de
-// GRUPO con texto nacía `nuevo`, el cajero lo reclamaba y lo mandaba a Ollama: carga que el Edge NUNCA ha
-// clasificado (el decorador inline la filtraba desde el Plan 029) colándose por la puerta nueva de la cola,
-// y justo sobre el recurso que el semáforo de 1 plaza existe para gobernar.
+// 🔴 AQUÍ VIVÍA TestOnMessage_Cola_GrupoNaceNoElegible, Y LO QUE AFIRMABA YA NO ES CIERTO (Plan 044 · Ola
+// 1.5 · T1.5-3, REQ-36). Aquel test fijaba la conducta de T2.12: un entrante de GRUPO dejaba fila y la fila
+// nacía `clasificado` con la marca `no_elegible`. Esa conducta está DEROGADA — el grupo se descarta ahora en
+// la PUERTA (paso 5 de onMessage), sin fila y sin entrega—, así que el test no se ha «arreglado»: se ha
+// sustituido por los de `listener_grupo_test.go`, que afirman lo contrario a propósito.
 //
-// Desde T3.0 esta rama es la ÚNICA puerta de elegibilidad que queda en el Edge: la copia del decorador
-// murió con él. Si esto se rompe, ya no hay nadie detrás que lo tape.
-func TestOnMessage_Cola_GrupoNaceNoElegible(t *testing.T) {
-	cola := &spyCola{}
-	l := listenerConCola(cola)
-
-	l.handleEvent(context.Background(), grupoMessage("MSG-GRUPO", "quiero dos empanadas"))
-
-	if len(cola.got) != 1 {
-		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
-	}
-	item := cola.got[0]
-	if item.Estado != app.EstadoClasificado {
-		t.Fatalf("estado = %q, quería %q: un mensaje de grupo NO puede quedar reclamable por el cajero",
-			item.Estado, app.EstadoClasificado)
-	}
-	// LITERAL A PROPÓSITO (mismo criterio que sin_texto/fastlane, ver arriba): el test fija el FORMATO DE
-	// CABLE que se persiste en la columna, con independencia de la constante que hoy lo produce.
-	if item.IntentJSON != `{"omitido":"no_elegible"}` {
-		t.Fatalf("intent = %q, quería la marca de omisión por no elegible", item.IntentJSON)
-	}
-}
+// Lo que T2.12 defendía NO se ha perdido, se ha reforzado: el tráfico de grupos sigue sin llegar al cajero
+// —y ahora tampoco al disco ni a la nube—. Si algún día se revierte REQ-36, es AQUÍ donde hay que volver a
+// escribir el test, no en el fichero nuevo.
 
 // TestOnMessage_Cola_ClasificadorApagadoNaceApagado: con la feature apagada, un mensaje que por lo demás
 // sería perfectamente clasificable (directo, con texto, que el fastlane no atrapa) nace resuelto con
@@ -759,18 +743,18 @@ func TestOnMessage_Cola_OrdenDeLosMotivos(t *testing.T) {
 		want    string
 		porque  string
 	}{
+		// 🔴 AQUÍ HABÍA DOS CASOS DE GRUPO Y SE FUERON CON REQ-36 (Plan 044 · T1.5-3): «grupo sin texto gana
+		// sin_texto» y «grupo con la feature apagada gana no_elegible». Los dos dirimían un solape que ya no
+		// se dirime aquí, porque un entrante de grupo NO LLEGA a este switch: se descarta en la puerta. El
+		// solape de la imagen de grupo tiene ahora su propio test con el veredicto nuevo
+		// (TestOnMessage_Grupo_SinTexto_SeDescartaComoGrupo, en listener_grupo_test.go).
 		{
-			nombre:  "grupo sin texto gana sin_texto",
-			mensaje: func() *events.Message { return grupoSinTexto("MSG-G-IMG") },
-			want:    `{"omitido":"sin_texto"}`,
-			porque:  "una imagen de grupo no tiene NADA que clasificar; contarla como no_elegible escondería el volumen de tráfico no textual",
-		},
-		{
-			nombre:  "grupo con la feature apagada gana no_elegible",
+			nombre:  "sin texto con la feature apagada gana sin_texto",
 			activo:  apagado,
-			mensaje: func() *events.Message { return grupoMessage("MSG-G-OFF", "quiero dos empanadas") },
-			want:    `{"omitido":"no_elegible"}`,
-			porque:  "ser de grupo es una propiedad del MENSAJE y no cambia al encender la feature; el estado del sistema se juzga después",
+			mensaje: func() *events.Message { return liveMessage("MSG-IMG-OFF", "") },
+			want:    `{"omitido":"sin_texto"}`,
+			porque: "la PROPIEDAD DEL MENSAJE se juzga antes que el estado del SISTEMA: apagar la feature no " +
+				"le pone texto a una imagen, y contarla como `apagado` escondería el volumen de tráfico no textual",
 		},
 		{
 			nombre:  "texto del fastlane con la feature apagada gana apagado",

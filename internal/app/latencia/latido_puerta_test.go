@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// TestLatido_LosContadoresDeLaPuerta_SalenConSuValor comprueba lo que el bloque promete: que los dos
+// TestLatido_LosContadoresDeLaPuerta_SalenConSuValor comprueba lo que el bloque promete: que los cuatro
 // campos llevan el acumulado del EDGE (no el de una sesión) y que llegan hasta la línea.
 //
 // ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO (ejecutadas):
@@ -40,6 +40,14 @@ func TestLatido_LosContadoresDeLaPuerta_SalenConSuValor(t *testing.T) {
 		h.Puerta().AnotaDescartePasivo()
 	}
 
+	// Plan 044 · T1.5-3 — el cuarto contador de la puerta, otra vez con un valor DISTINTO de los tres
+	// anteriores y por el mismo motivo: es el único cruce de campos que un test puede cazar sin leer el
+	// código. Confundir `descartes_grupo` con `descartes_perfil_pasivo` en la línea haría creer que hay
+	// sesiones calladas donde lo que hay es tráfico de grupos, que es una conclusión operativa distinta.
+	for i := 0; i < 7; i++ {
+		h.Puerta().AnotaDescarteGrupo()
+	}
+
 	correrLatido(t, Deps{Hist: h, Cada: 0, Log: log}, 20*time.Millisecond)
 
 	finales := log.porEmision(emisionFinal)
@@ -59,6 +67,9 @@ func TestLatido_LosContadoresDeLaPuerta_SalenConSuValor(t *testing.T) {
 		{"descartes_perfil_pasivo", 4, "es la ÚNICA huella de un filtro que no deja fila, no sube al cable y " +
 			"ACUSA a WhatsApp igual que si hubiera entregado: sin este campo, «la sesión pasiva está " +
 			"filtrando» y «a esa sesión no le escribe nadie» son indistinguibles desde fuera"},
+		{"descartes_grupo", 7, "desde REQ-36 el entrante de GRUPO no deja fila, no sube al cable y ACUSA " +
+			"igual que si se hubiera entregado: este número es la única prueba de que ese tráfico existe, " +
+			"y sin él la caída de `cola_pendientes` se lee como «entra menos tráfico»"},
 	}
 	for _, c := range casos {
 		v, ok := finales[0].clave(c.clave)
@@ -93,7 +104,7 @@ func TestLatido_LosContadoresDeLaPuerta_SalenAunqueSeanCeroYNoHayaCola(t *testin
 	if len(finales) != 1 {
 		t.Fatalf("se esperaba 1 bloque final, hubo %d", len(finales))
 	}
-	for _, clave := range []string{"cola_enqueue_errores", "cola_enqueue_panics", "descartes_perfil_pasivo"} {
+	for _, clave := range []string{"cola_enqueue_errores", "cola_enqueue_panics", "descartes_perfil_pasivo", "descartes_grupo"} {
 		v, ok := finales[0].clave(clave)
 		if !ok {
 			t.Errorf("%q desapareció de la línea por valer cero (o por no haber contador de cola).\n"+
