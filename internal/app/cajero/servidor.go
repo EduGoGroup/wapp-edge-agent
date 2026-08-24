@@ -252,8 +252,15 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	// esa diferencia es invisible, y con ella la única palanca que de verdad mueve la latencia.
 	//
 	// LA GENERACIÓN SALE DE `resp.EvalDuration` Y NO DE `Metrics`, que no la expone en ms: es el gemelo de
-	// PromptMs y ninguno de los dos incluye LoadDuration (cargar el modelo del disco), que es una tercera
-	// cosa y se loguea aparte como `load_ms` desde siempre.
+	// PromptMs, y ninguno de los dos incluye LoadDuration —cargar el modelo del disco—, que es una TERCERA
+	// cosa y se loguea aparte como `load_ms`.
+	//
+	// 🔴 SON TRES FASES Y HAY QUE PUBLICAR LAS TRES, o el A/B del precalentado saca la conclusión al revés.
+	// `keep_alive` protege DOS cosas que se enfrían juntas pero son distintas: el MODELO cargado (load) y la
+	// CACHÉ DE PREFIJOS (prefill). Con `keep_alive=0` se pierden las dos a la vez, así que una inferencia del
+	// lado A llega con load ALTO y prefill FRÍO — y sin `load_ms` no hay forma de saber cuánto de la
+	// diferencia fue recargar el modelo (39 s medidos) y cuánto fue digerir el prompt. Se atribuiría todo al
+	// prefijo, que es justo la magnitud que el experimento quiere medir.
 	regimen := c.observarFases(m.PromptMs, resp.EvalDuration/int64(time.Millisecond))
 	salida := resp.Content()
 	// 🔴 INV-051.1: ni `p.Prompt` ni `salida`. Sólo tamaños, tiempos y el desenlace.
@@ -280,6 +287,7 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 		//
 		// `regimen` VACÍO significa «no medible» —el proveedor no devolvió `prompt_eval_duration`—, nunca
 		// «templado». Es la misma semántica de presencia que el sub-mensaje del heartbeat.
+		"load_ms", m.LoadMs,
 		"prefill_ms", m.PromptMs,
 		"generacion_ms", resp.EvalDuration/int64(time.Millisecond),
 		"regimen", regimen,
