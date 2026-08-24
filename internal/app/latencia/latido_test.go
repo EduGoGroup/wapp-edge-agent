@@ -147,12 +147,19 @@ func correrLatido(t *testing.T, d Deps, vida time.Duration) {
 // acusa igual que si hubiera entregado; y porque LE QUITA CUENTA a los descartes por ventana (el corte va
 // antes del ADR-0037), así que sin él una caída de aquella serie se lee como una mejora del Edge cuando lo
 // que ha pasado es que hay más sesiones calladas.
+//
+// `descartes_grupo` (Plan 044 · Ola 1.5 · T1.5-3, REQ-36) entró como CUARTO contador de la puerta y por la
+// misma razón que el tercero: desde T1.5-3 un entrante de GRUPO se descarta en la puerta sin dejar fila, sin
+// entregar nada y ACUSANDO a WhatsApp igual que si hubiera entregado, así que desde fuera es indistinguible
+// de «a ese grupo no le escribió nadie». Lo que le quita cuenta no es a otra serie de descartes —va después
+// del pasivo y de la ventana— sino a las FILAS: quien vea caer `cola_pendientes` sin leer este campo dirá
+// «entra menos tráfico» cuando lo que pasa es que el Edge dejó de guardar los grupos.
 var camposObligatorios = []string{
 	"emision", "despachador", "inyector", "ventana_ms", "uptime_s",
 	"n", "p50_ms", "p95_ms", "p99_ms", "p99_bucket",
 	"n_descartes", "p99_ms_descartes",
 	"n_acum", "p99_ms_acum", "max_ms_acum",
-	"cola_enqueue_errores", "cola_enqueue_panics", "descartes_perfil_pasivo",
+	"cola_enqueue_errores", "cola_enqueue_panics", "descartes_perfil_pasivo", "descartes_grupo",
 	"cola_pendientes", "cola_nuevo", "cola_tomado", "cola_clasificado", "conteo_ms",
 }
 

@@ -134,7 +134,7 @@ const DefaultWorkerPollMS = 500
 
 // DefaultWorkerInferenceTimeoutMS es el plazo de UNA inferencia del worker-cajero.
 //
-// 🔴 ES UN NÚMERO DISTINTO DE DefaultIntentWaitMS (4000 ms) Y TIENE QUE SERLO. Aquel es el
+// 🔴 ERA UN NÚMERO DISTINTO DE `DefaultIntentWaitMS` (4000 ms) Y TENÍA QUE SERLO. Aquel era el
 // presupuesto del DESPACHADOR —cuánto espera a que aparezca el intent antes de entregar el mensaje sin
 // él— y es corto porque su trabajo es NO RETENER la entrega: pasado el plazo, el mensaje sale sin
 // intent y la sesión sigue viva. El worker existe justo para lo contrario: se sacó la inferencia a otro
@@ -178,6 +178,44 @@ const DefaultWorkerMaxIntentos = cajero.DefaultMaxIntentos
 // operador con el log a nivel info y muchos tenants puede querer callarlo). Sólo un valor NEGATIVO cae
 // al default. Configurable por WAPP_WORKER_STATS_EVERY_MS.
 const DefaultWorkerStatsEveryMS = 5 * 60 * 1000
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EL SERVICIO DE INFERENCIA (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045, REQ-34)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Tres números que gobiernan el camino `inference_request` → carril del daemon → socket → cajero →
+// Ollama. Van con el prefijo WAPP_AGENT_ aunque el último lo aplique el cajero: ver el doc comment del
+// campo Config.Inference.
+
+// DefaultInferenceMaxInflight son las inferencias que el Edge acepta atender A LA VEZ (y los workers del
+// carril del adaptador de CloudLink). Configurable por WAPP_AGENT_INFERENCE_MAX_INFLIGHT; <=0 cae al
+// default. El porqué del 4 —y por qué NO copia el aforo de Ollama, que es 1— está en
+// cloudlink.defaultInferenceMaxInflight.
+const DefaultInferenceMaxInflight = 4
+
+// DefaultInferenceMaxTimeoutMS es el TECHO del `timeout_ms` que el Cloud puede pedir. Configurable por
+// WAPP_AGENT_INFERENCE_MAX_TIMEOUT_MS; <=0 cae al default. El número (120.000, ~2,6× el peor máximo
+// medido en el VPS real) y su justificación están en cajero.DefaultMaxTimeoutMS.
+const DefaultInferenceMaxTimeoutMS = cajero.DefaultMaxTimeoutMS
+
+// DefaultInferenceLeaseGraciaMS es cuánto espera el gate de lease de una inferencia a que alguna sesión
+// se vuelva operable antes de rechazar con LEASE_INVALID. Configurable por
+// WAPP_AGENT_INFERENCE_LEASE_GRACIA_MS; <=0 cae al default.
+//
+// EXISTE POR UNA VENTANA MEDIDA: el Validator de lease NACE CERRADO y no deja operar hasta que llega el
+// primer LeaseUpdate, 0,5-1,1 s después de registrar la sesión. 2.000 ms es ~2× ese peor caso, y sólo se
+// paga cuando el gate iba a rechazar. El argumento largo, en cloudlink.defaultInferenceLeaseGracia.
+const DefaultInferenceLeaseGraciaMS = 2000
+
+// InferenceConfig son los tres números del servicio de inferencia. Bloque YAML `inference:`.
+type InferenceConfig struct {
+	// MaxInflight son las inferencias simultáneas que el Edge acepta. Default DefaultInferenceMaxInflight.
+	MaxInflight int `yaml:"max_inflight"`
+	// MaxTimeoutMS es el techo del plazo que el Cloud puede pedir. Default DefaultInferenceMaxTimeoutMS.
+	MaxTimeoutMS int `yaml:"max_timeout_ms"`
+	// LeaseGraciaMS es la gracia del gate de lease. Default DefaultInferenceLeaseGraciaMS.
+	LeaseGraciaMS int `yaml:"lease_gracia_ms"`
+}
 
 // Los CUATRO números del modelo (techo de entrada, hilos, contexto y tokens de salida) se REEXPORTAN,
 // NO se teclean aquí: el número tiene un dueño y tenerlo escrito dos veces es la duplicación
@@ -460,6 +498,12 @@ type Config struct {
 	// variables de entorno NO llevan el prefijo WAPP_AGENT_ sino WAPP_WORKER_ (ver WorkerEnvPrefix);
 	// el bloque YAML sí es `worker:` dentro del mismo config.yaml, porque el fichero es compartido.
 	Worker WorkerConfig `yaml:"worker"`
+	// Inference configura EL SERVICIO DE INFERENCIA que el Edge presta al Cloud (Plan 044 · Ola 1.6 ·
+	// T1.6-2, ADR-0045). Sus variables llevan el prefijo WAPP_AGENT_ y NO WAPP_WORKER_, aunque el techo
+	// del plazo lo aplique el cajero: los TRES números describen UN SOLO servicio que atraviesa los dos
+	// procesos, y partirlos entre dos prefijos obligaría a un operador a recordar cuál va en qué unidad
+	// de systemd — con el fallo silencioso de siempre si se equivoca (la variable no se lee y nadie avisa).
+	Inference InferenceConfig `yaml:"inference"`
 	// EnableAlphaTestAccounts activa el selector de usuarios de prueba (Alpha) en la UI de login. Default: false.
 	EnableAlphaTestAccounts bool `yaml:"enable_alpha_test_accounts"`
 	// PlatformAPIBaseURL es la URL base de la API PÚBLICA HTTP de la plataforma cloud (puerto 8103,
@@ -478,17 +522,6 @@ const DefaultIntentOllamaURL = "http://127.0.0.1:11434"
 // Configurable por WAPP_AGENT_INTENT_MODEL.
 const DefaultIntentModel = "qwen3:1.7b"
 
-// DefaultIntentWaitMS es el PRESUPUESTO DE ESPERA por defecto (ms) del DESPACHADOR (Plan 051 Ola 3):
-// cuánto aguanta la entrega de un mensaje esperando a que el worker-cajero deje su intent en la cola
-// antes de despacharlo SIN intención. Configurable por WAPP_AGENT_INTENT_WAIT_MS.
-//
-// 🔴 NO ES EL TIMEOUT DE INFERENCIA, y son dos números que NO se colapsan. El de inferencia es
-// WAPP_WORKER_INFERENCE_TIMEOUT_MS (15000, ver DefaultWorkerInferenceTimeoutMS) y mide «cuánto aguanto a Ollama»;
-// éste mide «cuánto retengo la entrega». Que el segundo sea MENOR que el primero es lo normal y no es
-// una incoherencia: el despachador se rinde antes de que la inferencia termine, entrega sin intent, y
-// la clasificación tardía sigue su curso en la cola sin retener a nadie.
-const DefaultIntentWaitMS = 4000
-
 // IntentConfig agrupa los parámetros del clasificador de intenciones (Plan 029). Todo OFF por defecto.
 type IntentConfig struct {
 	// Enabled activa el clasificador. false (default) ⇒ el sink no se decora (cableado idéntico al actual).
@@ -497,16 +530,6 @@ type IntentConfig struct {
 	OllamaURL string `yaml:"ollama_url"`
 	// Model es el modelo de clasificación (default qwen3:1.7b).
 	Model string `yaml:"model"`
-	// WaitMS es el PRESUPUESTO DE ESPERA DEL DESPACHADOR en milisegundos (default 4000): cuánto retiene
-	// la entrega de un mensaje aguardando a que aparezca su intent, antes de despacharlo sin él.
-	// <=0 cae al default.
-	//
-	// 🔴 NO ES EL TIMEOUT DE INFERENCIA. El timeout de inferencia es WAPP_WORKER_INFERENCE_TIMEOUT_MS
-	// (15000), que vive en Worker.InferenceTimeoutMS. SON DOS NÚMEROS DISTINTOS Y NO SE COLAPSAN: éste
-	// acota lo que espera el que ENTREGA; aquél acota lo que tarda el que CLASIFICA.
-	//
-	// Sustituye a la retirada WAPP_AGENT_INTENT_TIMEOUT_MS (Plan 051 Ola 3, T3.1): ver VariablesRetiradas.
-	WaitMS int `yaml:"wait_ms"`
 }
 
 // CloudLinkConfig agrupa los parámetros del conducto CloudLink. Todos OPCIONALES: con Endpoint vacío
@@ -622,7 +645,6 @@ func defaults() Config {
 			Enabled:   false,
 			OllamaURL: DefaultIntentOllamaURL,
 			Model:     DefaultIntentModel,
-			WaitMS:    DefaultIntentWaitMS,
 		},
 		Worker: WorkerConfig{
 			MaxConcurrent:      DefaultWorkerMaxConcurrent,
@@ -634,6 +656,11 @@ func defaults() Config {
 			MaxIntentos:        DefaultWorkerMaxIntentos,
 			InferenceTimeoutMS: DefaultWorkerInferenceTimeoutMS,
 			StatsEveryMS:       DefaultWorkerStatsEveryMS,
+		},
+		Inference: InferenceConfig{
+			MaxInflight:   DefaultInferenceMaxInflight,
+			MaxTimeoutMS:  DefaultInferenceMaxTimeoutMS,
+			LeaseGraciaMS: DefaultInferenceLeaseGraciaMS,
 		},
 		EnableAlphaTestAccounts: false,
 		PlatformAPIBaseURL:      DefaultPlatformAPIBaseURL,
@@ -711,7 +738,9 @@ func Load(path string) (Config, error) {
 	cfg.Intent.Enabled = loader.GetBool("INTENT_ENABLED", cfg.Intent.Enabled)
 	cfg.Intent.OllamaURL = loader.GetString("INTENT_OLLAMA_URL", cfg.Intent.OllamaURL)
 	cfg.Intent.Model = loader.GetString("INTENT_MODEL", cfg.Intent.Model)
-	cfg.Intent.WaitMS = loader.GetInt("INTENT_WAIT_MS", cfg.Intent.WaitMS)
+	cfg.Inference.MaxInflight = loader.GetInt("INFERENCE_MAX_INFLIGHT", cfg.Inference.MaxInflight)
+	cfg.Inference.MaxTimeoutMS = loader.GetInt("INFERENCE_MAX_TIMEOUT_MS", cfg.Inference.MaxTimeoutMS)
+	cfg.Inference.LeaseGraciaMS = loader.GetInt("INFERENCE_LEASE_GRACIA_MS", cfg.Inference.LeaseGraciaMS)
 	cfg.EnableAlphaTestAccounts = loader.GetBool("ALPHA_TEST_ACCOUNTS", loader.GetBool("ENABLE_ALPHA_LOGIN", cfg.EnableAlphaTestAccounts))
 	cfg.PlatformAPIBaseURL = loader.GetString("PLATFORM_API_BASE_URL", cfg.PlatformAPIBaseURL)
 
@@ -795,19 +824,13 @@ func Load(path string) (Config, error) {
 	}
 
 	// Clasificador de intenciones (Plan 029): normaliza defaults cuando la feature está ON. Un valor
-	// vacío/tecleado mal (YAML/env) cae al default en vez de dejar el clasificador sin URL/modelo/espera.
+	// vacío/tecleado mal (YAML/env) cae al default en vez de dejar el clasificador sin URL ni modelo.
 	// Con Enabled=false no se toca nada relevante (el decorador no se cablea).
 	if cfg.Intent.OllamaURL == "" {
 		cfg.Intent.OllamaURL = DefaultIntentOllamaURL
 	}
 	if cfg.Intent.Model == "" {
 		cfg.Intent.Model = DefaultIntentModel
-	}
-	// Presupuesto de espera del despachador (Plan 051 Ola 3): un 0 significaría no esperar NUNCA —el
-	// mensaje saldría siempre sin intent y el worker-cajero clasificaría para nadie—, y un negativo no
-	// significa nada. Los dos caen al default.
-	if cfg.Intent.WaitMS <= 0 {
-		cfg.Intent.WaitMS = DefaultIntentWaitMS
 	}
 
 	// Worker-cajero (Plan 051 Ola 2): TODOS sus números caen al default si son <=0. Ninguno es un
@@ -846,6 +869,24 @@ func Load(path string) (Config, error) {
 	if cfg.Worker.InferenceTimeoutMS <= 0 {
 		cfg.Worker.InferenceTimeoutMS = DefaultWorkerInferenceTimeoutMS
 	}
+	// SERVICIO DE INFERENCIA (Plan 044 · Ola 1.6 · T1.6-2): los TRES caen al default si son <=0, y
+	// ninguno admite el cero como valor legítimo — a diferencia de stats_every_ms, que sí. El porqué es el
+	// mismo para los tres y vale la pena decirlo: los tres ceros producen un Edge que SE COMPORTA MAL SIN
+	// DAR UN SOLO ERROR. Con max_inflight=0 el carril arranca sin un solo worker y rechaza toda inferencia
+	// con EDGE_SIN_CAPACIDAD; con max_timeout_ms=0 el techo desaparece y una petición mal calculada arriba
+	// ocupa la única plaza de Ollama el tiempo que diga; con lease_gracia_ms=0 se pierde la ventana que
+	// cubre el arranque del Validator y toda inferencia de ese primer segundo muere con LEASE_INVALID, que
+	// es el error que el Cloud degrada peor.
+	if cfg.Inference.MaxInflight <= 0 {
+		cfg.Inference.MaxInflight = DefaultInferenceMaxInflight
+	}
+	if cfg.Inference.MaxTimeoutMS <= 0 {
+		cfg.Inference.MaxTimeoutMS = DefaultInferenceMaxTimeoutMS
+	}
+	if cfg.Inference.LeaseGraciaMS <= 0 {
+		cfg.Inference.LeaseGraciaMS = DefaultInferenceLeaseGraciaMS
+	}
+
 	// 🔴 EL GUARDARRAÍL DE stats_every_ms ES DISTINTO Y A PROPÓSITO: el CERO es un valor legítimo que
 	// significa DESACTIVADO, no un dedazo. Sólo lo NEGATIVO —que no significa nada— cae al default.
 	if cfg.Worker.StatsEveryMS < 0 {
@@ -998,26 +1039,40 @@ type AvisoRetirada struct {
 func VariablesRetiradas() []AvisoRetirada {
 	var avisos []AvisoRetirada
 
-	// WAPP_AGENT_INTENT_TIMEOUT_MS (Plan 051 Ola 3, T3.1): era el plazo del camino INLINE —el decorador
-	// que clasificaba dentro del handler de whatsmeow— y ese camino se retira con la ola. Se nombran las
-	// DOS variables vivas porque la confusión clásica es colapsarlas en una: la que acota lo que ESPERA
-	// el despachador (WAPP_AGENT_INTENT_WAIT_MS) y la que acota lo que TARDA la inferencia del
-	// worker-cajero (WAPP_WORKER_INFERENCE_TIMEOUT_MS). Quien tenía puesta la retirada casi siempre
-	// quería la segunda, así que es la que se le señala como sustituta.
+	// LAS DOS SON DEL MISMO ENTIERRO, y por eso se avisan juntas: el push de clasificación del Edge.
 	//
-	// ⚠️ LA SUSTITUTA SE NOMBRA COMO ESTÁ EN EL CÓDIGO, NO COMO ESTÁ EN LOS DOCS. El plan y el ADR-0038
-	// la llaman `WAPP_WORKER_TIMEOUT_MS`, pero lo que Load lee de verdad es
-	// `WAPP_WORKER_INFERENCE_TIMEOUT_MS` (ver el overlay del workerLoader). Mandar al operador a la
-	// variable de los docs sería reproducir el mismo fallo silencioso que este aviso existe para evitar:
-	// la escribiría, no gobernaría nada y nadie se enteraría.
+	// WAPP_AGENT_INTENT_TIMEOUT_MS (Plan 051 Ola 3, T3.1) era el plazo del camino INLINE —el decorador que
+	// clasificaba dentro del handler de whatsmeow—. WAPP_AGENT_INTENT_WAIT_MS (Plan 044 Ola 1.6, T1.6-5)
+	// era el PRESUPUESTO DE ESPERA del despachador, y lo mata el ADR-0045: la clasificación pasó de PUSH a
+	// PULL, el Edge entrega cada entrante AL INSTANTE y es el Cloud quien PIDE la inferencia por el frame
+	// `inference_request` cuando la necesita. No hay ninguna espera que calibrar porque ya no se espera.
+	//
+	// 🔴 LA SUSTITUTA DE LA SEGUNDA NO ES OTRA VARIABLE: NO HAY. Y decirlo es el aviso entero. Quien tenía
+	// puesto un WAIT_MS alto lo puso para «que dé tiempo a clasificar»; hoy eso no lo gobierna una variable
+	// del Edge sino la ventana de agregación del Cloud, que vive en el Cloud. Ofrecerle aquí un sustituto
+	// plausible sería mandarlo a girar una palanca que no está conectada a nada — exactamente el fallo
+	// silencioso que esta función existe para evitar (Sustituta vacía ⇒ el arranque no nombra ninguna).
+	//
+	// ⚠️ LA SUSTITUTA DE LA PRIMERA SE NOMBRA COMO ESTÁ EN EL CÓDIGO, NO COMO ESTÁ EN LOS DOCS. El plan y el
+	// ADR-0038 la llaman `WAPP_WORKER_TIMEOUT_MS`, pero lo que Load lee de verdad es
+	// `WAPP_WORKER_INFERENCE_TIMEOUT_MS` (ver el overlay del workerLoader). Ese número SIGUE VIVO bajo pull:
+	// acota lo que tarda la inferencia que el Edge SIRVE al Cloud (ADR-0045 §Decisión.2).
 	if _, presente := os.LookupEnv(EnvPrefix + "INTENT_TIMEOUT_MS"); presente {
 		avisos = append(avisos, AvisoRetirada{
 			Variable:  EnvPrefix + "INTENT_TIMEOUT_MS",
 			Sustituta: WorkerEnvPrefix + "INFERENCE_TIMEOUT_MS",
 			Motivo: "el camino inline de clasificación se retiró (Plan 051 Ola 3): el timeout de INFERENCIA " +
-				"es ahora " + WorkerEnvPrefix + "INFERENCE_TIMEOUT_MS y el presupuesto de ESPERA del " +
-				"despachador es " + EnvPrefix + "INTENT_WAIT_MS; son dos números distintos y esta variable " +
-				"ya no gobierna ninguno",
+				"es ahora " + WorkerEnvPrefix + "INFERENCE_TIMEOUT_MS",
+		})
+	}
+
+	if _, presente := os.LookupEnv(EnvPrefix + "INTENT_WAIT_MS"); presente {
+		avisos = append(avisos, AvisoRetirada{
+			Variable:  EnvPrefix + "INTENT_WAIT_MS",
+			Sustituta: "",
+			Motivo: "la clasificación pasó de PUSH a PULL (ADR-0045, Plan 044 Ola 1.6): el Edge entrega cada " +
+				"entrante al instante y ya NO retiene ninguno esperando una intención, así que no hay " +
+				"presupuesto de espera que configurar; la inferencia la PIDE el Cloud cuando la necesita",
 		})
 	}
 

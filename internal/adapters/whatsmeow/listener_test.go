@@ -550,11 +550,18 @@ func TestNewListener_ColaSinSessionIDSeDesactiva(t *testing.T) {
 	}
 }
 
-// TestOnMessage_Cola_SinTextoNaceConMotivoPropio: F7 — un mensaje NO TEXTUAL (imagen, audio, sticker…)
-// llega con Texto vacío. Nace clasificado (no hay nada que clasificar), pero con el motivo `sin_texto`,
-// NO con `fastlane`: el fastlane devuelve true para la cadena vacía y contarlo como carril rápido
-// falsearía el desglose de INV-051.3.
-func TestOnMessage_Cola_SinTextoNaceConMotivoPropio(t *testing.T) {
+// TestOnMessage_Cola_SinTextoNaceNuevoYSinSobre: un mensaje NO TEXTUAL (imagen, audio, sticker…) llega
+// con Texto vacío y se encola como cualquier otro: `nuevo`, sin sobre, y se entrega.
+//
+// 🔴 ESTE TEST AFIRMA HOY LO CONTRARIO DE LO QUE AFIRMABA (era `…NaceConMotivoPropio`, F7 + T1.8). Hasta
+// el 2026-08-24 la fila nacía `clasificado` con la marca `sin_texto`, para que el cajero no gastara en
+// ella una plaza de su semáforo. Con el push retirado (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045) no hay
+// cajero al que ahorrarle nada: el Edge no clasifica.
+//
+// ⚠️ LO QUE NO CAMBIÓ, Y ES LO QUE ESTE TEST PROTEGE DE VERDAD: un mensaje sin texto SIGUE ENCOLÁNDOSE Y
+// ENTREGÁNDOSE. `sin_texto` nunca fue una puerta —una imagen es un entrante de pleno derecho y la nube la
+// quiere—, y quien lea el retiro de aquella rama podría concluir lo contrario.
+func TestOnMessage_Cola_SinTextoNaceNuevoYSinSobre(t *testing.T) {
 	cola := &spyCola{}
 	l := listenerConCola(cola)
 
@@ -563,18 +570,14 @@ func TestOnMessage_Cola_SinTextoNaceConMotivoPropio(t *testing.T) {
 	l.handleEvent(context.Background(), sinTexto)
 
 	if len(cola.got) != 1 {
-		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
+		t.Fatalf("se esperaba 1 fila encolada, hubo %d: un mensaje sin texto se entrega igual", len(cola.got))
 	}
 	item := cola.got[0]
-	if item.Estado != app.EstadoClasificado {
-		t.Fatalf("estado = %q, quería %q (el cajero no tiene nada que clasificar)", item.Estado, app.EstadoClasificado)
+	if item.Estado != app.EstadoNuevo {
+		t.Fatalf("estado = %q, quería %q: bajo pull TODA fila nace nuevo", item.Estado, app.EstadoNuevo)
 	}
-	// LITERAL A PROPÓSITO, no app.SobreOmitido(app.MotivoSinTexto): este test fija el FORMATO DE CABLE
-	// que se persiste en la columna, y hacerlo contra la misma función que lo produce no probaría nada
-	// (un cambio en el enum pasaría verde arrastrando el test consigo). El literal es el testigo
-	// independiente; si el sobre cambia de forma, aquí tiene que doler.
-	if item.IntentJSON != `{"omitido":"sin_texto"}` {
-		t.Fatalf("intent = %q, quería la marca de omisión por falta de texto", item.IntentJSON)
+	if item.IntentJSON != "" {
+		t.Fatalf("intent = %q, quería vacío: el listener ya no escribe sobres de omisión (ADR-0045)", item.IntentJSON)
 	}
 }
 
@@ -619,29 +622,35 @@ func TestOnMessage_Cola_EcoPropioNoEncola(t *testing.T) {
 	}
 }
 
-// TestOnMessage_Cola_FastLaneNaceClasificado: un texto del carril rápido ("2", una opción de menú) nace
-// en EstadoClasificado con la MARCA DE OMISIÓN — no con un intent inventado — para que el cajero no lo
-// reclame nunca.
+// TestOnMessage_Cola_TextoDelCarrilRapidoNaceIgualQueCualquiera: un texto que el antiguo carril rápido
+// atrapaba ("2", una opción de menú) se encola exactamente igual que un texto libre.
 //
-// EL FASTLANE SOBREVIVE A T3.0 y es legítimo que lo haga: es un regex léxico de microsegundos, no una
-// llamada al LLM. Lo que se retiró del hilo de whatsmeow es la INFERENCIA, no el criterio de elegibilidad.
-func TestOnMessage_Cola_FastLaneNaceClasificado(t *testing.T) {
+// 🔴 ESTE TEST AFIRMA HOY LO CONTRARIO DE LO QUE AFIRMABA (era `…FastLaneNaceClasificado`, T1.8). El
+// fastlane era un regex léxico de microsegundos que decidía «esto no necesita LLM», y con él la fila
+// nacía `clasificado` con la marca `fastlane` para que el cajero no la reclamara.
+//
+// EL CARRIL RÁPIDO NO SE HA BORRADO: HA CAMBIADO DE SEDE (ADR-0044 §1.B / ADR-0045). La pregunta «¿hace
+// falta el LLM para esto?» se la hace ahora quien va a llamar al LLM, y eso es el motor de flujos del
+// Cloud. Un fastlane en el Edge sólo podía ahorrar una inferencia que el Edge ya no decide lanzar, así
+// que el cableado (`WithFastLane`, `classifier.FastLane`) se retiró de este listener.
+func TestOnMessage_Cola_TextoDelCarrilRapidoNaceIgualQueCualquiera(t *testing.T) {
 	cola := &spyCola{}
 	l := listenerConCola(cola)
 
-	l.handleEvent(context.Background(), liveMessage("MSG-FAST", "2"))
+	// "2" es el ejemplo canónico del léxico del fastlane; "quiero dos empanadas" nunca lo fue. Bajo pull
+	// los dos tienen que producir EXACTAMENTE la misma fila — que es justo lo que fija este test.
+	for _, texto := range []string{"2", "quiero dos empanadas"} {
+		cola.got = nil
+		l.handleEvent(context.Background(), liveMessage("MSG-"+texto, texto))
 
-	if len(cola.got) != 1 {
-		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
-	}
-	item := cola.got[0]
-	if item.Estado != app.EstadoClasificado {
-		t.Fatalf("estado = %q, quería %q", item.Estado, app.EstadoClasificado)
-	}
-	// LITERAL A PROPÓSITO (mismo criterio que en el test de sin_texto, ver arriba): el test fija el
-	// formato de cable con independencia de la constante que hoy lo produce.
-	if item.IntentJSON != `{"omitido":"fastlane"}` {
-		t.Fatalf("intent = %q, quería la marca de omisión del fastlane", item.IntentJSON)
+		if len(cola.got) != 1 {
+			t.Fatalf("texto %q: se esperaba 1 fila encolada, hubo %d", texto, len(cola.got))
+		}
+		item := cola.got[0]
+		if item.Estado != app.EstadoNuevo || item.IntentJSON != "" {
+			t.Fatalf("texto %q: estado=%q intent=%q; bajo pull ningún texto nace resuelto (ADR-0045)",
+				texto, item.Estado, item.IntentJSON)
+		}
 	}
 }
 
@@ -675,11 +684,6 @@ func TestOnMessage_Cola_SinHoraUtilizableEncolaConSelloLocal(t *testing.T) {
 
 // --- puerta de elegibilidad en el listener (Plan 051 Ola 2 · T2.12) ---
 
-// apagado es el predicado de un clasificador APAGADO, para WithClasificadorActivo. Existe con nombre
-// propio porque aparece en casi todos los tests de esta sección y un `func() bool { return false }` suelto
-// en cada uno esconde de qué va el caso.
-func apagado() bool { return false }
-
 // grupoMessage arma un entrante EN VIVO que viene de un GRUPO. Solo marca IsGroup: es el único campo que
 // el listener consulta para juzgar la elegibilidad, así que fabricar un JID @g.us no probaría nada más y
 // ataría el test a un detalle que el código no usa.
@@ -689,105 +693,75 @@ func grupoMessage(id, text string) *events.Message {
 	return msg
 }
 
-// grupoSinTexto es una imagen/sticker recibida EN UN GRUPO: el caso que solapa las dos primeras ramas del
-// switch y donde tiene que ganar `sin_texto` (ver TestOnMessage_Cola_OrdenDeLosMotivos).
+// grupoSinTexto es una imagen/sticker recibida EN UN GRUPO. Fue durante dos planes el caso que solapaba las
+// dos primeras ramas del switch de elegibilidad, y allí ganaba `sin_texto`; desde el Plan 044 · T1.5-3
+// (REQ-36) ya no llega al switch — se descarta en la puerta por ser de grupo. Su test vive ahora en
+// listener_grupo_test.go (TestOnMessage_Grupo_SinTexto_SeDescartaComoGrupo).
 func grupoSinTexto(id string) *events.Message {
 	msg := grupoMessage(id, "")
 	msg.Message = nil
 	return msg
 }
 
-// TestOnMessage_Cola_GrupoNaceNoElegible: T2.12 — el defecto que aquella tarea cerró. Antes, un mensaje de
-// GRUPO con texto nacía `nuevo`, el cajero lo reclamaba y lo mandaba a Ollama: carga que el Edge NUNCA ha
-// clasificado (el decorador inline la filtraba desde el Plan 029) colándose por la puerta nueva de la cola,
-// y justo sobre el recurso que el semáforo de 1 plaza existe para gobernar.
+// 🔴🔴 AQUÍ VIVÍA LA SECCIÓN ENTERA «puerta de elegibilidad en el listener» (Plan 051 Ola 2 · T2.12), Y SE
+// FUE CON EL PUSH EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045 · D-044.31 · REQ-35).
 //
-// Desde T3.0 esta rama es la ÚNICA puerta de elegibilidad que queda en el Edge: la copia del decorador
-// murió con él. Si esto se rompe, ya no hay nadie detrás que lo tape.
-func TestOnMessage_Cola_GrupoNaceNoElegible(t *testing.T) {
-	cola := &spyCola{}
-	l := listenerConCola(cola)
+// Eran seis tests que fijaban en qué ESTADO nacía una fila según tres condiciones (sin texto / feature
+// apagada / texto del fastlane), incluido el ORDEN entre ellas —que era contrato, porque de él dependía
+// que la telemetría dijera la verdad sobre cuál motivo había ganado—. Todos afirmaban lo mismo de fondo:
+// «esta fila nace `clasificado` con su marca, para que el cajero no la reclame».
+//
+// NO SE HAN ARREGLADO, SE HAN SUSTITUIDO POR SU CONTRARIO, y por uno solo: bajo pull no hay nada que
+// decidir, así que no hay tres ramas que ordenar. Lo que queda por aseverar es que NINGUNA condición
+// produce ya una fila distinta — ver TestOnMessage_Cola_TodaFilaNaceNuevaYSinSobre, abajo. La conducta
+// individual de «sin texto» y «texto del fastlane» tiene además su propio test arriba, cada uno con la
+// nota de qué afirmaba antes.
+//
+// ⚠️ EL ORDEN QUE SE PIERDE NO ERA DEUDA: era información. Si algún día el Edge vuelve a resolver filas
+// al nacer, hay que volver a escribir el orden Y su test — y el argumento entero está en el bloque del
+// enqueue en listener.go, que se conserva por eso.
 
-	l.handleEvent(context.Background(), grupoMessage("MSG-GRUPO", "quiero dos empanadas"))
-
-	if len(cola.got) != 1 {
-		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
-	}
-	item := cola.got[0]
-	if item.Estado != app.EstadoClasificado {
-		t.Fatalf("estado = %q, quería %q: un mensaje de grupo NO puede quedar reclamable por el cajero",
-			item.Estado, app.EstadoClasificado)
-	}
-	// LITERAL A PROPÓSITO (mismo criterio que sin_texto/fastlane, ver arriba): el test fija el FORMATO DE
-	// CABLE que se persiste en la columna, con independencia de la constante que hoy lo produce.
-	if item.IntentJSON != `{"omitido":"no_elegible"}` {
-		t.Fatalf("intent = %q, quería la marca de omisión por no elegible", item.IntentJSON)
-	}
-}
-
-// TestOnMessage_Cola_ClasificadorApagadoNaceApagado: con la feature apagada, un mensaje que por lo demás
-// sería perfectamente clasificable (directo, con texto, que el fastlane no atrapa) nace resuelto con
-// `apagado`. Filtrarlo AQUÍ y no en el cajero es el punto de T2.12: en el cajero ya habría costado una
-// plaza del semáforo y un claim.
-func TestOnMessage_Cola_ClasificadorApagadoNaceApagado(t *testing.T) {
-	cola := &spyCola{}
-	l := listenerConCola(cola, WithClasificadorActivo(apagado))
-
-	l.handleEvent(context.Background(), liveMessage("MSG-OFF", "quiero dos empanadas"))
-
-	if len(cola.got) != 1 {
-		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
-	}
-	item := cola.got[0]
-	if item.Estado != app.EstadoClasificado {
-		t.Fatalf("estado = %q, quería %q: con la feature apagada no hay a quién preguntar",
-			item.Estado, app.EstadoClasificado)
-	}
-	if item.IntentJSON != `{"omitido":"apagado"}` {
-		t.Fatalf("intent = %q, quería la marca de omisión por feature apagada", item.IntentJSON)
-	}
-}
-
-// TestOnMessage_Cola_OrdenDeLosMotivos: el ORDEN de las ramas es contrato, no casualidad. Se comprueban los
-// tres solapes que importan; en los tres los cinco caminos acabarían igual (mensaje SIN intención), así que
-// lo único que se está fijando es QUÉ SE APRENDE al mirar la telemetría — que es de lo que va INV-051.3.
-func TestOnMessage_Cola_OrdenDeLosMotivos(t *testing.T) {
-	cases := []struct {
+// TestOnMessage_Cola_TodaFilaNaceNuevaYSinSobre es el reemplazo de la sección de arriba, y su forma es
+// deliberada: se recorren LAS MISMAS TRES CONDICIONES que antes producían tres filas distintas y se
+// asevera que hoy producen la MISMA fila.
+//
+// 🔴 POR QUÉ RECORRERLAS EN VEZ DE UN SOLO CASO FELIZ: un test con un único mensaje normal pasaría verde
+// aunque alguien dejara viva una de las tres ramas —justo la que no se probó—, y el síntoma en campo
+// sería una fila `clasificado` que nadie espera, en un Edge donde ya nadie la entrega por ese camino.
+// Aquí las tres son el caso.
+//
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): devolver al `enqueueCola` de listener.go cualquiera de las
+// tres ramas retiradas (p. ej. `case text == "": item.Estado = app.EstadoClasificado`) ⇒ el subtest de
+// esa condición falla nombrando el estado y el sobre.
+func TestOnMessage_Cola_TodaFilaNaceNuevaYSinSobre(t *testing.T) {
+	for _, c := range []struct {
 		nombre  string
-		activo  func() bool // nil ⇒ opción no cableada (clasificador activo por default)
 		mensaje func() *events.Message
-		want    string
-		porque  string
+		antes   string // qué producía esta condición bajo el push, para que el diff se lea solo
 	}{
 		{
-			nombre:  "grupo sin texto gana sin_texto",
-			mensaje: func() *events.Message { return grupoSinTexto("MSG-G-IMG") },
-			want:    `{"omitido":"sin_texto"}`,
-			porque:  "una imagen de grupo no tiene NADA que clasificar; contarla como no_elegible escondería el volumen de tráfico no textual",
+			nombre: "sin texto (imagen, audio, sticker)",
+			mensaje: func() *events.Message {
+				m := liveMessage("MSG-IMG", "")
+				m.Message = nil
+				return m
+			},
+			antes: `clasificado + {"omitido":"sin_texto"}`,
 		},
 		{
-			nombre:  "grupo con la feature apagada gana no_elegible",
-			activo:  apagado,
-			mensaje: func() *events.Message { return grupoMessage("MSG-G-OFF", "quiero dos empanadas") },
-			want:    `{"omitido":"no_elegible"}`,
-			porque:  "ser de grupo es una propiedad del MENSAJE y no cambia al encender la feature; el estado del sistema se juzga después",
+			nombre:  "texto que el carril rápido atrapaba",
+			mensaje: func() *events.Message { return liveMessage("MSG-FAST", "2") },
+			antes:   `clasificado + {"omitido":"fastlane"}`,
 		},
 		{
-			nombre:  "texto del fastlane con la feature apagada gana apagado",
-			activo:  apagado,
-			mensaje: func() *events.Message { return liveMessage("MSG-FAST-OFF", "2") },
-			want:    `{"omitido":"apagado"}`,
-			porque:  "si el fastlane fuera antes, con la feature apagada la telemetría mostraría una MEZCLA de fastlane y apagado en vez del 100 % de apagado que explica lo que pasa",
+			nombre:  "texto libre, el camino que iba al LLM",
+			mensaje: func() *events.Message { return liveMessage("MSG-LIBRE", "quiero dos empanadas") },
+			antes:   "nuevo + sin sobre (el único que no cambia)",
 		},
-	}
-	for _, c := range cases {
+	} {
 		t.Run(c.nombre, func(t *testing.T) {
 			cola := &spyCola{}
-			var opts []ListenerOption
-			if c.activo != nil {
-				opts = append(opts, WithClasificadorActivo(c.activo))
-			}
-			l := listenerConCola(cola, opts...)
+			l := listenerConCola(cola)
 
 			l.handleEvent(context.Background(), c.mensaje())
 
@@ -795,79 +769,11 @@ func TestOnMessage_Cola_OrdenDeLosMotivos(t *testing.T) {
 				t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
 			}
 			item := cola.got[0]
-			if item.Estado != app.EstadoClasificado {
-				t.Fatalf("estado = %q, quería %q", item.Estado, app.EstadoClasificado)
-			}
-			if item.IntentJSON != c.want {
-				t.Fatalf("intent = %q, quería %q — %s", item.IntentJSON, c.want, c.porque)
-			}
-		})
-	}
-}
-
-// TestOnMessage_Cola_SinPredicadoNoSeFiltraPorApagado: el DEFAULT SEGURO. Sin WithClasificadorActivo (la
-// opción no cableada, o cableada con nil) el filtro NO se activa por accidente: un mensaje normal sigue
-// naciendo `nuevo` y llega al cajero. La asimetría es deliberada — un cableado incompleto debe clasificar
-// de más (ruidoso, medible, sin pérdida de negocio), nunca dejar de clasificar en silencio.
-func TestOnMessage_Cola_SinPredicadoNoSeFiltraPorApagado(t *testing.T) {
-	for _, c := range []struct {
-		nombre string
-		opts   []ListenerOption
-	}{
-		{"opción no cableada", nil},
-		{"opción cableada con nil", []ListenerOption{WithClasificadorActivo(nil)}},
-	} {
-		t.Run(c.nombre, func(t *testing.T) {
-			cola := &spyCola{}
-			l := listenerConCola(cola, c.opts...)
-
-			l.handleEvent(context.Background(), liveMessage("MSG-DEFAULT", "quiero dos empanadas"))
-
-			if len(cola.got) != 1 {
-				t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
-			}
-			item := cola.got[0]
 			if item.Estado != app.EstadoNuevo || item.IntentJSON != "" {
-				t.Fatalf("estado=%q intent=%q; sin predicado el clasificador se considera ACTIVO y la fila debe quedar reclamable",
-					item.Estado, item.IntentJSON)
+				t.Fatalf("estado=%q intent=%q; bajo pull TODA fila nace `nuevo` y SIN sobre (antes: %s)",
+					item.Estado, item.IntentJSON, c.antes)
 			}
 		})
-	}
-}
-
-// TestOnMessage_Cola_DirectoConClasificadorActivoNaceNuevo: la NO-REGRESIÓN del camino que SÍ debe llegar
-// al cajero. Un mensaje directo, con texto, con el clasificador activo y que el fastlane no atrapa sigue
-// naciendo `nuevo` y sin sobre — si esto se rompe, T2.12 habría apagado el clasificador entero en vez de
-// filtrar lo que sobra.
-func TestOnMessage_Cola_DirectoConClasificadorActivoNaceNuevo(t *testing.T) {
-	cola := &spyCola{}
-	l := listenerConCola(cola, WithClasificadorActivo(func() bool { return true }))
-
-	l.handleEvent(context.Background(), liveMessage("MSG-VIVO", "quiero dos empanadas"))
-
-	if len(cola.got) != 1 {
-		t.Fatalf("se esperaba 1 fila encolada, hubo %d", len(cola.got))
-	}
-	item := cola.got[0]
-	if item.Estado != app.EstadoNuevo || item.IntentJSON != "" {
-		t.Fatalf("estado=%q intent=%q; el camino sano debe nacer nuevo y SIN sobre (lo reclama el cajero)",
-			item.Estado, item.IntentJSON)
-	}
-}
-
-// TestOnMessage_Cola_ColaNilNoConsultaElInterruptor: el predicado NO se llama cuando no hay cola — el
-// interruptor solo gobierna el nacimiento de una fila, y enqueueCola vuelve antes de tocarlo.
-func TestOnMessage_Cola_ColaNilNoConsultaElInterruptor(t *testing.T) {
-	consultas := 0
-	l := NewListener(quietLogger(), WithClasificadorActivo(func() bool {
-		consultas++
-		return false
-	})) // sin WithCola
-
-	l.handleEvent(context.Background(), liveMessage("MSG-SINCOLA", "quiero dos empanadas"))
-
-	if consultas != 0 {
-		t.Fatalf("el interruptor se consultó %d veces sin cola cableada; no debía consultarse ninguna", consultas)
 	}
 }
 

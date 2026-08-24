@@ -198,8 +198,8 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 	args = append(args, percentil(encAcum, 0.99, "p99_ms_acum", "")...)
 	args = append(args, "max_ms_acum", encAcum.MaxMS())
 
-	// LA PUERTA DE ENTRADA (T1.13, ampliada por el Plan 046 · T2.3). Van SIEMPRE, incluso en cero, y por dos
-	// motivos distintos:
+	// LA PUERTA DE ENTRADA (T1.13, ampliada por el Plan 046 · T2.3 y por el Plan 044 · T1.5-3). Van SIEMPRE,
+	// incluso en cero, y por dos motivos distintos:
 	//
 	//   - un cero explícito es un DATO («no se ha degradado nada en toda la vida del proceso») y un campo
 	//     ausente es una DUDA («¿no pasó nada, o dejó de mirarse?»). Es el mismo criterio que `n` y
@@ -209,7 +209,7 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 	//     dependen del COUNT ni de que el adaptador respalde el lado contador. Un Edge cuya cola no sepa
 	//     contar sigue teniendo derecho a ver si está reofreciendo mensajes.
 	//
-	// `d.Hist` no puede ser nil aquí (Latido retorna antes si lo es), así que estos TRES campos no tienen
+	// `d.Hist` no puede ser nil aquí (Latido retorna antes si lo es), así que estos CUATRO campos no tienen
 	// ninguna condición que los pueda dejar fuera de la línea.
 	//
 	// ⚠️ `cola_enqueue_errores` NO CUENTA MENSAJES PERDIDOS desde T1.13: cuenta mensajes que WhatsApp
@@ -228,13 +228,21 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 	// hay más sesiones pasivas. Los dos números se leen a la vez o no se leen.
 	//
 	// ⚠️ Y ES DEL EDGE, NO DE UNA SESIÓN: para saber CUÁL está callada, `GET /v1/health` publica el mismo
-	// contador por sesión como `dropped_passive`. Los tres mueren con el proceso (que se relanza solo desde
+	// contador por sesión como `dropped_passive`. Los cuatro mueren con el proceso (que se relanza solo desde
 	// T5.4): un cero recién arrancado no dice «no pasó nada», dice «acabo de nacer» — `uptime_s` lo aclara.
+	//
+	// `descartes_grupo` (Plan 044 · Ola 1.5 · T1.5-3, REQ-36) es el CUARTO, y entra por la misma lección que
+	// el tercero: desde T1.5-3 un entrante de GRUPO se descarta en la puerta (paso 5) —sin fila, sin entrega—
+	// y se ACUSA a WhatsApp igual que si se hubiera entregado, así que sin este campo el filtro es invisible.
+	// Lo que le quita cuenta NO es a otra serie de descartes —va después del pasivo y de la ventana— sino al
+	// volumen de la cola: quien vea caer `cola_pendientes` sin mirar aquí leerá «entra menos tráfico» cuando
+	// lo que pasa es que el Edge dejó de guardar los grupos.
 	puerta := d.Hist.Puerta().Snapshot()
 	args = append(args,
 		"cola_enqueue_errores", puerta.EnqueueErrors,
 		"cola_enqueue_panics", puerta.EnqueuePanics,
 		"descartes_perfil_pasivo", puerta.DescartesPasivos,
+		"descartes_grupo", puerta.DescartesGrupo,
 	)
 
 	if d.Cola != nil {

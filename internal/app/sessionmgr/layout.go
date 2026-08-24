@@ -32,6 +32,11 @@ const (
 	// colaDBName es la COLA DE ENTRANTES (Plan 051): una BD SQLite propia a nivel de <data_dir>, fuera
 	// de sessions/ porque es GLOBAL a todas las sesiones (ver ColaDB).
 	colaDBName = "cola_entrantes.db"
+	// cajeroSockName es el SOCKET DE INFERENCIA del worker-cajero (Plan 044 · Ola 1.6 · T1.6-2): el canal
+	// por el que `agent serve` le pide una inferencia a `agent cajero`, que es el único proceso que puede
+	// hablar con Ollama (REQ-051.10). Vive a nivel de <data_dir>, junto a la cola y por el mismo motivo:
+	// es del EDGE, no de una sesión (ver CajeroSock).
+	cajeroSockName = "cajero.sock"
 )
 
 // uuidPattern valida el formato UUID canónico (8-4-4-4-12 hex). El session_id es SIEMPRE un UUIDv4
@@ -113,6 +118,30 @@ func (l Layout) StoreDB(id string) (string, error) {
 // ciclo en cuanto los tests de sessionmgr importan db, cosa que ya hacen.
 func (l Layout) ColaDB() db.ColaDBPath {
 	return db.ColaDBPath(filepath.Join(l.dataDir, colaDBName))
+}
+
+// CajeroSock devuelve <data_dir>/cajero.sock: el Unix domain socket por el que el daemon le pide
+// inferencia al worker-cajero (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045).
+//
+// NO RECIBE session_id, igual que ColaDB y por una razón todavía más fuerte: el servicio de inferencia
+// es del EDGE —un proceso, un Ollama por máquina—, no de una sesión de WhatsApp. El propio contrato lo
+// dice dejando `InferenceRequest.session_id` normalmente VACÍO.
+//
+// SÍ CUELGA DEL data_dir, Y NO DE UN DIRECTORIO GLOBAL DE LA MÁQUINA, aunque el cajero pueda atender
+// varias instalaciones a la vez: el CLIENTE es el `agent serve` de cada instalación, y cada uno conoce
+// exactamente un directorio —el suyo—. Con un socket por data_dir, cada daemon busca en su propia casa y
+// no hay nada que configurar; con uno global habría que enseñarle a cada daemon dónde está el de los
+// demás. El cajero levanta N listeners sobre el MISMO servidor de inferencia, así que el aforo de Ollama
+// sigue siendo uno (ver cmd/agent/cajero.go).
+//
+// Al no haber id que validar no hay ruta que pueda escaparse de data_dir, así que no devuelve error
+// (mismo criterio que DataDir/SessionsRoot/ColaDB).
+//
+// Devuelve `string` y no un tipo propio, a diferencia de ColaDB: allí el tipo existía para impedir que
+// la BD se abriera por el constructor equivocado (los pragmas son por-conexión y la elección era
+// invisible), y aquí no hay dos formas de abrir un socket que difieran en algo que no se vea.
+func (l Layout) CajeroSock() string {
+	return filepath.Join(l.dataDir, cajeroSockName)
 }
 
 // DEKPath devuelve <data_dir>/keys/<session_id>.key (DEK de la sesión, custodiada por FileCustody).

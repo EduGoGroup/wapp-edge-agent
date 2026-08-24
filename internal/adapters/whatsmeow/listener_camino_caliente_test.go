@@ -104,70 +104,58 @@ func TestListener_NoTienePorDondeEntregarNiClasificar(t *testing.T) {
 	}
 }
 
-// TestOnMessage_CaminoCaliente_SoloElCarrilRapidoLocalYElEnqueue es el ángulo de COMPORTAMIENTO.
+// TestOnMessage_CaminoCaliente_SoloElEnqueue es el ángulo de COMPORTAMIENTO.
 //
-// Las llamadas del camino caliente son EXACTAMENTE DOS, y las dos son locales:
-//  1. `fastLane` — un regex léxico en memoria (µs). NO es «el clasificador»: no toca Ollama, no abre un
-//     socket y no puede bloquear. Su semántica es «este texto no necesita LLM», no «este texto significa X».
-//  2. `Enqueue` — el INSERT cifrado en SQLite local, y EL ÚLTIMO ACTO DEL HANDLER.
+// La llamada del camino caliente es EXACTAMENTE UNA, y es local: `Enqueue`, el INSERT cifrado en SQLite.
+// Y es EL ÚLTIMO ACTO DEL HANDLER — no es un detalle de orden, es lo que sostiene la promesa «mensaje
+// durable ANTES del acuse». Cualquier cosa que se colara detrás (una entrega, una métrica remota, un
+// flush) volvería a atar el hilo del socket a un tercero.
 //
-// Que el `Enqueue` sea el último no es un detalle de orden: es lo que sostiene la promesa «mensaje durable
-// ANTES del acuse». Cualquier cosa que se colara detrás (una entrega, una métrica remota, un flush) volvería
-// a atar el hilo del socket a un tercero.
+// 🔴 ERAN DOS HASTA EL 2026-08-24, y la que se fue es `fastLane` (Plan 044 · Ola 1.6 · T1.6-5 ·
+// ADR-0045). Era un regex léxico en memoria —barato, local, incapaz de bloquear— y por eso este test lo
+// toleraba explícitamente; lo que decidía era si la fila nacía ya resuelta para que el cajero no la
+// reclamara. Bajo pull el Edge no clasifica, así que esa pregunta no se hace: el carril rápido se mudó al
+// motor de flujos del Cloud (ADR-0044 §1.B).
+//
+// ⚠️ EL TEST QUEDA MÁS FUERTE, NO MÁS DÉBIL: pasar de «exactamente estas dos» a «exactamente esta una» es
+// una aserción más estrecha. Cualquier colaborador que alguien reintroduzca en el hilo de whatsmeow —el
+// fastlane incluido— la rompe.
 //
 // ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO:
-//   - añadir cualquier llamada a un colaborador registrado detrás del `Enqueue` ⇒ FALLA la aserción de que
-//     la última llamada es `enqueue`;
-//   - reintroducir una clasificación o una entrega en `onMessage` con un doble que se registre ⇒ FALLA el
-//     recuento exacto de dos llamadas;
-//   - mover la rama del fastlane por delante de la de `text == ""` en el switch de `enqueueCola` ⇒ FALLA el
-//     subtest del mensaje sin texto, que exige que el carril rápido ni se consulte (es la regresión que
-//     falsearía el desglose de INV-051.3, la que T1.8 vino a arreglar).
-func TestOnMessage_CaminoCaliente_SoloElCarrilRapidoLocalYElEnqueue(t *testing.T) {
-	t.Run("texto normal: fastlane local y luego enqueue, y nada mas", func(t *testing.T) {
+//   - añadir cualquier llamada a un colaborador registrado, antes o después del `Enqueue` ⇒ FALLA el
+//     recuento exacto de UNA llamada;
+//   - reintroducir en `enqueueCola` la rama que resolvía la fila sin texto ⇒ FALLA el subtest del mensaje
+//     sin texto, que exige que nazca `nuevo` y sin sobre.
+func TestOnMessage_CaminoCaliente_SoloElEnqueue(t *testing.T) {
+	t.Run("texto normal: enqueue, y nada mas", func(t *testing.T) {
 		calls := &callLog{}
 		cola := &spyCola{calls: calls}
-		l := listenerConCola(cola, WithFastLane(func(string) bool {
-			calls.record("fastlane")
-			return false
-		}))
+		l := listenerConCola(cola)
 
 		l.handleEvent(context.Background(), liveMessage("MSG-HOT", "quiero dos empanadas"))
 
 		got := calls.snapshot()
-		if len(got) != 2 || got[0] != "fastlane" || got[1] != "enqueue" {
-			t.Fatalf("llamadas = %v, se esperaba exactamente [fastlane enqueue]. "+
-				"El camino caliente del listener es un regex en memoria y un INSERT local: ni Ollama ni la nube "+
-				"(INV-051.2, T3.0)", got)
-		}
-		// Redundante con lo de arriba, y a propósito: es LA afirmación del bloque (f) escrita como tal, para
-		// que un cambio en la primera llamada no se lleve por delante la segunda.
-		if got[len(got)-1] != "enqueue" {
-			t.Fatalf("la última llamada del handler fue %q: el Enqueue tiene que ser el ÚLTIMO acto "+
-				"(es lo que hace durable el mensaje ANTES del acuse)", got[len(got)-1])
+		if len(got) != 1 || got[0] != "enqueue" {
+			t.Fatalf("llamadas = %v, se esperaba exactamente [enqueue]. "+
+				"El camino caliente del listener es UN INSERT local: ni un regex, ni Ollama, ni la nube "+
+				"(INV-051.2, T3.0 + T1.6-5)", got)
 		}
 	})
 
-	t.Run("sin texto: ni el carril rapido se consulta", func(t *testing.T) {
+	t.Run("sin texto: se encola igual, nueva y sin sobre", func(t *testing.T) {
 		calls := &callLog{}
 		cola := &spyCola{calls: calls}
-		l := listenerConCola(cola, WithFastLane(func(string) bool {
-			calls.record("fastlane")
-			return true
-		}))
+		l := listenerConCola(cola)
 
 		sinTexto := liveMessage("MSG-IMG", "")
 		sinTexto.Message = nil // imagen / audio / sticker: no hay cuerpo textual
 		l.handleEvent(context.Background(), sinTexto)
 
 		if got := calls.snapshot(); len(got) != 1 || got[0] != "enqueue" {
-			t.Fatalf("llamadas = %v, se esperaba solo [enqueue]. La rama `text == \"\"` va POR DELANTE del "+
-				"fastlane: el carril rápido devuelve true para la cadena vacía, así que consultarlo aquí "+
-				"contaría como `fastlane` todo el tráfico no textual y la telemetría mentiría sobre cuánto LLM "+
-				"ahorra el léxico (T1.8)", got)
+			t.Fatalf("llamadas = %v, se esperaba solo [enqueue]", got)
 		}
-		if len(cola.got) != 1 || cola.got[0].IntentJSON != `{"omitido":"sin_texto"}` {
-			t.Fatalf("la fila no nació con la marca de omisión por falta de texto: %v", colaWAIDs(cola.got))
+		if len(cola.got) != 1 || cola.got[0].Estado != app.EstadoNuevo || cola.got[0].IntentJSON != "" {
+			t.Fatalf("la fila de un mensaje sin texto debe nacer `nuevo` y SIN sobre: %+v", colaWAIDs(cola.got))
 		}
 	})
 
@@ -198,20 +186,21 @@ func TestOnMessage_CaminoCaliente_SoloElCarrilRapidoLocalYElEnqueue(t *testing.T
 	})
 }
 
-// TestOnMessage_CaminoCaliente_ElEcoPropioNiSiquieraLlegaAlCarrilRapido cierra el filtro 1 de la puerta por
-// el mismo criterio de «coste cero»: el eco propio se descarta ANTES de tocar nada, así que ni el regex ni
-// el store se llegan a consultar.
+// TestOnMessage_CaminoCaliente_ElEcoPropioNiSiquieraLlegaAlStore cierra el filtro 1 de la puerta por el
+// mismo criterio de «coste cero»: el eco propio se descarta ANTES de tocar nada, así que el store no se
+// llega a consultar.
+//
+// (Se llamaba `…NiSiquieraLlegaAlCarrilRapido` y comprobaba que tampoco se gastaba el regex del fastlane.
+// El fastlane se retiró de este listener el 2026-08-24 con el push, T1.6-5 · ADR-0045; lo que el test
+// cuida —que el descarte sea anterior a TODO— no cambia.)
 //
 // ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO: mover el filtro `e.Info.IsFromMe` por detrás del Enqueue (o quitarlo) ⇒
 // aparecen llamadas y una fila con un mensaje PROPIO, que además rompería la propiedad sobre la que el
 // despachador construye `IsFromMe = false` (ver app.ColaMeta).
-func TestOnMessage_CaminoCaliente_ElEcoPropioNiSiquieraLlegaAlCarrilRapido(t *testing.T) {
+func TestOnMessage_CaminoCaliente_ElEcoPropioNiSiquieraLlegaAlStore(t *testing.T) {
 	calls := &callLog{}
 	cola := &spyCola{calls: calls}
-	l := listenerConCola(cola, WithFastLane(func(string) bool {
-		calls.record("fastlane")
-		return false
-	}))
+	l := listenerConCola(cola)
 
 	eco := liveMessage("MSG-ECO", "esto lo mandé yo")
 	eco.Info.IsFromMe = true
@@ -219,7 +208,7 @@ func TestOnMessage_CaminoCaliente_ElEcoPropioNiSiquieraLlegaAlCarrilRapido(t *te
 
 	if got := calls.snapshot(); len(got) != 0 {
 		t.Fatalf("llamadas = %v, no debía haber ninguna: el eco propio se descarta en la puerta, antes de "+
-			"gastar un regex o un INSERT", got)
+			"gastar un INSERT", got)
 	}
 	if len(cola.got) != 0 {
 		t.Fatalf("el eco propio generó %d filas: no existe fila de la cola con un mensaje propio, y el "+

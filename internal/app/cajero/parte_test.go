@@ -7,6 +7,12 @@ package cajero
 // `intent_circuit` vacío—, es una señal INVENTADA: un taskset con valor por defecto, o un parte que
 // sigue saliendo cuando el cajero ya no puede escribirlo. Por eso los tests de abajo miran tanto lo que
 // se publica como lo que NO se publica.
+//
+// ⚠️ EL PARTE IMPORTA MÁS DESDE T1.6-2 (ADR-0045), no menos: es el mismo proceso que decide si una
+// `inference_request` del Cloud se sirve, así que su circuito es ahora la señal que dice si el Edge puede
+// clasificar. Lo que cambió es QUIÉN alimenta el p50 —antes el bucle al clasificar, hoy el servidor de
+// inferencia— y por eso los tests que necesitan una muestra medida piden una inferencia en vez de
+// encolar un lote.
 
 import (
 	"context"
@@ -17,7 +23,6 @@ import (
 	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
-	"github.com/EduGoGroup/wapp-edge-intent/classifier"
 )
 
 // escritorParteFake guarda todos los partes publicados y puede fallar a voluntad.
@@ -57,11 +62,11 @@ func (e *escritorParteFake) ultimo() (app.ParteWorker, bool) {
 // puede leer en absoluto.
 func nuevoCajeroDePrueba(t *testing.T, deps Deps) *Cajero {
 	t.Helper()
-	if deps.Clasificador == nil {
-		deps.Clasificador = &clasificadorFake{}
-	}
 	if deps.Breaker == nil {
 		deps.Breaker = nuevoBreakerFake()
+	}
+	if deps.Log == nil {
+		deps.Log = &logCaptura{}
 	}
 	c, err := New(deps)
 	if err != nil {
@@ -78,10 +83,10 @@ func TestParte_SePublicaAlArrancar(t *testing.T) {
 	cola := &colaFake{}
 
 	if _, err := correr(t, Deps{
-		Colas:        []ColaNombrada{{Nombre: "inst-a", Cola: cola, Parte: esc}},
-		Clasificador: &clasificadorFake{},
-		Breaker:      nuevoBreakerFake(),
-		Log:          &logCaptura{},
+		Colas:   []ColaNombrada{{Nombre: "inst-a", Cola: cola, Parte: esc}},
+		Ollama:  &chateadorFake{},
+		Breaker: nuevoBreakerFake(),
+		Log:     &logCaptura{},
 	}, 2); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -93,36 +98,29 @@ func TestParte_SePublicaAlArrancar(t *testing.T) {
 
 // TestParte_LlevaLasTresSeñales: circuito, taskset y p50 viajan en el mismo parte.
 //
-// El p50 se comprueba DESPUÉS de una clasificación real del bucle: es la única forma de ver que el
-// histograma está CABLEADO (que procesar() observa la latencia) y no sólo escrito. Se afirma «> 0» y no
-// un valor concreto porque lo que se publica es la COTA SUPERIOR del bucket donde cayó la muestra
-// (bordesInferenciaMS), y con un clasificador falso que responde en microsegundos esa cota es el primer
+// El p50 se comprueba DESPUÉS de una inferencia real SERVIDA: es la única forma de ver que el histograma
+// está CABLEADO (que el servidor observa la latencia) y no sólo escrito. Se afirma «> 0» y no un valor
+// concreto porque lo que se publica es la COTA SUPERIOR del bucket donde cayó la muestra
+// (bordesInferenciaMS), y con un proveedor falso que responde en microsegundos esa cota es el primer
 // borde de la rejilla — un número que cambiaría si algún día se recalibra la rejilla, y este test no va
 // de eso.
 func TestParte_LlevaLasTresSeñales(t *testing.T) {
 	esc := &escritorParteFake{}
-	cola := &colaFake{pendientes: []*app.ColaLote{loteDe("s1", "quiero una pizza")}}
-	cls := &clasificadorFake{res: classifier.Classification{Intent: "crear_pedido", Confidence: 0.9}}
 
-	c, err := correr(t, Deps{
-		Colas:        []ColaNombrada{{Nombre: "inst-a", Cola: cola, Parte: esc}},
-		Clasificador: cls,
-		Breaker:      nuevoBreakerFake(),
-		Log:          &logCaptura{},
-	}, 3)
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if c.Clasificados() != 1 {
-		t.Fatalf("el test necesita una inferencia MEDIDA para que el p50 exista; clasificados=%d", c.Clasificados())
+	c, s := servidorDe(t, Deps{
+		Colas:   []ColaNombrada{{Nombre: "inst-a", Cola: &colaFake{}, Parte: esc}},
+		Ollama:  &chateadorFake{salida: `{"intent":"crear_pedido"}`},
+		Breaker: nuevoBreakerFake(),
+		Log:     &logCaptura{},
+	})
+
+	if _, err := s.Inferir(context.Background(), peticionDe("clasifica esto", 5*time.Second)); err != nil {
+		t.Fatalf("el test necesita una inferencia MEDIDA para que el p50 exista: %v", err)
 	}
 	if n := c.inferencia.muestras(); n != 1 {
-		t.Fatalf("una inferencia ⇒ una muestra en el histograma; hay %d (¿procesar() no observa la latencia?)", n)
+		t.Fatalf("una inferencia ⇒ una muestra en el histograma; hay %d (¿el servidor no observa la latencia?)", n)
 	}
 
-	// El parte del arranque se publicó con el histograma vacío; el que interesa es uno tomado DESPUÉS de
-	// la inferencia. El ctx de `correr` ya está cancelado, así que se publica con uno limpio (publicarParte
-	// no hace nada con el contexto cancelado, y eso es justo lo que se quiere durante la parada).
 	c.publicarParte(context.Background())
 
 	p, hay := esc.ultimo()
@@ -156,7 +154,6 @@ func TestParte_TasksetDesconocido_ViajaVacío(t *testing.T) {
 	esc := &escritorParteFake{}
 	c := nuevoCajeroDePrueba(t, Deps{
 		Colas: []ColaNombrada{{Nombre: "inst-a", Cola: &colaFake{}, Parte: esc}},
-		Log:   &logCaptura{},
 	})
 
 	if c.Taskset() != "" {
@@ -210,30 +207,29 @@ func TestParte_VeredictoDeAfinidadSeRetiene(t *testing.T) {
 	}
 }
 
-// TestParte_ErrorDelEscritorNoRompeElBucle: el parte es telemetría, la cola es el trabajo. Un buzón que
-// falla en cada publicación no puede impedir que se clasifique, ni hacer que Run devuelva error (el
-// supervisor lo trataría como una caída y reiniciaría el worker en bucle por un fallo de telemetría).
+// TestParte_ErrorDelEscritorNoRompeElBucle: el parte es TELEMETRÍA, y ninguna de las dos cosas que este
+// proceso hace de verdad —barrer leases y servir inferencia— puede depender de él. Un buzón que falla en
+// cada publicación no puede hacer que Run devuelva error (el supervisor lo trataría como una caída y
+// reiniciaría el worker en bucle por un fallo de telemetría) ni contaminar los contadores del cajero.
 // Lo que sí tiene que hacer es DECIRLO: en Warn, con la cola nombrada.
 func TestParte_ErrorDelEscritorNoRompeElBucle(t *testing.T) {
 	esc := &escritorParteFake{err: errors.New("BD bloqueada")}
-	cola := &colaFake{pendientes: []*app.ColaLote{loteDe("s1", "quiero una pizza")}}
-	cls := &clasificadorFake{res: classifier.Classification{Intent: "crear_pedido", Confidence: 0.9}}
 	log := &logCaptura{}
 
 	c, err := correr(t, Deps{
-		Colas:        []ColaNombrada{{Nombre: "inst-a", Cola: cola, Parte: esc}},
-		Clasificador: cls,
-		Breaker:      nuevoBreakerFake(),
-		Log:          log,
+		Colas:   []ColaNombrada{{Nombre: "inst-a", Cola: &colaFake{}, Parte: esc}},
+		Ollama:  &chateadorFake{},
+		Breaker: nuevoBreakerFake(),
+		Log:     log,
 	}, 3)
 	if err != nil {
 		t.Fatalf("un fallo al publicar el parte NO puede hacer que Run devuelva error: %v", err)
 	}
-	if c.Clasificados() != 1 {
-		t.Errorf("el bucle debe seguir clasificando con el buzón roto: clasificados=%d", c.Clasificados())
+	if len(esc.todos()) == 0 {
+		t.Fatal("el test necesita que se haya INTENTADO publicar; si no, el error del buzón no se ejercita")
 	}
 	if c.Fallos() != 0 {
-		t.Errorf("un fallo de telemetría NO es un fallo del cajero: fallos=%d", c.Fallos())
+		t.Errorf("un fallo de telemetría NO es un fallo del proveedor de LLM: fallos=%d", c.Fallos())
 	}
 
 	e, ok := log.buscar("no se pudo publicar el parte")
@@ -254,16 +250,15 @@ func TestParte_ErrorDelEscritorNoRompeElBucle(t *testing.T) {
 // `intent_circuit` vacío para siempre y sin ningún síntoma.
 func TestParte_SePublicaEnTodasLasColas(t *testing.T) {
 	escA, escB := &escritorParteFake{}, &escritorParteFake{}
-	colaA, colaB := &colaFake{}, &colaFake{}
 
 	c, err := correr(t, Deps{
 		Colas: []ColaNombrada{
-			{Nombre: "inst-a", Cola: colaA, Parte: escA},
-			{Nombre: "inst-b", Cola: colaB, Parte: escB},
+			{Nombre: "inst-a", Cola: &colaFake{}, Parte: escA},
+			{Nombre: "inst-b", Cola: &colaFake{}, Parte: escB},
 		},
-		Clasificador: &clasificadorFake{},
-		Breaker:      nuevoBreakerFake(),
-		Log:          &logCaptura{},
+		Ollama:  &chateadorFake{},
+		Breaker: nuevoBreakerFake(),
+		Log:     &logCaptura{},
 	}, 2)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -293,9 +288,9 @@ func TestParte_ColaSinBuzon_NoRompeNada(t *testing.T) {
 			{Nombre: "sin-buzon", Cola: &colaFake{}}, // Parte nil a propósito
 			{Nombre: "con-buzon", Cola: &colaFake{}, Parte: esc},
 		},
-		Clasificador: &clasificadorFake{},
-		Breaker:      nuevoBreakerFake(),
-		Log:          &logCaptura{},
+		Ollama:  &chateadorFake{},
+		Breaker: nuevoBreakerFake(),
+		Log:     &logCaptura{},
 	}, 2)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
@@ -320,43 +315,43 @@ func TestParteRancio_EsTresVecesLaCadencia(t *testing.T) {
 }
 
 // TestParteRancio_SigueCubriendoElPeorCasoDelBucle ata `app.ParteRancio` a las constantes de las que su
-// cálculo DEPENDE, que hoy viven en tres ficheros distintos y nadie relaciona.
+// cálculo DEPENDE, que viven en ficheros distintos y nadie relaciona.
 //
-// El 3× de ParteRancio no es un número redondo: está derivado del peor retraso del ESCRITOR. El parte se
-// publica al principio de cada vuelta del bucle del cajero, en un select no bloqueante — pero la vuelta
-// siguiente se queda esperando plaza del semáforo (paso 3 de Cajero.Run), y con MAX_CONCURRENT=1 esa
-// espera dura una `procesar` entera: una inferencia (Timeout) más el cierre del lote (cierreTimeout).
-// O sea, el intervalo máximo entre dos publicaciones es ~`Timeout + cierreTimeout + ParteCada`.
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 EL PEOR CASO ENCOGIÓ EN T1.6-2, Y ESA ES LA MITAD IMPORTANTE DE ESTA REESCRITURA
+// ─────────────────────────────────────────────────────────────────────────────
+// Hasta el ADR-0045 el término dominante de esta suma era UNA INFERENCIA ENTERA: el parte se publicaba
+// desde el bucle, y la vuelta siguiente se quedaba esperando plaza del semáforo mientras una `procesar`
+// clasificaba. El peor intervalo entre dos publicaciones era `Timeout + cierre + ParteCada`, y con eso
+// el margen estaba tan justo que subir el plazo de inferencia a 60 s lo rompía.
 //
-// 🔴 POR QUÉ ESTE TEST Y NO UN COMENTARIO. Ese margen lo rompe un cambio de UNA constante, y el cambio
-// es previsible: el timeout de inferencia ya se movió una vez tras medir en el VPS (3 s abortaba el
-// 86,9 % de las inferencias), y un VPS más lento invita a subirlo otra vez. Con 60 s el peor caso pasa a
-// 60+5+30 = 95 s > 90 s, y a partir de ahí un Edge PERFECTAMENTE SANO publica `intent_circuit`
-// alternando lleno y vacío. Eso es peor que el hueco permanente: parece un breaker inestable, manda a
-// alguien a investigar un problema que no existe, y entrena a todos a ignorar el campo — que es como se
-// pierde una señal de salud para siempre.
+// Hoy el bucle NO TOMA PLAZA: sólo atiende dos latidos en un select no bloqueante y espera al
+// despertador (ver «EL BUCLE YA NO CLASIFICA» en cajero.go). Las inferencias las sirve OTRA goroutine, la
+// del servidor sobre el socket, y por lentas que sean no pueden retrasar el parte ni un milisegundo.
+// Consecuencia directa y verificable aquí: la subida de DefaultInferenceTimeoutMS de 15 s a 45 s —que con
+// la aritmética vieja habría dejado el margen en negativo— no toca este cálculo.
 //
-// Lo que el test NO puede hacer es medir el intervalo REAL bajo carga: eso es campo (UAT con backlog),
-// y sigue pendiente. Esto sólo garantiza que la ARITMÉTICA que sostiene el 90 s no se rompa sin que
-// nadie se entere.
+// LO QUE QUEDA EN EL PEOR CASO: el tick de ParteCada, más lo que tarde el bucle en volver a pasar por el
+// select (un poll), más lo que cueste la publicación anterior (parteTimeout por cola).
 //
-// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO (ejecutadas): DefaultInferenceTimeoutMS 15000 → 60000; cierreTimeout
-// 5 s → 40 s; app.ParteCada 30 s → 60 s; app.ParteRancio 3× → 2×.
+// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO: app.ParteCada 30 s → 60 s; app.ParteRancio 3× → 2×; parteTimeout
+// 2 s → 40 s; DefaultPollMS 500 → 30.000.
 func TestParteRancio_SigueCubriendoElPeorCasoDelBucle(t *testing.T) {
-	peorCaso := time.Duration(DefaultInferenceTimeoutMS)*time.Millisecond + cierreTimeout + app.ParteCada
+	// UNA instalación, que es el 99 % de los despliegues. Con N el término del escritor es N·parteTimeout,
+	// y el margen que se comprueba abajo dice cuántas caben.
+	poll := DefaultPollMS * time.Millisecond
+	peorCaso := app.ParteCada + poll + parteTimeout
 
 	if peorCaso >= app.ParteRancio {
-		t.Fatalf("el peor retraso del escritor (%v = inferencia %v + cierre %v + tick %v) alcanza o supera "+
+		t.Fatalf("el peor retraso del escritor (%v = tick %v + poll %v + publicación %v) alcanza o supera "+
 			"ParteRancio (%v): un cajero SANO publicaría partes que el lector tira por rancios, y la nube "+
-			"vería intent_circuit parpadeando. Sube ParteRancio con el número medido escrito al lado, o baja "+
-			"el timeout de inferencia — pero no dejes los dos así",
-			peorCaso, time.Duration(DefaultInferenceTimeoutMS)*time.Millisecond, cierreTimeout,
-			app.ParteCada, app.ParteRancio)
+			"vería intent_circuit parpadeando",
+			peorCaso, app.ParteCada, poll, parteTimeout, app.ParteRancio)
 	}
 
-	// Y que quede margen de verdad, no un empate técnico: el cálculo del doc de ParteRancio dice «~50 s
-	// < 90 s», o sea que sobra cerca de un tick entero. Si el margen baja de un ParteCada, la ventana ya
-	// no absorbe una tardanza extra (una reintento del cierre contra la BD con busy_timeout, p. ej.).
+	// Y que quede margen de verdad, no un empate técnico: si el margen baja de un ParteCada, la ventana ya
+	// no absorbe una tardanza extra (una publicación que reintenta contra la BD con busy_timeout, p. ej.)
+	// ni deja sitio para las colas de una máquina multi-instalación.
 	if margen := app.ParteRancio - peorCaso; margen < app.ParteCada {
 		t.Errorf("el margen sobre el peor caso es %v, menos de un tick (%v): la ventana ya no absorbe una "+
 			"tardanza extra del escritor y el parpadeo pasa a depender de la suerte", margen, app.ParteCada)

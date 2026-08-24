@@ -51,7 +51,7 @@ import (
 // Devuelve además el RELAY de auth de operador (Plan 033 Ola 3 / ADR-0025): el mismo Adapter satisface
 // edgeauth.Relay (login/refresh/logout por el stream). Cuando no hay endpoint (LogMux) el relay es nil: el
 // caller cae a un relay offline (login siempre falla; no hay login offline de primera vez).
-func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox, intentStack *IntentStack, collector cloudlink.HealthCollector, diagBuilder cloudlink.DiagnosticsBuilder) (sessionmgr.CloudLinkMux, edgeauth.Relay) {
+func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, ob app.Outbox, intentStack *IntentStack, collector cloudlink.HealthCollector, diagBuilder cloudlink.DiagnosticsBuilder, inferencia app.ServidorInferencia) (sessionmgr.CloudLinkMux, edgeauth.Relay) {
 	if cfg.CloudLink.Endpoint == "" {
 		log.Info("CloudLink deshabilitado (sin endpoint): usando LogMux por sesión para diagnóstico")
 		return cloudlink.NewLogMux(log), nil
@@ -81,6 +81,11 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, o
 		// REGISTRA pero no bloquea mientras se corre el gate en campo sin haberlo visto bloquear nunca.
 		// Por defecto false (fail-closed real). WAPP_AGENT_CLOUDLINK_LEASE_SHADOW_MODE.
 		cloudlink.WithLeaseShadowMode(cfg.CloudLink.LeaseShadowMode),
+		// Servicio de inferencia (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045): con él, un `inference_request`
+		// del Cloud se sirve por el socket del cajero. nil-safe (sin él ⇒ OLLAMA_DOWN).
+		cloudlink.WithServidorInferencia(inferencia),
+		cloudlink.WithInferenciaMaxInflight(cfg.Inference.MaxInflight),
+		cloudlink.WithInferenciaLeaseGracia(time.Duration(cfg.Inference.LeaseGraciaMS)*time.Millisecond),
 	)
 	go func() {
 		_ = adapter.Run(ctx)
@@ -93,7 +98,14 @@ func BuildMux(ctx context.Context, cfg config.Config, log sharedlogger.Logger, o
 	// lease_gate=true (sin validator no hay gate que poner en sombra).
 	log.Info("CloudLink habilitado (multi-sesión): un stream multiplexado por session_id",
 		"endpoint", cfg.CloudLink.Endpoint, "lease_gate", newValidator != nil, "sealed_transit", cloudEncPub != nil,
-		"lease_shadow_mode", cfg.CloudLink.LeaseShadowMode)
+		"lease_shadow_mode", cfg.CloudLink.LeaseShadowMode,
+		// `sealed_transit` y `inferencia` van juntos a propósito: SIN pública de cifrado, un
+		// inference_request NO se puede responder (la salida sólo viaja sellada) y el carril lo rechaza
+		// antes de llamar al proveedor. Verlos en la misma línea es lo que permite entender un Edge que
+		// responde a todo con un error sin causa nombrada.
+		"inferencia", inferencia != nil,
+		"inferencia_max_inflight", cfg.Inference.MaxInflight,
+		"inferencia_lease_gracia_ms", cfg.Inference.LeaseGraciaMS)
 	return adapter, adapter
 }
 

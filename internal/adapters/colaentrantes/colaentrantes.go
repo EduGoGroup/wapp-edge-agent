@@ -139,23 +139,14 @@ type Store struct {
 	// corresponder a 20 filas rescatadas, y cada inferencia tirada es un coste de LLM que sí se pagó.
 	cierresDescartadosPorFence atomic.Int64
 
-	// despachosSinIntentNoAplicados acumula las veces que DespacharSinIntent NO tocó nada: el
-	// despachador agotó el presupuesto y fue a escribir el sobre de omisión, pero la fila ya había dejado
-	// de estar `nuevo`/`tomado` — el cajero la cerró justo antes. El mensaje sale igual, y sale MEJOR (con
-	// su intent real), así que esto NO es una degradación: es la carrera resolviéndose del lado bueno.
+	// 🔴 AQUÍ VIVÍA `despachosSinIntentNoAplicados`, RETIRADO EL 2026-08-24 CON SU MÉTODO (Plan 044 · Ola
+	// 1.6 · T1.6-5 · ADR-0045). Contaba las veces que `DespacharSinIntent` NO tocaba nada: el despachador
+	// agotaba su presupuesto de 4 s y iba a escribir el sobre de omisión, pero el cajero había cerrado la
+	// fila un instante antes. Era el borde de la calibración —presupuesto de 4000 ms contra una p95 medida
+	// de 3.736 ms—, y por eso no era un número raro sino una carrera que se corría en CADA mensaje lento.
 	//
-	// SE CUENTA AQUÍ PORQUE NADIE MÁS PUEDE. DespacharSinIntent devuelve solo `error`, y el no-op no es
-	// un error, así que desde fuera «escribí la omisión» y «llegué tarde» son indistinguibles.
-	// El despachador (T3.4) contará sus DECISIONES por motivo; este número es el complemento exacto —
-	// «de esas decisiones, cuántas no llegaron a disco»— y con los dos se deriva el tercero. Por eso no
-	// se añade aquí un `DespachadasSinIntent` (sellos que sí aterrizaron): sería `decididas - este`,
-	// duplicando una serie que la Ola 4 ya va a publicar.
-	//
-	// ⚠️ Y NO ES UN NÚMERO RARO, es el borde de la calibración: el presupuesto son 4000 ms y la p95
-	// MEDIDA de una inferencia es de 3.736 ms. Los dos números están pegados a propósito, así que esta
-	// carrera se corre en cada mensaje lento. Un valor que sube dice que el presupuesto está justo — que
-	// se está pagando la espera entera para acabar recibiendo el intent igualmente.
-	despachosSinIntentNoAplicados atomic.Int64
+	// Se va entero porque la carrera dejó de existir: no hay presupuesto que agotar. Y la medida que mató
+	// aquel diseño explica el número: de 430 inferencias, UNA cupo en la ventana.
 
 	// seq es la secuencia monotónica del orden de la cola, sembrada de MAX(seq) en New. Atómica: el Edge
 	// encola desde varios listeners (uno por sesión) en paralelo.
@@ -433,6 +424,15 @@ func (s *Store) RescatadasPorLease() int64 { return s.rescatadasPorLease.Load() 
 // CierresDescartadosPorFence devuelve cuántos CIERRES DE LOTE se han descartado enteros porque el fence
 // (estado `tomado` + mismo `claim_token`) ya no mordía: el lote había dejado de ser de ese cajero. Cuenta
 // LOTES, no filas — es el número de inferencias pagadas y tiradas—. Acumulado monotónico, sin PII.
+//
+// ✅ EL HUECO DE LA RAMA SE CERRÓ EL 2026-08-24 (T1.6-2). Entre T1.6-5 y T1.6-2 este número subía EN CADA
+// LOTE y no era un incidente: el despachador ya entregaba la cabeza al instante y la sellaba, así que el
+// cierre del cajero llegaba siempre tarde y su fence no casaba nunca. T1.6-2 retiró el bucle de
+// clasificación, así que hoy NADIE llama a `MarcarClasificado` y este contador vuelve a ser lo que era.
+//
+// 🔴 CERO ES EL VALOR SANO, otra vez y para todas las ramas: un número que crece significa lo de siempre
+// —lease corto o cajeros relevándose—. Y mientras `MarcarClasificado` no tenga llamante, un número que
+// crezca significa además que ALGUIEN VOLVIÓ A CERRAR LOTES, que es una pregunta por derecho propio.
 func (s *Store) CierresDescartadosPorFence() int64 { return s.cierresDescartadosPorFence.Load() }
 
 // pruneTTLLocked borra las filas YA DESPACHADAS más viejas que el TTL. Debe llamarse bajo s.mu.
@@ -477,8 +477,12 @@ func (s *Store) pruneTTLLocked(ctx context.Context, nowUnix int64) error {
 //
 //  1. `despachado` — ya salieron al cable (cloudlink/outbox las tienen). Son basura pura: se borran
 //     de una en una, las de menor seq.
-//  2. `clasificado` — tienen su intent y el claim NUNCA las vuelve a concatenar, así que borrarlas es
+//  2. `clasificado` — filas HEREDADAS de un binario anterior a T1.6-5 (el estadio se disolvió con el
+//     push, ADR-0045). Traen su intent y el claim NUNCA las vuelve a concatenar, así que borrarlas es
 //     PÉRDIDA (ese mensaje no se despachará) pero NO abre hueco. Se borran las de menor seq.
+//     ⚠️ ESTA CAPA SE VACÍA SOLA a medida que las colas de campo se drenan; el día que no queden filas
+//     `clasificado` en ningún disco, se salta sin borrar nada y la presión pasa directa a la capa 3.
+//     No se retira porque mientras exista UNA sola de esas filas, sigue siendo el sacrificio barato.
 //  3. `nuevo`/`tomado` — aquí sí hay riesgo de hueco, así que NO se borran filas sueltas: se borra la
 //     CONVERSACIÓN COMPLETA más antigua (la (session_id, chat_jid) con el MIN(seq) más bajo entre sus
 //     filas pendientes) de golpe, y se repite con la siguiente mientras siga faltando sitio. Invariante
@@ -510,7 +514,7 @@ func (s *Store) dropOldestLocked(ctx context.Context) error {
 	}
 	faltan -= int(despachadas)
 
-	// Capa 2: las ya clasificadas (pérdida, pero nunca hueco).
+	// Capa 2: las HEREDADAS en `clasificado` (pérdida, pero nunca hueco). Ver el doc de arriba.
 	var clasificadas int64
 	if faltan > 0 {
 		clasificadas, err = s.dropPorEstadoLocked(ctx, app.EstadoClasificado, faltan)

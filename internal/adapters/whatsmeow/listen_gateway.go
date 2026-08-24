@@ -104,13 +104,6 @@ type ListenGateway struct {
 	//     y listenerOpts): sin él, un gateway sin cola apagaría el filtro entero en silencio.
 	sessionID string
 
-	// clasificadorActivo es el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
-	// T2.12) que serve() pasa al Listener. Gobierna si una fila de la cola nace reclamable por el cajero o
-	// ya resuelta con la marca `apagado`. Es COMPARTIDO por todas las sesiones (un solo clasificador en el
-	// Edge), a diferencia de la cola, que se etiqueta por sesión. nil ⇒ el Listener aplica su default
-	// SEGURO (activo: clasifica de más antes que callar). Lo cablea el factory del sessionmgr.
-	clasificadorActivo func() bool
-
 	// sesionPasiva es el CONSULTOR DE PERFILES de sesión (Plan 046 · Ola 2 · T2.2) que serve() pasa al
 	// Listener: dice si un session_id está marcado como PASIVO en la config que la nube empuja, y con eso el
 	// listener corta el entrante en la puerta (REQ-07). COMPARTIDO por todas las sesiones —un mapa por
@@ -134,17 +127,6 @@ func (g *ListenGateway) SetLatencia(h *latencia.Histograma) {
 		return
 	}
 	g.latencia = h
-}
-
-// SetClasificadorActivo liga el gateway (y su Listener) al interruptor del clasificador de intenciones
-// (Plan 051 Ola 2, T2.12). Se llama ANTES de Listen (al construir el gateway), como el resto de setters.
-// nil se ignora y manda el default del Listener (ACTIVO): un cableado a medias debe clasificar de más, no
-// dejar de clasificar en silencio. No es secreto ni PII.
-func (g *ListenGateway) SetClasificadorActivo(fn func() bool) {
-	if fn == nil {
-		return
-	}
-	g.clasificadorActivo = fn
 }
 
 // SetSesionPasiva liga el gateway (y su Listener) al CONSULTOR DE PERFILES de sesión (Plan 046 · Ola 2 ·
@@ -270,9 +252,9 @@ func (g *ListenGateway) Listen(ctx context.Context, dek []byte) error {
 //
 // 🔴 ESTÁ EXTRAÍDO DE serve() POR UN MOTIVO DE PRUEBA, y conviene que se sepa. serve() exige un
 // *store.Device pareado y un socket vivo contra WhatsApp, así que el CABLE entre los setters (SetCola,
-// SetClasificadorActivo, SetLatencia) y el Listener no era ejercitable por ningún test: borrar cualquiera
-// de estos `append` dejaba los cuatro gates en VERDE y en campo apagaba en silencio la cola, el
-// interruptor del clasificador o el cronómetro de INV-051.2. Con el ensamblaje aquí, un test construye el
+// SetSesionPasiva, SetLatencia) y el Listener no era ejercitable por ningún test: borrar cualquiera
+// de estos `append` dejaba los cuatro gates en VERDE y en campo apagaba en silencio la cola, el filtro
+// de perfiles o el cronómetro de INV-051.2. Con el ensamblaje aquí, un test construye el
 // Listener EXACTAMENTE como lo construye serve() y comprueba que lo cableado llega. El comportamiento no
 // cambia ni una coma respecto de tenerlo inline.
 func (g *ListenGateway) listenerOpts() []ListenerOption {
@@ -300,17 +282,15 @@ func (g *ListenGateway) listenerOpts() []ListenerOption {
 	// lo grita; aquí no se aborta porque este método no decide la política de arranque del daemon.
 	if g.cola != nil && g.sessionID != "" {
 		listenerOpts = append(listenerOpts, WithCola(g.cola))
-		// El interruptor del clasificador viaja DENTRO de este bloque a propósito (T2.12): lo único que
-		// gobierna es el ESTADO EN QUE NACE una fila de la cola, así que sin cola no tiene nada que decidir
-		// y pasarlo solo añadiría una opción inerte. nil se ignora en la opción (default ACTIVO).
-		listenerOpts = append(listenerOpts, WithClasificadorActivo(g.clasificadorActivo))
 	}
-	// Consultor de PERFILES de sesión (Plan 046 · Ola 2 · T2.2). Va FUERA del bloque de la cola, y la
-	// diferencia con el interruptor del clasificador —que sí va dentro— es de naturaleza: aquél solo decide
-	// en qué ESTADO nace una fila, así que sin cola no tiene nada que decidir; éste decide si el mensaje
-	// ENTRA por la puerta, y esa decisión es anterior e independiente de que haya cola donde anotarlo. Un
-	// listener sin cola con una sesión pasiva tiene que descartar igual (y contarlo). nil se ignora en la
-	// opción y manda el default fail-open del Listener.
+	// Consultor de PERFILES de sesión (Plan 046 · Ola 2 · T2.2). Va FUERA del bloque de la cola porque
+	// decide si el mensaje ENTRA por la puerta, y esa decisión es anterior e independiente de que haya cola
+	// donde anotarlo. Un listener sin cola con una sesión pasiva tiene que descartar igual (y contarlo).
+	// nil se ignora en la opción y manda el default fail-open del Listener.
+	//
+	// (Aquí dentro del bloque de la cola viajaba también el INTERRUPTOR DEL CLASIFICADOR, retirado el
+	// 2026-08-24 con el push: gobernaba el estado en que nacía la fila, y desde T1.6-5 todas nacen
+	// `nuevo`. Ver el bloque del enqueue en listener.go.)
 	//
 	// 🔑 Y ESTO SOLO ES CIERTO PORQUE `WithSessionID` SALIÓ DEL BLOQUE DE ARRIBA. El predicado por sí solo no
 	// basta: el Listener pregunta por SU session_id y sin él no pregunta nada.

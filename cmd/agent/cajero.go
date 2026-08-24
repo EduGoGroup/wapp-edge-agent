@@ -3,39 +3,46 @@ package main
 import (
 	"context"
 	"fmt"
-	"path/filepath"
+	"net"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/edgeconfig"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cajerosock"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/cajero"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/config"
-	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/daemon"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/db"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/wiring"
-	"github.com/EduGoGroup/wapp-edge-intent/classifier"
 	"github.com/EduGoGroup/wapp-edge-intent/ollama"
-	"github.com/EduGoGroup/wapp-shared/intents"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 )
-
-// refrescoContrato es cada cuánto el cajero relee el contrato de intenciones de edge.db. Los
-// ConfigUpdate del Cloud los recibe y persiste `agent serve` (es quien tiene el stream CloudLink); el
-// cajero es otro proceso y no se entera del push, así que sondea. 30 s es holgado: cambiar el contrato
-// de intenciones de un tenant no es una operación de segundos.
-const refrescoContrato = 30 * time.Second
 
 // runCajero cablea y ejecuta el WORKER-CAJERO (Plan 051 Ola 2 · T2.2, `agent cajero`), el tercer hijo
 // de `wapp-ctl`. Mismo molde que `agent serve`: misma config, mismo logger, mismo Layout — papel
 // distinto.
 //
-// LO QUE NO TIENE, y es deliberado: NO levanta plano de control propio. Su readiness es «el proceso
-// está vivo» y de eso se encarga el supervisor (`wapp-ctl`, con Restart automático). Un socket /v1
-// aquí sería una segunda superficie que mantener para exponer seis contadores.
+// 🔧 EL CAJERO SÍ LEVANTA UN SOCKET PROPIO DESDE EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-2, ADR-0045),
+// y esta decisión REVIERTE la que estaba escrita aquí. Conviene dejar dicho qué cambió, porque la
+// justificación anterior no era mala: era CORRECTA PARA EL OFICIO QUE EL CAJERO TENÍA ENTONCES.
+//
+//	ANTES decía: «NO levanta plano de control propio. Su readiness es "el proceso está vivo" y de eso se
+//	encarga el supervisor (wapp-ctl, con Restart automático). Un socket /v1 aquí sería una segunda
+//	superficie que mantener para EXPONER SEIS CONTADORES.»
+//
+// Esa frase pesaba un socket contra su beneficio, y el beneficio era telemetría. Con el ADR-0045 el
+// cajero deja de clasificar por iniciativa propia y pasa a SERVIR inferencia al Cloud: el socket ya no
+// expone contadores, es EL ÚNICO CAMINO por el que el trabajo llega al proceso. Sin él, `agent serve`
+// —que es quien recibe el frame `inference_request`— tendría que hablar con Ollama, y eso rompe
+// REQ-051.10. No es que el argumento de antes fuera flojo; es que la pieza cambió de oficio y con ella
+// el lado en que cae la balanza.
+//
+// LO QUE **NO** ES ESE SOCKET, para que nadie lo confunda: no es un plano de control `/v1`. No tiene
+// autenticación de operador, no expone estado ni contadores, y su único endpoint es `POST /inferencia`
+// (internal/adapters/cajerosock). La readiness del cajero SIGUE siendo «el proceso está vivo», y de eso
+// sigue encargándose el supervisor.
 //
 // ✅ REQ-051.10 SE CUMPLE DESDE T3.0 («ningún otro proceso que el worker habla con Ollama»). Durante la
 // Ola 1 no se cumplía: `agent serve` clasificaba en línea con su decorador y había DOS clientes de Ollama
@@ -45,10 +52,17 @@ const refrescoContrato = 30 * time.Second
 // nombre de la pieza.
 func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) error {
 	if !cfg.Intent.Enabled {
-		// Sin clasificador no hay nada que hacer, pero SALIR sería peor: el supervisor lo interpretaría
-		// como caída y lo reiniciaría en bucle. Se aparca hasta SIGTERM, que es la forma honesta de
-		// decir «estoy vivo y no tengo trabajo».
-		log.Warn("cajero: el clasificador de intenciones está DESHABILITADO (WAPP_AGENT_INTENT_ENABLED=false); el worker queda inactivo")
+		// Sin LLM no hay nada que servir, pero SALIR sería peor: el supervisor lo interpretaría como caída
+		// y lo reiniciaría en bucle. Se aparca hasta SIGTERM, que es la forma honesta de decir «estoy vivo
+		// y no tengo trabajo».
+		//
+		// 🔴 CON LA FEATURE APAGADA NO SE LEVANTA EL SOCKET, y esa ausencia ES la respuesta: el daemon no
+		// podrá conectar y traducirá el fallo a OLLAMA_DOWN, que es la verdad operativa —desde `agent
+		// serve`, el proveedor local de LLM es este proceso, y este proceso no está sirviendo—. Levantar el
+		// socket para responder «apagado» exigiría un sexto código en el contrato que no existe, y el que
+		// más se le parece diría algo falso.
+		log.Warn("cajero: el LLM local está DESHABILITADO (WAPP_AGENT_INTENT_ENABLED=false); el worker queda " +
+			"inactivo y NO levanta su socket de inferencia (el daemon verá OLLAMA_DOWN)")
 		<-ctx.Done()
 		return nil
 	}
@@ -89,147 +103,141 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 	}
 	defer cerrarColas()
 
-	// ── El contrato de intenciones ────────────────────────────────────────────
-	// Vive en edge.db (tabla edge_config), que MIGRA `agent serve`: aquí se abre SIN migrar, porque dos
-	// procesos aplicando el mismo set de migraciones a la vez es pedir problemas y el daemon es el
-	// dueño de esa BD. Si la tabla aún no existe (instalación limpia, `serve` nunca arrancó), el Get
-	// falla, `Listo()` devuelve false y el cajero simplemente no reclama hasta que aparezca.
+	// ── El proveedor local de LLM ─────────────────────────────────────────────
 	//
-	// El nombre del fichero sale de daemon.SingleDBFileName —el DUEÑO de esa BD— y no de un literal
-	// local: un literal duplicado aquí fallaría en silencio si el original cambiara (el cajero abriría
-	// un edge.db vacío, `Listo()` sería false para siempre y no reclamaría nada, sin error alguno).
+	// 🔴 AQUÍ VIVÍA EL CLASIFICADOR, Y SE RETIRÓ ENTERO EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-2,
+	// ADR-0045). Había un `classifier.New(...)` con su prompt y su schema, y un `contratoIntenciones` que
+	// sondeaba `edge.db` cada 30 s para recargarlo en caliente. Los dos existían para que ESTE proceso
+	// supiera clasificar por su cuenta; bajo pull no clasifica por iniciativa propia, así que se quedaron
+	// sin llamante y se borran (un objeto sin llamante es deuda, no previsión).
 	//
-	// ─────────────────────────────────────────────────────────────────────────
-	// 🔴 DECISIÓN DE T4.1, EXPLÍCITA Y REVISABLE: EL CONTRATO ES UNO, EL DEL PRIMER data_dir
-	// ─────────────────────────────────────────────────────────────────────────
-	// Cada data_dir de la lista tiene TAMBIÉN su propio edge.db, así que la pregunta «¿el contrato de
-	// intenciones es por-instalación o compartido?» es real y no se deja ambigua. Aquí se resuelve como
-	// COMPARTIDO, tomando el del PRIMER data_dir de la lista.
+	// CON ELLOS SE FUE LA ÚNICA RAZÓN POR LA QUE EL CAJERO ABRÍA `edge.db`, y con ella la decisión de T4.1
+	// sobre «el contrato es uno, el del primer data_dir» y su límite declarado (dos instalaciones con
+	// contratos distintos clasificándose con el de la primera). Ese límite ya no existe porque el contrato
+	// de intenciones ya no lo lee este proceso: lo usa el CLOUD para armar el prompt, y lo que baja por el
+	// frame es el prompt ya construido.
 	//
-	// El motivo NO es la pereza de no abrir N ficheros: es que EL CLASIFICADOR ES UNO. `classifier.New`
-	// produce un objeto con UN prompt y UN schema, y `cls.Reload(parsed)` los sustituye en caliente. Con N
-	// contratos distintos aplicados sobre ese único objeto, el último refresco ganaría y las otras N-1
-	// instalaciones se clasificarían contra el contrato de un vecino —silenciosamente, y con un
-	// `config_version` en el sobre que MENTIRÍA sobre con qué se clasificó—. Servir N contratos de verdad
-	// exige N clasificadores, y eso arrastra N goroutines de `mantener`, N conexiones a edge.db y una
-	// decisión sobre cómo se reparte entre ellos el semáforo único de Ollama: es una tarea, no un detalle
-	// de esta.
-	//
-	// LO QUE ESTO IMPLICA, dicho para que nadie lo descubra en campo: el round-robin de T4.1 está pensado
-	// para N instalaciones DEL MISMO tenant/contrato en una máquina. Si dos instalaciones de la lista
-	// tuvieran contratos de intenciones distintos, la segunda se clasificaría con el de la primera. Ese es
-	// el límite de esta ola y el disparador para revisar esta decisión.
-	dirContrato := dataDirs[0]
-	edgeDSN := cfg.DBDSN
-	if cfg.DBDialect == db.DialectSQLite && edgeDSN == "" {
-		edgeDSN = filepath.Join(dirContrato, daemon.SingleDBFileName)
-	}
-	edgeDB, err := db.Open(ctx, cfg.DBDialect, edgeDSN)
-	if err != nil {
-		return fmt.Errorf("cajero: abrir la BD única del Edge (dialecto %q): %w", cfg.DBDialect, err)
-	}
-	defer func() { _ = edgeDB.Close() }()
-
-	// ── El clasificador ───────────────────────────────────────────────────────
-	// Arranca con un contrato VACÍO, igual que el decorador inline: hasta que el refresco encuentre una
-	// config persistida no hay prompt ni schema útiles, y `Listo()` mantiene al cajero sin reclamar.
+	// LO QUE SÍ SE CONSERVA es el cliente de Ollama. `ollama.New` de abajo sigue siendo el ÚNICO del repo
+	// fuera de un test con build tag: ese grep es el gate de REQ-051.10.
 	client := ollama.New(cfg.Intent.OllamaURL)
-	cls := classifier.New(client, cfg.Intent.Model, &intents.Config{},
-		// T2.5 · el techo de entrada: sin él, pegar ~65 KB en un chat basta para que la inferencia
-		// tarde lo suficiente como para abrir el breaker COMPARTIDO y apagar la clasificación de todas
-		// las sesiones. Es la denegación de servicio más barata que existe hoy contra esta pieza.
-		classifier.WithMaxRunes(cfg.Worker.MaxRunes),
-		// T2.5 · las tres opciones de modelo, EXPLÍCITAS. El clasificador ya las manda por su cuenta con
-		// los mismos valores (classifier.DefaultNumThread/NumCtx/NumPredict, que es de donde salen los
-		// defaults de config), así que pasarlas aquí no cambia nada mientras el operador no las toque:
-		// lo que hace es dar a WAPP_WORKER_NUM_* un efecto real sin tener que releasear el módulo del
-		// clasificador para ajustar una máquina concreta. WithLLMOptions FUSIONA, así que la
-		// temperatura 0.1 —que no se nombra— sobrevive intacta.
-		classifier.WithLLMOptions(map[string]any{
-			"num_thread":  cfg.Worker.NumThread,
-			"num_predict": cfg.Worker.NumPredict,
-			"num_ctx":     cfg.Worker.NumCtx,
-		}),
-	)
-
-	contrato := &contratoIntenciones{store: edgeconfig.NewSQLStore(edgeDB), cls: cls, log: log}
-	contrato.refrescar(ctx) // primer intento en el arranque: si hay contrato, se empieza clasificando ya
-
-	ctxRefresco, pararRefresco := context.WithCancel(ctx)
-	var refresco sync.WaitGroup
-	refresco.Add(1)
-	go func() {
-		defer refresco.Done()
-		contrato.mantener(ctxRefresco, refrescoContrato)
-	}()
-	// 🔴 EL PARO DEL REFRESCO ES UN defer, Y ESTÁ AQUÍ POR ORDEN, NO POR ESTILO. La goroutine de
-	// `mantener` hace `store.Get` contra edgeDB; los `defer` que cierran edgeDB y las N colas
-	// (`cerrarColas`) ya están registrados ARRIBA, así que este defer se ejecuta ANTES que ellos (LIFO) y
-	// garantiza que nadie está dentro de un Get cuando el *sql.DB se cierra. La versión anterior sólo
-	// esperaba a la goroutine en el camino FELIZ (al final de la función): cualquier `return err`
-	// intermedio —y hay uno justo debajo, el de cajero.New— cerraba las BDs con el refresco todavía vivo.
-	// Carrera real, de las que `-race` caza.
-	//
-	// T4.1 NO CAMBIÓ ESTE ORDEN, y ese era el riesgo de pasar a N colas: `cerrarColas` es UN solo defer
-	// registrado tras el bucle de aperturas, no N defer apilados dentro de él, así que la secuencia sigue
-	// siendo exactamente {paro del refresco} → {edgeDB} → {las N colas, en orden inverso al de apertura}.
-	defer func() {
-		pararRefresco()
-		refresco.Wait()
-	}()
 
 	// ── El bucle ──────────────────────────────────────────────────────────────
 	c, err := cajero.New(cajero.Deps{
 		// Colas (plural) y NO Cola: la lista es la fuente única desde T4.1, incluso con una entrada. Pasar
 		// las dos cosas sería dejar dos verdades sobre lo mismo esperando a divergir.
-		Colas:         colas,
-		Clasificador:  cls,
+		Colas:  colas,
+		Ollama: client,
+		// EL MODELO LO ELIGE EL EDGE y no viaja en el frame (ADR-0045): es propiedad de la máquina del
+		// cliente. `WAPP_AGENT_INTENT_MODEL` sigue siendo la variable que lo fija.
+		Modelo: cfg.Intent.Model,
+		// Las tres opciones de modelo, EXPLÍCITAS. Antes se las pasaba el clasificador (WithLLMOptions) y
+		// ahora se las pasa el servidor de inferencia; los valores son LOS MISMOS y salen de la misma
+		// config, así que la máquina ve exactamente la petición que veía antes. La temperatura NO va aquí:
+		// tiene su propio campo porque el Cloud puede sobreescribirla por petición.
+		Opciones: map[string]any{
+			"num_thread":  cfg.Worker.NumThread,
+			"num_predict": cfg.Worker.NumPredict,
+			"num_ctx":     cfg.Worker.NumCtx,
+		},
 		Despertador:   cajero.NewPollFijo(time.Duration(cfg.Worker.PollMS) * time.Millisecond),
 		Log:           log,
-		MaxFilas:      cfg.ColaClaimMaxFilas,
 		MaxConcurrent: cfg.Worker.MaxConcurrent,
-		// T2.19 · el freno del lote venenoso. Sin este cableado la constante existiría y nadie la miraría:
-		// un lote cuya inferencia siempre falla vuelve a `nuevo` conservando su `seq`, se lo lleva otra vez
-		// el claim siguiente y —con MaxConcurrent=1— congela la cola entera sin más síntoma que el contador
-		// de fallos subiendo.
-		MaxIntentos: cfg.Worker.MaxIntentos,
-		Lease:       time.Duration(cfg.ColaLeaseSeconds) * time.Second,
-		// 🔴 EL PLAZO SALE DE cfg.Worker.InferenceTimeoutMS, NO DE cfg.Intent.WaitMS. Aquel es el
-		// presupuesto del DESPACHADOR (4 s: no retener la entrega más de la cuenta) y usarlo aquí
-		// calibraba el worker PARA FALLAR — queda pegado a la p95 medida por la O0 (3.736 ms), así que
-		// abortaría una fracción grande de las inferencias, abriría el breaker y dejaría la cola dando
-		// vueltas sin progresar. El worker existe justo para poder tardar. Ver el doc comment de
-		// config.DefaultWorkerInferenceTimeoutMS y el de cajero.Deps.Timeout.
-		Timeout:       time.Duration(cfg.Worker.InferenceTimeoutMS) * time.Millisecond,
-		StatsEvery:    time.Duration(cfg.Worker.StatsEveryMS) * time.Millisecond,
-		Listo:         contrato.Listo,
-		ConfigVersion: contrato.Version,
-		OllamaURL:     cfg.Intent.OllamaURL,
-		// T2.8 · el mismo número que se le manda al clasificador arriba (WithLLMOptions), aquí sólo para
-		// que el aviso de sobresuscripción compare lo que DE VERDAD se está pidiendo y no el default.
+		Lease:         time.Duration(cfg.ColaLeaseSeconds) * time.Second,
+		// El plazo por DEFECTO de una inferencia (cuando el Cloud manda `timeout_ms=0`). El argumento del
+		// número —y por qué el 15 s anterior estaba calibrado contra una muestra CENSURADA por él mismo—
+		// está en cajero.DefaultInferenceTimeoutMS.
+		Timeout: time.Duration(cfg.Worker.InferenceTimeoutMS) * time.Millisecond,
+		// Y el TECHO de lo que el Cloud puede pedir: sin él, un `timeout_ms` mal calculado arriba ocuparía
+		// la única plaza de Ollama el tiempo que dijera.
+		TimeoutMax: time.Duration(cfg.Inference.MaxTimeoutMS) * time.Millisecond,
+		StatsEvery: time.Duration(cfg.Worker.StatsEveryMS) * time.Millisecond,
+		OllamaURL:  cfg.Intent.OllamaURL,
+		// T2.8 · el mismo número que se le manda a Ollama arriba, aquí sólo para que el aviso de
+		// sobresuscripción compare lo que DE VERDAD se está pidiendo y no el default.
 		NumThread: cfg.Worker.NumThread,
 	})
 	if err != nil {
 		return err
 	}
 
-	log.Info("agent cajero: worker-cajero de la cola de entrantes (Plan 051 Ola 2; round-robin de N colas desde la Ola 4)",
+	// ── EL SOCKET DE INFERENCIA: UNO POR data_dir ─────────────────────────────
+	//
+	// POR QUÉ N SOCKETS Y NO UNO: el cliente es el `agent serve` de CADA instalación, y cada uno conoce
+	// exactamente un directorio —el suyo—. Un socket único obligaría a que los N daemons supieran cuál de
+	// los data_dir's es el «principal», que es un acoplamiento nuevo entre instalaciones que hoy no se
+	// conocen entre sí. Con un socket por data_dir, cada daemon busca `<su data_dir>/cajero.sock` y no hay
+	// nada que configurar.
+	//
+	// 🔴 LOS N SOCKETS COMPARTEN UN SOLO SERVIDOR DE DOMINIO, y por tanto UN SOLO AFORO, UN SOLO BREAKER y
+	// UN SOLO HISTOGRAMA. Es la propiedad que no se puede romper: N aforos de una plaza serían N
+	// inferencias simultáneas contra el mismo Ollama —el solapamiento que la O0 midió como causa de que el
+	// p50 se dispare—. Por eso el servidor sale de `c.ServidorInferencia()` (el Cajero es su dueño) y se
+	// pasa EL MISMO a los N listeners, en vez de construir uno por socket.
+	puerto := c.ServidorInferencia()
+	if puerto == nil {
+		// No debería ocurrir: Deps.Ollama está poblado unas líneas más arriba. Se comprueba porque un nil
+		// aquí daría N sockets que responden OLLAMA_DOWN a todo sin que nadie sepa por qué.
+		return fmt.Errorf("cajero: no se pudo construir el servidor de inferencia (¿proveedor local nil?)")
+	}
+
+	// MISMO PATRÓN DE CIERRE QUE LAS COLAS, y por el mismo motivo: los cierres se acumulan y se invocan en
+	// orden INVERSO desde un único punto, en vez de apilar N `defer` dentro del bucle. Aquí importa además
+	// que el apagado de los sockets ocurra ANTES de que se cierren las BDs (los defer de arriba), porque
+	// una inferencia en vuelo puede estar publicando su parte.
+	var sockets []*cajerosock.Servidor
+	var servidores sync.WaitGroup
+	cerrarSockets := func() {
+		for i := len(sockets) - 1; i >= 0; i-- {
+			// El plazo del drenaje es el techo de UNA inferencia: es exactamente lo que puede quedar en
+			// vuelo. Cortar antes tiraría trabajo ya pagado; esperar más dejaría al supervisor mandando
+			// SIGKILL sobre un proceso que se está tomando su tiempo.
+			ctxCierre, cancelCierre := context.WithTimeout(context.WithoutCancel(ctx),
+				time.Duration(cfg.Inference.MaxTimeoutMS)*time.Millisecond)
+			if err := sockets[i].Apagar(ctxCierre); err != nil {
+				log.Warn("cajero: el socket de inferencia no cerró limpiamente", "error", err)
+			}
+			cancelCierre()
+		}
+		servidores.Wait()
+	}
+	for _, dataDir := range dataDirs {
+		layout := sessionmgr.NewLayout(dataDir)
+		srv := cajerosock.Nuevo(ctx, layout.CajeroSock(), puerto, log)
+		ln, err := srv.Escuchar()
+		if err != nil {
+			cerrarSockets() // el defer de abajo aún no está registrado: se cierra a mano lo ya abierto
+			// ES FATAL, con el mismo criterio que la cola: sin socket, el daemon de esta instalación no
+			// puede pedir NI UNA inferencia y el único síntoma sería un OLLAMA_DOWN permanente con Ollama
+			// perfectamente vivo. Arrancar sería prometer un servicio que no existe.
+			return fmt.Errorf("cajero: abrir el socket de inferencia de %s: %w", dataDir, err)
+		}
+		sockets = append(sockets, srv)
+		servidores.Add(1)
+		go func(srv *cajerosock.Servidor, ln net.Listener) {
+			defer servidores.Done()
+			if err := srv.Servir(ln); err != nil {
+				log.Error("cajero: el socket de inferencia falló", "error", err)
+			}
+		}(srv, ln)
+	}
+	defer cerrarSockets()
+
+	log.Info("agent cajero: el Edge SIRVE inferencia al Cloud por socket (ADR-0045); ya no clasifica por iniciativa propia",
 		"data_dir", cfg.DataDir,
-		// `colas` es cuántas instalaciones se turnan y `data_dirs` cuáles: con una sola instalación
-		// coincide con `data_dir` y la línea dice lo mismo que decía antes de T4.1.
+		// `colas` es cuántas instalaciones atiende y `data_dirs` cuáles; `sockets` coincide con las dos
+		// porque hay exactamente un socket de inferencia por instalación.
 		"colas", len(colas),
+		"sockets", len(sockets),
 		"data_dirs", strings.Join(dataDirs, ","),
-		"data_dir_contrato", dirContrato,
 		"ollama_url", cfg.Intent.OllamaURL,
 		"model", cfg.Intent.Model,
 		"max_concurrent", cfg.Worker.MaxConcurrent,
 		"poll_ms", cfg.Worker.PollMS,
-		"max_runes", cfg.Worker.MaxRunes,
 		"num_thread", cfg.Worker.NumThread,
 		"num_predict", cfg.Worker.NumPredict,
 		"num_ctx", cfg.Worker.NumCtx,
-		"max_intentos", cfg.Worker.MaxIntentos,
 		"inferencia_timeout_ms", cfg.Worker.InferenceTimeoutMS,
+		"inferencia_timeout_max_ms", cfg.Inference.MaxTimeoutMS,
 		"stats_cada_ms", cfg.Worker.StatsEveryMS,
 		// T4.5 · la cadencia del PARTE va al lado de la del latido de log para que se vean juntas y se
 		// entienda que son DOS relojes distintos: `stats_cada_ms` es verbosidad de log (y un 0 la apaga),
@@ -237,8 +245,8 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 		"parte_cada_s", int(app.ParteCada.Seconds()),
 	)
 
-	// El paro del refresco lo hace el defer de arriba, en TODOS los caminos de salida (este y los
-	// `return err` intermedios), y siempre antes de que se cierren las BDs.
+	// El cierre de los sockets y de las colas lo hacen los defer de arriba, en TODOS los caminos de salida,
+	// y en el orden inverso al de apertura: {sockets} → {las N colas}.
 	return c.Run(ctx)
 }
 
@@ -341,89 +349,4 @@ func abrirCola(ctx context.Context, cfg config.Config, dataDir string, log share
 	// El NOMBRE de la cola es el data_dir: es lo que un operador con cinco instalaciones reconoce de un
 	// vistazo en el log, y es material público (una ruta de directorio), nunca contenido de negocio.
 	return cajero.ColaNombrada{Nombre: dataDir, Cola: colaCajero, Parte: parteEscritor}, cerrar, nil
-}
-
-// contratoIntenciones mantiene vivo el contrato de intenciones del clasificador del cajero leyéndolo
-// de edge.db, y responde las dos preguntas que el bucle le hace: «¿hay contrato?» y «¿qué versión?».
-//
-// POR QUÉ SONDEA Y NO SE SUSCRIBE: el push del Cloud (ConfigUpdate) llega por el stream CloudLink, que
-// vive en `agent serve`. El cajero es OTRO PROCESO y el único canal que comparten es el disco. Un
-// sondeo cada 30 s es la costura más barata que no inventa un IPC nuevo.
-type contratoIntenciones struct {
-	store edgeconfig.Store
-	cls   *classifier.Classifier
-	log   sharedlogger.Logger
-
-	mu      sync.RWMutex
-	version string
-}
-
-// Listo reporta si hay contrato cargado. Es el espejo del `ready` del decorador inline: sin contrato
-// el clasificador no tiene prompt ni schema, y reclamar sería marcar filas `tomado` para clasificarlas
-// contra un prompt vacío.
-func (c *contratoIntenciones) Listo() bool {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.version != ""
-}
-
-// Version devuelve la versión del contrato vigente, que viaja en el sobre que el cajero persiste.
-func (c *contratoIntenciones) Version() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.version
-}
-
-// refrescar relee el contrato y, si la versión cambió, recarga el clasificador en caliente.
-func (c *contratoIntenciones) refrescar(ctx context.Context) {
-	// El `kind` sale de wiring.IntentsConfigKind —el paquete que lo REGISTRA— por el mismo motivo que
-	// el nombre del fichero: desalinearlos no daría error, sólo un worker que no clasifica nunca.
-	rec, encontrado, err := c.store.Get(ctx, wiring.IntentsConfigKind)
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-		c.log.Warn("cajero: no se pudo leer el contrato de intenciones; el worker no reclamará hasta que aparezca",
-			"error", err)
-		return
-	}
-	if !encontrado {
-		return
-	}
-
-	c.mu.RLock()
-	actual := c.version
-	c.mu.RUnlock()
-	if rec.Version == actual {
-		return
-	}
-
-	parsed, err := intents.ParseAndValidate(rec.Payload)
-	if err != nil {
-		// El Service del daemon valida ANTES de persistir, así que un fallo aquí sería un blob corrupto
-		// en disco. Se conserva el contrato anterior en vez de recargar con basura.
-		c.log.Error("cajero: contrato de intenciones ilegible (se conserva el anterior)",
-			"version", rec.Version, "error", err)
-		return
-	}
-
-	c.cls.Reload(parsed)
-	c.mu.Lock()
-	c.version = rec.Version
-	c.mu.Unlock()
-	c.log.Info("cajero: contrato de intenciones cargado; la clasificación está ACTIVA", "config_version", rec.Version)
-}
-
-// mantener refresca el contrato cada `cada` hasta que ctx se cancele.
-func (c *contratoIntenciones) mantener(ctx context.Context, cada time.Duration) {
-	t := time.NewTicker(cada)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			c.refrescar(ctx)
-		}
-	}
 }

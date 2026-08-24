@@ -47,17 +47,29 @@ import (
 // TestOnMessage_ElINSERTQueFalla_NoSeAcusa es EL test de T1.13: el disco lleno, la DEK ausente, la BD
 // bloqueada. El mensaje no está en ningún sitio, así que no se puede dar por recibido.
 //
-// 🔴 SE PRUEBAN LOS DOS CAMINOS QUE ADMITEN, y no por completismo: onMessage propaga el veredicto del
-// INSERT desde DOS `return` distintos —el normal y el del entrante SIN HORA UTILIZABLE (t="0")—, así que
-// son dos sitios donde alguien puede tirar el valor por la borda. Con un solo caso, cambiar el del
-// entrante sin hora por `l.enqueueCola(...); return true` dejaba este fichero ENTERO en verde (mutación
-// M12, comprobada: se quedó verde hasta que se añadió el segundo caso). El camino sin hora es además el
-// que menos se mira —lo dispara una condición rarísima— y el que peor se diagnostica en campo.
+// 🔴 SE PRUEBAN LOS DOS CAMINOS QUE ADMITEN, y no por completismo. Desde el Plan 044 · Ola 1.5 · T1.5-3
+// onMessage propaga el veredicto del INSERT desde UN SOLO `return l.enqueueCola(...)`: los dos caminos que
+// ADMITEN —el normal y el del entrante SIN HORA UTILIZABLE (t="0")— fijan `tsCola` y CONVERGEN en él, para
+// que el filtro de GRUPO del paso 5 pueda dominarlos a los dos con una sola rama (ver el bloque «⚠️
+// CONSECUENCIA PARA LOS TESTS» que precede al `var tsCola int64` de onMessage, en listener.go).
 //
-// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO (ejecutadas):
-//   - `return false` → `return true` en la rama del error de Enqueue (listener.go) ⇒ vuelve el defecto
-//     entero: se acusa lo que no se escribió.
-//   - dejar de propagar el retorno en CUALQUIERA de los dos `return l.enqueueCola(...)` de onMessage.
+// Los dos casos siguen valiendo lo mismo, pero custodian otra cosa: ya no dos `return`, sino los DOS
+// CAMINOS que desembocan en el único encolado. Que hoy converjan es una propiedad del código, no una
+// garantía: quien vuelva a darle salida propia al camino sin hora —el que menos se mira, porque lo dispara
+// una condición rarísima, y el que peor se diagnostica en campo— tiene que encontrarse este caso en rojo.
+//
+// 🔴 LA MUTACIÓN M12 MURIÓ CON LA CONVERGENCIA, y se deja dicho para que nadie la busque: pedía tirar el
+// retorno en «CUALQUIERA de los dos `return l.enqueueCola(...)`», y ya no hay dos, así que NO COMPILA
+// contra este código. La sustituye la segunda de aquí abajo, que es lo que quedaba vivo de ella.
+//
+// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO (compilan las dos):
+//   - `return false` → `return true` en la rama del error de Enqueue (enqueueCola) ⇒ vuelve el defecto
+//     entero —se acusa lo que no se escribió— y caen LOS DOS casos.
+//   - en la rama `e.Info.Timestamp.IsZero()` de onMessage, cambiar `tsCola = time.Now().Unix()` por
+//     `l.enqueueCola(ctx, e, time.Now().Unix()); return true` ⇒ el camino sin hora recupera su salida
+//     propia y tira el veredicto por la borda: cae SOLO el caso `t="0"` y el normal sigue VERDE, que es
+//     exactamente lo que el segundo caso existe para ver. (Escrita en T1.5-3 y razonada contra el código;
+//     pendiente de EJECUTAR en el barrido con compilador, a diferencia de la primera.)
 func TestOnMessage_ElINSERTQueFalla_NoSeAcusa(t *testing.T) {
 	sinHora := liveMessage("MSG-ERR-SINHORA", "quiero dos empanadas")
 	sinHora.Info.Timestamp = time.Time{}
@@ -164,15 +176,16 @@ func TestOnMessage_SinColaCableada_NoSeAcusa(t *testing.T) {
 // --- LO QUE NO DEJA FILA POR DECISIÓN NUESTRA: SÍ SE ACUSA ---
 
 // TestOnMessage_LosDescartesDeliberados_SIAcusan es la mitad que impide que este arreglo se convierta en
-// una tormenta de reenvíos. Son los dos caminos que salen SIN fila y con razón, y en los dos el reenvío
-// sería un bucle: lo reenviado llega idéntico (mismo IsFromMe, mismo Info.Timestamp, que es el reloj del
-// SERVIDOR del mensaje original) y se volvería a descartar por el mismo criterio.
+// una tormenta de reenvíos. Son los caminos que salen SIN fila y con razón, y en todos el reenvío sería un
+// bucle: lo reenviado llega idéntico (mismo IsFromMe, mismo Info.Timestamp —que es el reloj del SERVIDOR
+// del mensaje original—, mismo IsGroup) y se volvería a descartar por el mismo criterio.
 //
 // La ráfaga del ADR-0037 son MILES de eventos. Negarles el acuse no rescata ni uno: los reofrece todos en
-// cada reconexión, para siempre.
+// cada reconexión, para siempre. Con el grupo (Plan 044 · T1.5-3) el argumento es idéntico y el volumen
+// puede ser mayor todavía: es TODO el tráfico de TODOS los grupos en los que esté el número.
 //
-// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO (ejecutadas, una por caso): `return true` → `return false` en la
-// rama de IsFromMe y en la del descarte por ventana de onMessage.
+// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO (una por caso): `return true` → `return false` en la rama de IsFromMe,
+// en la del descarte por ventana y en la del filtro de grupo de onMessage.
 func TestOnMessage_LosDescartesDeliberados_SIAcusan(t *testing.T) {
 	seal := time.Now()
 
@@ -193,6 +206,16 @@ func TestOnMessage_LosDescartesDeliberados_SIAcusan(t *testing.T) {
 			porque: "el descarte es determinista sobre Info.Timestamp, que es inmutable: el reenvío llegaría " +
 				"con el mismo sello y volvería a caer fuera. Sería un bucle a ritmo de reconexión, y sobre " +
 				"la ráfaga entera del ADR-0037",
+		},
+		{
+			// Plan 044 · Ola 1.5 · T1.5-3 (REQ-36/D-044.30). Antes este caso vivía en la lista de abajo, la
+			// de lo que DEJA FILA: acusaba porque el mensaje estaba en disco. Hoy acusa por la razón de esta
+			// lista —el descarte es determinista—, que es una razón más fuerte, no más débil.
+			nombre:  "de un grupo (Plan 044, REQ-36)",
+			mensaje: grupoMessage("MSG-GRUPO", "quiero dos empanadas"),
+			porque: "venir de un grupo es determinista sobre el JID del chat: lo reofrecido llegaría con el " +
+				"mismo IsGroup y lo volveríamos a descartar. Negarlo convertiría TODO el tráfico de TODOS " +
+				"los grupos en una ráfaga perpetua de reofrecimientos (D-044.30, detalle 1)",
 		},
 	}
 
@@ -217,15 +240,23 @@ func TestOnMessage_LosDescartesDeliberados_SIAcusan(t *testing.T) {
 }
 
 // TestOnMessage_LoQueDejaFila_SIEMPREAcusa recorre TODOS los caminos que terminan con el mensaje en disco
-// y exige el acuse en los seis.
+// y exige el acuse en los cuatro.
 //
-// ⚠️ LOS CUATRO MOTIVOS DE OMISIÓN NO SON DESCARTES, y es el malentendido más fácil de este código: sin
-// texto, grupo, clasificador apagado y fastlane DEJAN FILA (nacen en EstadoClasificado con su marca). La
-// puerta de elegibilidad no decide si el mensaje entra, decide si el CAJERO lo reclama. Acusan porque el
-// mensaje está en disco — no por indulgencia.
+// ⚠️ NINGUNO DE ESTOS CAMINOS ES UN DESCARTE, y es el malentendido más fácil de este código. Un mensaje
+// SIN TEXTO (imagen, audio, sticker) y un texto que el antiguo carril rápido atrapaba se encolan y se
+// entregan EXACTAMENTE IGUAL que un texto libre: acusan porque el mensaje está en disco, no por
+// indulgencia. Lo que sí decide si el mensaje entra son las puertas de verdad —el eco propio, el grupo
+// (T1.5-3) y la sesión pasiva (Plan 046)—, y ésas tienen su lista aparte, arriba.
+//
+// ⚠️ ERAN SEIS CASOS Y CUATRO MOTIVOS. Se fueron en dos tiempos, y por razones distintas:
+//   - `no_elegible` (el entrante de GRUPO) en el Plan 044 · Ola 1.5 · T1.5-3 (REQ-36): dejó de dejar fila
+//     y pasó a la lista de descartes deterministas de arriba. Cambió de lista, no de veredicto.
+//   - «clasificador apagado» el 2026-08-24, con el push (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045): ya no
+//     es un caso propio porque con la feature apagada la fila nace IDÉNTICA a la de un texto normal. El
+//     caso no desapareció: se FUNDIÓ con el primero de la lista.
 //
 // ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): `return true` → `return false` al final de enqueueCola ⇒
-// caen los seis casos a la vez.
+// caen los cuatro casos a la vez.
 func TestOnMessage_LoQueDejaFila_SIEMPREAcusa(t *testing.T) {
 	sinTexto := liveMessage("MSG-IMG", "")
 	sinTexto.Info.Type = "image"
@@ -239,9 +270,15 @@ func TestOnMessage_LoQueDejaFila_SIEMPREAcusa(t *testing.T) {
 	}{
 		{"texto directo (nace nuevo)", liveMessage("MSG-OK", "quiero dos empanadas"), nil},
 		{"sin texto (imagen, audio…)", sinTexto, nil},
-		{"de un grupo (no elegible)", grupoMessage("MSG-GRUPO", "quiero dos empanadas"), nil},
-		{"clasificador apagado", liveMessage("MSG-OFF", "quiero dos empanadas"), []ListenerOption{WithClasificadorActivo(apagado)}},
-		{"carril rápido (fastlane)", liveMessage("MSG-FAST", "2"), nil},
+		// «de un grupo (no elegible)» estaba aquí y se fue con REQ-36 (Plan 044 · T1.5-3): un entrante de
+		// grupo ya NO deja fila, así que dejarlo en esta lista habría puesto el test en rojo por el testigo
+		// —el que exige exactamente 1 fila—, no por el acuse. Su acuse se sigue exigiendo, pero en la lista
+		// de los DESCARTES DELIBERADOS de arriba, que es la familia a la que pertenece desde T1.5-3.
+		//
+		// «clasificador apagado» estaba aquí y se fue con T1.6-5: ver la cabecera. Se conserva el texto que
+		// el antiguo carril rápido atrapaba porque, aunque hoy nazca igual que cualquiera, es el caso que
+		// alguien reintroduciría primero si volviera a meter un atajo en el enqueue.
+		{"texto del antiguo carril rápido", liveMessage("MSG-FAST", "2"), nil},
 		{"sin hora utilizable (t=0)", sinHora, nil},
 	}
 

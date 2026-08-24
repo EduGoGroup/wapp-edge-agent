@@ -39,32 +39,22 @@ type InboundEvent struct {
 	IsFromMe bool
 	// IsGroup indica que el chat es un grupo/lista de difusión.
 	IsGroup bool
-	// Intent es la clasificación LLM del texto (Plan 029, ADR-0020). SOLO se puebla cuando el clasificador
-	// local resolvió una intención accionable; nil en todo lo demás (feature off, no elegible, fastlane,
-	// timeout/error/circuito abierto, o "desconocido"). La clasificación JAMÁS bloquea ni pierde el mensaje:
-	// es un enriquecimiento best-effort. Al reenviar a la nube viaja DENTRO del sobre sellado cuando el
-	// sellado en tránsito está activo (params llevan texto literal del cliente).
+	// 🔴 AQUÍ VIVÍA `Intent *ClassifiedIntent`, RETIRADO EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 ·
+	// ADR-0045 · D-044.31 · REQ-35). Era la clasificación LLM que el Edge adjuntaba al entrante — el
+	// modelo PUSH — y la escribía el worker-cajero en la columna `intent_json` de la cola durable para
+	// que el despachador la reconstruyera aquí al drenarla.
 	//
-	// QUIÉN LO RELLENA cambió en el Plan 051 Ola 3 · T3.0. Antes: el decorador internal/adapters/intent, en
-	// línea, en el hilo de whatsmeow. Ahora: el WORKER-CAJERO clasifica y escribe el resultado en la columna
-	// `intent_json` de la cola durable, y el DESPACHADOR de la sesión reconstruye este campo al drenarla
-	// (internal/app/despachador · `evento`). El contrato del campo no cambió ni un byte; cambió el productor.
-	Intent *ClassifiedIntent
-}
-
-// ClassifiedIntent es la intención accionable extraída del texto por el clasificador local (Plan 029): el
-// "el LLM extrae, el código (Cloud) resuelve". NO lleva texto de respuesta — la respuesta al cliente la
-// produce el Motor de Flujos del Cloud, nunca el LLM del Edge. Los Params pueden contener texto literal del
-// mensaje del cliente (p.ej. el nombre del producto), por eso son SENSIBLES y viajan sellados a la nube.
-type ClassifiedIntent struct {
-	// Name es el nombre de la intención (enum del contrato de intenciones del tenant; p.ej. "crear_pedido").
-	Name string
-	// Params son los parámetros extraídos y SANEADOS por el clasificador (claves libres → valores presentes
-	// en el mensaje). Sensibles (texto literal del cliente).
-	Params map[string]string
-	// Confidence es la confianza del modelo [0,1] tras aplicar el umbral del contrato.
-	Confidence float64
-	// ConfigVersion es la versión de la config de intenciones con la que se clasificó (viaja en la señal
-	// para que el Cloud sepa contra qué contrato se resolvió).
-	ConfigVersion string
+	// Se retira porque el ADR-0045 invirtió la dirección: el Edge ya no clasifica por iniciativa propia,
+	// entrega cada entrante al instante, y cuando el Cloud necesita saber si un texto es una solicitud la
+	// PIDE por el frame `inference_request` del stream CloudLink. El campo `ClassifiedIntent` salió del
+	// proto en el mismo cambio (11 de `IncomingMessage`, 5 de `SensitivePayload`, ambos `reserved`).
+	//
+	// 🔴 NO SE DEJÓ EL CAMPO «POR SI ACASO», y ésa es la parte que importa: un campo de dominio que se
+	// puede rellenar y no llega a ninguna parte compila, no rompe ningún test y no aparece en ningún log.
+	// Es el fallo más caro de este repo precisamente porque es invisible. Sin campo, cualquier intento de
+	// volver a adjuntar una intención por este camino deja de compilar.
+	//
+	// La MEDIDA que lo mató, para que no se reintente por intuición: con el push, de 430 inferencias
+	// UNA cupo en la ventana de 4 s; hubo descartes a 8 ms de llegar la etiqueta; ningún intent llegó
+	// jamás a la nube.
 }

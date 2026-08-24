@@ -137,9 +137,11 @@ const (
 //	                  solo invoca `if m.inboundMargin > 0` (sessionmgr/listen.go:120-122). Si algún día se
 //	                  admite un margen cero, este fichero deja de ser correcto: hay que cambiar aquí el
 //	                  sello, no allí el guardarraíl.
-//	listener.go:716 · `case e.Info.IsGroup` ⇒ un grupo no descarta, pero hace nacer la fila ya
-//	                  `clasificado` con la marca `no_elegible`: el cajero no la reclama nunca. Por eso
-//	                  IsGroup = false.
+//	El filtro de GRUPO · `if e.Info.IsGroup` ⇒ DESCARTA en la puerta desde el Plan 044 · Ola 1.5 · T1.5-3
+//	                  (REQ-36): ni fila, ni entrega, ni camino que medir. Por eso IsGroup = false.
+//	                  ⚠️ La guarda se ENDURECIÓ: hasta T1.5-3 un grupo no descartaba, solo hacía nacer la
+//	                  fila `clasificado`/`no_elegible`, así que un sintético de grupo medía un handler más
+//	                  corto pero AL MENOS dejaba fila. Hoy no dejaría ninguna y la población saldría en cero.
 //
 // Y la quinta, que es la validación de entrada: `listener.go:713` (`case text == ""`) hace nacer la fila
 // `clasificado` con la marca `sin_texto`. Un inyectado sin texto recorrería el handler pero NO el camino
@@ -179,7 +181,8 @@ func FabricarEntranteSintetico(p app.InyeccionEntrante) (*events.Message, error)
 				Sender: chat,
 				// listener.go:511 — un true aquí descartaría el sintético en la puerta.
 				IsFromMe: false,
-				// listener.go:716 — un true aquí haría nacer la fila `clasificado`/`no_elegible`.
+				// Un true aquí DESCARTARÍA el sintético en la puerta (Plan 044 · T1.5-3, REQ-36): sin fila
+				// y sin camino que medir. Hasta T1.5-3 solo lo hacía nacer `clasificado`/`no_elegible`.
 				IsGroup: false,
 				// AddressingMode "pn": el sintético imita un chat por NÚMERO, que es el 100 % del tráfico
 				// que hoy mide INV-051.2. Se copia al meta de la fila tal cual (listener.go:784).
