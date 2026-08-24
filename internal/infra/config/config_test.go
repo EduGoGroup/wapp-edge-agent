@@ -899,6 +899,12 @@ func TestLoad_InferenceTimeout_SigueVivoTrasElRetiroDelPush(t *testing.T) {
 	// Esto NO es tautológico: no compara una constante consigo misma, sino DOS constantes independientes
 	// (el plazo y la fracción) contra un TERCER número que no está en el código —el p50 medido en campo—.
 	// Si alguien mueve el plazo sin mirar, este test dice cuál es el criterio que rompió.
+	//
+	// ⚠️ SU ALCANCE SE ESTRECHÓ CON T1.7-2 (Plan 044 · Ola 1.7), y la relación que vigila sigue siendo la
+	// misma: desde entonces el umbral de lentitud sale del plazo de CADA PETICIÓN, así que este default
+	// gobierna a las que lleguen sin `timeout_ms` y a ninguna más. Lo que se comprueba aquí es que ESE
+	// caso —el de la petición sin plazo— siga calibrado; que la relación se cumpla también en las otras la
+	// garantiza la fórmula, no un número (ver cajero.registrarAcierto).
 	const p50DeCampoMS = 8100 // 430 inferencias en el VPS de UAT, 2026-08-23
 	umbralLentoMS := int(float64(DefaultWorkerInferenceTimeoutMS) * cajero.FraccionLentitud)
 	if factor := float64(umbralLentoMS) / p50DeCampoMS; factor < 4.0 {

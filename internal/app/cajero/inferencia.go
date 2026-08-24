@@ -16,11 +16,10 @@ package cajero
 // no por un margen discutible:
 //
 //   - Su rejilla se calibró para el HANDLER DE ENTRANTES, cuyo criterio es «< 50 ms p99» (INV-051.2):
-//     el borde más alto son 2,5 s y por encima está el bucket de desbordamiento. La inferencia vive un
-//     orden de magnitud más arriba — la O0 midió p50 = 2.613 ms y p95 = 3.736 ms contra un timeout de
-//     15 s (docs/plans/051-worker-cajero-edge/O0-resultados-2026-08-09.md)—, así que CASI TODAS las
-//     muestras caerían en el desbordamiento y Percentil devolvería CotaDesbordada (-1). Un instrumento
-//     que devuelve «se salió de la escala» para el 100 % de las medidas no mide nada.
+//     el borde más alto son 2,5 s y por encima está el bucket de desbordamiento. La inferencia vive DOS
+//     órdenes de magnitud más arriba —el p50 medido en campo son 8,1 s y la Ola 1.6 vio lotes de 61 s—,
+//     así que CASI TODAS las muestras caerían en el desbordamiento y Percentil devolvería CotaDesbordada
+//     (-1). Un instrumento que devuelve «se salió de la escala» para el 100 % de las medidas no mide nada.
 //   - Su enum `Camino` (Encolado/Descartado) es vocabulario del LISTENER. Meter aquí la inferencia
 //     obligaría a etiquetarla como una de esas dos poblaciones, y el doc del paquete dice expresamente
 //     que INV-051.2 se juzga contra `Encolado`: contaminar esa serie con muestras de segundos rompería
@@ -48,33 +47,50 @@ const numBucketsInferencia = 16
 //
 // LOS BORDES ESTÁN PUESTOS DONDE LA MEDICIÓN DICE, no repartidos en potencias de dos:
 //
-//   - El racimo 2000/2500/3000/3500/4000 rodea la zona donde de verdad viven las medidas (p50 2.613 ms,
-//     p95 3.736 ms). Ahí la resolución es de 500 ms, que sobre un p50 de ~2,6 s es un 19 % — bastante
-//     para ver que el clasificador se degrada y no tanto como para gastar buckets en precisión falsa.
-//   - 15000 es EXACTAMENTE DefaultInferenceTimeoutMS, y ese borde es el que sostiene la pregunta
-//     operativa que importa: «¿cuántas inferencias se comieron el plazo?». Es el mismo truco del borde
-//     de 50 ms de internal/app/latencia con INV-051.2; sin él, la respuesta habría que estimarla.
-//   - 20000/60000 existen para el caso en que alguien DESACTIVA el plazo propio (Deps.Timeout <= 0 ⇒
-//     manda el ctx del proceso): sin ellos, un Ollama agonizante aplastaría todo en el último bucket.
+//   - El racimo 7500/10000/12500/15000 rodea la zona donde de verdad viven las medidas: el p50 REAL de
+//     campo son 8,1 s y el p90 12,8 s (430 inferencias en UAT,
+//     docs/brainstorm/2026-08-23-tres-niveles-de-llm-y-doctrina-del-transporte.md §Anexo). Ahí la
+//     resolución es de 2,5 s, un ~30 % sobre el p50 — bastante para ver que el clasificador se degrada y
+//     no tanto como para gastar buckets en precisión falsa.
+//   - LOS TRES BORDES DE ARRIBA SE DERIVAN DE SUS CONSTANTES Y NO SE ESCRIBEN A MANO, que es lo que
+//     arregló T1.7-2: el umbral de lentitud, el plazo por defecto y el techo son exactamente los números
+//     contra los que se juzga una inferencia, y un borde copiado a mano CADUCA EN SILENCIO en cuanto
+//     alguien mueve la constante. Ya pasó: esta rejilla llevaba un borde en 15.000 rotulado «EL TIMEOUT»
+//     desde que la Ola 1.6 subió el plazo a 45.000, y con él la pregunta operativa que este histograma
+//     existe para responder —«¿cuántas se comieron el plazo?»— no tenía respuesta: todo lo que pasaba de
+//     20 s caía en un bucket de 20→60 s. Es el mismo truco del borde de 50 ms de internal/app/latencia
+//     con INV-051.2, sólo que atado a la constante en vez de a una copia suya.
+//   - 30000 flanquea por abajo al umbral de lentitud para poder distinguir «va justo» de «cuenta como
+//     fallo para el breaker», que con un solo borde serían indistinguibles (el mismo par 40/50 ms del
+//     gemelo).
+//   - Los bordes bajos (250…5000) se conservan sin racimo: ya no es donde viven las medidas, pero es
+//     donde vive una máquina SANA con la caché de prefijo caliente, y aplastarlas todas en un bucket
+//     dejaría el p50 sin resolución justo el día que la cosa vaya bien.
 //
-// El último borde es el DESBORDAMIENTO. Con el timeout por defecto es inalcanzable —la inferencia se
-// aborta a los 15 s—, así que sólo se puebla con el plazo desactivado.
+// El último borde es el DESBORDAMIENTO: peor que el TECHO que el propio Edge impone. Sólo es alcanzable
+// con el plazo desactivado (Deps.Timeout <= 0 y el Cloud sin fijar `timeout_ms`), porque cualquier otra
+// inferencia se aborta al llegar a su plazo, que nunca pasa del techo.
+//
+// ⚠️ EL ORDEN ES UNA INVARIANTE Y SE COMPRUEBA: con tres bordes derivados de constantes, mover una podría
+// romper la partición y dejar buckets muertos sin que nada fallara. Lo caza
+// TestRejillaInferencia_EsEstrictamenteCrecienteYCadaBucketEsAlcanzable, gemelo del que ya protegía
+// bordesUS en internal/app/latencia.
 var bordesInferenciaMS = [numBucketsInferencia]int64{
 	250,
 	500,
 	1_000,
-	1_500,
 	2_000,
-	2_500,
-	3_000, // ← aquí cae el p50 medido por la O0 (2.613 ms)
-	3_500,
-	4_000, // ← y aquí el p95 (3.736 ms)
+	3_000,
 	5_000,
 	7_500,
 	10_000,
-	15_000, // ← EL TIMEOUT (DefaultInferenceTimeoutMS)
+	12_500, // ← el p90 de campo (12,8 s) cae en el bucket siguiente
+	15_000,
 	20_000,
-	60_000,
+	30_000,
+	int64(float64(DefaultInferenceTimeoutMS) * FraccionLentitud), // 36 s ← EL UMBRAL DE LENTITUD (ADR-0042)
+	DefaultInferenceTimeoutMS,                                    // 45 s ← EL PLAZO por defecto
+	DefaultMaxTimeoutMS,                                          // 120 s ← EL TECHO de lo que el Cloud puede pedir
 	math.MaxInt64,
 }
 
@@ -99,8 +115,8 @@ type histogramaInferencia struct {
 
 // observar anota una latencia de inferencia.
 //
-// 🔴 LOS FALLOS ENTRAN, Y ES UNA DECISIÓN, NO UNA OBVIEDAD. Un timeout de 15 s es latencia que el
-// cajero PAGÓ de verdad: la plaza del semáforo estuvo ocupada esos 15 s y el resto de la cola esperó.
+// 🔴 LOS FALLOS ENTRAN, Y ES UNA DECISIÓN, NO UNA OBVIEDAD. Un timeout es latencia que el cajero PAGÓ de
+// verdad: la plaza del aforo estuvo ocupada TODO el plazo de esa petición y el resto de la cola esperó.
 // Medir sólo los éxitos daría el número exactamente al revés de como hace falta: con Ollama medio
 // caído, los pocos lotes que salen adelante son los cortos, así que el p50 MEJORARÍA a medida que el
 // clasificador empeora, y el operador vería un número verde mientras la cola se atasca. Es el mismo
@@ -141,12 +157,12 @@ func bucketInferenciaDe(ms int64) int {
 // «este cajero todavía no ha clasificado nada» — que es exactamente lo que el operador necesita
 // entender cuando ve el hueco.
 //
-// EN EL DESBORDAMIENTO SE PUBLICA EL ÚLTIMO BORDE FINITO (60.000) y no un centinela negativo, al revés
-// que latencia.CotaDesbordada. El motivo es el consumidor: esto viaja en un entero del contrato del
-// heartbeat, donde un -1 se leería como un valor medido o rompería una agregación aguas arriba. El
-// número publicado entonces MIENTE A LA BAJA (el p50 real es peor que 60 s), pero un p50 de un minuto
-// ya es una alarma tan estridente que no hay decisión que dependa de la diferencia. Y sólo es
-// alcanzable con Deps.Timeout desactivado.
+// EN EL DESBORDAMIENTO SE PUBLICA EL ÚLTIMO BORDE FINITO —el TECHO, DefaultMaxTimeoutMS— y no un
+// centinela negativo, al revés que latencia.CotaDesbordada. El motivo es el consumidor: esto viaja en un
+// entero del contrato del heartbeat, donde un -1 se leería como un valor medido o rompería una agregación
+// aguas arriba. El número publicado entonces MIENTE A LA BAJA (el p50 real es peor que el techo), pero un
+// p50 de dos minutos ya es una alarma tan estridente que no hay decisión que dependa de la diferencia. Y
+// sólo es alcanzable con el plazo desactivado.
 func (h *histogramaInferencia) p50MS() int64 {
 	if h == nil {
 		return 0

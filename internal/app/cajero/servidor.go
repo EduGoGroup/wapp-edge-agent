@@ -100,6 +100,24 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	c := s.c
 	plazo := c.plazoDe(p.Timeout)
 
+	// ─── ④bis ¿ESTA PETICIÓN LE ENSEÑA ALGO AL CIRCUITO? ─────────────────────
+	//
+	// 🔴 LA COSTURA DEL CALENTAMIENTO (T1.7-2, para T1.7-4). Se resuelve AQUÍ, en una sola variable y antes
+	// de que el breaker haga nada, y no repartida por los seis sitios que lo tocan: el compromiso de
+	// `BeginAttempt` obliga a que quien lo pidió lo salde, así que «pedir permiso pero no registrar el
+	// resultado» dejaría el sondeo del medio-abierto RESERVADO PARA SIEMPRE (ver cerrarSinIntentar). O el
+	// breaker participa entero en la petición, o no participa nada. Un calentamiento no participa.
+	//
+	// CONSECUENCIA QUE HAY QUE SABER LEER: un calentamiento tampoco CONSULTA el circuito, así que se sirve
+	// con el circuito abierto. Es lo correcto para lo que es —con Ollama recién caído, el calentamiento es
+	// exactamente lo que hay que seguir intentando para saber cuándo vuelve— y además evita gastar un
+	// sondeo del medio-abierto en tráfico que a nadie le importa. Lo que sí paga como todos es el AFORO: no
+	// hay adelantamiento, un calentamiento no le quita la plaza a una petición real.
+	//
+	// El resto del camino —aforo, plazo, histograma, contadores y log— es EL MISMO. Un calentamiento que
+	// no se midiera igual que lo demás sería una inferencia invisible ocupando la máquina del cliente.
+	cuentaParaElBreaker := !p.Calentamiento
+
 	// ─── ⑤ EL BREAKER, PRIMERO Y SIN TOCAR NADA MÁS ──────────────────────────
 	//
 	// Va ANTES del aforo a propósito: el ADR-0045 exige que un breaker abierto responda INMEDIATAMENTE.
@@ -115,13 +133,16 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	// era sondeo y registraremos un fallo de más — conservador. El caso contrario (creer «cerrado» algo
 	// que era sondeo, y dejar el flag reservado para siempre) exigiría que cinco fallos y sesenta
 	// segundos cupieran entre dos instrucciones.
-	eraSondeo := c.breaker.State() == breaker.StateHalfOpen
-	if !c.breaker.BeginAttempt() {
-		c.errBreakerAbierto.Add(1)
-		c.log.Warn("cajero: inferencia RECHAZADA con el circuito abierto; no se llamó al proveedor",
-			"command_id", p.CommandID, "circuito", c.breaker.State(),
-			"prompt_bytes", len(p.Prompt))
-		return app.RespuestaInferencia{}, app.ErrInferenciaBreakerAbierto
+	var eraSondeo bool
+	if cuentaParaElBreaker {
+		eraSondeo = c.breaker.State() == breaker.StateHalfOpen
+		if !c.breaker.BeginAttempt() {
+			c.errBreakerAbierto.Add(1)
+			c.log.Warn("cajero: inferencia RECHAZADA con el circuito abierto; no se llamó al proveedor",
+				"command_id", p.CommandID, "circuito", c.breaker.State(),
+				"prompt_bytes", len(p.Prompt))
+			return app.RespuestaInferencia{}, app.ErrInferenciaBreakerAbierto
+		}
 	}
 
 	// ─── ⑥ EL AFORO, CON ESPERA ACOTADA ──────────────────────────────────────
@@ -194,7 +215,13 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	// (ADR-0042) —un acierto que se comió >= 80 % de su plazo castiga al breaker igual que un timeout—, y
 	// saltárselo aquí devolvería el circuito a la conducta que el MP-09 encontró rota: contra un proveedor
 	// LENTO no abre nunca, porque un acierto casual borra la racha de fallos.
-	lento := c.registrarAcierto(transcurrido)
+	// 🔴 EL PLAZO VIAJA HASTA AQUÍ, Y ES EL ARREGLO DE T1.7-2. El umbral de lentitud se deriva del plazo de
+	// ESTA petición y no del default del proceso: sin esto, una interactiva de 10 s que responde en 9,9 s
+	// se contaba como sana (9,9 < 36, el umbral del default de 45 s) habiéndose quedado a 100 ms de morir.
+	var lento bool
+	if cuentaParaElBreaker {
+		lento = c.registrarAcierto(transcurrido, plazo)
+	}
 
 	m := resp.Metrics()
 	salida := resp.Content()
@@ -209,7 +236,13 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 		"prompt_bytes", len(p.Prompt),
 		"salida_bytes", len(salida),
 		"plazo_ms", plazo.Milliseconds(),
+		// EL UMBRAL CON EL QUE SE JUZGÓ ESTA, al lado de su plazo y su latencia. Los tres juntos hacen que la
+		// línea se pueda auditar sola: con dos vías conviviendo (ADR-0044) un `lento=false` sin el umbral
+		// obliga a adivinar contra qué número se comparó. Es también el dato que necesitaría quien algún día
+		// publique esto como serie — sin él habría que reconstruirlo desde una constante y un default.
+		"umbral_lento_ms", umbralLentoDe(plazo).Milliseconds(),
 		"lento", lento,
+		"calentamiento", p.Calentamiento,
 	)
 	c.servidas.Add(1)
 	return app.RespuestaInferencia{RawJSON: salida}, nil
@@ -337,7 +370,16 @@ func (s *servidorInferencia) registrarFalloDeInferencia(
 	} else {
 		c.errOllamaCaido.Add(1)
 	}
-	c.registrarFallo()
+	// LA MISMA COSTURA QUE EN EL LADO ÉXITO, y por el mismo motivo (ver `cuentaParaElBreaker` en Inferir):
+	// un calentamiento que falla no es evidencia contra el proveedor para las peticiones de nadie. El
+	// CONTADOR DEL DESENLACE de arriba (err_timeout / err_ollama_caido) sí se toca —el fallo ocurrió y tiene
+	// que verse en la telemetría—; lo que no se toca es el circuito. `fallos` tampoco sube, y es coherente:
+	// vive DENTRO de registrarFallo porque cuenta la misma población que el breaker juzga.
+	// `eraSondeo` llega en false por construcción cuando la petición no cuenta (nunca se pidió permiso), así
+	// que las dos guardas de `cerrarSinIntentar` de este camino ya están cubiertas sin repetir la condición.
+	if !p.Calentamiento {
+		c.registrarFallo()
+	}
 
 	// 🔴 INV-051.1: del error se dice que existe (va en `error`, que es lo que ya se loguea en el resto
 	// del paquete), jamás el prompt que lo provocó.

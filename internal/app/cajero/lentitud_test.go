@@ -124,17 +124,29 @@ func (c *chateadorGuionado) Chat(_ context.Context, _ ollama.ChatRequest) (*olla
 func (c *chateadorGuionado) SupportsThinking(_ context.Context, _ string) bool { return false }
 
 // correrGuion monta el cajero con el breaker REAL, el aforo en una plaza y el presupuesto de la
-// medición, y le pide al servidor de inferencia tantas inferencias como pasos tenga el guion.
+// medición, y le pide al servidor de inferencia tantas inferencias como pasos tenga el guion. Los dos
+// plazos —el del proceso y el de las peticiones— valen lo mismo, que es el caso de siempre.
+func correrGuion(t *testing.T, pasos []pasoGuion, plazo time.Duration) (*Cajero, *logCaptura) {
+	t.Helper()
+	return correrGuionCon(t, pasos, plazo, plazo)
+}
+
+// correrGuionCon es la versión que SEPARA los dos plazos, y esa separación es lo que hace medibles los
+// casos de T1.7-2.
 //
-// 🔴 EL PLAZO DE CADA PETICIÓN LO PONE EL «CLOUD» (p.Timeout) Y NO Deps.Timeout, y esa separación es la
-// que hace que el último caso del fichero se pueda escribir: desde el ADR-0045 `Deps.Timeout` gobierna
-// SÓLO dos cosas —el default cuando el Cloud no fija plazo, y el umbral de lentitud que se deriva de
-// él—, así que se le puede pasar 0 para apagar el criterio del MP-09 sin dejar a las peticiones sin
-// presupuesto.
+// 🔴 SON DOS NÚMEROS DISTINTOS Y ESE ES EL SUJETO DEL FICHERO DESDE T1.7-2:
+//
+//   - `plazoPropio` es Deps.Timeout, el DEFAULT del Edge. Desde T1.7-2 gobierna una sola cosa: qué plazo
+//     se le pone a una petición que llegue sin él.
+//   - `plazoPeticion` es el `timeout_ms` que manda el Cloud, y es DE ÉL de quien sale el umbral de
+//     lentitud con el que se juzga ESA inferencia.
+//
+// Antes de T1.7-2 el umbral salía del primero para todas, y esa es exactamente la mutación que estos
+// tests cazan.
 //
 // Las inferencias se piden EN SERIE a propósito: el guion es una secuencia temporal (el orden de los
 // aciertos y los fallos es lo que decide si el circuito abre) y el reloj falso es compartido.
-func correrGuion(t *testing.T, pasos []pasoGuion, umbral time.Duration) (*Cajero, *logCaptura) {
+func correrGuionCon(t *testing.T, pasos []pasoGuion, plazoPropio, plazoPeticion time.Duration) (*Cajero, *logCaptura) {
 	t.Helper()
 
 	reloj := nuevoRelojFalso()
@@ -149,11 +161,11 @@ func correrGuion(t *testing.T, pasos []pasoGuion, umbral time.Duration) (*Cajero
 		Log:           log,
 		Ahora:         reloj.ahora,
 		MaxConcurrent: 1, // el aforo, tercera pieza de la interacción
-		Timeout:       umbral,
+		Timeout:       plazoPropio,
 	})
 
 	for i := range pasos {
-		_, err := s.Inferir(context.Background(), peticionDe("clasifica esto", timeoutDeLaMedicion))
+		_, err := s.Inferir(context.Background(), peticionDe("clasifica esto", plazoPeticion))
 		// El error se IGNORA a propósito y sólo aquí: el guion decide qué pasos fallan, y lo que el test
 		// mide es el estado en que quedan el circuito y los contadores, no el desenlace de cada llamada.
 		// Se comprueba, eso sí, que no sea uno que delate un test mal montado.
@@ -266,21 +278,26 @@ func TestLentitud_OllamaSano_NiUnPicoAisladoAbreElCircuito(t *testing.T) {
 	}
 }
 
-// TestLentitud_SinPresupuestoPropio_ElCriterioSeApaga protege la promesa de Deps.Timeout <= 0 en lo que
-// hoy gobierna: el UMBRAL DE LENTITUD. Sin presupuesto propio no hay «demasiado tarde» que definir, así
-// que el criterio no puede inventarse uno y el breaker vuelve exactamente a la conducta de antes del
-// MP-09.
+// TestLentitud_SinPlazoEFECTIVO_ElCriterioSeApaga protege la promesa de «sin plazo no hay criterio»: sin
+// presupuesto no hay «demasiado tarde» que definir, así que el criterio no puede inventarse uno y el
+// breaker vuelve exactamente a la conducta de antes del MP-09.
 //
-// ⚠️ Las peticiones SÍ llevan plazo (se lo pone el Cloud, ver correrGuion): lo que se apaga con
-// `Deps.Timeout = 0` es el umbral derivado, no el presupuesto de cada inferencia. Los dos eran lo mismo
-// antes del ADR-0045 y desde entonces no lo son.
-func TestLentitud_SinPresupuestoPropio_ElCriterioSeApaga(t *testing.T) {
-	c, _ := correrGuion(t, []pasoGuion{
+// 🔴 QUÉ CAMBIÓ EN T1.7-2, Y ES UN CAMBIO DE SEMÁNTICA DECLARADO. Antes bastaba `Deps.Timeout = 0` para
+// apagarlo, porque el umbral salía de ahí y de ningún otro sitio. Hoy sale del plazo EFECTIVO de cada
+// petición, así que apagarlo exige las DOS cosas: que el Cloud tampoco fije `timeout_ms`. Y es lo
+// correcto: una petición que llega con 15 s encima TIENE un plazo, lo haya puesto quien lo haya puesto, y
+// tratarla como si no lo tuviera era precisamente el defecto —el Edge miraba su propia configuración para
+// juzgar un presupuesto que ya no era suyo—.
+//
+// El caso complementario —`Deps.Timeout = 0` pero el Cloud SÍ fija plazo, que antes apagaba el criterio y
+// ahora no— es el que mide TestLentitud_ElDefaultDelProcesoNoGobierna.
+func TestLentitud_SinPlazoEFECTIVO_ElCriterioSeApaga(t *testing.T) {
+	c, _ := correrGuionCon(t, []pasoGuion{
 		resp(13_000), resp(13_100), resp(12_400), resp(14_878), resp(13_500),
-	}, 0) // ← sin plazo propio
+	}, 0, 0) // ← ni plazo propio ni plazo del Cloud
 
 	if c.Circuito() != breaker.StateClosed {
-		t.Errorf("sin plazo propio no hay umbral de lentitud que aplicar, got %q", c.Circuito())
+		t.Errorf("sin plazo EFECTIVO no hay umbral de lentitud que aplicar, got %q", c.Circuito())
 	}
 	if c.Lentas() != 0 {
 		t.Errorf("Lentas: got %d want 0", c.Lentas())
@@ -335,7 +352,7 @@ func TestLentitud_ElSondeoLentoDelMedioAbierto_REABRE(t *testing.T) {
 	}
 
 	for range breaker.DefaultThreshold {
-		c.registrarAcierto(13 * time.Second)
+		c.registrarAcierto(13*time.Second, timeoutDeLaMedicion)
 	}
 	if c.Circuito() != breaker.StateOpen {
 		t.Fatalf("precondición: el circuito debe estar abierto, got %q", c.Circuito())
@@ -347,7 +364,7 @@ func TestLentitud_ElSondeoLentoDelMedioAbierto_REABRE(t *testing.T) {
 	}
 
 	// El sondeo responde, y tarda lo mismo que antes: Ollama sigue enfermo.
-	c.registrarAcierto(13 * time.Second)
+	c.registrarAcierto(13*time.Second, timeoutDeLaMedicion)
 	if c.Circuito() != breaker.StateOpen {
 		t.Errorf("un sondeo LENTO debe REABRIR la ventana, no cerrar el circuito, got %q", c.Circuito())
 	}
@@ -357,8 +374,145 @@ func TestLentitud_ElSondeoLentoDelMedioAbierto_REABRE(t *testing.T) {
 
 	// Y el contrapunto: un sondeo RÁPIDO sí cierra. Sin esto, el circuito no podría recuperarse nunca.
 	reloj.avanzar(breaker.DefaultOpenFor + time.Second)
-	c.registrarAcierto(2 * time.Second)
+	c.registrarAcierto(2*time.Second, timeoutDeLaMedicion)
 	if c.Circuito() != breaker.StateClosed {
 		t.Errorf("un sondeo dentro de plazo CIERRA el circuito, got %q", c.Circuito())
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T1.7-2 · EL UMBRAL ES DE LA PETICIÓN, NO DEL PROCESO (Plan 044 · Ola 1.7)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Los plazos de abajo no son ejemplos redondos: son las DOS VÍAS del ADR-0044 conviviendo en el mismo
+// Edge, que es lo que rompió el umbral único.
+const (
+	// plazoDeLote es el `timeout_ms` de la vía B/C: un lote puede tardar, para eso se sacó a un proceso
+	// aparte. Su umbral de lentitud son 72 s (0,8 × 90).
+	plazoDeLote = 90 * time.Second
+	// plazoInteractivo es el `timeout_ms` de la vía A: hay una persona esperando al otro lado y el plazo
+	// es corto a propósito. Su umbral son 8 s (0,8 × 10).
+	plazoInteractivo = 10 * time.Second
+)
+
+// TestLentitud_LaMISMALatenciaEsSanaOEnfermaSEGUNSuPlazo es el criterio (a) de T1.7-2, y la propiedad
+// entera cabe en su nombre: VEINTE SEGUNDOS no son ni sanos ni enfermos por sí mismos. Lo son contra un
+// plazo, y con dos vías vivas (ADR-0044) hay dos plazos distintos a la vez.
+//
+// Cinco respuestas idénticas de 20 s, dos veredictos opuestos:
+//
+//	timeout_ms = 90.000 (lote)         → umbral 72 s → 20 s va HOLGADA      → circuito CERRADO
+//	timeout_ms = 10.000 (interactiva)  → umbral  8 s → 20 s se comió TODO   → circuito ABIERTO
+//
+// ⚠️ CÓMO ATERRIZA EL SEGUNDO CASO, para que nadie lo lea como una promesa de campo: con reloj falso el
+// `context.WithTimeout` de la inferencia NO vence (usa el reloj del sistema, ver pasoGuion), así que la
+// respuesta de 20 s llega hasta `registrarAcierto`. En campo esa misma inferencia habría muerto por
+// TIMEOUT a los 10 s y habría castigado al breaker por el otro camino. Lo que este test mide es el
+// VEREDICTO del criterio de lentitud, que es lo que T1.7-2 cambió; el caso realista —una respuesta que
+// llega DENTRO de su plazo pero rozándolo— es el de abajo, TestLentitud_NueveComaNueveSobreDiez.
+func TestLentitud_LaMISMALatenciaEsSanaOEnfermaSEGUNSuPlazo(t *testing.T) {
+	guion := func() []pasoGuion {
+		return []pasoGuion{resp(20_000), resp(20_000), resp(20_000), resp(20_000), resp(20_000)}
+	}
+
+	// El plazo propio se deja en el default de hoy (45 s ⇒ umbral 36 s) EN LOS DOS CASOS a propósito: es
+	// un número que no explica ninguno de los dos veredictos, así que si algo los explicara sería él.
+	porDefecto := DefaultInferenceTimeoutMS * time.Millisecond
+
+	lote, _ := correrGuionCon(t, guion(), porDefecto, plazoDeLote)
+	if lote.Lentas() != 0 {
+		t.Errorf("bajo plazo de LOTE (90 s ⇒ umbral 72 s) una respuesta de 20 s va holgada: Lentas got %d want 0",
+			lote.Lentas())
+	}
+	if lote.Circuito() != breaker.StateClosed {
+		t.Errorf("bajo plazo de lote el circuito debe seguir CERRADO, got %q", lote.Circuito())
+	}
+	if lote.Servidas() != 5 {
+		t.Errorf("Servidas: got %d want 5", lote.Servidas())
+	}
+
+	interactiva, _ := correrGuionCon(t, guion(), porDefecto, plazoInteractivo)
+	if interactiva.Lentas() != 5 {
+		t.Errorf("bajo plazo INTERACTIVO (10 s ⇒ umbral 8 s) esas MISMAS respuestas de 20 s son lentas: "+
+			"Lentas got %d want 5", interactiva.Lentas())
+	}
+	if interactiva.Circuito() != breaker.StateOpen {
+		t.Errorf("cinco respuestas por encima del umbral de SU plazo abren el circuito, got %q", interactiva.Circuito())
+	}
+	if interactiva.Fallos() != 0 {
+		t.Errorf("Fallos: got %d want 0 — el proveedor no falló ni una vez, sólo tardó", interactiva.Fallos())
+	}
+}
+
+// TestLentitud_NueveComaNueveSobreDiez es el criterio (b), y es EL DEFECTO que esta tarea cerró contado
+// con un solo número. Una interactiva con 10 s de presupuesto que responde a los 9.900 ms se quedó a
+// 100 ms de morir: es la definición literal de «se comió su plazo». Hasta T1.7-2 el breaker la contaba
+// como ÉXITO —9,9 s está muy por debajo de los 36 s que salían del default del proceso— y encima BORRABA
+// la racha de fallos acumulada, que es el mecanismo exacto que el MP-09 encontró roto, reaparecido en la
+// vía estrecha.
+//
+// Cinco seguidas y el circuito abre, sin un solo fallo del proveedor.
+func TestLentitud_NueveComaNueveSobreDiez(t *testing.T) {
+	c, log := correrGuionCon(t, []pasoGuion{
+		resp(9_900), resp(9_900), resp(9_900), resp(9_900), resp(9_900),
+	}, DefaultInferenceTimeoutMS*time.Millisecond, plazoInteractivo)
+
+	if c.Lentas() != 5 {
+		t.Errorf("una respuesta de 9,9 s con 10 s de plazo se comió su presupuesto y cuenta como LENTA: "+
+			"Lentas got %d want 5 (hasta T1.7-2 pasaban las cinco por sanas)", c.Lentas())
+	}
+	if c.Circuito() != breaker.StateOpen {
+		t.Errorf("cinco respuestas al borde de su plazo abren el circuito, got %q", c.Circuito())
+	}
+	if c.Servidas() != 5 {
+		t.Errorf("Servidas: got %d want 5 — la lentitud castiga al CIRCUITO, no a la respuesta ya pagada", c.Servidas())
+	}
+
+	// La línea tiene que decir contra QUÉ se la juzgó, o en campo no se puede distinguir de una lenta de
+	// lote: la latencia sola no basta cuando hay dos plazos vivos.
+	e, ok := log.buscar("inferencia LENTA")
+	if !ok {
+		t.Fatal("una inferencia lenta debe dejar su propia línea de Warn")
+	}
+	claves := clavesDe(e)
+	for _, k := range []string{"latencia_ms", "umbral_lento_ms", "plazo_ms"} {
+		if !claves[k] {
+			t.Errorf("la línea de lenta debe llevar %q para poder auditarse sola, args: %v", k, e.args)
+		}
+	}
+}
+
+// TestLentitud_ElDefaultDelProcesoNoGobierna es EL TEST DE LA MUTACIÓN, y por eso ataca por los dos
+// lados: en los dos casos el default del Edge y el plazo de la petición apuntan a veredictos OPUESTOS,
+// así que sólo puede pasar si manda el de la petición.
+//
+//	Deps.Timeout = 45 s (umbral 36 s) · petición 10 s (umbral 8 s) · 9,9 s ⇒ LENTA   (el default diría sana)
+//	Deps.Timeout = 10 s (umbral  8 s) · petición 90 s (umbral 72 s) · 20 s ⇒ SANA    (el default diría lenta)
+//
+// 🔴 MUTACIÓN EJECUTADA (criterio (c) de T1.7-2): devolver `registrarAcierto` al umbral fijo del proceso
+// —`umbral := umbralLentoDe(c.timeout)` en vez de `umbralLentoDe(plazo)`, un cambio que COMPILA— pone en
+// rojo los dos subcasos de este test y también
+// TestLentitud_LaMISMALatenciaEsSanaOEnfermaSEGUNSuPlazo. Y NO pone en rojo ninguno de los tests del
+// MP-09, que es justo el motivo por el que el defecto llevaba una ola entera vivo con la suite verde:
+// allí los dos plazos valen lo mismo.
+func TestLentitud_ElDefaultDelProcesoNoGobierna(t *testing.T) {
+	lentaAunqueElDefaultDiriaSana, _ := correrGuionCon(t, []pasoGuion{
+		resp(9_900), resp(9_900), resp(9_900), resp(9_900), resp(9_900),
+	}, DefaultInferenceTimeoutMS*time.Millisecond, plazoInteractivo)
+	if lentaAunqueElDefaultDiriaSana.Lentas() != 5 {
+		t.Errorf("MANDA EL PLAZO DE LA PETICIÓN (10 s ⇒ umbral 8 s), no el default del proceso (45 s ⇒ 36 s): "+
+			"Lentas got %d want 5", lentaAunqueElDefaultDiriaSana.Lentas())
+	}
+
+	sanaAunqueElDefaultDiriaLenta, _ := correrGuionCon(t, []pasoGuion{
+		resp(20_000), resp(20_000), resp(20_000), resp(20_000), resp(20_000),
+	}, plazoInteractivo, plazoDeLote)
+	if sanaAunqueElDefaultDiriaLenta.Lentas() != 0 {
+		t.Errorf("MANDA EL PLAZO DE LA PETICIÓN (90 s ⇒ umbral 72 s), no el default del proceso (10 s ⇒ 8 s): "+
+			"Lentas got %d want 0 — castigar al breaker por una inferencia que va holgada dentro de SU "+
+			"presupuesto es el mismo error, con el signo cambiado", sanaAunqueElDefaultDiriaLenta.Lentas())
+	}
+	if sanaAunqueElDefaultDiriaLenta.Circuito() != breaker.StateClosed {
+		t.Errorf("el circuito debe seguir CERRADO, got %q", sanaAunqueElDefaultDiriaLenta.Circuito())
 	}
 }

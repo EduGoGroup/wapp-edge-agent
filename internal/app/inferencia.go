@@ -51,6 +51,25 @@ type PeticionInferencia struct {
 	// Edge además lo ACOTA por su techo (WAPP_AGENT_INFERENCE_MAX_TIMEOUT_MS): una petición que pida
 	// diez minutos ocuparía la única plaza de Ollama diez minutos.
 	Timeout time.Duration
+	// Calentamiento marca esta petición como TRÁFICO SINTÉTICO: no viene de nadie esperando una respuesta,
+	// su único fin es dejar caliente lo que se enfría solo (hoy, la caché de prefijo de Ollama). El Edge la
+	// sirve exactamente igual —mismo modelo, mismo aforo, mismo plazo— y sólo la trata distinto en UN
+	// sitio: NO LE ENSEÑA NADA AL CIRCUIT BREAKER (ver cajero.servidorInferencia.Inferir).
+	//
+	// 🔴 POR QUÉ SE EXCLUYE, que no es una excepción de conveniencia. El breaker existe para responder «¿le
+	// pido al proveedor la SIGUIENTE petición de un cliente?», y su población tiene que ser la de las
+	// peticiones de clientes. Un calentamiento es justo lo contrario: se emite CUANDO NO HAY TRÁFICO, y con
+	// el modelo descargado es EL MÁS LENTO de todos —es su razón de ser—. Contándolo, una máquina ociosa se
+	// abriría el circuito sola a base de calentamientos lentos y rechazaría con BREAKER_OPEN la primera
+	// petición real que llegase: el remedio provocando la enfermedad. Y al revés, un calentamiento rápido
+	// borraría la racha de fallos de un Ollama que sigue caído.
+	//
+	// ⏳ HOY NADIE LO PONE A `true`, Y ES DELIBERADO: esto es la COSTURA que T1.7-2 dejó abierta para
+	// T1.7-4, que es quien enseñará al Cloud a emitir calentamientos y quien decidirá cómo se marcan EN EL
+	// FRAME (`inference_request`). Hasta entonces el campo sólo lo pone el test que fija la conducta. El
+	// mecanismo de marcado NO está inventado aquí a propósito: lo único que esta tarea fija es DÓNDE se
+	// consulta la marca —antes de que el breaker evalúe nada— y QUÉ significa.
+	Calentamiento bool
 }
 
 // RespuestaInferencia es lo que el modelo devolvió. Un solo campo, y es a propósito: el contrato

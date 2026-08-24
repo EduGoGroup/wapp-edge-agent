@@ -185,16 +185,25 @@ const DefaultInferenceTimeoutMS = 45_000
 // campo, que es la relación con la que se calibró. La constante NO se ha tocado: lo que estaba mal era
 // el número del que se deriva.
 //
-// LO QUE ESTA CONSTANTE NO ES: no es una perilla. Se deriva del plazo —que sí es configurable
-// (WAPP_WORKER_INFERENCE_TIMEOUT_MS)—, así que quien mueva el presupuesto mueve el umbral con él y la
-// relación entre los dos números no se puede desincronizar a mano. Si algún día hace falta afinarla en
-// campo sin recompilar, hacerla configurable es un cambio de una línea; hasta que la medición lo pida,
-// una perilla más es una forma de romper esta calibración por descuido.
+// LO QUE ESTA CONSTANTE NO ES: no es una perilla. Se deriva de un plazo, así que quien mueva el
+// presupuesto mueve el umbral con él y la relación entre los dos números no se puede desincronizar a
+// mano. Si algún día hace falta afinarla en campo sin recompilar, hacerla configurable es un cambio de
+// una línea; hasta que la medición lo pida, una perilla más es una forma de romper esta calibración por
+// descuido.
 //
-// CON EL PLAZO DESACTIVADO (Deps.Timeout <= 0, manda el ctx del proceso) NO HAY PRESUPUESTO del que
-// derivar nada y el criterio se apaga entero: el breaker vuelve exactamente a la conducta de antes del
-// MP-09. Es la única lectura honesta —sin plazo, «tardar demasiado» no está definido—, y además es la
-// que mantiene intacta la promesa de Deps.Timeout <= 0.
+// 🔴 DE QUÉ PLAZO, Y ES LO QUE ARREGLÓ T1.7-2 (Plan 044 · Ola 1.7). Del plazo de CADA PETICIÓN, no del
+// default del proceso. Todo lo de arriba se escribió cuando el Edge decidía el presupuesto y había UNO
+// solo; desde el ADR-0045 lo fija el Cloud petición a petición, y desde el ADR-0044 conviven dos vías con
+// plazos de un orden de magnitud de diferencia (interactiva y lote). Contra un umbral único, la relación
+// «~4,6× el p50 sano» que esta constante protege sólo podía cumplirse para UNA de las dos: la otra
+// quedaba o inmune al criterio (una interactiva de 9,9 s sobre 10 s contada como sana) o marcada como
+// enferma yendo holgada (una de lote de 40 s sobre 90 s). Derivándolo del plazo de cada una, la relación
+// se cumple en las dos a la vez y sin tocar este número.
+//
+// SIN PLAZO EFECTIVO NO HAY PRESUPUESTO del que derivar nada y el criterio se apaga: el breaker vuelve
+// exactamente a la conducta de antes del MP-09. Es la única lectura honesta —sin plazo, «tardar
+// demasiado» no está definido—. Hoy eso exige las dos cosas a la vez: que el Cloud no fije `timeout_ms` Y
+// que el Edge tenga Deps.Timeout desactivado, que es como se mantiene intacta esa promesa.
 const FraccionLentitud = 0.8
 
 // DefaultMaxIntentos es cuántas veces se RECLAMA un lote antes de abandonarlo con
@@ -345,8 +354,9 @@ type Deps struct {
 	// —y por qué el 15 s anterior estaba calibrado contra una muestra CENSURADA— está en
 	// DefaultInferenceTimeoutMS.
 	//
-	// ⚠️ De él se DERIVA el umbral de lentitud del breaker (FraccionLentitud): mover este número mueve
-	// aquél, y esa dependencia es deliberada (los dos no se pueden desincronizar a mano).
+	// ⚠️ De él se DERIVA el umbral de lentitud del breaker (FraccionLentitud) SÓLO PARA LAS PETICIONES QUE
+	// LLEGUEN SIN PLAZO. Desde T1.7-2 el umbral es de cada petición y sale del plazo de ella, así que mover
+	// este número mueve el umbral de las que caen en el default y de ninguna más (ver registrarAcierto).
 	Timeout time.Duration
 	// TimeoutMax es el TECHO de lo que el Cloud puede pedir en `timeout_ms`. <=0 ⇒ DefaultMaxTimeoutMS.
 	// Un plazo por encima se RECORTA y se avisa (nunca se rechaza la petición): ver Cajero.plazoDe.
@@ -404,10 +414,6 @@ type Cajero struct {
 	lease       time.Duration
 	timeout     time.Duration
 	timeoutMax  time.Duration
-	// umbralLento es el plazo por encima del cual un ACIERTO deja de contar como éxito para el breaker
-	// (MP-09). Se DERIVA de timeout en New —timeout × FraccionLentitud— y vale 0 cuando no hay plazo
-	// propio (Deps.Timeout <= 0), que es como se apaga el criterio entero. Ver FraccionLentitud.
-	umbralLento time.Duration
 	statsEvery  time.Duration
 	ollamaURL   string
 	numThread   int
@@ -587,7 +593,6 @@ func New(deps Deps) (*Cajero, error) {
 		lease:       lease,
 		timeout:     deps.Timeout,
 		timeoutMax:  timeoutMax,
-		umbralLento: umbralLentoDe(deps.Timeout),
 		statsEvery:  deps.StatsEvery,
 		ollamaURL:   deps.OllamaURL,
 		numThread:   numThread,
@@ -621,7 +626,11 @@ func (c *Cajero) Run(ctx context.Context) error {
 		"lease_s", int(c.lease.Seconds()),
 		"inferencia_timeout_ms", c.timeout.Milliseconds(),
 		"inferencia_timeout_max_ms", c.timeoutMax.Milliseconds(),
-		"umbral_lento_ms", c.umbralLento.Milliseconds(),
+		// 🔴 «_default_» EN EL NOMBRE, Y NO ES COSMÉTICA (T1.7-2): desde esta tarea el umbral de lentitud NO
+		// es del proceso sino DE CADA PETICIÓN —se deriva del plazo de ella, ver registrarAcierto—. Éste es
+		// sólo el que le tocará a las que lleguen SIN plazo, y llamarlo `umbral_lento_ms` haría creer a quien
+		// lea el arranque que todas se juzgan contra este número.
+		"umbral_lento_default_ms", umbralLentoDe(c.timeout).Milliseconds(),
 		"stats_cada_ms", c.statsEvery.Milliseconds(),
 	)
 
@@ -820,8 +829,28 @@ const (
 // ella. Por eso `lentas` es un contador aparte y NO suma en `fallos` —que gobierna el freno del lote
 // venenoso (DefaultMaxIntentos)—: castigar los intentos de un lote por la lentitud de Ollama abandonaría
 // mensajes ajenos al problema.
-func (c *Cajero) registrarAcierto(transcurrido time.Duration) bool {
-	if c.umbralLento <= 0 || transcurrido < c.umbralLento {
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 EL UMBRAL ES DE LA PETICIÓN, NO DEL PROCESO (T1.7-2, Plan 044 · Ola 1.7)
+// ─────────────────────────────────────────────────────────────────────────────
+// `plazo` es el plazo EFECTIVO de ESTA inferencia —el que ya calculó `plazoDe` para ella, default y techo
+// aplicados—, y el umbral se deriva de él en cada llamada. Antes se derivaba UNA vez en New, del default
+// del proceso, y esa versión mentía en las dos direcciones desde que el ADR-0045 le dio el plazo al Cloud:
+//
+//   - MENTÍA POR ARRIBA, y es el defecto que cerró esta tarea: una petición interactiva con
+//     `timeout_ms = 10 s` que tardaba 9,9 s se le contaba al circuito como ÉXITO —9,9 s < 36 s, el umbral
+//     del default— cuando se había quedado a 100 ms de morir. El breaker no podía ver enferma la vía
+//     estrecha por muy mal que fuese.
+//   - MENTÍA POR ABAJO en la vía de lote: una petición con `timeout_ms = 90 s` que responde en 40 s va
+//     holgadísima dentro de SU presupuesto, y el umbral del proceso la marcaba como lenta y castigaba al
+//     circuito por ella.
+//
+// LA FÓRMULA NO CAMBIA (ADR-0042 §4: × FraccionLentitud). Cambia DE QUÉ PLAZO SE DERIVA, que es donde
+// estaba el error: un umbral derivado hereda el error de su fuente sin dar ninguna señal, y con dos vías
+// conviviendo (ADR-0044) no hay UN plazo del proceso que pueda representarlas a las dos.
+func (c *Cajero) registrarAcierto(transcurrido, plazo time.Duration) bool {
+	umbral := umbralLentoDe(plazo)
+	if umbral <= 0 || transcurrido < umbral {
 		c.breaker.RecordSuccess()
 		return false
 	}
@@ -837,8 +866,11 @@ func (c *Cajero) registrarAcierto(transcurrido time.Duration) bool {
 	c.log.Warn("cajero: inferencia LENTA; respondió, pero se comió casi todo su plazo y cuenta como fallo "+
 		"para el circuit breaker (el lote se cierra con su intent, no se pierde)",
 		"latencia_ms", transcurrido.Milliseconds(),
-		"umbral_lento_ms", c.umbralLento.Milliseconds(),
-		"timeout_ms", c.timeout.Milliseconds(),
+		"umbral_lento_ms", umbral.Milliseconds(),
+		// EL PLAZO DE ESTA PETICIÓN, no el default del proceso: es lo único que hace legible el `umbral_lento_ms`
+		// de al lado. Con dos vías conviviendo (interactiva y lote, ADR-0044) el mismo `latencia_ms` es sano en
+		// una y enfermo en la otra, y sin este número las dos líneas serían indistinguibles en el log.
+		"plazo_ms", plazo.Milliseconds(),
 		"lentas", n,
 		"circuito", c.breaker.State(),
 	)
@@ -861,9 +893,19 @@ func (c *Cajero) anotarApertura(abrio bool, causa string) {
 		"causa", causa, "aperturas", n, "abierto_por_s", int(breaker.DefaultOpenFor.Seconds()))
 }
 
-// umbralLentoDe deriva el umbral de lentitud del presupuesto de inferencia (ver FraccionLentitud). Un
-// presupuesto <= 0 —Deps.Timeout desactivado, manda el ctx del proceso— devuelve 0, que APAGA el
-// criterio: sin plazo no hay «demasiado tarde» que definir.
+// umbralLentoDe deriva el umbral de lentitud de UN plazo de inferencia (ver FraccionLentitud). Un plazo
+// <= 0 devuelve 0, que APAGA el criterio: sin plazo no hay «demasiado tarde» que definir.
+//
+// 🔴 SIGUE SIENDO EL ÚNICO SITIO DONDE VIVE LA FÓRMULA, y por eso T1.7-2 no la movió: lo que cambió es
+// QUIÉN la llama y CON QUÉ. Su llamante de producción es `registrarAcierto`, una vez por petición y con
+// el plazo de ella; `Run` la usa además para poder anunciar en el arranque el umbral que le tocará a las
+// peticiones que lleguen sin plazo (`umbral_lento_default_ms`), que es un dato informativo y no un
+// criterio. Si algún día hace falta afinar la fracción, se afina aquí y las dos vías se mueven juntas.
+//
+// EL CERO SIGUE SIENDO ALCANZABLE, sólo que ahora exige las DOS cosas a la vez: que el Cloud no fije
+// plazo Y que el Edge tenga Deps.Timeout desactivado (`plazoDe` devuelve el default cuando el pedido es
+// 0). Es la lectura honesta: con un plazo real encima, «tardar demasiado» SÍ está definido, venga de
+// donde venga el número.
 func umbralLentoDe(timeout time.Duration) time.Duration {
 	if timeout <= 0 {
 		return 0
