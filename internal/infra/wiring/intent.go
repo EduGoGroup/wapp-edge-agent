@@ -75,34 +75,18 @@ func (s *IntentStack) ConfigVersion() string {
 	return rec.Version
 }
 
-// ClasificadorActivo reporta si el CLASIFICADOR de intenciones está encendido en este Edge. Lo consume el
-// listener (Plan 051 Ola 2, T2.12) para que una fila que llega con el clasificador apagado nazca ya resuelta
-// (`apagado`) en vez de gastar una plaza del semáforo del cajero.
+// 🔴 AQUÍ VIVÍAN `ClasificadorActivo()` y `ClasificadorActivoFunc()`, RETIRADOS EL 2026-08-24 (Plan 044 ·
+// Ola 1.6 · T1.6-5 · ADR-0045). Eran el interruptor del entitlement `llm_intent` que el sessionmgr cableaba
+// en cada listener para que una fila que llegaba con la feature apagada naciera ya resuelta (marca
+// `apagado`) en vez de gastar una plaza del semáforo del cajero. Bajo pull el Edge no clasifica por
+// iniciativa propia, todas las filas nacen `nuevo`, y ese cableado —listener, gateway, sessionmgr y
+// daemon— se retiró entero, dejando a los dos métodos SIN UN SOLO LLAMANTE.
 //
-// 🔄 CAMBIÓ DE FUENTE EN T3.0, y el cambio es una MEJORA, no un apaño. Antes leía `Decorator != nil`, que
-// era un proxy de la feature: BuildIntent solo construía el decorador con la feature ON. Retirado el
-// decorador, se lee el flag DIRECTO (`s.Enabled` = cfg.Intent.Enabled), que es lo que la semántica
-// documentada de `app.MotivoApagado` siempre dijo —«la feature llm_intent está apagada»— y de paso elimina
-// la salvedad que el comentario anterior arrastraba sobre `Decorator.ready`.
-//
-// ⚠️ LO QUE SIGUE SIN SABER: si el WORKER-CAJERO está realmente corriendo y con contrato cargado. Eso vive
-// en otro proceso y el daemon no puede verlo. Con la feature ON y el cajero caído, las filas nacen `nuevo`
-// y esperan en la cola hasta que el supervisor lo levante; el despachador las entrega igual al agotar su
-// presupuesto. Es el fallo del lado barato y visible, que es el que se eligió a propósito.
-func (s *IntentStack) ClasificadorActivo() bool {
-	return s != nil && s.Enabled
-}
-
-// ClasificadorActivoFunc devuelve el predicado que el sessionmgr cablea en cada listener
-// (sessionmgr.WithClasificadorActivo). Devuelve un MÉTODO y no un bool ya evaluado para no congelar la foto
-// del arranque: quien lo llame lee el estado del stack en el momento del mensaje. Con el stack nil devuelve
-// nil, y el Listener cae a su default SEGURO (activo).
-func (s *IntentStack) ClasificadorActivoFunc() func() bool {
-	if s == nil {
-		return nil
-	}
-	return s.ClasificadorActivo
-}
+// Se BORRAN en vez de conservarse «para T1.6-2»: un predicado sin llamante es deuda, no previsión, y el
+// dato que envolvían sigue aquí al alcance de la mano en el campo `Enabled` —que es justo lo que ya lee el
+// status del plano de control (daemon.go)—. Cuando el worker sirva `inference_request` y tenga que
+// responder un error nombrado con la feature apagada, leerá ese campo o pedirá lo que necesite; no hay
+// nada que preservar.
 
 // BuildIntent construye el conducto del CONTRATO de intenciones (Plan 029) sobre la BD única YA migrada
 // (la tabla edge_config la crea db.Migrate). El Store se crea SIEMPRE (lo consulta el status). Con
@@ -137,10 +121,10 @@ func BuildIntent(cfg config.Config, database *sql.DB, log sharedlogger.Logger) *
 
 	st.Applier = svc
 	st.Service = svc
-	// `wait_ms` es el presupuesto del DESPACHADOR (lo único que este proceso controla del camino de la
-	// intención). El plazo de la inferencia y la URL de Ollama son del worker y se loguean allí: emitirlos
+	// SÓLO EL MODELO. `wait_ms` era el presupuesto del despachador y murió con el push (T1.6-5,
+	// ADR-0045); el plazo de la inferencia y la URL de Ollama son del worker y se loguean allí — emitirlos
 	// aquí sugeriría que este proceso los usa.
-	log.Info("contrato de intenciones HABILITADO (Plan 029, ADR-0020); la clasificación la ejecuta el worker-cajero, no el daemon",
-		"model", cfg.Intent.Model, "wait_ms", cfg.Intent.WaitMS)
+	log.Info("contrato de intenciones HABILITADO (Plan 029, ADR-0020); este proceso NO clasifica",
+		"model", cfg.Intent.Model)
 	return st
 }

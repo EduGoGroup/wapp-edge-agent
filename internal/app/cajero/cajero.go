@@ -80,7 +80,7 @@ const (
 )
 
 // DefaultInferenceTimeoutMS es el plazo por defecto de UNA inferencia del worker (ms), el que gobierna
-// Deps.Timeout — y NO tiene nada que ver con WAPP_AGENT_INTENT_WAIT_MS, el presupuesto de espera del
+// Deps.Timeout — y NO tenía nada que ver con el retirado WAPP_AGENT_INTENT_WAIT_MS, el presupuesto de espera del
 // despachador. Ver el doc comment de Deps.Timeout para el argumento completo: son dos presupuestos
 // distintos, de dos caminos distintos.
 const DefaultInferenceTimeoutMS = 15000
@@ -267,19 +267,21 @@ type Deps struct {
 	// Timeout acota UNA inferencia del WORKER (WAPP_WORKER_INFERENCE_TIMEOUT_MS, default
 	// DefaultInferenceTimeoutMS = 15 s). <=0 ⇒ sin plazo propio (manda el ctx del proceso).
 	//
-	// 🔴 NO ES `WAPP_AGENT_INTENT_WAIT_MS` (4 s), Y CONFUNDIRLOS ROMPE EL WORKER EN SILENCIO. Son dos
-	// presupuestos de dos caminos distintos y el design §5 avisa expresamente de no colapsarlos:
+	// 🔴 ES EL ÚNICO PLAZO DEL CAMINO DE LA INTENCIÓN QUE QUEDA EN EL EDGE, y conviene saber contra qué se
+	// le comparaba: hubo DOS presupuestos hermanos y los dos se retiraron por confundirse con éste.
 	//
-	//   - WAPP_AGENT_INTENT_WAIT_MS (4 s, T3.1) es cuánto espera el DESPACHADOR a que aparezca un intent
-	//     antes de entregar el mensaje sin él. Es corto porque su objetivo es NO RETENER LA ENTREGA:
-	//     pasado el plazo el mensaje sale sin intent y la sesión sigue viva. (Sustituyó a la retirada
-	//     WAPP_AGENT_INTENT_TIMEOUT_MS, que era el plazo del camino inline; ese camino muere en T3.0.)
+	//   - `WAPP_AGENT_INTENT_TIMEOUT_MS` era el plazo del camino INLINE de clasificación, retirado en la
+	//     Ola 3 (T3.1) con ese camino.
+	//   - `WAPP_AGENT_INTENT_WAIT_MS` (4 s) era cuánto RETENÍA el despachador la entrega esperando a que
+	//     apareciera un intent, retirado el 2026-08-24 con el push entero (Plan 044 · Ola 1.6 · T1.6-5 ·
+	//     ADR-0045: la clasificación pasó a PULL y el Edge entrega al instante).
+	//
 	//   - Éste es «cuánto aguanto a Ollama», y el worker EXISTE JUSTO PARA PODER TARDAR: se sacó la
 	//     inferencia a otro proceso precisamente para que un Ollama lento no coma el proceso de los
 	//     sockets. Heredar aquí el presupuesto del despachador lo calibraría PARA FALLAR: la O0 midió
 	//     p50 = 2.613 ms y p95 = 3.736 ms (docs/plans/051-worker-cajero-edge/O0-resultados-2026-08-09.md),
-	//     así que cualquier plazo pegado a la p95 (los 3 s del inline retirado, los 4 s del despachador)
-	//     aborta una fracción grande de las inferencias → cada aborto es un fallo → 5
+	//     así que cualquier plazo pegado a la p95 (los 3 s del inline, los 4 s del despachador; los dos ya
+	//     retirados) aborta una fracción grande de las inferencias → cada aborto es un fallo → 5
 	//     seguidos abren el breaker 60 s → las filas se quedan en `tomado` → el barrido las devuelve a
 	//     `nuevo` → se re-reclaman y vuelven a expirar. Un bucle que no progresa hasta que el tope de la
 	//     cola las descarta, y sin un solo error que lo delate.

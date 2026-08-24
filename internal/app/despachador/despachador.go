@@ -18,11 +18,25 @@ import (
 // llenó (el cajero clasifica): sin él, la cola se llena y nadie la vacía.
 //
 // LA INVARIANTE QUE COMPRA LA OLA, y por la que existe todo esto (REQ-051.18): **la fila N+1 no sale
-// antes que la N**, aunque la N+1 esté lista y la N siga esperando al cajero. Un mensaje entregado fuera
-// de orden es una conversación reordenada delante del cliente final, y eso no se arregla aguas arriba.
-// El precio de esa invariante es que una fila atascada RETIENE a su sesión, y por eso existe el
-// PRESUPUESTO (T3.4): la retención está acotada por reloj (WAPP_AGENT_INTENT_WAIT_MS, 4000 ms por
-// defecto) y al vencer el mensaje sale igual, sin intención. Se retrasa, nunca se pierde.
+// antes que la N**. Un mensaje entregado fuera de orden es una conversación reordenada delante del
+// cliente final, y eso no se arregla aguas arriba.
+//
+// ─── EL PRESUPUESTO DE ESPERA MURIÓ (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045 · D-044.31 · REQ-35) ───
+//
+// Hasta el 2026-08-23 este bucle RETENÍA la cabeza hasta 4 s (`WAPP_AGENT_INTENT_WAIT_MS`) esperando a que
+// el worker-cajero le dejara un intent en la columna `intent_json`. El ADR-0045 invirtió la clasificación
+// de PUSH a PULL —el Cloud PIDE la inferencia por el frame `inference_request` cuando la necesita— y con
+// ella disolvió la espera entera: **ya no hay nada que esperar, así que ya no se espera**.
+//
+// 🔴 NO SE «BAJÓ EL PRESUPUESTO A CERO», SE BORRÓ EL MECANISMO, y la diferencia importa para quien lea
+// esto buscando la palanca: no la hay. El número no estaba mal calibrado —la medida de campo fue 1 de 430
+// inferencias dentro de la ventana, con descartes a 8 ms de llegar la etiqueta—; lo que estaba mal era
+// acoplar la ENTREGA a la INFERENCIA. Desacoplarlas hace que la única pregunta de este bucle sea «¿hay
+// cabeza?», y la respuesta se entrega en el acto.
+//
+// CONSECUENCIA EN LA COLA: sin espera, `clasificado` dejó de ser un estadio del ciclo (queda
+// `nuevo → tomado → despachado`, ADR-0045 §Decisión.4) y este bucle entrega CUALQUIER cabeza que no esté
+// ya `despachado`, sea cual sea su estado. Ver `vuelta`.
 //
 // ─── EL MOLDE, Y LAS DOS DIFERENCIAS DELIBERADAS ───
 //
@@ -62,18 +76,6 @@ import (
 // localiza la fila sin nombrar la conversación. Si algún día hace falta citarla, se copia el helper con
 // su hash de 8 hex — NUNCA el JID.
 
-// DefaultPresupuestoMS es el presupuesto de espera por defecto, en milisegundos: cuánto retiene el
-// despachador la cabeza de su sesión esperando a que el cajero la clasifique, antes de entregarla igual
-// sin intención.
-//
-// 🔴 ES EL MISMO NÚMERO QUE `config.DefaultIntentWaitMS`, y que esté escrito dos veces es deliberado y
-// acotado. La alternativa sería importar `internal/infra/config` desde `internal/app/…`, que invierte la
-// dirección de la hexagonal: el núcleo pasaría a depender de la infraestructura para leer una constante.
-// El valor REAL siempre llega inyectado (`Deps.Presupuesto`, cableado desde `cfg.Intent.WaitMS`); este
-// default sólo cubre un `Deps` que no lo fije — es decir, los tests. Si divergieran, el que manda en
-// producción es el de config, y este no se usaría jamás.
-const DefaultPresupuestoMS = 4000
-
 // plazoSello acota la escritura del SELLO (`MarcarDespachada`) cuando el contexto de la sesión ya se
 // canceló. El sello corre con `context.WithoutCancel` a propósito —ver `entregar`: el mensaje ya salió
 // al cable y no anotarlo obligaría a re-entregarlo en el arranque siguiente—, y un contexto sin
@@ -105,35 +107,34 @@ type Deps struct {
 	SessionID string
 	// Log es el logger; nil ⇒ el default del proceso. Conviene pasarlo ya etiquetado con session_id.
 	Log sharedlogger.Logger
-	// Ahora es el reloj INYECTABLE con el que se mide el presupuesto. nil ⇒ time.Now.
+	// Ahora es el reloj INYECTABLE con el que se mide el ESPACIADO ENTRE RE-ENTREGAS (`reintentoEntrega`).
+	// nil ⇒ time.Now.
 	//
-	// Nunca `time.Now()` directo en el cuerpo del bucle: el presupuesto es la única lógica temporal de esta
+	// 🔴 YA NO MIDE NINGÚN PRESUPUESTO: ésa era su razón de ser hasta T1.6-5 y esa lógica murió con el
+	// push. Sigue inyectable porque el backoff de la re-entrega es hoy la única lógica temporal de la
 	// pieza, y un test que no pueda adelantar el reloj sólo puede comprobarla durmiendo — que es como se
 	// escriben los tests que fallan en CI un martes de cada tres.
 	Ahora func() time.Time
-	// Presupuesto es cuánto se retiene la cabeza esperando al cajero (WAPP_AGENT_INTENT_WAIT_MS).
-	// <= 0 ⇒ DefaultPresupuestoMS.
-	Presupuesto time.Duration
 	// Despertador es cómo se espera entre dos miradas a la cola. nil ⇒ PollFijo(DefaultPollMS).
 	Despertador Despertador
 }
 
-// cabezaEnCurso es el estado del PRESUPUESTO: qué fila es hoy la cabeza y desde cuándo se la está
-// esperando. Lo toca SÓLO la goroutine de Run, así que no lleva candado.
-//
-// 🔴 EL RELOJ ARRANCA CUANDO LA FILA SE CONVIERTE EN CABEZA DESPACHABLE, NO CUANDO SE ENCOLÓ, y la
-// diferencia es el sentido entero del presupuesto. Si se midiera desde el `Enqueue`, una fila que pasó
-// diez minutos detrás de otras nacería con el presupuesto ya agotado y saldría sin intención sin que
-// nadie le hubiera dado al cajero una sola oportunidad de clasificarla. Lo que se acota es LA ESPERA DE
-// ESTE DESPACHADOR, que es lo único que él controla.
 // reintentoEntrega recuerda cuántas veces seguidas ha fallado la entrega de UNA fila concreta y a
-// partir de cuándo tiene sentido volver a intentarlo. Se identifica por el par (id, seq) por el mismo
-// motivo que `cabezaEnCurso`: el rowid solo no identifica una fila a lo largo del tiempo.
+// partir de cuándo tiene sentido volver a intentarlo.
 //
 // Se limpia en cuanto una entrega sale bien, así que un fallo aislado —un corte de red que se cura—
 // no deja rastro ni penaliza a la fila siguiente.
 type reintentoEntrega struct {
-	id     int64
+	id int64
+	// seq acompaña al id porque EL ROWID SOLO NO IDENTIFICA UNA FILA A LO LARGO DEL TIEMPO (T3.10): la
+	// tabla no declara AUTOINCREMENT, y SQLite reutiliza el rowid de una fila borrada. Entre la poda TTL
+	// y el tope de filas, borrar es rutina aquí. Si una fila nueva heredara el rowid de la que este bucle
+	// venía reintentando, la comparación por id sola diría «es la misma fila» y la nueva NACERÍA FRENADA:
+	// su primera entrega se saltaría por un backoff que nunca fue suyo.
+	//
+	// `seq` es monotónico por sesión y nunca se reusa, así que el par (id, seq) sí identifica. (La otra
+	// mitad de este argumento vivía en `cabezaEnCurso.seq`, que murió con el presupuesto en T1.6-5; se
+	// conserva aquí porque el peligro es el mismo y ahora éste es su único sitio.)
 	seq    int64
 	fallos int
 	// desde marca a partir de cuándo se puede reintentar. Mientras no llegue, la vuelta no llama al
@@ -169,29 +170,6 @@ const (
 	topeBackoffEntrega = 30 * time.Second
 )
 
-type cabezaEnCurso struct {
-	// id es la fila que se está esperando; 0 = ninguna.
-	id int64
-	// seq acompaña al id porque EL ROWID SOLO NO IDENTIFICA UNA FILA A LO LARGO DEL TIEMPO (T3.10):
-	// la tabla no declara AUTOINCREMENT, y SQLite reutiliza el rowid de una fila borrada. Entre la
-	// poda TTL y el tope de filas, borrar es rutina aquí. Si una fila nueva heredara el rowid de la
-	// que este bucle estaba esperando, la comparación por id sola diría «es la misma cabeza» y la
-	// nueva HEREDARÍA el `desde` de la vieja: su presupuesto nacería ya consumido y se despacharía
-	// sin intención de inmediato. Una degradación silenciosa y difícil de creer leyendo los logs.
-	//
-	// `seq` es monotónico por sesión y nunca se reusa, así que el par (id, seq) sí identifica.
-	seq int64
-	// desde es el instante en que se la vio por primera vez como cabeza sin clasificar.
-	desde time.Time
-	// disparado marca que YA se llamó a DespacharSinIntent para esta fila. Impide re-disparar en bucle si
-	// la sentencia no la sacó de `nuevo`/`tomado` (ver correrPresupuesto). En el camino normal esta marca
-	// vive un suspiro: la vuelta siguiente encuentra la fila `clasificado`, la entrega, y `olvidarCabeza`
-	// borra el struct entero.
-	disparado bool
-	// avisada marca que ya se gritó el Warn de «esta cabeza no avanza». Un aviso por fila, no por poll.
-	avisada bool
-}
-
 // Despachador drena la cola de UNA sesión, en orden de `seq`, y entrega al sink. Uno por sesión; entre
 // sesiones son independientes y concurrentes.
 type Despachador struct {
@@ -200,11 +178,7 @@ type Despachador struct {
 	sessionID   string
 	log         sharedlogger.Logger
 	ahora       func() time.Time
-	presupuesto time.Duration
 	despertador Despertador
-
-	// enCurso es estado LOCAL DEL BUCLE (no compartido): sólo lo lee y escribe Run/vuelta.
-	enCurso cabezaEnCurso
 
 	// reintento es el freno de la RE-ENTREGA, y también estado local del bucle.
 	//
@@ -225,42 +199,49 @@ type Despachador struct {
 	//
 	// Son las series LOCALES que la Ola 4 (T4.0) publicará al heartbeat. Todos son acumulados monotónicos
 	// sin PII: cardinalidades, nunca contenido.
-	despachados          atomic.Int64
-	conIntent            atomic.Int64
-	fragmentosDeLote     atomic.Int64
-	sobresIlegibles      atomic.Int64
-	metasIlegibles       atomic.Int64
-	presupuestosVencidos atomic.Int64
-	fallosLectura        atomic.Int64
-	fallosEntrega        atomic.Int64
-	panicos              atomic.Int64
-	// EL SELLO FALLA EN DOS SITIOS QUE NO SIGNIFICAN LO MISMO, y por eso son dos series y no una
-	// (misma razón por la que `omitidos` desglosa por motivo en vez de agregar):
+	despachados atomic.Int64
+	// intentsDescartados cuenta las filas ANTIGUAS que se drenan trayendo un sobre de clasificación REAL
+	// escrito bajo el modelo push, y cuya intención YA NO PUEDE VIAJAR: el ADR-0045 retiró
+	// `ClassifiedIntent` del proto, así que no existe campo donde ponerla. El mensaje sale igual y
+	// completo; lo único que se pierde es una clasificación que ya estaba pagada.
 	//
-	//   - fallosSelloPresupuesto: falló `DespacharSinIntent`. La fila sigue en `nuevo`/`tomado`, se
-	//     reintenta en el poll siguiente y AGUAS ARRIBA NO PASA NADA. Es ruido operativo.
-	//   - fallosSelloDespacho: falló `MarcarDespachada` DESPUÉS de una entrega con éxito. Cada uno de
-	//     estos es **un duplicado garantizado en la nube**: el mensaje ya salió y la fila se releerá.
+	// 🔴 CERO ES EL VALOR SANO Y ESPERADO, y crecer NO es un bug: es el rastro de las colas que venían
+	// escritas por un binario anterior a T1.6-5 vaciándose. Si crece SOSTENIDAMENTE en un Edge que lleva
+	// días con este binario, entonces sí es una señal — significa que algo sigue escribiendo sobres de
+	// clasificación en `intent_json`, es decir que el push no está del todo muerto en esa máquina.
+	intentsDescartados atomic.Int64
+	sobresIlegibles    atomic.Int64
+	metasIlegibles     atomic.Int64
+	fallosLectura      atomic.Int64
+	fallosEntrega      atomic.Int64
+	panicos            atomic.Int64
+	// fallosSelloDespacho: falló `MarcarDespachada` DESPUÉS de una entrega con éxito. Cada uno de éstos es
+	// **un duplicado garantizado en la nube**: el mensaje ya salió y la fila se releerá.
 	//
-	// Agregarlos haría ilegible justo el número que importa. Y desde que el sello corre con
-	// `context.WithoutCancel` (ver `entregar`), el segundo dejó de dispararse en cada apagado —antes ni
-	// siquiera se contaba ahí—, así que ahora sí es una señal limpia de «hubo duplicados».
-	fallosSelloPresupuesto atomic.Int64
-	fallosSelloDespacho    atomic.Int64
-	// LA CABEZA ATASCADA: una fila en un estado que esta versión no conoce se queda de cabeza para
-	// siempre y su sesión NO DRENA MÁS. Es la peor degradación posible del despachador y hasta el
-	// 2026-08-17 su única señal era UN `Warn` en toda la vida del proceso (`avisada`), sin un solo
-	// atómico subiendo: la telemetría de la Ola 4 habría publicado una sesión MUERTA como una sesión
-	// ociosa, que es exactamente lo que INV-051.3 prohíbe (ninguna degradación silenciosa).
+	// 🔴 ERAN DOS SERIES HASTA T1.6-5, y la otra —`fallosSelloPresupuesto`, el fallo de
+	// `DespacharSinIntent`— murió con el presupuesto: ya no existe esa segunda escritura. Se separaron en
+	// su día (T3.12) porque sólo UNA de las dos tiene consecuencia aguas arriba, y ésta es esa. El campo
+	// `failed_seal_budget` del heartbeat sobrevive por contrato de proto y queda clavado a 0; ver
+	// `health.DespachoStats.FallosSelloPresupuesto`.
+	fallosSelloDespacho atomic.Int64
+	// 🔴 LA CABEZA ATASCADA SE DISOLVIÓ CON EL PRESUPUESTO (T1.6-5), y aquí vivían sus dos contadores
+	// (`cabezasAtascadas`, `pollsCabezaAtascada`). El atasco era ESTE caso y sólo éste: una fila que el
+	// sello por presupuesto dejaba en un estado que esta versión no conocía se quedaba de cabeza para
+	// siempre, porque `vuelta` sólo entregaba desde `clasificado`. Hoy `vuelta` entrega CUALQUIER cabeza
+	// que no esté `despachado` —el estado ya no es una condición de entrega—, así que ningún estado
+	// imprevisto puede retener a una sesión y no hay nada que contar.
 	//
-	// Son dos porque responden preguntas distintas: `cabezasAtascadas` cuántas filas han llegado a este
-	// estado (sube una vez por fila, como el aviso), y `pollsCabezaAtascada` cuánto lleva la sesión sin
-	// drenar AHORA (sube en cada vuelta que sigue bloqueada). La primera sola no distingue «pasó una vez
-	// hace horas» de «lleva parada desde entonces».
-	cabezasAtascadas    atomic.Int64
-	pollsCabezaAtascada atomic.Int64
-	// omitidos desglosa los despachos SIN intención POR MOTIVO. Se construye en New recorriendo
-	// app.MotivosOmitido() y NO se muta después, así que leerlo concurrentemente es seguro.
+	// Los campos `stuck_heads` / `stuck_head_polls` del heartbeat sobreviven por contrato de proto y
+	// quedan clavados a 0. Retirarlos es un cambio de proto y no es de esta tarea (T1.6-1).
+
+	// omitidos desglosa por MOTIVO las filas que se drenan trayendo un sobre `{"omitido":…}`. Se construye
+	// en New recorriendo app.MotivosOmitido() y NO se muta después, así que leerlo concurrentemente es
+	// seguro.
+	//
+	// 🔴 BAJO PULL ESTE DESGLOSE SÓLO PUEDE MOVERSE CON FILAS ANTIGUAS. Ningún productor del Edge escribe
+	// ya sobres de omisión (ADR-0045: el Edge no clasifica, así que no hay omisión que anotar); lo que
+	// queda es DECODIFICAR las colas escritas por binarios anteriores a T1.6-5 mientras se vacían. Ver la
+	// lista canónica en `internal/app/cola.go`, donde cada motivo dice desde cuándo está huérfano.
 	//
 	// 🔴 SE RECORRE LA LISTA CANÓNICA, JAMÁS UNA LISTA ESCRITA A MANO. Los motivos son OCHO y han sido
 	// siete dos veces: `sin_texto` entró en T1.8 y `fallo_repetido` en T2.19, cada uno por un incidente de
@@ -303,10 +284,6 @@ func New(deps Deps) (*Despachador, error) {
 	if ahora == nil {
 		ahora = time.Now
 	}
-	presupuesto := deps.Presupuesto
-	if presupuesto <= 0 {
-		presupuesto = DefaultPresupuestoMS * time.Millisecond
-	}
 	desp := deps.Despertador
 	if desp == nil {
 		desp = NewPollFijo(DefaultPollMS * time.Millisecond)
@@ -326,7 +303,6 @@ func New(deps Deps) (*Despachador, error) {
 		sessionID:   deps.SessionID,
 		log:         log,
 		ahora:       ahora,
-		presupuesto: presupuesto,
 		despertador: desp,
 		omitidos:    omitidos,
 	}, nil
@@ -340,9 +316,8 @@ func New(deps Deps) (*Despachador, error) {
 // `ctx.Done()` sin agotar el tick, y (c) que el propio `Deliver` recibe el ctx, de modo que una entrega
 // ya empezada se corta con él. Es lo que el gate `-race` de la ola tiene que comprobar.
 func (d *Despachador) Run(ctx context.Context) error {
-	d.log.Info("despachador: arrancando (drenado de la cola de entrantes)",
+	d.log.Info("despachador: arrancando (drenado de la cola de entrantes, sin retención)",
 		"session_id", d.sessionID,
-		"presupuesto_ms", d.presupuesto.Milliseconds(),
 	)
 
 	for {
@@ -350,9 +325,9 @@ func (d *Despachador) Run(ctx context.Context) error {
 			return d.detener()
 		}
 
-		// progreso = «se movió la cabeza»: se entregó una fila o se selló una por presupuesto. En ese caso
-		// se vuelve a mirar INMEDIATAMENTE, sin pagar un poll: una ráfaga de mensajes ya clasificados sale
-		// de una tirada en vez de a razón de uno cada 500 ms, que sería latencia inventada.
+		// progreso = «se movió la cabeza»: se entregó una fila. En ese caso se vuelve a mirar
+		// INMEDIATAMENTE, sin pagar un poll: una ráfaga de mensajes sale de una tirada en vez de a razón de
+		// uno cada 500 ms, que sería latencia inventada.
 		progreso := d.vuelta(ctx)
 
 		if ctx.Err() != nil {
@@ -389,7 +364,7 @@ func (d *Despachador) vuelta(ctx context.Context) (progreso bool) {
 		if r := recover(); r != nil {
 			d.panicos.Add(1)
 			d.log.Error("despachador: pánico en una vuelta del bucle (aislado); la sesión sigue drenando",
-				"session_id", d.sessionID, "id_cabeza", d.enCurso.id)
+				"session_id", d.sessionID)
 			progreso = false
 		}
 	}()
@@ -410,128 +385,33 @@ func (d *Despachador) vuelta(ctx context.Context) (progreso bool) {
 		return false
 	}
 	if cabeza == nil {
-		// Sesión al día: el estado NORMAL de casi todos los polls. Se olvida el presupuesto en curso —no
-		// hay a quién esperar— para que la próxima cabeza estrene su reloj entero.
-		d.olvidarCabeza()
+		// Sesión al día: el estado NORMAL de casi todos los polls.
 		return false
 	}
 
-	if cabeza.Estado == app.EstadoClasificado {
-		// 🔴 EL `olvidarCabeza()` AQUÍ ES LO QUE HACE QUE EL PRESUPUESTO NO SE REINICIE POR ID, SINO POR
-		// «esta fila ya no es una espera». Desde el arreglo del 2026-08-17, `nuevo/tomado → clasificado`
-		// SIN cambiar de id es un camino NORMAL y frecuente (es el desenlace del propio presupuesto: el
-		// sobre de omisión resuelve la fila en su sitio). Si el reinicio dependiera sólo del `id != id`
-		// de `correrPresupuesto`, el estado `{disparado, avisada}` de la fila anterior sobreviviría a su
-		// entrega y contaminaría a la SIGUIENTE cabeza que casualmente reusara el mismo id — y con
-		// `disparado=true` heredado, esa fila nunca se sellaría por presupuesto: se quedaría esperando
-		// eternamente tras un único Warn. Se olvida ANTES de entregar, no después, para que el olvido
-		// ocurra también cuando la entrega falla.
-		d.olvidarCabeza()
-		// EL FRENO DE LA RE-ENTREGA (ver `reintentoEntrega`). Si esta misma fila viene fallando, se deja
-		// pasar la vuelta sin llamar al sink: no es progreso, así que el bucle paga su poll y vuelve.
-		// Ojo al orden — va DESPUÉS de `olvidarCabeza`, porque el presupuesto ya se resolvió: lo que se
-		// frena es la entrega, no la espera.
-		if d.reintento.id == cabeza.ID && d.reintento.seq == cabeza.Seq &&
-			d.ahora().Before(d.reintento.desde) {
-			return false
-		}
-		return d.entregar(ctx, cabeza)
-	}
-	// `nuevo`, `tomado` — o cualquier estado que esta versión no conozca. Se les corre el presupuesto a
-	// todos por el mismo criterio con el que sqlCabezaDeSesion usa `estado <> 'despachado'` en vez de un
-	// `IN`: una fila en un estado imprevisto BLOQUEA la cabeza de forma visible y acotada, en vez de
-	// volverse invisible y provocar un salto de orden silencioso.
-	return d.correrPresupuesto(ctx, cabeza)
-}
-
-// olvidarCabeza reinicia el reloj del presupuesto. Se llama cuando la cabeza deja de ser una fila que se
-// esté esperando (no hay nada pendiente, o la que hay ya está clasificada).
-func (d *Despachador) olvidarCabeza() { d.enCurso = cabezaEnCurso{} }
-
-// correrPresupuesto es T3.4a: gestiona la espera acotada de una cabeza que aún no está clasificada.
-//
-// TRES ESTADOS, en este orden:
-//
-//  1. Es una cabeza NUEVA para nosotros ⇒ se arranca su reloj y se espera un poll. Cambiar de cabeza
-//     REINICIA el reloj, y tiene que ser así: cada fila tiene derecho a su presupuesto completo.
-//  2. El reloj aún no ha vencido ⇒ se espera otro poll. La cabeza sigue siendo la misma y la fila N+1
-//     NO se adelanta, aunque esté lista (REQ-051.18: eso es justo lo que se está comprando).
-//  3. El reloj venció ⇒ se resuelve con `DespacharSinIntent(presupuesto)` y se RELEE INMEDIATAMENTE.
-//
-// 🔴 AQUÍ NO SE ENTREGA NADA, Y ESA AUSENCIA ES EL ARREGLO DEL 2026-08-17. `DespacharSinIntent` deja la
-// fila en `clasificado` con su sobre `{"omitido":"presupuesto"}` y suelta el claim; NO la sella. Así la
-// relectura de la vuelta siguiente SÍ la encuentra (`sqlCabezaDeSesion` sólo excluye `despachado`), la
-// rama `EstadoClasificado` de `vuelta` la lleva a `entregar`, y ahí el camino NORMAL hace lo correcto sin
-// una sola línea de código especial: `app.EsOmitido` devuelve `presupuesto`, `evt.Intent` queda nil (el
-// sobre NO viaja al cable), se cuenta el omitido POR MOTIVO y `MarcarDespachada` pone el sello terminal.
-//
-// La versión anterior sellaba `despachado` aquí y releía: la relectura ya no encontraba la fila, `entregar`
-// —única puerta al sink— no se ejecutaba jamás y el mensaje MORÍA en disco. Si alguien vuelve a meter una
-// rama de entrega en esta función, es la señal de que el sello volvió a ser terminal: mirar el SQL primero.
-//
-// 🔴 POR QUÉ SE RELEE EN VEZ DE ENTREGAR CON LO QUE TENÍAMOS EN LA MANO (esto sigue siendo cierto y es la
-// segunda razón para no entregar aquí): el sello puede ser NO-OP porque el cajero cerró el lote un instante
-// antes (`estado IN ('nuevo','tomado')` deja de casar). Ese es el desenlace BUENO de la carrera —el mensaje
-// sale CON su intención real— y sólo se descubre releyendo. Entregar con la foto vieja tiraría una
-// clasificación ya pagada y escrita en disco.
-func (d *Despachador) correrPresupuesto(ctx context.Context, cabeza *app.ColaCabeza) bool {
-	ahora := d.ahora()
-
-	// Se compara el PAR (id, seq), no el id solo: ver `cabezaEnCurso.seq`. Un rowid reciclado por
-	// SQLite tras una poda haría que una fila nueva heredase el presupuesto ya consumido de la vieja.
-	if d.enCurso.id != cabeza.ID || d.enCurso.seq != cabeza.Seq {
-		d.enCurso = cabezaEnCurso{id: cabeza.ID, seq: cabeza.Seq, desde: ahora}
+	// 🔴 SE ENTREGA SIN MIRAR EL `estado`, Y ESA AUSENCIA DE `if` ES LA TAREA ENTERA (T1.6-5, ADR-0045).
+	// Hasta aquí había una bifurcación: `clasificado` ⇒ entregar, cualquier otra cosa ⇒ correr el
+	// presupuesto y esperar. Bajo pull no hay a quién esperar, así que la cabeza sale en el acto y el
+	// estado deja de ser una condición de entrega. Tres consecuencias que conviene tener escritas:
+	//
+	//  1. LAS FILAS ANTIGUAS SE DRENAN SOLAS, SIN MIGRACIÓN. Las colas escritas por un binario anterior
+	//     traen filas en `clasificado` (y con su sobre en `intent_json`); aquí entran por la misma puerta
+	//     que las nuevas y salen. Por eso T1.6-5 no necesitó tocar `migrations/cola/`.
+	//  2. UNA FILA EN UN ESTADO IMPREVISTO YA NO PUEDE ATASCAR LA SESIÓN. Antes bloqueaba la cabeza para
+	//     siempre —era la peor degradación del bucle, y tenía dos contadores propios—; ahora se entrega
+	//     como cualquier otra. El fallo seguro cambió de «retener» a «entregar», que es el que esta cola
+	//     quiere: se retrasa, nunca se pierde.
+	//  3. UNA FILA `tomado` SE ENTREGA IGUAL. El claim con fencing sigue vivo (ADR-0038, ADR-0045 §4) y
+	//     protege lo que siempre protegió —que dos procesos no cierren el mismo lote—, pero NO es un
+	//     derecho de retención sobre la entrega y nunca lo fue.
+	//
+	// EL FRENO DE LA RE-ENTREGA (ver `reintentoEntrega`). Si esta misma fila viene fallando, se deja pasar
+	// la vuelta sin llamar al sink: no es progreso, así que el bucle paga su poll y vuelve.
+	if d.reintento.id == cabeza.ID && d.reintento.seq == cabeza.Seq &&
+		d.ahora().Before(d.reintento.desde) {
 		return false
 	}
-	if ahora.Sub(d.enCurso.desde) < d.presupuesto {
-		return false
-	}
-
-	if d.enCurso.disparado {
-		// SÓLO ALCANZABLE SI LA FILA SIGUE SIN ESTAR `clasificado` DESPUÉS DEL SELLO, es decir: en un
-		// estado que esta versión no conoce (uno nuevo que alguien añada mañana, o un 'zombi' escrito a
-		// mano). Los dos desenlaces normales del sello salen por la rama `EstadoClasificado` de `vuelta`,
-		// no por aquí: si el UPDATE aterrizó, la fila quedó `clasificado` con su sobre de omisión; y si
-		// fue no-op, quedó `clasificado` con el intent real del cajero. En ambos casos se entrega.
-		//
-		// Un aviso POR FILA (no por poll) y a esperar: gritarlo cada 500 ms convertiría una anomalía en una
-		// tormenta de log, que es la forma más rápida de que nadie la lea.
-		// El poll SIEMPRE se cuenta, aunque el aviso sea uno solo: es lo que permite distinguir «esto
-		// pasó una vez» de «esta sesión lleva cuatro horas sin drenar».
-		d.pollsCabezaAtascada.Add(1)
-		if !d.enCurso.avisada {
-			d.enCurso.avisada = true
-			d.cabezasAtascadas.Add(1)
-			d.log.Warn("despachador: la cabeza no avanza tras el sello por presupuesto (estado inesperado); la sesión no drena",
-				"session_id", d.sessionID, "id", cabeza.ID, "seq", cabeza.Seq,
-				"estado", cabeza.Estado, "wa_message_id", cabeza.WAMessageID)
-		}
-		return false
-	}
-
-	if err := d.cola.DespacharSinIntent(ctx, cabeza.ID, app.MotivoPresupuesto); err != nil {
-		if ctx.Err() != nil {
-			return false
-		}
-		d.fallosSelloPresupuesto.Add(1)
-		d.log.Error("despachador: no se pudo sellar la cabeza por presupuesto vencido; se reintenta en el siguiente poll",
-			"session_id", d.sessionID, "id", cabeza.ID, "seq", cabeza.Seq, "error", err)
-		return false
-	}
-	d.enCurso.disparado = true
-	// Se cuenta el DISPARO, que no es lo mismo que la entrega sin intención: si el cajero ganó la carrera,
-	// el sobre fue no-op y la fila saldrá con su intención real. Cuántas de esas esperas se pagaron para
-	// nada lo cuenta el adaptador (Store.DespachosSinIntentNoAplicados); aquí se cuenta cuántas veces se
-	// agotó el reloj. Ver PresupuestosVencidos() para cuándo pueden diferir legítimamente de
-	// OmitidosPorMotivo()[presupuesto].
-	d.presupuestosVencidos.Add(1)
-	d.log.Debug("despachador: presupuesto agotado esperando al cajero; la fila se resuelve sin intención y se entrega en la vuelta siguiente",
-		"session_id", d.sessionID, "id", cabeza.ID, "seq", cabeza.Seq,
-		"presupuesto_ms", d.presupuesto.Milliseconds())
-	// PROGRESO: la cabeza se movió (de `nuevo`/`tomado` a `clasificado`), así que Run vuelve a mirar SIN
-	// pagar un poll y la entrega ocurre en la misma ráfaga. No es una optimización: sin este `true`, un
-	// mensaje ya resuelto se quedaría 500 ms más en disco por nada.
-	return true
+	return d.entregar(ctx, cabeza)
 }
 
 // entregar publica la cabeza en el sink y, SÓLO SI la entrega salió bien, la sella como despachada.
@@ -580,15 +460,16 @@ func (d *Despachador) entregar(ctx context.Context, cabeza *app.ColaCabeza) bool
 	d.reintento = reintentoEntrega{}
 
 	d.despachados.Add(1)
+	// EL SWITCH SÓLO CLASIFICA LO QUE TRAÍA LA FILA, y bajo pull su rama dominante es la ÚLTIMA: una fila
+	// nueva no lleva nada en `intent_json`, así que no incrementa ninguna de las series de sobre. Las tres
+	// primeras ramas sólo las alcanzan las filas ANTIGUAS mientras las colas de campo se vacían.
 	switch {
 	case v.ilegible:
 		d.sobresIlegibles.Add(1)
-	case v.fragmento:
-		d.fragmentosDeLote.Add(1)
 	case v.omitido:
 		d.contarOmitido(v.motivo)
-	default:
-		d.conIntent.Add(1)
+	case v.intentDescartado:
+		d.intentsDescartados.Add(1)
 	}
 
 	// EL SELLO NO HEREDA LA CANCELACIÓN, y esa es la diferencia entre un duplicado inevitable y uno
@@ -635,34 +516,46 @@ func (d *Despachador) contarOmitido(motivo app.MotivoOmitido) {
 // veredicto es lo que se aprendió del `intent_json` de una fila: qué se cuenta cuando su entrega salga
 // bien. Es un tipo aparte —y no tres booleanos sueltos— para que el `switch` de `entregar` sea exhaustivo
 // de un vistazo.
+//
+// 🔴 SU CERO ES HOY EL CASO NORMAL: una fila escrita bajo pull no lleva sobre ninguno, así que las tres
+// marcas de abajo sólo las levantan filas ANTIGUAS. Ver `evento`.
 type veredicto struct {
 	// motivo es el del sobre de omisión; vacío en los demás casos.
 	motivo app.MotivoOmitido
 	// omitido: el sobre era `{"omitido":…}` y el mensaje sale SIN intención.
 	omitido bool
-	// fragmento: fila `clasificado` con `intent_json` NULL, es decir un fragmento intermedio de un lote
-	// (ver evento).
-	fragmento bool
+	// intentDescartado: el sobre traía una clasificación REAL, escrita bajo el modelo push, que ya no tiene
+	// por dónde viajar (el ADR-0045 retiró `ClassifiedIntent` del proto). El mensaje sale entero; la
+	// clasificación se tira. Ver `Despachador.intentsDescartados`.
+	intentDescartado bool
 	// ilegible: había sobre, pero no se pudo leer como ninguna de las dos formas conocidas.
 	ilegible bool
 }
 
-// evento reconstruye el domain.InboundEvent de una fila `clasificado` y aplica LA REGLA DEL SOBRE
-// (T3.4b). Es la traducción inversa exacta de `toInboundEvent` + `colaMeta` del listener.
+// evento reconstruye el domain.InboundEvent de una fila de la cola. Es la traducción inversa exacta de
+// `toInboundEvent` + `colaMeta` del listener.
 //
-// ─── LA REGLA DEL SOBRE, en las cuatro formas que puede tener `intent_json` ───
+// ─── LA REGLA DEL SOBRE, y por qué HOY sólo se aplica a filas ANTIGUAS (T1.6-5, ADR-0045) ───
 //
-//  1. `{"omitido":"<motivo>"}` ⇒ `evt.Intent = nil` y EL SOBRE MUERE AQUÍ. No viaja al cable: el proto
-//     `ClassifiedIntent` no tiene dónde ponerlo (sólo intent/params/confidence/config_version) y, sobre
-//     todo, no debe — lo que sale del Edge es el CONTADOR por motivo, en el heartbeat de la Ola 4. Byte a
-//     byte, es el comportamiento que tenía el decorador inline retirado en T3.0: tampoco anotaba nada en
-//     esos casos. Esa equivalencia es la garantía de que la Ola 3 no cambió lo que ve la nube.
-//  2. Un sobre del cajero legible ⇒ se rellena `evt.Intent`. Y SE RELLENA Y YA: la traducción al proto la
-//     hace `classifiedIntentToProto` en el adaptador de CloudLink. Traducir aquí también sería traducir
-//     dos veces y abrir la puerta a que las dos traducciones diverjan.
-//  3. NULL (`TieneIntent == false`) ⇒ ver el bloque de abajo. NO es el caso del presupuesto.
-//  4. Cualquier otra cosa ⇒ se entrega SIN intención y se cuenta como sobre ilegible. Nunca se retiene el
-//     mensaje por no entender su sobre.
+// Bajo pull NADIE escribe ya en `intent_json`: el Edge no clasifica, así que no hay ni intención que
+// anotar ni omisión que justificar. Una fila nacida con este binario llega aquí con la columna a NULL,
+// SIEMPRE, y ése es el camino normal. Lo que sigue existiendo es la lectura, para drenar las colas que ya
+// estaban escritas en el disco de un cliente cuando se actualizó el binario:
+//
+//  1. NULL (`TieneIntent == false`) ⇒ EL CASO NORMAL. Nada que contar, nada que decidir.
+//  2. `{"omitido":"<motivo>"}` ⇒ se cuenta el MOTIVO y ya. El sobre nunca viajó al cable y sigue sin
+//     hacerlo; lo que sale del Edge es el contador por motivo, en el heartbeat.
+//  3. Un sobre del cajero legible (una clasificación REAL, ya pagada) ⇒ SE TIRA, y se cuenta en
+//     `intentsDescartados`. 🔴 No hay dónde ponerla: el ADR-0045 retiró `ClassifiedIntent` del proto —de
+//     `IncomingMessage` (11) y de `SensitivePayload` (5), ambos con `reserved`— porque bajo pull la
+//     señal la pide el Cloud, no la empuja el Edge. Ésta es la ÚNICA pérdida de la migración, es acotada
+//     (las filas ya escritas) y es de una etiqueta, jamás de un mensaje.
+//  4. Cualquier otra cosa ⇒ se entrega igual y se cuenta como sobre ilegible. Nunca se retiene el mensaje
+//     por no entender su sobre.
+//
+// 🔴 EL `evt.Intent` YA NO EXISTE. `domain.InboundEvent` perdió el campo en T1.6-5 y no es un descuido de
+// limpieza: mientras existiera, rellenarlo aquí compilaba, no fallaba ningún test y no llegaba a ninguna
+// parte — un dato que se produce y nadie consume es el fallo más caro de este repo, porque es invisible.
 func (d *Despachador) evento(c *app.ColaCabeza) (domain.InboundEvent, veredicto) {
 	meta, err := app.DecodeColaMeta(c.Meta)
 	if err != nil {
@@ -704,42 +597,30 @@ func (d *Despachador) evento(c *app.ColaCabeza) (domain.InboundEvent, veredicto)
 		// app.ColaMeta.Sintetico: ese bool es la marca LOCAL, el ID es la portante.
 	}
 
+	if !c.TieneIntent {
+		// EL CAMINO NORMAL BAJO PULL: la columna está a NULL porque nadie la escribe.
+		//
+		// ⚠️ HASTA T1.6-5 ESTE MISMO NULL SIGNIFICABA OTRA COSA y se contaba como `fragmentosDeLote`: era
+		// una fila intermedia de un lote, de las que el cajero dejaba sin sobre propio porque el intent del
+		// turno vivía en la última fila. Aquel contador se retiró aquí mismo. Mantenerlo habría sido peor
+		// que quitarlo: subiría en CADA mensaje entrante y seguiría rotulado «fragmentos de lote», que es
+		// exactamente la clase de contador que hace tomar decisiones al revés.
+		return evt, veredicto{}
+	}
+
 	if motivo, ok := app.EsOmitido(c.IntentJSON); ok {
 		return evt, veredicto{motivo: motivo, omitido: true}
 	}
 
-	if !c.TieneIntent {
-		// ⚠️ ESTE CASO ES NORMAL Y NO ES EL DEL PRESUPUESTO. El cajero cierra un LOTE (una conversación
-		// entera) escribiendo el `intent_json` SÓLO en la ÚLTIMA fila y dejando las anteriores en
-		// `clasificado` sin sobre propio: son fragmentos del mismo párrafo —los tres mensajes seguidos que
-		// una persona manda en un turno— y no tienen intención independiente que anotar. Un turno de tres
-		// mensajes produce, por diseño, dos filas que llegan aquí con NULL.
-		//
-		// 🔴 POR ESO NO SE CUENTAN COMO `presupuesto`, y es una desviación consciente del encargo. El
-		// presupuesto vencido ESCRIBE su sobre `{"omitido":"presupuesto"}` en la MISMA sentencia que pasa la
-		// fila a `clasificado` (sqlDespacharSinIntent), así que una fila resuelta por presupuesto llega aquí
-		// con `TieneIntent = true` y se va por la rama de arriba: este NULL no puede venir de ahí — un
-		// `clasificado` sin sobre sólo lo produce el cierre por lotes del cajero. Cargarlo al contador de
-		// `presupuesto` inflaría con tráfico perfectamente sano justo la serie que el operador usa para
-		// decidir si sube WAPP_AGENT_INTENT_WAIT_MS — le haría girar una palanca contra un problema que no
-		// existe. Es el mismo error que MotivoSinTexto vino a corregir en T1.8, y se evita igual: contador
-		// propio, hecho distinto.
-		return evt, veredicto{fragmento: true}
-	}
-
-	sobre, ok := app.LeerSobreClasificado(c.IntentJSON)
-	if !ok {
-		d.log.Warn("despachador: sobre de clasificación ilegible; el mensaje se entrega SIN intención",
+	if _, ok := app.LeerSobreClasificado(c.IntentJSON); !ok {
+		d.log.Warn("despachador: sobre de clasificación ilegible; el mensaje se entrega igual",
 			"session_id", d.sessionID, "id", c.ID, "seq", c.Seq, "wa_message_id", c.WAMessageID)
 		return evt, veredicto{ilegible: true}
 	}
-	evt.Intent = &domain.ClassifiedIntent{
-		Name:          sobre.Intent,
-		Params:        sobre.Params,
-		Confidence:    sobre.Confidence,
-		ConfigVersion: sobre.ConfigVersion,
-	}
-	return evt, veredicto{}
+	// Sobre bueno de una fila vieja: la clasificación se TIRA (ya no hay campo en el proto donde ponerla) y
+	// se cuenta. El contenido NO se loguea —son params con texto literal del cliente (INV-051.1)—; lo único
+	// que se publica es que ocurrió.
+	return evt, veredicto{intentDescartado: true}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -750,13 +631,15 @@ func (d *Despachador) evento(c *app.ColaCabeza) (domain.InboundEvent, veredicto)
 // re-entrega por sello fallido suma dos (ver `entregar`).
 func (d *Despachador) Despachados() int64 { return d.despachados.Load() }
 
-// ConIntent es cuántas entregas llevaron una intención real en el sobre.
-func (d *Despachador) ConIntent() int64 { return d.conIntent.Load() }
-
-// FragmentosDeLote es cuántas entregas fueron filas intermedias de un lote (sin sobre propio porque el
-// intent vive en la última fila del turno). Es tráfico SANO: un número alto sólo dice que los clientes
-// escriben en varios mensajes seguidos.
-func (d *Despachador) FragmentosDeLote() int64 { return d.fragmentosDeLote.Load() }
+// IntentsDescartados es cuántas filas ANTIGUAS se drenaron trayendo una clasificación real que ya no
+// tiene por dónde viajar (T1.6-5, ADR-0045: `ClassifiedIntent` salió del proto). El mensaje salió entero;
+// lo que se tiró fue la etiqueta.
+//
+// CERO ES EL VALOR ESPERADO EN RÉGIMEN, y un número que sube tras actualizar el binario y luego se
+// estabiliza es exactamente lo que debe pasar: la cola vieja vaciándose. 🔴 Si sigue subiendo días
+// después, algo está escribiendo sobres de clasificación en `intent_json` — es decir, el push sigue vivo
+// en esa máquina.
+func (d *Despachador) IntentsDescartados() int64 { return d.intentsDescartados.Load() }
 
 // SobresIlegibles es cuántas veces el `intent_json` no se pudo leer como ninguna de las dos formas
 // conocidas. CERO ES EL VALOR SANO: cualquier otra cosa es un sobre corrupto o un cambio de formato sin
@@ -767,25 +650,6 @@ func (d *Despachador) SobresIlegibles() int64 { return d.sobresIlegibles.Load() 
 // crece, los mensajes están saliendo sin remitente ni push_name.
 func (d *Despachador) MetasIlegibles() int64 { return d.metasIlegibles.Load() }
 
-// PresupuestosVencidos es cuántas veces se agotó la espera al cajero y se pidió resolver la cabeza sin
-// intención. CUENTA DISPAROS (vencimientos del reloj), no entregas.
-//
-// 🔴 NO ES LA MISMA SERIE QUE `OmitidosPorMotivo()[presupuesto]`, QUE CUENTA ENTREGAS, y las dos DEBEN
-// poder diferir en los dos sentidos. Que alguien las «cuadre» es exactamente el error a evitar:
-//
-//   - vencimiento SIN entrega por presupuesto: el cajero ganó la carrera y `DespacharSinIntent` fue no-op
-//     (lo confirma Store.DespachosSinIntentNoAplicados). La fila sale CON su intención real y se cuenta en
-//     `con_intent`. Es el desenlace BUENO, y con un presupuesto de 4000 ms frente a una p95 medida de
-//     3.736 ms no es un caso raro.
-//   - entrega por presupuesto SIN vencimiento EN ESTE PROCESO: la fila la resolvió el despachador de una
-//     EJECUCIÓN ANTERIOR (se selló `clasificado` con su sobre y el proceso murió antes de entregarla), y
-//     este bucle se la encuentra ya resuelta al arrancar y la entrega. Es precisamente la propiedad
-//     crash-safe que compró el arreglo del 2026-08-17; los contadores son por proceso, la cola es durable.
-//   - y una re-entrega por sello fallido suma en `omitido_presupuesto` sin sumar aquí (ver `entregar`).
-//
-// SI CRECE, la palanca es WAPP_AGENT_INTENT_WAIT_MS o la latencia de Ollama, no este código.
-func (d *Despachador) PresupuestosVencidos() int64 { return d.presupuestosVencidos.Load() }
-
 // FallosLectura es cuántos polls no pudieron leer la cabeza (típicamente: la DEK de la sesión no se puede
 // abrir). Mientras crece, ESA SESIÓN NO DRENA: es el contador que hay que mirar si una sesión se queda
 // callada sin que nada más falle.
@@ -795,29 +659,9 @@ func (d *Despachador) FallosLectura() int64 { return d.fallosLectura.Load() }
 // incluso con el stream caído (el sink encola en vez de fallar).
 func (d *Despachador) FallosEntrega() int64 { return d.fallosEntrega.Load() }
 
-// FallosSello es el TOTAL de sellos fallidos, y se conserva por compatibilidad de la serie. Para
-// decidir hay que mirar las dos de abajo: sumadas no se pueden interpretar, porque sólo una de las dos
-// tiene consecuencia aguas arriba.
-func (d *Despachador) FallosSello() int64 {
-	return d.fallosSelloPresupuesto.Load() + d.fallosSelloDespacho.Load()
-}
-
-// FallosSelloPresupuesto: falló `DespacharSinIntent`. La fila se reintenta en el poll siguiente y NADA
-// sale mal aguas arriba. Es ruido operativo, no un incidente.
-func (d *Despachador) FallosSelloPresupuesto() int64 { return d.fallosSelloPresupuesto.Load() }
-
 // FallosSelloDespacho: falló `MarcarDespachada` tras una entrega CON ÉXITO. 🔴 Cada uno es **un
 // duplicado en la nube**: el mensaje ya salió y la fila se releerá. Es el número que se mira.
 func (d *Despachador) FallosSelloDespacho() int64 { return d.fallosSelloDespacho.Load() }
-
-// CabezasAtascadas es cuántas filas quedaron de cabeza en un estado que esta versión no conoce. 🔴 CERO
-// ES EL ÚNICO VALOR SANO: cada una es una sesión que dejó de drenar y no vuelve sola.
-func (d *Despachador) CabezasAtascadas() int64 { return d.cabezasAtascadas.Load() }
-
-// PollsCabezaAtascada dice si el atasco es HISTORIA o es AHORA: sigue creciendo mientras la sesión siga
-// bloqueada. Un `CabezasAtascadas` > 0 con este número estable es un susto pasado; creciendo, es una
-// sesión muerta en este instante.
-func (d *Despachador) PollsCabezaAtascada() int64 { return d.pollsCabezaAtascada.Load() }
 
 // Panicos es cuántas vueltas del bucle murieron en un pánico recuperado. CERO ES EL VALOR SANO y
 // cualquier otra cosa es un bug: el aislamiento existe para que no tumbe el proceso, no para tolerarlo.
@@ -831,9 +675,9 @@ func (d *Despachador) Panicos() int64 { return d.panicos.Load() }
 // operativos distintos y uno de ellos exige mirar Ollama. Devuelve una COPIA: el mapa interno es
 // inmutable desde New y quien lo recibiera podría escribirlo.
 //
-// ⚠️ LA ENTRADA `presupuesto` CUENTA ENTREGAS, y NO tiene por qué cuadrar con `PresupuestosVencidos()`,
-// que cuenta VENCIMIENTOS del reloj. Ver allí las tres formas legítimas en que difieren; ninguna es un
-// bug y ninguna se debe «corregir» haciendo que una serie alimente a la otra.
+// ⚠️ BAJO PULL NINGUNA DE LAS OCHO ENTRADAS TIENE PRODUCTOR VIVO en este Edge: sólo se mueven al drenar
+// filas antiguas (ver `evento`). Las ocho claves siguen publicándose porque un motivo a 0 sigue siendo un
+// dato, y porque el contrato del heartbeat las espera.
 func (d *Despachador) OmitidosPorMotivo() map[app.MotivoOmitido]int64 {
 	out := make(map[app.MotivoOmitido]int64, len(d.omitidos))
 	for _, m := range app.MotivosOmitido() {
@@ -867,21 +711,13 @@ func (d *Despachador) contadores() []any {
 	kv := []any{
 		"session_id", d.sessionID,
 		"despachados", d.Despachados(),
-		"con_intent", d.ConIntent(),
 		"omitidos", d.Omitidos(),
-		"fragmentos_de_lote", d.FragmentosDeLote(),
+		"intents_descartados", d.IntentsDescartados(),
 		"sobres_ilegibles", d.SobresIlegibles(),
 		"metas_ilegibles", d.MetasIlegibles(),
-		"presupuestos_vencidos", d.PresupuestosVencidos(),
 		"fallos_lectura", d.FallosLectura(),
 		"fallos_entrega", d.FallosEntrega(),
-		"fallos_sello", d.FallosSello(),
-		// Desglosado: sólo el de despacho implica duplicados aguas arriba, y el bloque final de un
-		// apagado es justo donde alguien va a leer este número.
 		"fallos_sello_despacho", d.FallosSelloDespacho(),
-		"fallos_sello_presupuesto", d.FallosSelloPresupuesto(),
-		"cabezas_atascadas", d.CabezasAtascadas(),
-		"polls_cabeza_atascada", d.PollsCabezaAtascada(),
 		"panicos", d.Panicos(),
 		"omitidos_fuera_de_lista", d.OmitidosFueraDeLista(),
 	}

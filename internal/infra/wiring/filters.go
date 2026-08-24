@@ -159,7 +159,7 @@ func (p *Perfiles) EsPasiva(sessionID string) bool {
 }
 
 // PasivaFunc devuelve el predicado que el sessionmgr cablea en cada listener (sessionmgr.WithSesionPasiva).
-// Devuelve un MÉTODO y no un bool ya evaluado, por el mismo motivo que ClasificadorActivoFunc: quien lo
+// Devuelve un MÉTODO y no un bool ya evaluado (mismo molde que el retirado ClasificadorActivoFunc): quien lo
 // llame lee el estado en el momento del mensaje, no la foto del arranque. Con el receptor nil devuelve nil
 // y el Listener cae a su default SEGURO (nadie es pasiva).
 func (p *Perfiles) PasivaFunc() func(string) bool {

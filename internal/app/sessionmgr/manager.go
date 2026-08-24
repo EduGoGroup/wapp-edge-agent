@@ -147,19 +147,6 @@ type Manager struct {
 	// WithDespachadorApagado; en producción sale de WAPP_AGENT_DESPACHADOR_APAGADO.
 	despachadorApagado bool
 
-	// presupuestoIntent es cuánto retiene el despachador la cabeza de una sesión esperando a que el cajero
-	// la clasifique, antes de entregarla sin intención (WAPP_AGENT_INTENT_WAIT_MS). 0 (opción no inyectada)
-	// ⇒ manda el default del propio despachador. Lo inyecta WithPresupuestoIntent.
-	presupuestoIntent time.Duration
-
-	// clasificadorActivo es el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
-	// T2.12) que el factory pasa al gateway de cada sesión: con él, un entrante que llega con la feature
-	// apagada nace en la cola YA resuelto (marca `apagado`) en vez de ocupar una plaza del semáforo del
-	// cajero para acabar descartado. Es COMPARTIDO (un solo clasificador por Edge), a diferencia de la cola,
-	// que se etiqueta por sesión. nil (opción no inyectada) ⇒ NO se toca el gateway
-	// y manda el default SEGURO del Listener (activo). Lo inyecta WithClasificadorActivo.
-	clasificadorActivo func() bool
-
 	// sesionPasiva es el CONSULTOR DE PERFILES de sesión (Plan 046 · Ola 2 · T2.2) que el factory pasa al
 	// gateway de cada sesión y de ahí al Listener: dice si un session_id está marcado como PASIVO en la
 	// config que la nube empuja (kind:"filters"), y con eso el listener corta el entrante en la puerta sin
@@ -259,21 +246,6 @@ func WithColaEntrantes(c app.ColaEntrantes) Option {
 	return func(m *Manager) {
 		if c != nil {
 			m.cola = c
-		}
-	}
-}
-
-// WithClasificadorActivo inyecta el LECTOR del interruptor del clasificador de intenciones (Plan 051 Ola 2,
-// T2.12): cada listener lo consulta al encolar para que un entrante que llega con la feature apagada nazca
-// ya resuelto (`apagado`) en vez de gastar una plaza del semáforo del cajero y acabar descartado igual. En
-// producción lo cablea el daemon desde el stack de intent (wiring.IntentStack); los tests que no lo pasan
-// quedan con el default del Listener. Se pide un `func() bool` y no un bool para que la feature pueda
-// apagarse en caliente sin que el Manager quede con la foto del arranque. nil se IGNORA (default ACTIVO:
-// clasificar de más es barato y visible; dejar de clasificar en silencio, no).
-func WithClasificadorActivo(fn func() bool) Option {
-	return func(m *Manager) {
-		if fn != nil {
-			m.clasificadorActivo = fn
 		}
 	}
 }

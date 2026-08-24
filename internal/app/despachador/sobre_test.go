@@ -2,14 +2,14 @@ package despachador
 
 // sobre_test.go — LA REGLA DEL SOBRE, hasta sus bordes (Plan 051 Ola 3 · T3.5, bloque (d)).
 //
-// `despachador_test.go` ya recorre los OCHO motivos canónicos y comprueba que ninguno viaja como
-// `evt.Intent`. Aquí se cierran las tres cosas que aquello no cubría, y que son justamente por donde el
-// sobre se filtraría o se contaría mal:
+// `despachador_test.go` ya recorre los OCHO motivos canónicos y comprueba que las filas que los traen se
+// entregan y se cuentan. Aquí se cierran las tres cosas que aquello no cubría, y que son justamente por
+// donde el sobre se filtraría o se contaría mal:
 //
-//  1. QUE EL JSON DEL SOBRE NO APAREZCA EN *NADA* DE LO ENTREGADO — no basta con `Intent == nil`. Si
-//     alguien "rescatara" el sobre metiéndolo en `Text`, en `Type` o en un `Params`, el `Intent == nil`
-//     seguiría siendo cierto y el sobre habría cruzado el cable igual. ADR-0038 §(e) prohíbe que salga del
-//     Edge, no que salga por un campo concreto.
+//  1. QUE EL JSON DEL SOBRE NO APAREZCA EN *NADA* DE LO ENTREGADO. Hasta el 2026-08-24 el argumento era
+//     «no basta con `Intent == nil`, porque alguien podría rescatar el sobre metiéndolo en `Text`»; el
+//     campo `Intent` ya no existe (T1.6-5, ADR-0045) y por eso este barrido es HOY LA ÚNICA aserción del
+//     contrato: ADR-0038 §(e) prohíbe que el sobre salga del Edge, no que salga por un campo concreto.
 //  2. EL MOTIVO QUE ESTA VERSIÓN NO CONOCE — el «noveno motivo» escrito por un binario más nuevo (un
 //     rollback a medias). Es el único caso en que el desglose puede mentir, y tiene contador propio.
 //  3. LOS DOS SOBRES QUE NO SE PUEDEN LEER — el `intent_json` corrupto y el `meta_enc` corrupto. En los dos
@@ -17,13 +17,17 @@ package despachador
 //     remitente es malo; retener el mensaje es peor.
 //
 // Reutiliza el arnés de `despachador_test.go` (colaFake, sinkFake, despertadorManual, relojFalso, arrancar,
-// filaClasificada): mismo paquete a propósito, para que no nazcan dos moldes del mismo bucle.
+// filaNueva/filaVieja): mismo paquete a propósito, para que no nazcan dos moldes del mismo bucle.
+//
+// ⚠️ TODOS LOS CASOS DE ESTE FICHERO USAN `filaVieja`, y es información, no un detalle: bajo pull ningún
+// productor del Edge escribe en `intent_json`, así que un sobre —bueno, ilegible o del futuro— sólo puede
+// venir de una cola escrita por un binario anterior. Lo que se prueba aquí es que esas colas se drenan
+// bien mientras se vacían.
 
 import (
 	"fmt"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
@@ -31,21 +35,17 @@ import (
 
 // exigirSobreNoViaja comprueba que NI UN BYTE del sobre de omisión aparece en el evento entregado.
 //
-// 🔴 POR QUÉ NO BASTA CON `evt.Intent == nil`, que es lo que comprobaba el test de los ocho motivos: esa
-// aserción cubre UN campo. El contrato de ADR-0038 §(e) es que el sobre MUERE EN EL EDGE, y el proto
-// `ClassifiedIntent` no es el único sitio por el que podría escaparse — bastaría con que alguien lo
-// concatenara al `Text` "para no perder la traza" o lo colara como un `Params["omitido"]`. Se barre el
-// evento ENTERO.
+// 🔴 POR QUÉ SE BARRE EL EVENTO ENTERO Y NO UN CAMPO: el contrato de ADR-0038 §(e) es que el sobre MUERE
+// EN EL EDGE, no que un campo concreto esté a nil. Bastaría con que alguien lo concatenara al `Text` «para
+// no perder la traza». (Hasta T1.6-5 este helper empezaba comprobando `evt.Intent == nil`, que era la
+// aserción del test de los ocho motivos; ese campo ya no existe y el barrido se quedó solo.)
 //
 // INV-051.1: si algo casa, el mensaje de fallo dice QUÉ aguja apareció y en qué mensaje, pero NO vuelca el
 // evento — llevaría el texto y el push_name a la salida de CI, que es un log más.
 func exigirSobreNoViaja(t *testing.T, evt domain.InboundEvent, sobre string, motivo app.MotivoOmitido) {
 	t.Helper()
-	if evt.Intent != nil {
-		t.Fatalf("un sobre de omisión (%s) viajó como intención en %s", motivo, evt.MessageID)
-	}
-	// El evento entero, serializado con %+v: incluye todos los campos exportados y el `Intent` deref si lo
-	// hubiera. Es una cadena LOCAL que no se imprime salvo que haya hallazgo.
+	// El evento entero, serializado con %+v: incluye todos los campos exportados. Es una cadena LOCAL que
+	// no se imprime salvo que haya hallazgo.
 	pajar := fmt.Sprintf("%+v", evt)
 	for _, aguja := range []string{sobre, `"omitido"`, "omitido", string(motivo)} {
 		if aguja == "" {
@@ -62,19 +62,17 @@ func exigirSobreNoViaja(t *testing.T, evt domain.InboundEvent, sobre string, mot
 // TestSobreDeOmisionNoSeCuelaPorNingunCampoDelEvento es el complemento del recorrido de los ocho motivos:
 // allí se comprueba que el sobre no llega como `Intent`; aquí, que no llega POR NINGÚN SITIO.
 //
-// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO: en `Despachador.evento`, hacer que la rama de `app.EsOmitido` deje
-// rastro del sobre en el evento — p.ej. `evt.Text = evt.Text + c.IntentJSON`, o rellenar
-// `evt.Intent = &domain.ClassifiedIntent{Name: string(motivo)}` en vez de devolver el veredicto. La primera
-// pasaría el `Intent == nil` del test de los ocho motivos; esta la caza.
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): en `Despachador.evento`, hacer que la rama de
+// `app.EsOmitido` deje rastro del sobre en el evento — p.ej. `evt.Text = evt.Text + c.IntentJSON`.
 func TestSobreDeOmisionNoSeCuelaPorNingunCampoDelEvento(t *testing.T) {
 	motivos := app.MotivosOmitido()
 	filas := make([]*app.ColaCabeza, 0, len(motivos))
 	for i, m := range motivos {
 		id := int64(i + 1)
-		filas = append(filas, filaClasificada(id, id*10, app.SobreOmitido(m)))
+		filas = append(filas, filaVieja(id, id*10, app.SobreOmitido(m)))
 	}
 	cola := nuevaColaFake(filas...)
-	a := arrancar(t, cola, time.Minute)
+	a := arrancar(t, cola)
 
 	for _, m := range motivos {
 		evt := a.esperarEntrega(t)
@@ -116,13 +114,10 @@ func TestSobreConMotivoDelFuturoSaleSinIntentYSeCuentaAparte(t *testing.T) {
 		}
 	}
 
-	cola := nuevaColaFake(filaClasificada(1, 10, sobreDelFuturo))
-	a := arrancar(t, cola, time.Minute)
+	cola := nuevaColaFake(filaVieja(1, 10, sobreDelFuturo))
+	a := arrancar(t, cola)
 
 	evt := a.esperarEntrega(t)
-	if evt.Intent != nil {
-		t.Fatalf("un sobre de omisión desconocido viajó como intención (%s)", evt.MessageID)
-	}
 	if evt.Text != "hola" {
 		t.Fatalf("el mensaje se entregó mutilado (%s): un motivo que no entendemos no puede costar el mensaje", evt.MessageID)
 	}
@@ -145,8 +140,8 @@ func TestSobreConMotivoDelFuturoSaleSinIntentYSeCuentaAparte(t *testing.T) {
 			t.Fatalf("el motivo canónico %q se contó %d veces por un sobre que no era suyo", m, n)
 		}
 	}
-	if got := a.d.ConIntent(); got != 0 {
-		t.Fatalf("con_intent = %d, se esperaba 0", got)
+	if got := a.d.IntentsDescartados(); got != 0 {
+		t.Fatalf("intents_descartados = %d, se esperaba 0: era un sobre de OMISIÓN, no una clasificación", got)
 	}
 	if got := a.d.Despachados(); got != 1 {
 		t.Fatalf("despachados = %d, se esperaba 1: el mensaje salió", got)
@@ -159,10 +154,11 @@ func TestSobreConMotivoDelFuturoSaleSinIntentYSeCuentaAparte(t *testing.T) {
 // EL CRITERIO ES EL FALLO SEGURO: se entrega SIN intención y se cuenta en `SobresIlegibles`, cuyo valor
 // sano es CERO. Retener el mensaje sería convertir un byte corrupto en una conversación perdida.
 //
-// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO: hacer que la rama `!ok` de `app.LeerSobreClasificado` devuelva
-// `veredicto{}` (el del camino feliz) en vez de `veredicto{ilegible: true}` ⇒ el mensaje se contaría como
-// `con_intent` y `sobres_ilegibles` se quedaría en 0, que es el mismo valor que tiene cuando todo va bien:
-// la degradación se volvería invisible.
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): hacer que la rama `!ok` de `app.LeerSobreClasificado`
+// devuelva `veredicto{}` (el del camino normal bajo pull) en vez de `veredicto{ilegible: true}` ⇒
+// `sobres_ilegibles` se queda en 0, que es el mismo valor que tiene cuando todo va bien: la degradación se
+// vuelve invisible. 🔴 Y hoy esa mutación es MÁS FÁCIL DE COLAR que antes, porque `veredicto{}` pasó de
+// ser el caso raro a ser el caso dominante — de ahí que este test importe más, no menos.
 func TestSobreIlegibleSeEntregaIgualYSeCuenta(t *testing.T) {
 	casos := []struct {
 		nombre string
@@ -176,13 +172,10 @@ func TestSobreIlegibleSeEntregaIgualYSeCuenta(t *testing.T) {
 	}
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
-			cola := nuevaColaFake(filaClasificada(1, 10, c.sobre))
-			a := arrancar(t, cola, time.Minute)
+			cola := nuevaColaFake(filaVieja(1, 10, c.sobre))
+			a := arrancar(t, cola)
 
 			evt := a.esperarEntrega(t)
-			if evt.Intent != nil {
-				t.Fatalf("un sobre ilegible produjo una intención (%s): el Cloud resolvería contra una intención vacía", evt.MessageID)
-			}
 			if evt.Text != "hola" {
 				t.Fatalf("el mensaje se entregó mutilado (%s): un sobre corrupto no puede costar el mensaje", evt.MessageID)
 			}
@@ -190,11 +183,9 @@ func TestSobreIlegibleSeEntregaIgualYSeCuenta(t *testing.T) {
 			if got := a.d.SobresIlegibles(); got != 1 {
 				t.Fatalf("sobres_ilegibles = %d, se esperaba 1 (CERO es el valor sano, y por eso no puede confundirse con este caso)", got)
 			}
-			if got := a.d.ConIntent(); got != 0 {
-				t.Fatalf("con_intent = %d, se esperaba 0", got)
-			}
-			if got := a.d.FragmentosDeLote(); got != 0 {
-				t.Fatalf("fragmentos_de_lote = %d: un sobre ilegible NO es un fragmento de lote (aquel llega con la columna NULL)", got)
+			if got := a.d.IntentsDescartados(); got != 0 {
+				t.Fatalf("intents_descartados = %d: un sobre que no se pudo LEER no es una clasificación descartada; "+
+					"son dos hechos distintos y sólo uno manda a mirar la integridad del disco", got)
 			}
 			if got := a.d.Despachados(); got != 1 {
 				t.Fatalf("despachados = %d, se esperaba 1: el mensaje salió", got)
@@ -212,10 +203,10 @@ func TestSobreIlegibleSeEntregaIgualYSeCuenta(t *testing.T) {
 // `app.DecodeColaMeta` falla ⇒ el mensaje no se entrega y FALLA la entrega. Quitar el `metasIlegibles.Add(1)`
 // ⇒ FALLA el contador y la ceguera vuelve a ser total (el evento no se distingue de uno sin push_name).
 func TestMetaIlegibleEntregaElMensajeSinRemitente(t *testing.T) {
-	fila := filaClasificada(1, 10, `{"intent":"crear_pedido","confidence":0.9}`)
+	fila := filaVieja(1, 10, `{"intent":"crear_pedido","confidence":0.9}`)
 	fila.Meta = []byte(`{esto no es json`)
 	cola := nuevaColaFake(fila)
-	a := arrancar(t, cola, time.Minute)
+	a := arrancar(t, cola)
 
 	evt := a.esperarEntrega(t)
 	if evt.Text != "hola" {
@@ -229,9 +220,12 @@ func TestMetaIlegibleEntregaElMensajeSinRemitente(t *testing.T) {
 	if evt.MessageID == "" || evt.Chat == "" {
 		t.Fatal("se perdieron los identificadores de enrutado, que no viven en el metadato sino en columnas propias")
 	}
-	// Y la intención, que tampoco vive en el metadato, se entrega igual.
-	if evt.Intent == nil || evt.Intent.Name != "crear_pedido" {
-		t.Fatalf("un metadato ilegible se llevó por delante la intención (%s)", evt.MessageID)
+	// Y el sobre de la fila vieja se procesó igual: un metadato roto no puede alterar el veredicto sobre el
+	// `intent_json`, que vive en otra columna.
+	a.sincronizar(t)
+	if got := a.d.IntentsDescartados(); got != 1 {
+		t.Fatalf("intents_descartados = %d, se esperaba 1: el metadato y el sobre son columnas distintas "+
+			"y un fallo en una no puede cambiar la lectura de la otra", got)
 	}
 	a.sincronizar(t)
 	if got := a.d.MetasIlegibles(); got != 1 {

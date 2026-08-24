@@ -30,21 +30,32 @@ type DespachoStats struct {
 	// `app.MotivosOmitido()` devuelve una copia y por eso existe el guardarraíl AST de `internal/app`.
 	// Ninguna línea de este repo —ni de producción ni de test— debe volver a enumerar los ocho a mano.
 	//
-	// 🔴 Y NUNCA SE AGREGA ENTRE MOTIVOS: `fastlane` es el camino SANO (el regex resolvió el intent en µs);
-	// `presupuesto` y `breaker` son FALLOS, y uno de ellos manda a mirar Ollama. Sumarlos deja un número que
+	// 🔴 Y NUNCA SE AGREGA ENTRE MOTIVOS: `fastlane` era el camino SANO (el regex resolvía el intent en µs);
+	// `presupuesto` y `breaker`, FALLOS, y uno de ellos mandaba a mirar Ollama. Sumarlos deja un número que
 	// no responde ninguna pregunta. Sumar el MISMO motivo entre sesiones sí es legítimo.
+	//
+	// ⚠️ Desde T1.6-5 (ADR-0045) ninguno tiene productor vivo: sólo se mueven al drenar filas antiguas.
 	OmitidosPorMotivo map[string]int64
 
-	// CabezasAtascadas: filas de cabeza en un estado que esta versión no conoce. CERO es el único valor sano.
-	CabezasAtascadas int64
-	// PollsCabezaAtascada: si el atasco es HISTORIA (estable) o AHORA (creciendo).
-	PollsCabezaAtascada int64
 	// FallosSelloDespacho: falló `MarcarDespachada` tras entregar. 🔴 Cada uno es un DUPLICADO en la nube.
+	// Es el único de los cuatro que sigue teniendo productor.
 	FallosSelloDespacho int64
-	// FallosSelloPresupuesto: falló `DespacharSinIntent`. La fila se reintenta sola; es ruido operativo.
+
+	// 🔴 LOS TRES DE ABAJO ESTÁN CLAVADOS A 0 DESDE EL 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045),
+	// y su 0 NO significa «va todo bien»: significa que lo que medían dejó de existir.
 	//
-	// 🔴 SEPARADO DEL DE ARRIBA A PROPÓSITO (T3.12) y sin ningún campo «total» que los sume: sólo uno de los
-	// dos implica mensajes duplicados. Agregarlos deshace esa tarea.
+	//   - CabezasAtascadas / PollsCabezaAtascada medían una fila que se quedaba de cabeza en un estado que
+	//     esta versión no conocía, dejando su sesión sin drenar. El despachador ya no mira el estado para
+	//     decidir si entrega, así que ningún estado imprevisto puede retener nada.
+	//   - FallosSelloPresupuesto medía los fallos de `DespacharSinIntent`, sentencia retirada con el
+	//     presupuesto. Estaba separado de FallosSelloDespacho a propósito (T3.12) porque sólo uno de los
+	//     dos implicaba duplicados; hoy sólo queda ese uno.
+	//
+	// SE CONSERVAN porque son campos del proto del heartbeat (`stuck_heads`, `stuck_head_polls`,
+	// `failed_seal_budget`) y retirarlos es un cambio de contrato — decisión de T1.6-1, no de esta tarea.
+	// `statsDe` (sessionmgr) ya no los asigna: se quedan en el 0 de DespachoStatsCero().
+	CabezasAtascadas       int64
+	PollsCabezaAtascada    int64
 	FallosSelloPresupuesto int64
 }
 
