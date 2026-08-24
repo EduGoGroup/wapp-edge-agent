@@ -49,10 +49,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // LAS FILAS SON INDISTINGUIBLES DE LAS REALES AGUAS ABAJO
 // ─────────────────────────────────────────────────────────────────────────────
-// Nacen en `estado = nuevo` con `intent_json` NULL, que es como nace un entrante que el cajero SÍ tiene que
-// clasificar. No se escribe ninguna marca de omisión: el fastlane, el filtro de grupo y el interruptor de
-// la feature son decisiones del listener sobre un mensaje real, y falsificarlas aquí produciría filas que
-// el cajero nunca reclama — justo lo contrario de lo que la herramienta existe para provocar.
+// Nacen en `estado = nuevo` con `intent_json` NULL, que desde el 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 ·
+// ADR-0045) es como nace TODO entrante: el listener ya no escribe marcas de omisión ni resuelve filas al
+// nacer, porque el Edge dejó de clasificar por iniciativa propia.
+//
+// ⚠️ ANTES ESTA COINCIDENCIA HABÍA QUE BUSCARLA: el listener podía parir la fila ya `clasificado` con una
+// marca (`fastlane`, `apagado`, `sin_texto`) y falsificar eso aquí habría dado filas que el cajero no
+// reclamaba nunca — la carga desaparecería sin que nada fallara. Hoy la coincidencia es automática.
 //
 // Lo que SÍ las distingue —a propósito— es el `chat_jid`: `colaseed-<lote>-NNNN@s.whatsapp.net`. No puede
 // colisionar con un JID real (ningún número de teléfono empieza por letras), grita «esto es de prueba» a
@@ -369,10 +372,10 @@ func (o opciones) item(conv, msg int) (app.ColaItem, error) {
 		TSWhatsApp: time.Now().Unix(),
 		Texto:      o.texto(conv, msg),
 		Meta:       meta,
-		// 🔴 NACE `nuevo` Y CON intent_json NULL. Es lo que hace que el cajero TENGA que clasificarla, que
-		// es el trabajo que esta herramienta existe para provocar. Marcarla `clasificado` (con una marca de
-		// omisión, como hace el listener para el fastlane o los grupos) daría filas que el cajero no
-		// reclama nunca: la carga desaparecería sin que nada fallara.
+		// 🔴 NACE `nuevo` Y CON intent_json NULL, exactamente igual que una fila real (ver la cabecera). Es
+		// lo que hace que el cajero pueda reclamarla, que es el trabajo que esta herramienta existe para
+		// provocar. Marcarla `clasificado` daría filas que el cajero no reclama nunca: la carga
+		// desaparecería sin que nada fallara.
 		Estado: app.EstadoNuevo,
 	}, nil
 }

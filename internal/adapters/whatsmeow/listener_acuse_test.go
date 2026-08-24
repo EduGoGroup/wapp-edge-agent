@@ -240,19 +240,23 @@ func TestOnMessage_LosDescartesDeliberados_SIAcusan(t *testing.T) {
 }
 
 // TestOnMessage_LoQueDejaFila_SIEMPREAcusa recorre TODOS los caminos que terminan con el mensaje en disco
-// y exige el acuse en los cinco.
+// y exige el acuse en los cuatro.
 //
-// ⚠️ LOS TRES MOTIVOS DE OMISIÓN NO SON DESCARTES, y es el malentendido más fácil de este código: sin
-// texto, clasificador apagado y fastlane DEJAN FILA (nacen en EstadoClasificado con su marca). La puerta de
-// elegibilidad no decide si el mensaje entra, decide si el CAJERO lo reclama. Acusan porque el mensaje está
-// en disco — no por indulgencia.
+// ⚠️ NINGUNO DE ESTOS CAMINOS ES UN DESCARTE, y es el malentendido más fácil de este código. Un mensaje
+// SIN TEXTO (imagen, audio, sticker) y un texto que el antiguo carril rápido atrapaba se encolan y se
+// entregan EXACTAMENTE IGUAL que un texto libre: acusan porque el mensaje está en disco, no por
+// indulgencia. Lo que sí decide si el mensaje entra son las puertas de verdad —el eco propio, el grupo
+// (T1.5-3) y la sesión pasiva (Plan 046)—, y ésas tienen su lista aparte, arriba.
 //
-// ⚠️ ERAN CUATRO MOTIVOS Y SEIS CASOS hasta el Plan 044 · Ola 1.5 · T1.5-3 (REQ-36): `no_elegible` —el
-// entrante de GRUPO— dejaba fila y se acusaba por estar en disco. Hoy se descarta en la puerta y se acusa
-// por ser un descarte DETERMINISTA, así que cambió de lista, no de veredicto.
+// ⚠️ ERAN SEIS CASOS Y CUATRO MOTIVOS. Se fueron en dos tiempos, y por razones distintas:
+//   - `no_elegible` (el entrante de GRUPO) en el Plan 044 · Ola 1.5 · T1.5-3 (REQ-36): dejó de dejar fila
+//     y pasó a la lista de descartes deterministas de arriba. Cambió de lista, no de veredicto.
+//   - «clasificador apagado» el 2026-08-24, con el push (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045): ya no
+//     es un caso propio porque con la feature apagada la fila nace IDÉNTICA a la de un texto normal. El
+//     caso no desapareció: se FUNDIÓ con el primero de la lista.
 //
 // ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): `return true` → `return false` al final de enqueueCola ⇒
-// caen los cinco casos a la vez.
+// caen los cuatro casos a la vez.
 func TestOnMessage_LoQueDejaFila_SIEMPREAcusa(t *testing.T) {
 	sinTexto := liveMessage("MSG-IMG", "")
 	sinTexto.Info.Type = "image"
@@ -270,8 +274,11 @@ func TestOnMessage_LoQueDejaFila_SIEMPREAcusa(t *testing.T) {
 		// grupo ya NO deja fila, así que dejarlo en esta lista habría puesto el test en rojo por el testigo
 		// —el que exige exactamente 1 fila—, no por el acuse. Su acuse se sigue exigiendo, pero en la lista
 		// de los DESCARTES DELIBERADOS de arriba, que es la familia a la que pertenece desde T1.5-3.
-		{"clasificador apagado", liveMessage("MSG-OFF", "quiero dos empanadas"), []ListenerOption{WithClasificadorActivo(apagado)}},
-		{"carril rápido (fastlane)", liveMessage("MSG-FAST", "2"), nil},
+		//
+		// «clasificador apagado» estaba aquí y se fue con T1.6-5: ver la cabecera. Se conserva el texto que
+		// el antiguo carril rápido atrapaba porque, aunque hoy nazca igual que cualquiera, es el caso que
+		// alguien reintroduciría primero si volviera a meter un atajo en el enqueue.
+		{"texto del antiguo carril rápido", liveMessage("MSG-FAST", "2"), nil},
 		{"sin hora utilizable (t=0)", sinHora, nil},
 	}
 

@@ -17,11 +17,11 @@ package whatsmeow
 //   - `WithCola` + `WithSessionID` (Ola 1): sin ellos LA COLA DEJA DE LLENARSE. El entrante no se
 //     persiste, el cajero no tiene qué clasificar y el despachador no tiene qué entregar — el plan
 //     entero se queda sin materia prima, y el Edge sigue conectado a WhatsApp como si nada.
-//   - `WithClasificadorActivo` (Ola 2): sin él el interruptor no llega y manda el default ACTIVO, así que
-//     con la feature APAGADA las filas nacen `nuevo`, el cajero las reclama, gasta su plaza del semáforo
-//     y llama a Ollama para tráfico que este Edge no debía clasificar.
 //
-// Los tres se prueban igual: ejerciendo `listenerOpts()` y comprobando que lo que dejaron los setters
+// (Eran TRES hasta el 2026-08-24: el tercero era `WithClasificadorActivo` (Ola 2), retirado con el push
+// en T1.6-5 · ADR-0045. Su test y el porqué de su retirada están más abajo, donde vivía.)
+//
+// Los dos se prueban igual: ejerciendo `listenerOpts()` y comprobando que lo que dejaron los setters
 // LLEGA hasta la conducta del Listener.
 //
 // POR QUÉ SE PUDO PROBAR AHORA Y ANTES NO: el ensamblaje vivía dentro de serve(), que exige un
@@ -260,66 +260,22 @@ func TestListenerOpts_SinCola_ElFiltroDePerfilesSigueCortando(t *testing.T) {
 	}
 }
 
-// TestListenerOpts_ElInterruptorDelClasificador_LLEGA_AlListener custodia el cable de la Ola 2 (T2.12): el
-// predicado que decide si una fila NACE reclamable por el cajero o ya resuelta con la marca `apagado`.
+// 🔴 AQUÍ VIVÍA TestListenerOpts_ElInterruptorDelClasificador_LLEGA_AlListener, Y SE FUE CON SU CABLE EL
+// 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045). Custodiaba el `append` de
+// `WithClasificadorActivo(g.clasificadorActivo)` en `listenerOpts()`: probaba por CONSECUENCIA que, con
+// el clasificador apagado, la fila nacía `clasificado` con la marca `apagado` en vez de reclamable.
 //
-// Se prueba por CONSECUENCIA —el estado y el motivo con que nace la fila— y no comprobando que el campo
-// esté puesto: lo que importa no es que el predicado llegue, sino que llegue A TIEMPO de gobernar la
-// puerta de elegibilidad, que es lo único que hace ese cable.
+// NO SE HA ARREGLADO NI DEBILITADO: el cable que custodiaba YA NO EXISTE. Bajo pull el Edge no clasifica,
+// así que no hay ninguna plaza de semáforo que ahorrarle a un cajero y toda fila nace `nuevo`. El setter
+// (`SetClasificadorActivo`), el campo del gateway, la opción del Listener y el predicado del wiring se
+// retiraron enteros, del daemon para abajo.
 //
-// Las dos mitades del test se necesitan mutuamente: la segunda fija que el default sin cablear es ACTIVO
-// (la asimetría deliberada de la Ola 2 — clasificar de más antes que callar), y es lo que hace que la
-// primera signifique algo. Sin ella, un `clasificadorActivo` que devolviera siempre false pasaría.
+// ⚠️ EL ENTITLEMENT `llm_intent` NO HA MUERTO, sólo dejó de decidir aquí: bajo pull decide si el Edge
+// ATIENDE una petición de inferencia (T1.6-2), no si encola. Si ese cable acaba pasando otra vez por
+// `listenerOpts()`, este es el sitio donde vuelve a hacer falta un test como aquél.
 //
-// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): borrar `WithClasificadorActivo(g.clasificadorActivo)` del
-// bloque de la cola en listenerOpts().
-func TestListenerOpts_ElInterruptorDelClasificador_LLEGA_AlListener(t *testing.T) {
-	// (a) Clasificador APAGADO: la fila tiene que nacer YA RESUELTA con la marca `apagado`.
-	apagada := &spyCola{calls: &callLog{}}
-	g := gatewayDePrueba()
-	g.SetCola(apagada, "sess-1")
-	g.SetClasificadorActivo(func() bool { return false })
-
-	l := NewListener(g.log, g.listenerOpts()...)
-	l.handleEvent(context.Background(), liveMessage("MSG-APAGADO", "quiero dos empanadas"))
-
-	if len(apagada.got) != 1 {
-		t.Fatalf("filas anotadas = %d, se esperaba 1: el escenario no es el que el test cree", len(apagada.got))
-	}
-	if got := apagada.got[0].Estado; got != app.EstadoClasificado {
-		t.Errorf("con el clasificador APAGADO la fila nació en estado %q y debía nacer %q.\n"+
-			"    CONSECUENCIA: el interruptor no llega al Listener y manda su default ACTIVO, así que la fila\n"+
-			"    nace reclamable: el cajero la toma, GASTA UNA PLAZA del semáforo de un hueco y llama a Ollama\n"+
-			"    para tráfico que este Edge no debía clasificar. A ~45 msg/min por caja, esa plaza es el\n"+
-			"    recurso escaso que el Plan 051 entero existe para gobernar.\n"+
-			"    SI EL CAMBIO ES DELIBERADO: el filtro se puso en el listener porque aquí es GRATIS; moverlo\n"+
-			"    al cajero es rehacer T2.12, no borrar un append.",
-			got, app.EstadoClasificado)
-	}
-	if got := string(apagada.got[0].IntentJSON); got != string(app.SobreOmitido(app.MotivoApagado)) {
-		t.Errorf("la fila nació con el sobre %q y se esperaba el de %q: el motivo es lo que permite\n"+
-			"    distinguir «apagado» de «fastlane» en el desglose de INV-051.3, y con el motivo equivocado la\n"+
-			"    telemetría explicaría mal lo que está pasando", got, app.MotivoApagado)
-	}
-
-	// (b) SIN cablear el interruptor: manda el default SEGURO (ACTIVO) y la fila nace reclamable. Es lo que
-	// hace que (a) pruebe el cable y no una constante.
-	viva := &spyCola{calls: &callLog{}}
-	sinInterruptor := gatewayDePrueba()
-	sinInterruptor.SetCola(viva, "sess-1")
-
-	l2 := NewListener(sinInterruptor.log, sinInterruptor.listenerOpts()...)
-	l2.handleEvent(context.Background(), liveMessage("MSG-DEFAULT", "quiero dos empanadas"))
-
-	if len(viva.got) != 1 {
-		t.Fatalf("filas anotadas = %d, se esperaba 1", len(viva.got))
-	}
-	if got := viva.got[0].Estado; got != app.EstadoNuevo {
-		t.Errorf("sin interruptor cableado la fila nació %q y debía nacer %q: el default de la Ola 2 es "+
-			"ACTIVO a propósito (clasificar de más antes que callar), y un cableado a medias no puede "+
-			"apagar el clasificador en silencio", got, app.EstadoNuevo)
-	}
-}
+// Los otros dos cables de la cabecera —`WithCola`+`WithSessionID` y `WithLatencia`— siguen probados
+// arriba, intactos.
 
 // TestServeConstruyeSuListenerConListenerOpts cierra la vía de escape que abre la extracción: el test de
 // arriba prueba que `listenerOpts()` cablea bien, pero no que serve() —el único llamante de producción—

@@ -74,6 +74,8 @@ func (s *Store) Pendientes(ctx context.Context) (app.ColaPendientes, error) {
 		case app.EstadoTomado:
 			p.Tomado = n
 		case app.EstadoClasificado:
+			// HEREDADAS de un binario anterior a T1.6-5 (ADR-0045). Se siguen contando aparte —en vez de
+			// dejarlas caer en el hueco entre `Total` y la suma— para poder VER vaciarse las colas viejas.
 			p.Clasificado = n
 		}
 		p.Total += n
