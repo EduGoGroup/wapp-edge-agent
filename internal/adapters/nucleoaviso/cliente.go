@@ -104,7 +104,9 @@ func (c *Cliente) Anunciar(ctx context.Context, dataDir string, listo bool) erro
 
 // AvisarPrefijoFrio le dice al núcleo que el cajero SIGUE SIRVIENDO pero perdió su caché de prefijo, para
 // que el Cloud vuelva a calentar (DEUDA-044.10, Plan 044). Lo dispara el desenlace de una inferencia REAL
-// —un `regimen=frio` que no era un calentamiento—, nunca una sonda ni un reloj (D-044.43).
+// —que salió `regimen=frio`, o que venció el plazo CON EL PROVEEDOR TRABAJANDO— y nunca una sonda ni un
+// reloj (D-044.43). 🔴 Los DOS desenlaces cuentan, y el segundo se añadió porque el primero solo no se
+// disparó ni una vez en campo: tras reiniciar Ollama la inferencia fría muere por timeout.
 //
 // ES EL MISMO CANAL Y EL MISMO PLAZO que `Anunciar`, y por la misma razón: lo que viaja es un enum y una
 // ruta. Lo que cambia es lo que se AFIRMA — de ahí que el valor del cable tenga nombre propio y no se

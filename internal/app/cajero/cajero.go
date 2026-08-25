@@ -562,8 +562,26 @@ type Cajero struct {
 	recalentamientosPedidos atomic.Int64
 }
 
+// Las DOS causas por las que se pide un recalentamiento. Van al log como `causa=` y no como una frase
+// dentro del mensaje porque **son estados distintos y el aviso tiene que decir CUÁL afirma**: la primera
+// es una inferencia que llegó a servirse y salió fría; la segunda es una que no llegó a servirse nunca.
+// Un solo texto para las dos mentiría en la mitad de los casos, y el log es lo único que queda cuando
+// esto se diagnostica a las semanas.
+const (
+	// CausaFrioServida — se sirvió, y el prefill dijo `regimen=frio`. Es la señal LIMPIA.
+	CausaFrioServida = "servida_fria"
+	// CausaFrioTimeout — venció el plazo CON EL PROVEEDOR TRABAJANDO ⇒ nunca hubo muestra de régimen.
+	// Es la señal que la 1.ª pasada de DEUDA-044.10 no miraba, y por eso no se disparaba nunca.
+	CausaFrioTimeout = "timeout"
+)
+
 // avisarPrefijoFrio pide UNA vez por episodio que se reponga el calentamiento. El episodio lo cierra la
 // primera inferencia CALIENTE que se sirva (ver el llamante), no un plazo.
+//
+// 🔴 SE LLAMA DESDE LOS DOS DESENLACES, Y ESO ES EL ARREGLO DE LA 2.ª PASADA: la 1.ª sólo miraba el
+// camino feliz (una inferencia SERVIDA con `regimen=frio`) y en campo dio **cero avisos**, porque tras
+// reiniciar Ollama la inferencia fría MUERE por timeout —y ese timeout calienta el prefijo, así que la
+// siguiente ya sale caliente—. El detalle medido está en el llamante del camino de fallo.
 //
 // 🔴 VA EN GOROUTINE Y ESO ES DELIBERADO: el aviso viaja por el socket del plano de control con su propio
 // plazo, y hacerlo en línea metería esa espera DENTRO de la petición del cliente que ya está pagando el
@@ -573,7 +591,7 @@ type Cajero struct {
 //
 // SI EL AVISO FALLA SE REARMA LA GUARDA, y así el reintento lo dispara la SIGUIENTE inferencia fría —un
 // evento— en vez de un temporizador. Es la misma doctrina que hizo que `nucleoaviso` no reintente solo.
-func (c *Cajero) avisarPrefijoFrio(ctx context.Context) {
+func (c *Cajero) avisarPrefijoFrio(ctx context.Context, causa string) {
 	if c.avisoPrefijo == nil {
 		return
 	}
@@ -586,13 +604,13 @@ func (c *Cajero) avisarPrefijoFrio(ctx context.Context) {
 			// Warn y no Error: es una degradación con consecuencia conocida y acotada —el próximo cliente
 			// paga el prefill—, no un fallo del cajero, que sigue sirviendo.
 			c.log.Warn("cajero: no se pudo pedir el recalentamiento del prefijo al núcleo; el próximo "+
-				"cliente pagará el prefill entero (DEUDA-044.10)", "error", err)
+				"cliente pagará el prefill entero (DEUDA-044.10)", "causa", causa, "error", err)
 			c.prefijoFrioAvisado.Store(false)
 			return
 		}
 		c.recalentamientosPedidos.Add(1)
-		c.log.Info("cajero: PREFIJO FRÍO detectado en una inferencia real (no era un calentamiento); " +
-			"se pidió al núcleo que el Cloud vuelva a calentar")
+		c.log.Info("cajero: PREFIJO FRÍO detectado en una inferencia real (no era un calentamiento); "+
+			"se pidió al núcleo que el Cloud vuelva a calentar", "causa", causa)
 	}()
 }
 
