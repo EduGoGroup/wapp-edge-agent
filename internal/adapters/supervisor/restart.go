@@ -53,8 +53,26 @@ func (r RestartPolicy) conDefaults() RestartPolicy {
 }
 
 // ProbeProcesoVivo devuelve un ReadyProbe que solo exige que el proceso siga arriba tras una gracia: se
-// limita a esperar `gracia` y decir «listo». Es el probe de un hijo SIN PLANO HTTP propio (el cajero del
-// Plan 051, que no escucha en ningún socket: solo reclama trabajo de la cola y clasifica).
+// limita a esperar `gracia` y decir «listo». Es el probe de un hijo SIN ENDPOINT DE SALUD que sondear.
+//
+// 🔧 DOS AFIRMACIONES DE ESTE PÁRRAFO CADUCARON EL 2026-08-24 (ADR-0045), y las dos hablaban del cajero:
+//
+// ANTES decía: «Es el probe de un hijo SIN PLANO HTTP propio (el cajero del Plan 051, que no escucha en
+// ningún socket: solo reclama trabajo de la cola y clasifica).»
+//
+//   - «no escucha en ningún socket» es FALSO: desde la Ola 1.6 el cajero levanta un socket unix por
+//     instalación (`<data_dir>/cajero.sock`, internal/adapters/cajerosock).
+//   - «clasifica» también es FALSO: bajo pull el cajero ya no clasifica por iniciativa propia; SIRVE
+//     inferencia al Cloud. El clasificador se retiró entero (ver cmd/agent/cajero.go).
+//
+// 🔴 LA DECISIÓN NO CAMBIA, y conviene decir por qué para que nadie la "arregle": ese socket NO ES
+// SONDEABLE COMO READINESS. Tiene un único endpoint, `POST /inferencia`, y NO tiene `GET /health`;
+// sondearlo significaría mandar una inferencia de mentira —quemando la única plaza de Ollama y el tiempo
+// de un modelo— sólo para saber si el proceso respira. Este probe débil sigue siendo la elección correcta.
+//
+// Y LA PREGUNTA «¿PUEDE SERVIR?» YA TIENE OTRA RESPUESTA, mejor que cualquier sonda: desde T1.8-5 el
+// cajero AVISA al núcleo al abrir y al cerrar su socket, y el núcleo lo retransmite en el Heartbeat
+// (`inference_readiness`). No es trabajo de este probe y no debe intentarlo.
 //
 // Es DELIBERADAMENTE más débil que el probe HTTP y conviene saber qué NO garantiza:
 //   - No garantiza que el hijo haya terminado de inicializarse (abrir la base cifrada, resolver la DEK,

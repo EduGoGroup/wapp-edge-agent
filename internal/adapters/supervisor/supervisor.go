@@ -12,7 +12,10 @@
 // solo `agent serve`. Dos costuras, ambas ADITIVAS y con VALOR CERO = comportamiento histórico:
 //
 //   - Config.ReadyProbe sustituye el sondeo HTTP de /v1/health por el criterio de readiness que el hijo
-//     admita (el cajero no tiene plano HTTP propio: ver ProbeProcesoVivo, restart.go).
+//     admita. 🔧 El paréntesis que había aquí («el cajero no tiene plano HTTP propio») quedó FALSO el
+//     2026-08-24 (ADR-0045): el cajero levanta un socket unix por instalación. Lo que sigue siendo cierto
+//     —y es lo que sostiene la costura— es que ESE SOCKET NO ES SONDEABLE como readiness: su único
+//     endpoint es `POST /inferencia`, sin `GET /health`. Ver ProbeProcesoVivo, restart.go.
 //   - Config.Restart activa el RELANZADO AUTOMÁTICO con backoff exponencial (restart.go). Con el valor
 //     cero el supervisor sigue SIN relanzar: el núcleo se rearranca a mano por /v1/daemon/start.
 //

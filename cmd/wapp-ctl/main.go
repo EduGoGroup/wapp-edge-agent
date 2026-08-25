@@ -95,8 +95,17 @@ func main() {
 	//
 	//   - PIDFile PROPIO Y EXPLÍCITO: el default del supervisor se deriva del socket (<socket>.pid) y dos
 	//     supervisores sobre el mismo socket colisionarían en el mismo lock file, matándose entre ellos.
-	//   - ReadyProbe de proceso vivo: el cajero NO tiene plano HTTP que sondear (no escucha en ningún
-	//     socket; reclama trabajo de la cola). Ver ProbeProcesoVivo y sus límites.
+	//   - ReadyProbe de proceso vivo. 🔧 EL HECHO QUE JUSTIFICABA ESTA LÍNEA CAMBIÓ EL 2026-08-24 (ADR-0045):
+	//     el cajero SÍ escucha, en un socket unix por instalación (cmd/agent/cajero.go). LA DECISIÓN NO
+	//     CAMBIA, y el motivo es otro: ese socket NO ES SONDEABLE como readiness. Su único endpoint es
+	//     `POST /inferencia` (internal/adapters/cajerosock) y no hay `GET /health`; sondearlo exigiría
+	//     mandarle una inferencia de mentira —quemar la única plaza de Ollama para saber si está vivo— o
+	//     inventarle un endpoint nuevo. Ver ProbeProcesoVivo y sus límites.
+	//
+	//     Y DESDE T1.8-5 HAY ADEMÁS UN CAMINO MEJOR QUE CUALQUIER SONDA: el cajero AVISA por su cuenta al
+	//     núcleo cuando su socket abre y cuando se cierra (POST /v1/inference/readiness). Eso no sustituye
+	//     a este probe —son cosas distintas: el supervisor pregunta «¿arrancó el proceso?» y el aviso dice
+	//     «¿puede servir esta instalación?»— pero es la razón por la que aquí no hace falta más.
 	//   - Relanzado automático: si el worker se cae, la cola deja de vaciarse en silencio. El núcleo NO
 	//     lo lleva (lo rearranca el operador por /v1/daemon/start); el cajero sí (REQ-051.10).
 	//   - StopTimeout de 20s en vez de los 10s por defecto: al recibir el SIGTERM el cajero intenta CERRAR
@@ -250,6 +259,12 @@ func newRouterConCajero(sup, cajeroSup *supervisor.Supervisor, socketPath, platf
 	// forma (hay consumidores) — quien quiera el estado del worker pregunta por /v1/cajero/status, que
 	// reutiliza el cuerpo {state,pid,healthy} del núcleo MÁS un campo "probe" propio (ver
 	// cajeroStatusResponse): el healthy del cajero es una señal más débil y hay que decirlo.
+	//
+	// 🔧 «SEÑAL MÁS DÉBIL» SIGUE SIENDO CIERTO, PERO SU MOTIVO SE ACTUALIZÓ EL 2026-08-24 (ADR-0045). No es
+	// que el cajero no escuche —desde la Ola 1.6 levanta un socket por instalación—: es que ese socket no
+	// tiene endpoint de salud, así que este `healthy` sigue significando «el proceso no se murió en los
+	// primeros 2 s» y nada más. Quien quiera saber si el Edge PUEDE SERVIR inferencia no debe preguntar
+	// aquí: eso viaja en el `inference_readiness` del Heartbeat, y lo afirma el propio cajero (T1.8-5).
 	if cajeroSup != nil {
 		mux.HandleFunc("/v1/cajero/start", requireCSRFIfSession(store, func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != http.MethodPost {

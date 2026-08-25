@@ -178,6 +178,28 @@ type Listener struct {
 	// caer hacia «activa» solo sube tráfico que la nube ya sabe ignorar (`reactiveBlocked`, D-046.7). Se
 	// falla hacia el lado que no pierde mensajes.
 	sesionPasiva func(sessionID string) bool
+
+	// aviso es EL TIMBRE DEL DESPACHADOR (Plan 044 · Ola 1.8 · T1.8-7): un canal con BUFFER 1 que se toca
+	// justo después de que el `Enqueue` del entrante haya vuelto sin error, para que el bucle que drena la
+	// cola de esta sesión no tenga que enterarse por su poll.
+	//
+	// 🔴 QUÉ CAMBIA Y QUÉ NO. El `INSERT` sigue siendo la verdad durable y el poll sigue existiendo: lo que
+	// cambia es QUIÉN DISPARA. Hasta esta tarea un mensaje entrante esperaba de 0 a 500 ms a que el
+	// despachador volviera a mirar; con el aviso, el despachador despierta en cuanto la fila está en disco,
+	// y el intervalo pasa a ser un RESPALDO largo para lo que no viene por aquí (`cmd/colaseed`, cualquier
+	// otro proceso que escriba la cola). Ver despachador/despertador.go.
+	//
+	// 🔴 NO PUEDE BLOQUEAR EL HILO DE WHATSMEOW, y por eso es un canal con buffer y envío no bloqueante y no
+	// una llamada a nadie. INV-051.2 («handler < 50 ms p99») prohíbe que este handler espere a un tercero;
+	// un `ch <- struct{}{}` a secas sobre un despachador ocupado sería exactamente eso. Ver `avisar`.
+	//
+	// 🔴 INV-051.1: por aquí NO viaja nada del mensaje. Es `struct{}{}`, no el evento: el aviso dice «hay
+	// trabajo», no «hay este trabajo». Quien quiera saber qué hay lo lee de la cola, con la DEK, en su
+	// propia goroutine — que es justo lo que la Ola 3 del 051 compró y esta tarea no puede deshacer.
+	//
+	// nil ⇒ NO SE AVISA Y NADA MÁS CAMBIA: el despachador se entera por su poll, exactamente como antes de
+	// T1.8-7. Es la degradación de todos los cableados que no vienen del daemon (y de los tests).
+	aviso chan<- struct{}
 }
 
 // ListenerOption configura el Listener sin romper la firma de NewListener (variádica), igual que
@@ -192,6 +214,28 @@ func WithCola(c app.ColaEntrantes) ListenerOption {
 	return func(l *Listener) {
 		if c != nil {
 			l.cola = c
+		}
+	}
+}
+
+// WithAviso cablea EL TIMBRE DEL DESPACHADOR de esta sesión (Plan 044 · Ola 1.8 · T1.8-7): el canal que
+// el listener toca tras cada `Enqueue` con éxito para que el bucle de drenado despierte sin esperar a su
+// intervalo. nil se IGNORA, y a diferencia de `WithCola` eso NO deja sorda a la sesión: sin aviso el
+// despachador se entera por el poll de siempre, sólo que hasta medio segundo más tarde.
+//
+// 🔴 EL CANAL LO CREA Y LO POSEE `sessionmgr` (una `liveSession` = un canal), que es el único sitio donde
+// el listener y el despachador de una misma sesión se ven las caras. Aquí llega ya como canal de SOLO
+// ENVÍO a propósito: este lado nunca recibe, y el tipo lo hace imposible en vez de dejarlo a la disciplina.
+//
+// ⚠️ VA SIEMPRE CON `WithCola`: un aviso sin cola sería un timbre para una casa vacía (no hay fila que
+// anunciar), y una cola sin aviso es exactamente el comportamiento previo a esta tarea — degradado, pero
+// correcto. La pareja NO se impone aquí con un `if` porque no hay nada que proteger: el peor caso de
+// desparejarlas es una vuelta del bucle en vacío. Compárese con `WithCola`+`WithSessionID`, donde
+// desparejar sí escribe filas que nadie puede descifrar.
+func WithAviso(aviso chan<- struct{}) ListenerOption {
+	return func(l *Listener) {
+		if aviso != nil {
+			l.aviso = aviso
 		}
 	}
 }
@@ -872,7 +916,44 @@ func (l *Listener) enqueueCola(ctx context.Context, e *events.Message, tsWhatsAp
 			"error", err, "message_id", e.Info.ID)
 		return false
 	}
+	// EL TIMBRE (Plan 044 · Ola 1.8 · T1.8-7). PATRÓN OUTBOX: primero se persiste, DESPUÉS se avisa. El
+	// orden no es estético — avisar antes del INSERT despertaría al despachador para que mirara una cola
+	// donde su fila todavía no está, y el aviso se gastaría en vacío.
+	//
+	// 🔴 UN DUPLICADO TAMBIÉN TOCA EL TIMBRE, Y ES BENIGNO. `Enqueue` devuelve nil cuando la fila ya estaba
+	// (idempotencia por choque contra `ux_cola_session_wamid`, colaentrantes.go:298-302) y desde aquí eso es
+	// INDISTINGUIBLE de una fila nueva: whatsmeow reofrece los mismos mensajes al reconectar, así que este
+	// caso ocurre de verdad y no es raro. Consecuencia: un despertar que no encuentra trabajo, mira, no ve
+	// nada y se vuelve a dormir. Se acepta a sabiendas —distinguirlo obligaría a que el puerto
+	// `app.ColaEntrantes` devolviera «era duplicado», ensuciando su contrato para ahorrar una vuelta de
+	// bucle— y es coherente con lo que el aviso ES: una PISTA. La verdad durable es la fila.
+	l.avisar()
 	return true
+}
+
+// avisar toca el timbre del despachador de esta sesión: envío NO BLOQUEANTE sobre un canal con buffer 1.
+//
+// 🔴 LAS DOS PROPIEDADES SON EL PATRÓN ENTERO, y ninguna es opcional:
+//
+//   - NO BLOQUEANTE (`default:`) — esto corre en el hilo de eventos de whatsmeow. Un envío que esperase a
+//     que el despachador estuviera escuchando ataría el camino caliente a la velocidad del drenado, que es
+//     exactamente lo que INV-051.2 prohíbe y lo que la Ola 3 del 051 desmontó. Preferimos perder un aviso
+//     antes que retener el hilo del socket un solo milisegundo.
+//   - BUFFER 1 — los avisos NO SE APILAN porque no hace falta: el despachador drena TODO lo pendiente cada
+//     vez que despierta, no «un ítem por aviso». Con buffer 1, veinte entrantes de una ráfaga producen como
+//     mucho un puñado de despertares y las veinte entregas igual. Y el descarte no pierde nada: si el
+//     buffer estaba lleno es que hay un aviso pendiente que provocará una mirada COMPLETA posterior a este
+//     INSERT (el argumento entero está en despachador.AvisoConRespaldo).
+//
+// nil ⇒ no-op silencioso: sin canal cableado el despachador se entera por su poll, como antes de T1.8-7.
+func (l *Listener) avisar() {
+	if l.aviso == nil {
+		return
+	}
+	select {
+	case l.aviso <- struct{}{}:
+	default:
+	}
 }
 
 // sesionEsPasiva consulta el perfil de ESTA sesión con el DEFAULT FAIL-OPEN aplicado (Plan 046 · T2.2):
