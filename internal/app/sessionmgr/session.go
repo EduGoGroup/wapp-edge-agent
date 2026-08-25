@@ -98,6 +98,29 @@ type liveSession struct {
 	// sin tocar a las demás (design §7)— sin usar el WaitGroup GLOBAL del Manager (que une a todas). nil
 	// si no se arrancó listener (sesión registrada sin escucha): waitDone es entonces un no-op.
 	done chan struct{}
+	// aviso es EL TIMBRE ENTRE LOS DOS HILOS DE ESTA SESIÓN (Plan 044 · Ola 1.8 · T1.8-7): el listener lo
+	// toca tras cada `Enqueue` con éxito y el despachador lo escucha para despertar sin esperar a su poll.
+	//
+	// 🔴 VIVE AQUÍ Y NO EN EL Manager PORQUE ES POR SESIÓN. El listener y el despachador de una sesión no
+	// comparten ninguna otra estructura —el listener nace dentro de un ListenGateway, el despachador es una
+	// goroutine del Manager—, y esta `liveSession` es literalmente el ÚNICO punto donde se ven las caras.
+	// Un canal global despertaría al despachador de TODAS las sesiones cada vez que llegara un mensaje a
+	// cualquiera, que es trabajo inventado multiplicado por la flota.
+	//
+	// BUFFER 1 Y ENVÍO NO BLOQUEANTE (el envío lo hace `Listener.avisar`, no este paquete): los avisos no
+	// se apilan porque el despachador drena TODO lo pendiente al despertar, no un ítem por aviso.
+	//
+	// 🔴 LO CREA `arm`, JUNTO A `done` Y ANTES DEL `go` DEL LISTENER, y ese sitio es load-bearing: en
+	// startListener el listener arranca ANTES que el despachador, así que un entrante puede encolarse
+	// cuando todavía no hay nadie escuchando. Está cubierto por DOBLE VÍA — el buffer 1 guarda ese aviso
+	// hasta que el despachador llegue a su primer `Esperar`, y además `Despachador.Run` hace una mirada
+	// completa a la cola ANTES de esperar nada—, pero con el canal creado más tarde ni siquiera habría
+	// dónde guardarlo.
+	//
+	// nil ⇒ nadie avisa y nadie escucha: el despachador cae a su poll de siempre (ver startDespachador, que
+	// NO construye el despertador por aviso con un canal nil). Es el caso de las sesiones registradas sin
+	// escucha y el de los tests que no llaman a `arm`.
+	aviso chan struct{}
 	// despachadores cuenta la(s) goroutine(s) del DESPACHADOR de la cola de esta sesión (Plan 051 Ola 3,
 	// T3.3). Es el gemelo POR SESIÓN de `done`, para el segundo hilo que la sesión estrena en esa ola: el
 	// que drena su cola durable y entrega al cable.
@@ -246,13 +269,36 @@ func (s *liveSession) inyectarVia(ctx context.Context, p app.InyeccionEntrante) 
 }
 
 // arm prepara la sesión para su goroutine listener bajo lock: guarda su cancel (apagado ordenado /
-// borrado quirúrgico) y abre el canal done que esa goroutine cerrará al retornar. Lo invoca
-// startListener justo antes de lanzar la goroutine; Stop usa cancel y Unlink espera done.
+// borrado quirúrgico), abre el canal done que esa goroutine cerrará al retornar y abre el TIMBRE con el
+// que el listener despertará al despachador. Lo invoca startListener justo antes de lanzar la goroutine;
+// Stop usa cancel y Unlink espera done.
+//
+// 🔴 EL TIMBRE SE CREA AQUÍ, CON `done`, Y NO EN startDespachador (Plan 044 · Ola 1.8 · T1.8-7). El orden
+// de arranque de una sesión es: `arm` → `go runListener` → `startDespachador`. Si el canal naciera con el
+// despachador, el listener podría encolar su primer entrante contra un `aviso` nil y ese despertar se
+// perdería; naciendo aquí, el buffer 1 lo guarda hasta que el despachador exista. (Aun así no se perdería
+// el MENSAJE: `Run` drena antes de esperar. Pero un aviso perdido en el arranque es medio segundo de
+// latencia en el primer mensaje de cada sesión, que es justo lo que esta tarea existe para quitar.)
 func (s *liveSession) arm(cancel context.CancelFunc) {
 	s.mu.Lock()
 	s.cancel = cancel
 	s.done = make(chan struct{})
+	// BUFFER 1: ver el campo. Basta uno porque el despachador drena todo lo pendiente al despertar.
+	s.aviso = make(chan struct{}, 1)
 	s.mu.Unlock()
+}
+
+// avisoCanal devuelve el timbre de esta sesión (nil si no se armó). Lee bajo lock por la misma razón que
+// waitDone: `arm` lo escribe desde el hilo que arranca la sesión y esto lo leen tanto el factory del
+// listener como startDespachador.
+//
+// Devuelve el canal BIDIRECCIONAL a propósito: los dos extremos salen de aquí y cada uno lo estrecha en su
+// frontera —`chan<- struct{}` al entrar en el gateway/listener, `<-chan struct{}` al entrar en el
+// despertador—, de modo que ningún lado pueda hacer lo que no le toca sin que el compilador se entere.
+func (s *liveSession) avisoCanal() chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.aviso
 }
 
 // signalDone cierra el canal done (la goroutine listener ya retornó). Idempotente solo dentro de una

@@ -260,6 +260,81 @@ func TestListenerOpts_SinCola_ElFiltroDePerfilesSigueCortando(t *testing.T) {
 	}
 }
 
+// TestListenerOpts_ElTimbreDelDespachador_LLEGA_AlListenerQueNaceDeAqui custodia el CUARTO cable que pasa
+// por este punto inauditable (Plan 044 · Ola 1.8 · T1.8-7): el canal con el que el listener despierta al
+// despachador de su sesión.
+//
+// 🔴 SU MODO DE FALLO ES EL PEOR DE LOS CUATRO PARA DETECTARLO, aunque el menos grave de sufrirlo: borrar
+// el `append` de `WithAviso(g.aviso)` NO rompe nada visible. El entrante se sigue anotando, se sigue
+// entregando y se sigue acusando; lo único que pasa es que vuelve a esperar al poll del despachador. O sea:
+// el Edge funciona, los cuatro gates salen verdes, y la tarea entera —de 500 ms a milisegundos— queda
+// deshecha sin un solo síntoma. Un cable así sólo lo sostiene un test.
+//
+// Se comprueba por CONDUCTA (se hace pasar un mensaje y se mira si el timbre sonó) y no por inspección de
+// la lista de opciones: una opción presente pero inerte pasaría una comprobación estructural.
+//
+// ⚠️ QUÉ MUTACIONES LO PONEN EN ROJO (ejecutadas):
+//   - borrar `listenerOpts = append(listenerOpts, WithAviso(g.aviso))` de listenerOpts() ⇒ el Listener nace
+//     sin timbre y el canal se queda vacío;
+//   - `WithAviso(make(chan struct{}, 1))` en ese append ⇒ el listener toca un canal gemelo que nadie
+//     escucha: el mismo agujero, sin ningún nil que lo delate;
+//   - vaciar el cuerpo de SetAviso (o hacerlo escribir en otro campo) ⇒ el gateway nunca guarda nada.
+func TestListenerOpts_ElTimbreDelDespachador_LLEGA_AlListenerQueNaceDeAqui(t *testing.T) {
+	canal := make(chan struct{}, 1)
+	cola := &spyCola{calls: &callLog{}}
+
+	g := gatewayDePrueba()
+	g.SetCola(cola, "sess-1")
+	g.SetAviso(canal)
+
+	l := NewListener(g.log, g.listenerOpts()...)
+	l.handleEvent(context.Background(), liveMessage("MSG-TIMBRE", "quiero dos empanadas"))
+
+	select {
+	case <-canal:
+	default:
+		t.Error("el entrante se anotó y NADIE tocó el timbre del despachador.\n" +
+			"    CONSECUENCIA: el canal que el sessionmgr creó y cableó en el gateway no llega al Listener,\n" +
+			"    así que el despachador de la sesión vuelve a enterarse por su poll — hasta medio segundo de\n" +
+			"    espera por mensaje, exactamente lo que T1.8-7 vino a quitar. Nada falla, nada se pierde y\n" +
+			"    ningún gate lo ve: por eso este test existe.")
+	}
+}
+
+// TestListenerOpts_SinTimbre_ElEntranteSeAnotaIGUAL fija la otra mitad de la decisión, que es lo que
+// separa este cable de `WithCola`: sin timbre cableado la sesión NO queda degradada en nada que importe.
+// El entrante se anota y se acusa igual; sólo se entrega más tarde.
+//
+// Importa dejarlo escrito porque la asimetría es deliberada: una cola sin session_id se prohíbe con un `if`
+// (escribiría filas indescifrables) y un aviso sin cola se permite sin condiciones (no puede hacer daño:
+// `avisar()` sólo se alcanza tras un `Enqueue` con éxito). Si alguien «armoniza» los dos casos metiendo el
+// aviso dentro del bloque de la cola, este test no cae — pero el de arriba tampoco, y por eso el porqué
+// vive además en el comentario de producción.
+//
+// ⚠️ QUÉ MUTACIÓN LO PONE EN ROJO (ejecutada): hacer que `Listener.avisar` deje de comprobar el nil. Ojo
+// al matiz, porque la mutación evidente NO vale: un `select` con `default` sobre un canal nil no entra en
+// pánico, se va por el `default`. La que muerde es sustituir el cuerpo entero por un envío BLOQUEANTE,
+// `l.aviso <- struct{}{}` ⇒ el handler se cuelga para siempre sobre un canal nil. Ejecutada: el test no
+// falla con un mensaje, muere con `panic: test timed out` — que es el síntoma correcto de haber atado el
+// hilo del socket de whatsmeow a nadie.
+func TestListenerOpts_SinTimbre_ElEntranteSeAnotaIgual(t *testing.T) {
+	cola := &spyCola{calls: &callLog{}}
+
+	g := gatewayDePrueba()
+	g.SetCola(cola, "sess-1")
+	// Sin SetAviso: es el cableado de cualquier sesión que no pasó por `arm` y el de los tests del paquete.
+
+	l := NewListener(g.log, g.listenerOpts()...)
+	if !l.handleEvent(context.Background(), liveMessage("MSG-SIN-TIMBRE", "quiero dos empanadas")) {
+		t.Fatal("sin timbre cableado el entrante dejó de acusarse: la falta de aviso degradó la DURABILIDAD, " +
+			"que es justo lo que no puede tocar")
+	}
+	if len(cola.got) != 1 {
+		t.Errorf("filas anotadas = %d, se esperaba 1: sin timbre el entrante tiene que anotarse igual "+
+			"(el aviso es una PISTA; la verdad durable es el INSERT)", len(cola.got))
+	}
+}
+
 // 🔴 AQUÍ VIVÍA TestListenerOpts_ElInterruptorDelClasificador_LLEGA_AlListener, Y SE FUE CON SU CABLE EL
 // 2026-08-24 (Plan 044 · Ola 1.6 · T1.6-5 · ADR-0045). Custodiaba el `append` de
 // `WithClasificadorActivo(g.clasificadorActivo)` en `listenerOpts()`: probaba por CONSECUENCIA que, con
