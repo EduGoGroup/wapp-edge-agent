@@ -136,6 +136,21 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// VA FUERA de cualquier condicional de la cola a propósito: el corte decide si el mensaje ENTRA,
 			// no en qué estado nace su fila.
 			gateway.SetSesionPasiva(m.sesionPasiva)
+			// TIMBRE DEL DESPACHADOR (Plan 044 · Ola 1.8 · T1.8-7): el canal POR SESIÓN con el que el
+			// listener despierta al bucle que drena su cola, en vez de dejar que se entere por el poll. Es
+			// la mitad ESCRITORA del cable; la lectora la coge startDespachador de la misma `liveSession`
+			// (despacho.go), que es el único punto donde los dos hilos de una sesión se ven.
+			//
+			// 🔴 NO VA DENTRO DEL BLOQUE DE LA COLA aunque sólo sirva habiéndola: `avisar()` sólo se alcanza
+			// tras un `Enqueue` con éxito, así que un timbre sin cola no se toca jamás. Lo que sí importa es
+			// que esta línea y la de despacho.go cojan EL MISMO canal de la MISMA sesión — un canal distinto
+			// en cada lado no daría error, daría un despachador que nunca despierta y un listener que llama
+			// a una puerta que nadie escucha, con todos los gates en verde.
+			//
+			// `s.avisoCanal()` es nil si la sesión no pasó por `arm` (registrada sin escucha, o un test que
+			// cablea el factory a mano): SetAviso ignora el nil y el listener no avisa, que es exactamente
+			// el comportamiento previo a esta tarea.
+			gateway.SetAviso(s.avisoCanal())
 			// Cronómetro del handler de entrantes (Plan 051 Ola 3 · T3.13): mismo molde que el interruptor
 			// del clasificador —COMPARTIDO por todo el Edge, no ligado a la sesión— porque el criterio
 			// INV-051.2 («handler < 50 ms p99») se juzga sobre el Edge entero. m.latencia nil (opción no

@@ -117,6 +117,34 @@ type ListenGateway struct {
 	// DEK—, este es uno solo para todo el Edge: el criterio INV-051.2 es del Edge, no de cada sesión.
 	// nil ⇒ el Listener no mide, y todo lo demás se comporta igual. Lo cablea el factory del sessionmgr.
 	latencia *latencia.Histograma
+
+	// aviso es EL TIMBRE DEL DESPACHADOR de ESTA sesión (Plan 044 · Ola 1.8 · T1.8-7) que serve() pasa al
+	// Listener: el canal que se toca tras cada `Enqueue` con éxito para que el bucle de drenado despierte
+	// sin esperar a su intervalo.
+	//
+	// VA LIGADO A LA SESIÓN, como la cola y al contrario que el cronómetro o el consultor de perfiles: hay
+	// UN despachador por sesión y cada uno escucha SU canal, así que compartir uno entre sesiones
+	// despertaría a todas cada vez que llegara un mensaje a cualquiera. Lo crea y lo posee la `liveSession`
+	// (sessionmgr), que es el único sitio donde el listener y el despachador de una sesión coinciden.
+	//
+	// nil ⇒ el Listener no avisa y el despachador se entera por su poll, igual que antes de T1.8-7. Lo
+	// cablea el factory del sessionmgr (SetAviso).
+	aviso chan<- struct{}
+}
+
+// SetAviso liga el gateway (y su Listener) al TIMBRE DEL DESPACHADOR de esta sesión (Plan 044 · Ola 1.8 ·
+// T1.8-7). Se llama ANTES de Listen (al construir el gateway), como el resto de setters.
+//
+// nil se ignora y el listener queda SIN avisar: es una degradación de LATENCIA (el entrante espera al poll
+// del despachador, hasta medio segundo), nunca de correctitud — la fila ya está en disco y el bucle la
+// encuentra igual. Por eso, a diferencia de SetCola, aquí no hay pareja que custodiar ni nada que gritar.
+//
+// No es secreto ni PII: por el canal viaja `struct{}{}`, no el mensaje (INV-051.1).
+func (g *ListenGateway) SetAviso(aviso chan<- struct{}) {
+	if aviso == nil {
+		return
+	}
+	g.aviso = aviso
 }
 
 // SetLatencia liga el gateway (y su Listener) al cronómetro del handler de entrantes (Plan 051 Ola 3 ·
@@ -299,6 +327,13 @@ func (g *ListenGateway) listenerOpts() []ListenerOption {
 	// clasificador— porque mide el handler ENTERO, incluidos los caminos que no encolan: una sesión sin cola
 	// sigue gastando tiempo del hilo de whatsmeow y ese tiempo cuenta para INV-051.2. nil se ignora.
 	listenerOpts = append(listenerOpts, WithLatencia(g.latencia))
+	// TIMBRE DEL DESPACHADOR (Plan 044 · Ola 1.8 · T1.8-7). Va FUERA del bloque de la cola aunque sólo se
+	// toque cuando hay cola, y la razón es la de siempre en este método: los `if` de aquí existen para
+	// impedir cableados PELIGROSOS (una cola sin identidad escribe filas indescifrables), no para ahorrar
+	// una opción inerte. Un aviso sin cola no puede hacer daño —nadie lo tocaría nunca, porque `avisar()`
+	// sólo se alcanza tras un `Enqueue` con éxito— y meterlo dentro del bloque sólo añadiría una condición
+	// más que alguien puede romper sin que ningún test lo note. nil se ignora en la opción.
+	listenerOpts = append(listenerOpts, WithAviso(g.aviso))
 	// Margen de la ventana temporal de ingesta (ADR-0037). Va también FUERA del bloque de la cola: la
 	// ventana decide QUÉ ENTRA por la puerta, y esa decisión es anterior e independiente de que haya cola
 	// donde anotarlo. 0 (no configurado) se ignora en la opción y manda el default del Listener.

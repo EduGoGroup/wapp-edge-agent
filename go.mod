@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/EduGoGroup/identity-shared/auth v0.3.1
-	github.com/EduGoGroup/wapp-cloudlink v0.16.0
+	github.com/EduGoGroup/wapp-cloudlink v0.17.0
 	github.com/EduGoGroup/wapp-edge-intent v0.3.0
 	github.com/EduGoGroup/wapp-shared/auth v0.4.1
 	github.com/EduGoGroup/wapp-shared/config v0.3.0

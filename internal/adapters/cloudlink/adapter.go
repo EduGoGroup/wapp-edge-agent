@@ -189,6 +189,16 @@ type Adapter struct {
 	// cajero`, que es el ÚNICO que puede hablar con Ollama (REQ-051.10). nil ⇒ un inference_request se
 	// responde OLLAMA_DOWN (que es la verdad: no hay proveedor alcanzable desde este proceso).
 	inferencia app.ServidorInferencia
+	// infReadiness es lo que este Edge AFIRMA sobre su capacidad de servir inferencia (Plan 044 · Ola 1.8
+	// · T1.8-5): uno de readinessDesconocida/readinessListo/readinessCaida, que viaja como
+	// `inference_readiness` en TODOS los heartbeats. El porqué entero —las dos fuentes, por qué el cero no
+	// es DOWN y por qué una transición produce N latidos— está en readiness.go.
+	//
+	// atomic.Int32 y no un campo bajo a.mu: lo escriben dos goroutines ajenas entre sí (el handler del
+	// plano de control y los K workers del carril de inferencia) y lo lee el emisor de latidos, que ya
+	// tiene a.mu tomado cuando snapshotea el registro de sesiones. Meterlo bajo el mismo candado obligaría
+	// a razonar sobre ese orden en cada llamada; el atómico lo hace innecesario.
+	infReadiness atomic.Int32
 	// inferenciaMaxInflight son las inferencias que este Edge acepta atender A LA VEZ, y a la vez los
 	// workers del carril (WAPP_AGENT_INFERENCE_MAX_INFLIGHT). <=0 ⇒ defaultInferenceMaxInflight.
 	inferenciaMaxInflight int
@@ -1061,6 +1071,15 @@ func (a *Adapter) sendHeartbeat(cl *client.Client, sessionID string, e *sessionE
 			SelfJid:       e.selfJID,
 			State:         heartbeatStateFor(domain.SessionStateActive),
 			SessionHealth: a.collectHealth(sessionID),
+			// Plan 044 · Ola 1.8 · T1.8-5: lo que este Edge DICE sobre su capacidad de servir inferencia.
+			//
+			// 🔴 VA EN **TODOS** LOS LATIDOS, no sólo en el de la transición, y eso no es redundancia: el
+			// campo es de ESTADO (así lo declara el contrato). Un Cloud que se reconecta, o que se reinicia,
+			// o que perdió el latido de la transición, tiene que poder leer la readiness del PRIMER latido
+			// que vea sin haber visto ninguno anterior. Quitarlo de aquí y dejarlo sólo en la transición
+			// haría que el Cloud dependiera de no perderse nunca un frame — que es exactamente la clase de
+			// suposición que un stream que se cae y se reabre no puede sostener.
+			InferenceReadiness: a.readinessProto(),
 		}},
 	})
 }

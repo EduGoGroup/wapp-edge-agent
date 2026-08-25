@@ -2,6 +2,7 @@ package sessionmgr
 
 import (
 	"context"
+	"time"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/despachador"
@@ -120,14 +121,35 @@ func (m *Manager) startDespachador(ctx context.Context, s *liveSession) {
 		return
 	}
 
-	d, err := despachador.New(despachador.Deps{
+	deps := despachador.Deps{
 		Cola:      m.colaDespachador,
 		Sink:      sink,
 		SessionID: sid,
 		// s.log ya arrastra session_id/jid: la traza del drenado sale etiquetada por sesión, igual que la
 		// de la carga de DEK.
 		Log: s.log,
-	})
+	}
+
+	// EL TIMBRE, LADO RECEPTOR (Plan 044 · Ola 1.8 · T1.8-7). Con el canal de la sesión cableado, este
+	// bucle deja de despertar por reloj y despierta por EVENTO: el `Enqueue` del listener toca el canal en
+	// cuanto la fila está en disco (whatsmeow/listener.go, `avisar`) y el intervalo se queda de RESPALDO.
+	//
+	// 🔴 ES LA MITAD LECTORA DEL MISMO CABLE QUE `gateway.SetAviso(s.avisoCanal())` (listen.go). Los dos
+	// extremos tienen que salir de la MISMA `liveSession`, y por eso los dos preguntan a `s.avisoCanal()`
+	// en vez de fabricarse un canal cada uno: dos canales distintos no darían error de compilación ni una
+	// línea de log — darían un listener llamando a una puerta que nadie escucha, con el mismo síntoma de
+	// campo que si esta tarea no existiera (medio segundo de más por mensaje, invisible).
+	//
+	// 🔴 SIN CANAL NO SE CONSTRUYE EL DESPERTADOR, Y ESA CONDICIÓN NO ES DECORATIVA. `AvisoConRespaldo`
+	// acepta un canal nil y degrada a poll puro, pero de su RESPALDO — o sea, pasaría de mirar cada 500 ms
+	// a mirar cada 5 s, empeorando en diez veces justo lo que esta tarea vino a mejorar, y en silencio.
+	// Dejando el campo a nil manda el default de `despachador.New`, que es el `PollFijo(DefaultPollMS)` de
+	// siempre. Ocurre en las sesiones que no pasaron por `arm` y en los tests que cablean el Manager a mano.
+	if aviso := s.avisoCanal(); aviso != nil {
+		deps.Despertador = despachador.NewAvisoConRespaldo(aviso, despachador.DefaultRespaldoMS*time.Millisecond)
+	}
+
+	d, err := despachador.New(deps)
 	if err != nil {
 		// Error y no fatal: la sesión queda escuchando y ENCOLANDO, pero sin drenar. Nada se pierde —las
 		// filas siguen en disco y un reinicio las despacha—, pero nada sube: el síntoma es su cola creciendo.

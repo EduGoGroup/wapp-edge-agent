@@ -10,6 +10,7 @@ import (
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cajerosock"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/nucleoaviso"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/cajero"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
@@ -188,54 +189,23 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 		return fmt.Errorf("cajero: no se pudo construir el servidor de inferencia (¿proveedor local nil?)")
 	}
 
-	// MISMO PATRÓN DE CIERRE QUE LAS COLAS, y por el mismo motivo: los cierres se acumulan y se invocan en
-	// orden INVERSO desde un único punto, en vez de apilar N `defer` dentro del bucle. Aquí importa además
-	// que el apagado de los sockets ocurra ANTES de que se cierren las BDs (los defer de arriba), porque
-	// una inferencia en vuelo puede estar publicando su parte.
-	var sockets []*cajerosock.Servidor
-	var servidores sync.WaitGroup
-	cerrarSockets := func() {
-		for i := len(sockets) - 1; i >= 0; i-- {
-			// El plazo del drenaje es el techo de UNA inferencia: es exactamente lo que puede quedar en
-			// vuelo. Cortar antes tiraría trabajo ya pagado; esperar más dejaría al supervisor mandando
-			// SIGKILL sobre un proceso que se está tomando su tiempo.
-			ctxCierre, cancelCierre := context.WithTimeout(context.WithoutCancel(ctx),
-				time.Duration(cfg.Inference.MaxTimeoutMS)*time.Millisecond)
-			if err := sockets[i].Apagar(ctxCierre); err != nil {
-				log.Warn("cajero: el socket de inferencia no cerró limpiamente", "error", err)
-			}
-			cancelCierre()
-		}
-		servidores.Wait()
-	}
-	for _, dataDir := range dataDirs {
-		layout := sessionmgr.NewLayout(dataDir)
-		srv := cajerosock.Nuevo(ctx, layout.CajeroSock(), puerto, log)
-		ln, err := srv.Escuchar()
-		if err != nil {
-			cerrarSockets() // el defer de abajo aún no está registrado: se cierra a mano lo ya abierto
-			// ES FATAL, con el mismo criterio que la cola: sin socket, el daemon de esta instalación no
-			// puede pedir NI UNA inferencia y el único síntoma sería un OLLAMA_DOWN permanente con Ollama
-			// perfectamente vivo. Arrancar sería prometer un servicio que no existe.
-			return fmt.Errorf("cajero: abrir el socket de inferencia de %s: %w", dataDir, err)
-		}
-		sockets = append(sockets, srv)
-		servidores.Add(1)
-		go func(srv *cajerosock.Servidor, ln net.Listener) {
-			defer servidores.Done()
-			if err := srv.Servir(ln); err != nil {
-				log.Error("cajero: el socket de inferencia falló", "error", err)
-			}
-		}(srv, ln)
+	// LOS N SOCKETS, EL AVISO AL NÚCLEO Y EL CIERRE, todo en levantarSocketsDeInferencia: ver allí por qué
+	// el aviso va ENTRE abrir y servir, y no después de las dos cosas.
+	cerrarSockets, err := levantarSocketsDeInferencia(ctx, dataDirs, puerto,
+		nucleoaviso.Nuevo(cfg.ControlSocketPath),
+		time.Duration(cfg.Inference.MaxTimeoutMS)*time.Millisecond, log)
+	if err != nil {
+		return err
 	}
 	defer cerrarSockets()
 
 	log.Info("agent cajero: el Edge SIRVE inferencia al Cloud por socket (ADR-0045); ya no clasifica por iniciativa propia",
 		"data_dir", cfg.DataDir,
 		// `colas` es cuántas instalaciones atiende y `data_dirs` cuáles; `sockets` coincide con las dos
-		// porque hay exactamente un socket de inferencia por instalación.
+		// porque hay exactamente un socket de inferencia por instalación (por eso se cuenta sobre la misma
+		// lista: si alguno no hubiera abierto, no se habría llegado hasta aquí — es fatal).
 		"colas", len(colas),
-		"sockets", len(sockets),
+		"sockets", len(dataDirs),
 		"data_dirs", strings.Join(dataDirs, ","),
 		"ollama_url", cfg.Intent.OllamaURL,
 		"model", cfg.Intent.Model,
@@ -256,6 +226,130 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 	// El cierre de los sockets y de las colas lo hacen los defer de arriba, en TODOS los caminos de salida,
 	// y en el orden inverso al de apertura: {sockets} → {las N colas}.
 	return c.Run(ctx)
+}
+
+// levantarSocketsDeInferencia abre el socket de inferencia de CADA instalación, le dice al núcleo de
+// cada una que ya está listo, y sólo entonces empieza a servirlos. Devuelve la función de cierre, que
+// anuncia «caído» y drena lo que quede en vuelo.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// 🔴 TRES FASES, Y EL ORDEN ENTRE ELLAS ES LO ÚNICO QUE HAY QUE PROTEGER AQUÍ
+// ─────────────────────────────────────────────────────────────────────────────
+//
+//	FASE 1 · ABRIR   — `Escuchar()` es SÍNCRONO: al volver, el socket ya está bound y en el backlog.
+//	FASE 2 · AVISAR  — un POST «listo» por instalación al plano de control de su núcleo.
+//	FASE 3 · SERVIR  — recién ahí arranca el `Servir` de cada socket.
+//
+// LO QUE COMPRA PARTIR EL BUCLE EN DOS es que ninguna petición pueda ser ATENDIDA antes de que el aviso
+// haya salido: entre la fase 1 y la 3 un cliente puede conectar, pero se queda en el backlog del kernel
+// sin que nadie lo lea. Con un único bucle que abriera-avisara-sirviera por vuelta, el socket de la
+// primera instalación ya estaría sirviendo mientras se abre el de la segunda, y el orden dejaría de ser
+// una propiedad de la estructura para pasar a ser una carrera que casi siempre se gana. Casi.
+//
+// Y COMPRA UNA SEGUNDA COSA, menos vistosa: si la instalación número 3 no puede abrir su socket, no se
+// ha anunciado NADA todavía. Anunciando dentro del bucle, los núcleos 1 y 2 se habrían quedado con un
+// «listo» que ya no es verdad —el proceso aborta— y sin nadie que les mande el «caído», porque el
+// arranque falló antes de registrar el cierre.
+//
+// EL AVISO NO ES UN REQUISITO DE ARRANQUE: si falla (el núcleo aún no ha abierto su socket, o esta
+// instalación no tiene daemon), se avisa en el log y se sigue. El núcleo tiene el otro camino —la
+// primera inferencia servida lo pone READY por sí sola— y negarse a servir por no haber podido
+// anunciarlo sería convertir una aceleración en un punto de fallo.
+func levantarSocketsDeInferencia(
+	ctx context.Context,
+	dataDirs []string,
+	puerto app.ServidorInferencia,
+	// aviso es el CLIENTE CONCRETO, no una interfaz, y esa es la decisión. Un puerto aquí no tendría más
+	// que una implementación y ningún doble: los tests de esta función usan el *nucleoaviso.Cliente de
+	// producción contra un plano de control falso levantado sobre un socket unix de verdad, porque lo que
+	// hay que probar es el ORDEN de lo que sale POR EL CABLE. Una interfaz sólo añadiría un nombre.
+	aviso *nucleoaviso.Cliente,
+	plazoDrenaje time.Duration,
+	log sharedlogger.Logger,
+) (func(), error) {
+	var sockets []*cajerosock.Servidor
+	var listeners []net.Listener
+	var servidores sync.WaitGroup
+
+	// MISMO PATRÓN DE CIERRE QUE LAS COLAS, y por el mismo motivo: los cierres se acumulan y se invocan en
+	// orden INVERSO desde un único punto, en vez de apilar N `defer` dentro del bucle. Aquí importa además
+	// que el apagado de los sockets ocurra ANTES de que se cierren las BDs (los defer de runCajero), porque
+	// una inferencia en vuelo puede estar publicando su parte.
+	apagarSockets := func() {
+		for i := len(sockets) - 1; i >= 0; i-- {
+			// El plazo del drenaje es el techo de UNA inferencia: es exactamente lo que puede quedar en
+			// vuelo. Cortar antes tiraría trabajo ya pagado; esperar más dejaría al supervisor mandando
+			// SIGKILL sobre un proceso que se está tomando su tiempo.
+			ctxCierre, cancelCierre := context.WithTimeout(context.WithoutCancel(ctx), plazoDrenaje)
+			if err := sockets[i].Apagar(ctxCierre); err != nil {
+				log.Warn("cajero: el socket de inferencia no cerró limpiamente", "error", err)
+			}
+			cancelCierre()
+		}
+		servidores.Wait()
+	}
+
+	// ── FASE 1 · ABRIR ────────────────────────────────────────────────────────
+	for _, dataDir := range dataDirs {
+		layout := sessionmgr.NewLayout(dataDir)
+		srv := cajerosock.Nuevo(ctx, layout.CajeroSock(), puerto, log)
+		ln, err := srv.Escuchar()
+		if err != nil {
+			apagarSockets() // aún no hay `defer` registrado, y NO hay nada anunciado que desdecir
+			// ES FATAL, con el mismo criterio que la cola: sin socket, el daemon de esta instalación no
+			// puede pedir NI UNA inferencia y el único síntoma sería un OLLAMA_DOWN permanente con Ollama
+			// perfectamente vivo. Arrancar sería prometer un servicio que no existe.
+			return nil, fmt.Errorf("cajero: abrir el socket de inferencia de %s: %w", dataDir, err)
+		}
+		sockets = append(sockets, srv)
+		listeners = append(listeners, ln)
+	}
+
+	// ── FASE 2 · AVISAR ───────────────────────────────────────────────────────
+	//
+	// 🔴 UN AVISO POR INSTALACIÓN, NUNCA UNO GLOBAL: hay N daemons, uno por data_dir, y cada uno sólo
+	// puede afirmar algo sobre el suyo. El `data_dir` viaja en el cuerpo y el núcleo que lo recibe
+	// descarta el que no le toca (ver internal/adapters/control/server/readiness.go).
+	for _, dataDir := range dataDirs {
+		if err := aviso.Anunciar(ctx, dataDir, true); err != nil {
+			// Warn y no Error: es una degradación con recuperación conocida (el núcleo pasará a READY con la
+			// primera inferencia que sirva), no un fallo del arranque. El mensaje nombra la consecuencia real
+			// —el calentamiento del Cloud llegará tarde— porque «no se pudo avisar» no le dice nada a nadie.
+			log.Warn("cajero: no se pudo anunciar «listo» al núcleo de esta instalación; su Cloud se enterará "+
+				"con la primera inferencia servida, no ahora (el calentamiento de arranque llegará tarde)",
+				"data_dir", dataDir, "error", err)
+		}
+	}
+
+	// ── FASE 3 · SERVIR ───────────────────────────────────────────────────────
+	for i := range sockets {
+		servidores.Add(1)
+		go func(srv *cajerosock.Servidor, ln net.Listener) {
+			defer servidores.Done()
+			if err := srv.Servir(ln); err != nil {
+				log.Error("cajero: el socket de inferencia falló", "error", err)
+			}
+		}(sockets[i], listeners[i])
+	}
+
+	cerrar := func() {
+		// 🔴 EL «CAÍDO» VA ANTES DEL DRENAJE, y ese orden es la mitad del valor de esta señal. Anunciarlo
+		// primero le da al Cloud la ventaja de dejar de mandar inferencias a este Edge MIENTRAS se drena lo
+		// que ya está en vuelo; al revés, el aviso saldría cuando ya no queda nada que proteger y el Cloud
+		// se habría pasado el drenaje entero mandando trabajo a un socket que se está cerrando.
+		//
+		// EL ctx DEL PROCESO YA ESTÁ CANCELADO cuando esto corre (llega por SIGTERM), así que el aviso lleva
+		// `context.WithoutCancel` y su propio plazo corto (nucleoaviso.PlazoAviso): sin lo primero moriría
+		// antes de salir, y sin lo segundo podría comerse el presupuesto de parada del supervisor.
+		for _, dataDir := range dataDirs {
+			if err := aviso.Anunciar(context.WithoutCancel(ctx), dataDir, false); err != nil {
+				log.Warn("cajero: no se pudo anunciar «caído» al núcleo de esta instalación; lo descubrirá al "+
+					"fallar su próxima inferencia", "data_dir", dataDir, "error", err)
+			}
+		}
+		apagarSockets()
+	}
+	return cerrar, nil
 }
 
 // abrirCola abre, migra y construye la cola de UNA instalación (un data_dir) y devuelve, además de la
