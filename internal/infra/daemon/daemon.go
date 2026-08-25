@@ -301,6 +301,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		Model:         intentStack.Model,
 		ConfigVersion: intentStack.ConfigVersion,
 	}))
+	// POST /v1/inference/readiness — LA SEÑAL DEL WORKER-CAJERO (Plan 044 · Ola 1.8 · T1.8-5, D-044.43).
+	//
+	// 🔴 CON Handle (dentro de RegisterInferenceReadiness) Y NO CON HandleAuthorized: el emisor es `agent
+	// cajero`, otro proceso hijo del mismo supervisor, que no tiene Bearer de operador — cualquier ruta
+	// protegida le devolvería 401/403 y la señal no llegaría NUNCA, sin más síntoma que un calentamiento
+	// que siempre llega tarde. La justificación entera de la exención, y —más importante— qué NO se acepta
+	// por esa puerta, está en el encabezado de control/server/readiness.go.
+	//
+	// SE LE PASA cfg.DataDir PORQUE EL AVISO ES POR INSTALACIÓN: el cajero atiende N data_dir's y este
+	// daemon sirve uno. El handler descarta el aviso que hable de otro.
+	srv.RegisterInferenceReadiness(cfg.DataDir, readinessDeInferencia(mux, log))
 	srv.RegisterPairing(mgr)
 	srv.RegisterUnlink(mgr)
 	srv.RegisterEnroll(enrolladapter.New(cfg, log))
@@ -505,6 +516,28 @@ func registrarInyectorEntrantes(srv *server.Server, cfg config.Config, mgr inyec
 // de programación, no un estado degradado — pero tumbar el daemon con un pánico por una línea de
 // observabilidad sería peor que la ausencia del dato. Se avisa y se sigue: el bloque de latencia saldrá
 // sin los campos de cola, que es lo honesto.
+// readinessDeInferencia devuelve el lado del multiplexor que ACEPTA la readiness afirmada por el
+// worker-cajero (Plan 044 · Ola 1.8 · T1.8-5), o nil si el mux no la respalda.
+//
+// LA ASERCIÓN SE COMPRUEBA, mismo criterio que colaContador: con el *cloudlink.Adapter real siempre se
+// cumple. El caso nil no es un fallo de programación sino un modo declarado: cuando no hay endpoint de
+// CloudLink, BuildMux devuelve un LogMux —un Edge sin stream a la nube, para diagnóstico— y ahí no hay
+// ningún Heartbeat donde retransmitir la señal.
+//
+// 🔴 SE AVISA EN Info Y NO EN Warn, y la diferencia importa: un Edge sin endpoint de CloudLink no tiene
+// nada roto, tiene la nube apagada a propósito. Un Warn por arranque entrenaría a ignorar la línea. La
+// ruta se registra igual (el handler responde 200 con applied:false diciendo por qué), para que el
+// aviso del cajero no se convierta en un 404 recurrente en el log de un entorno de diagnóstico.
+func readinessDeInferencia(mux sessionmgr.CloudLinkMux, log sharedlogger.Logger) server.InferenceReadinessSink {
+	sink, ok := mux.(server.InferenceReadinessSink)
+	if !ok {
+		log.Info("agent serve: el multiplexor de CloudLink no respalda la readiness de inferencia (Edge sin " +
+			"stream a la nube); el aviso del worker-cajero se aceptará y NO se retransmitirá")
+		return nil
+	}
+	return sink
+}
+
 func colaContador(cola app.ColaEntrantes, log sharedlogger.Logger) app.ColaContador {
 	c, ok := cola.(app.ColaContador)
 	if !ok {

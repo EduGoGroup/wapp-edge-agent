@@ -283,6 +283,22 @@ func (c *carrilInferencia) atender(c2e *cloudlinkv1.CloudToEdge) {
 				"(bug: app.ServidorInferencia promete los cinco)", "command_id", cmdID, "error", err)
 			canonico = app.ErrInferenciaOllamaCaido
 		}
+		// ─── Plan 044 · Ola 1.8 · T1.8-5 · LA SEGUNDA FUENTE DE LA READINESS ───
+		//
+		// 🔴 SÓLO OLLAMA_DOWN LA MUEVE, Y LOS OTROS CUATRO CÓDIGOS NO. La distinción es entre «el proveedor
+		// local NO ESTÁ» y «esta petición concreta no salió»: BREAKER_ABIERTO, TIMEOUT, LEASE_INVALID y
+		// EDGE_SIN_CAPACIDAD los devuelve un cajero VIVO —que sigue ahí y volverá a servir en cuanto se
+		// cierre el breaker, o baje la carga, o llegue el lease—, así que declararlo DOWN sería mentirle al
+		// Cloud sobre la máquina para contarle algo de una petición. Y encima sería una mentira que se
+		// arregla sola y vuelve, o sea una señal que oscila: el Cloud dejaría de calentar a rachas sin que
+		// nada hubiera cambiado en el Edge.
+		//
+		// ESTE ES EL CAMINO QUE CUBRE EL SIGKILL. Un cajero muerto de golpe no manda «caído» (no corre su
+		// `defer`), y esta línea es la que lo descubre sin necesidad de un probe: la petición ya se estaba
+		// haciendo, sólo faltaba anotar lo que su fracaso significa.
+		if canonico == app.ErrInferenciaOllamaCaido {
+			c.a.MarcarInferenciaReadiness(false)
+		}
 		// 🔴 INV-051.1: del error se dice que existe; jamás el prompt que lo provocó.
 		c.a.log.Warn("CloudLink: inference_request NO servido; sube el error nombrado y el Cloud degrada",
 			"command_id", cmdID, "codigo", canonico.Codigo(), "error", err,
@@ -290,6 +306,17 @@ func (c *carrilInferencia) atender(c2e *cloudlinkv1.CloudToEdge) {
 		c.responderError(c2e, canonico)
 		return
 	}
+
+	// LA CARA POSITIVA DE LA SEGUNDA FUENTE (T1.8-5): una inferencia SERVIDA es la prueba más dura que
+	// existe de que el proveedor local está ahí. Va aquí —justo tras el error y ANTES del sellado— porque
+	// lo que se afirma es sobre el PROVEEDOR, y un fallo de sellado o de marshal de más abajo es de este
+	// proceso, no suyo: pasar a DOWN por un bug propio del daemon culparía al cajero de algo que no hizo.
+	//
+	// Es la red que repone la READY perdida: si el aviso de arranque del cajero no llegó (el socket del
+	// núcleo aún no estaba, el daemon se estaba reiniciando), la primera inferencia que salga bien
+	// devuelve el estado a su sitio y emite el latido de la transición. Sin ella, un aviso perdido dejaría
+	// al Edge marcado DOWN para siempre pese a estar sirviendo — la peor forma de fallar de las dos.
+	c.a.MarcarInferenciaReadiness(true)
 
 	// ⑤ SELLADO. La salida del modelo puede llevar texto literal del cliente, así que NO viaja en claro
 	// (ADR-0020 §5, mismo trato que SensitivePayload en IncomingMessage). En ESTA dirección sí se puede
