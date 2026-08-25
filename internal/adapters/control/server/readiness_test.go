@@ -12,6 +12,7 @@ package server
 //     y uno vacío no puede leerse como «todas».
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -25,12 +26,22 @@ type sinkFake struct {
 	llamadas int
 	ultimo   bool
 	cambio   bool
+	// reposiciones cuenta las llamadas a ReponerCalentamientoInferencia (DEUDA-044.10). Va APARTE de
+	// `llamadas` a propósito: el test que importa es justo que el aviso de prefijo frío NO se cuele por el
+	// camino de `MarcarInferenciaReadiness`, y con un contador común eso sería indistinguible.
+	reposiciones int
+	repuso       bool
 }
 
 func (s *sinkFake) MarcarInferenciaReadiness(listo bool) bool {
 	s.llamadas++
 	s.ultimo = listo
 	return s.cambio
+}
+
+func (s *sinkFake) ReponerCalentamientoInferencia() bool {
+	s.reposiciones++
+	return s.repuso
 }
 
 // postReadiness monta un Server con la ruta colgada y le manda un cuerpo crudo.
@@ -155,5 +166,55 @@ func TestReadiness_Idempotente_LaRespuestaDistingueTransicionDeRepeticion(t *tes
 	cuerpo := rec.Body.String()
 	if !strings.Contains(cuerpo, `"applied":true`) || !strings.Contains(cuerpo, `"changed":false`) {
 		t.Errorf("repetir el mismo estado debe salir applied:true + changed:false; got %s", cuerpo)
+	}
+}
+
+// TestReadiness_PrefijoFrio_NoSeCuelaPorElCaminoDeReadiness es el test que separa las DOS señales que
+// comparten endpoint (DEUDA-044.10). El aviso de prefijo frío tiene que llegar a
+// ReponerCalentamientoInferencia y NO tocar MarcarInferenciaReadiness — si se colara por ahí, el núcleo
+// dejaría escrito que el cajero cambió de estado, que es justamente la línea falsa que este valor propio
+// del cable existe para evitar.
+//
+// MUTACIÓN QUE LO PONE ROJO (ejecutada): cambiar en el handler `h.sink.ReponerCalentamientoInferencia()`
+// por `h.sink.MarcarInferenciaReadiness(true)` ⇒ reposiciones=0 y llamadas=1.
+func TestReadiness_PrefijoFrio_NoSeCuelaPorElCaminoDeReadiness(t *testing.T) {
+	sink := &sinkFake{repuso: true}
+	rec := postReadiness(t, sink, `{"readiness":"`+ReadinessPrefijoFrio+`","data_dir":"`+dataDirPropio+`"}`, nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("http = %d, want 200 (cuerpo: %s)", rec.Code, rec.Body.String())
+	}
+	if sink.reposiciones != 1 {
+		t.Errorf("reposiciones = %d, want 1: el aviso de prefijo frío debe ir por su propio camino", sink.reposiciones)
+	}
+	if sink.llamadas != 0 {
+		t.Errorf("llamadas a MarcarInferenciaReadiness = %d, want 0: el cajero NO afirmó ningún estado nuevo "+
+			"—sigue sirviendo—, y contarlo como readiness dejaría una línea falsa en el log del núcleo", sink.llamadas)
+	}
+
+	var resp ReadinessResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("respuesta ilegible: %v", err)
+	}
+	if !resp.Applied || !resp.Changed {
+		t.Errorf("applied=%v changed=%v, want true/true", resp.Applied, resp.Changed)
+	}
+	if resp.Readiness != ReadinessPrefijoFrio {
+		t.Errorf("readiness = %q, want %q: la respuesta debe devolver lo que se afirmó", resp.Readiness, ReadinessPrefijoFrio)
+	}
+}
+
+// TestReadiness_PrefijoFrio_DeOtraInstalacion_NoSeAplica: el filtro por data_dir gobierna IGUAL a la
+// señal nueva. Sin esto, un cajero que atiende dos instalaciones haría recalentar a un daemon que no es
+// el suyo — el mismo error que RegisterInferenceReadiness ya impedía para «listo»/«caído».
+func TestReadiness_PrefijoFrio_DeOtraInstalacion_NoSeAplica(t *testing.T) {
+	sink := &sinkFake{repuso: true}
+	rec := postReadiness(t, sink, `{"readiness":"`+ReadinessPrefijoFrio+`","data_dir":"/otra/instalacion"}`, nil)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("http = %d, want 200", rec.Code)
+	}
+	if sink.reposiciones != 0 {
+		t.Errorf("reposiciones = %d, want 0: el aviso hablaba de otra instalación", sink.reposiciones)
 	}
 }

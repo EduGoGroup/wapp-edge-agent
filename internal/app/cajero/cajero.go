@@ -338,6 +338,10 @@ type Deps struct {
 	// ola entera (el techo de 45 s que nunca llegó a producción porque el VPS traía 15 s).
 	PrefillCaliente time.Duration
 	PrefillFrio     time.Duration
+	// AvisoPrefijoFrio es por dónde se pide reponer el calentamiento cuando el prefijo se enfría sin que
+	// el cajero se haya movido (DEUDA-044.10). nil ⇒ no se avisa a nadie, que es exactamente la conducta
+	// anterior a T-044.10: el primer cliente tras un reinicio de Ollama paga el prefill entero.
+	AvisoPrefijoFrio AvisadorPrefijoFrio
 	// KeepAlive son los SEGUNDOS que Ollama debe mantener el modelo cargado tras responder, y viaja en el
 	// primer nivel de cada /api/chat (T1.7-4). Negativo = para siempre (ollama.KeepAliveForever).
 	// nil ⇒ ollama.DefaultKeepAliveSeconds (hoy -1).
@@ -542,6 +546,67 @@ type Cajero struct {
 	errBreakerAbierto atomic.Int64
 	errTimeout        atomic.Int64
 	errSinCapacidad   atomic.Int64
+
+	// avisoPrefijo es por dónde el cajero pide que se reponga el calentamiento cuando descubre que su
+	// caché de prefijo se enfrió (DEUDA-044.10). Puede ser nil —el cajero funciona igual sin él, solo que
+	// nadie recalienta, que es la conducta de antes de este arreglo— y por eso toda llamada va guardada.
+	avisoPrefijo AvisadorPrefijoFrio
+	// prefijoFrioAvisado impide la TORMENTA: con el prefijo frío, todas las inferencias que lleguen antes
+	// de que el calentamiento surta efecto saldrían `frio` y cada una pediría otro recalentamiento. Se
+	// levanta al avisar y se baja en cuanto se vuelve a ver una inferencia CALIENTE, que es la prueba de
+	// que la caché volvió. NO es un reloj: el ciclo lo cierra un hecho observado, no un plazo.
+	prefijoFrioAvisado atomic.Bool
+	// recalentamientosPedidos cuenta los avisos emitidos. Sale en la línea de contadores porque un número
+	// que sube sin parar es la señal de que el prefijo se está desalojando de verdad (memoria justa), y no
+	// de que Ollama se reinició una vez.
+	recalentamientosPedidos atomic.Int64
+}
+
+// avisarPrefijoFrio pide UNA vez por episodio que se reponga el calentamiento. El episodio lo cierra la
+// primera inferencia CALIENTE que se sirva (ver el llamante), no un plazo.
+//
+// 🔴 VA EN GOROUTINE Y ESO ES DELIBERADO: el aviso viaja por el socket del plano de control con su propio
+// plazo, y hacerlo en línea metería esa espera DENTRO de la petición del cliente que ya está pagando el
+// prefill frío — cobrarle dos veces por el mismo problema. `context.WithoutCancel` porque el ctx de la
+// inferencia muere en cuanto se responde, y sin eso el aviso se cancelaría a sí mismo casi siempre; el
+// techo lo pone el cliente (nucleoaviso.PlazoAviso), así que la goroutine no puede quedarse colgada.
+//
+// SI EL AVISO FALLA SE REARMA LA GUARDA, y así el reintento lo dispara la SIGUIENTE inferencia fría —un
+// evento— en vez de un temporizador. Es la misma doctrina que hizo que `nucleoaviso` no reintente solo.
+func (c *Cajero) avisarPrefijoFrio(ctx context.Context) {
+	if c.avisoPrefijo == nil {
+		return
+	}
+	if !c.prefijoFrioAvisado.CompareAndSwap(false, true) {
+		return // ya avisado en este episodio: no se pide un calentamiento por cada inferencia fría
+	}
+	desligado := context.WithoutCancel(ctx)
+	go func() {
+		if err := c.avisoPrefijo.AvisarPrefijoFrio(desligado); err != nil {
+			// Warn y no Error: es una degradación con consecuencia conocida y acotada —el próximo cliente
+			// paga el prefill—, no un fallo del cajero, que sigue sirviendo.
+			c.log.Warn("cajero: no se pudo pedir el recalentamiento del prefijo al núcleo; el próximo "+
+				"cliente pagará el prefill entero (DEUDA-044.10)", "error", err)
+			c.prefijoFrioAvisado.Store(false)
+			return
+		}
+		c.recalentamientosPedidos.Add(1)
+		c.log.Info("cajero: PREFIJO FRÍO detectado en una inferencia real (no era un calentamiento); " +
+			"se pidió al núcleo que el Cloud vuelva a calentar")
+	}()
+}
+
+// AvisadorPrefijoFrio es el puerto por el que el cajero pide que el Cloud vuelva a calentar su prefijo.
+// Lo implementa el adaptador `nucleoaviso` desde `cmd/agent`, que es quien sabe a QUÉ instalaciones hay
+// que decírselo; aquí sólo se conoce el hecho, no los destinatarios.
+//
+// 🔴 EL CAJERO NO PUEDE CALENTARSE SOLO, y por eso esto es un aviso y no una acción: el prompt del
+// calentamiento lo compone el CLOUD con el catálogo del tenant (ADR-0045, «la inferencia la orquesta el
+// Cloud, el Edge la sirve»). Lo único que el Edge puede hacer es decir que le hace falta.
+type AvisadorPrefijoFrio interface {
+	// AvisarPrefijoFrio informa de que la caché de prefijo se perdió aunque el cajero siga sirviendo.
+	// Su error se registra y se sigue: es una aceleración, no un requisito.
+	AvisarPrefijoFrio(ctx context.Context) error
 }
 
 // montarColas resuelve las DOS formas de pasar colas (Deps.Colas y el atajo Deps.Cola) en la lista única
@@ -648,26 +713,27 @@ func New(deps Deps) (*Cajero, error) {
 	}
 
 	return &Cajero{
-		colas:       colas,
-		ollama:      deps.Ollama,
-		modelo:      deps.Modelo,
-		temperatura: temperatura,
-		opciones:    deps.Opciones,
-		keepAlive:   keepAlive,
-		umbrales:    nuevosUmbralesRegimen(deps.PrefillCaliente, deps.PrefillFrio, log),
-		porRegimen:  nuevoContador(RegimenesInferencia...),
-		porClase:    nuevoContador(app.ClasesInferencia...),
-		breaker:     br,
-		despertador: desp,
-		log:         log,
-		ahora:       ahora,
-		lease:       lease,
-		timeout:     deps.Timeout,
-		timeoutMax:  timeoutMax,
-		statsEvery:  deps.StatsEvery,
-		ollamaURL:   deps.OllamaURL,
-		numThread:   numThread,
-		aforo:       NuevoAforo(deps.MaxConcurrent),
+		colas:        colas,
+		ollama:       deps.Ollama,
+		modelo:       deps.Modelo,
+		temperatura:  temperatura,
+		opciones:     deps.Opciones,
+		keepAlive:    keepAlive,
+		umbrales:     nuevosUmbralesRegimen(deps.PrefillCaliente, deps.PrefillFrio, log),
+		avisoPrefijo: deps.AvisoPrefijoFrio,
+		porRegimen:   nuevoContador(RegimenesInferencia...),
+		porClase:     nuevoContador(app.ClasesInferencia...),
+		breaker:      br,
+		despertador:  desp,
+		log:          log,
+		ahora:        ahora,
+		lease:        lease,
+		timeout:      deps.Timeout,
+		timeoutMax:   timeoutMax,
+		statsEvery:   deps.StatsEvery,
+		ollamaURL:    deps.OllamaURL,
+		numThread:    numThread,
+		aforo:        NuevoAforo(deps.MaxConcurrent),
 	}, nil
 }
 
@@ -769,6 +835,11 @@ func (c *Cajero) contadores() []any {
 		"fallos", c.Fallos(),
 		"lentas", c.Lentas(),
 		"rescatados", c.Rescatados(),
+		// Los recalentamientos PEDIDOS (DEUDA-044.10) van aquí y no en una línea propia: es un número que en
+		// régimen normal se queda quieto, y lo que dice cuando se mueve depende de a qué ritmo lo hace. Uno
+		// suelto = a Ollama lo reiniciaron (o saltó su fusible de memoria). Subiendo sin parar = el prefijo
+		// se está DESALOJANDO de verdad, y eso ya es la conversación de la afinidad por tenant, no un susto.
+		"recalentamientos_pedidos", c.recalentamientosPedidos.Load(),
 		"aperturas_breaker", c.AperturasBreaker(),
 		"circuito", c.Circuito(),
 		// Las tres señales del parte se emiten TAMBIÉN en el log local (T4.5). No es duplicar por
