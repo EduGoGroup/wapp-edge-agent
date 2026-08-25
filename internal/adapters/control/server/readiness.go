@@ -72,6 +72,18 @@ const (
 	ReadinessListo = "ready"
 	// ReadinessCaido: ese socket deja de servir (apagado ordenado del cajero).
 	ReadinessCaido = "down"
+	// ReadinessPrefijoFrio: el cajero SIGUE SIRVIENDO, pero su caché de prefijo se perdió y la próxima
+	// inferencia de un cliente pagaría el prefill entero (DEUDA-044.10, Plan 044). NO es un tercer estado
+	// de readiness: es un HECHO que pide una acción —que el Cloud vuelva a calentar—, y el daemon lo
+	// traduce a la única transición que el contrato de CloudLink sabe expresar (ver
+	// InferenceReadinessSink.ReponerCalentamientoInferencia).
+	//
+	// 🔴 POR QUÉ TIENE VALOR PROPIO Y NO SE MANDAN DOS AVISOS («down» y luego «ready»), que produciría la
+	// misma transición con cero código nuevo: porque el log mentiría. Un «down» seguido de un «ready»
+	// deja escrito que el cajero se cayó y volvió, y **el cajero no se cayó** — lo que se enfrió fue
+	// Ollama por debajo. Esta casa ya tiene la regla escrita (*un mensaje automático debe filtrar por el
+	// estado que AFIRMA*), y un par de líneas falsas en el log del arranque cuestan más que este enum.
+	ReadinessPrefijoFrio = "prefix_cold"
 )
 
 // ReadinessRequest es el cuerpo de POST /v1/inference/readiness. Lo escribe el cajero
@@ -110,6 +122,18 @@ type InferenceReadinessSink interface {
 	// TRANSICIÓN (el estado anterior era distinto). Debe ser idempotente: repetir el mismo valor no es un
 	// error, simplemente no transiciona.
 	MarcarInferenciaReadiness(listo bool) bool
+
+	// ReponerCalentamientoInferencia le pide al núcleo que consiga que el Cloud vuelva a calentar el
+	// prefijo de este Edge, y devuelve true si se emitió algo. La llama el cajero cuando descubre —por el
+	// `regimen` de una inferencia REAL, no por una sonda— que su caché de prefijo se perdió
+	// (DEUDA-044.10).
+	//
+	// 🔴 POR QUÉ ES UN MÉTODO APARTE Y NO `MarcarInferenciaReadiness(true)`: ese es IDEMPOTENTE, y ahí está
+	// el problema. Tras un reinicio de Ollama el Edge sigue marcado READY, así que repetir READY no
+	// transiciona, y el Cloud calienta **sólo en la transición a READY**
+	// (gateway/grpc/readiness.go). El estado correcto y la acción necesaria se contradicen: hay que
+	// PROVOCAR la transición sin que nadie escriba en el log que el cajero se cayó.
+	ReponerCalentamientoInferencia() bool
 }
 
 // readinessHandler cuelga la señal sobre el puerto, atada al data_dir de ESTE daemon.
@@ -150,15 +174,19 @@ func (h *readinessHandler) handle(w http.ResponseWriter, r *http.Request) {
 	// El valor se normaliza (trim + minúsculas) porque lo escribe otro proceso y un espacio de más no es
 	// un error de nadie; lo que NO se hace es adivinar: un valor que no sea uno de los dos se rechaza.
 	estado := strings.ToLower(strings.TrimSpace(req.Readiness))
-	var listo bool
+	var listo, prefijoFrio bool
 	switch estado {
 	case ReadinessListo:
 		listo = true
 	case ReadinessCaido:
 		listo = false
+	case ReadinessPrefijoFrio:
+		// Ni listo ni caído: el cajero sirve, y lo que afirma es que su prefijo se enfrió. Se resuelve
+		// abajo, contra el sink, por un camino distinto — ver el bloque final de este handler.
+		prefijoFrio = true
 	default:
 		writeError(w, http.StatusBadRequest, codeInvalidRequest,
-			`readiness debe ser "`+ReadinessListo+`" o "`+ReadinessCaido+`"`)
+			`readiness debe ser "`+ReadinessListo+`", "`+ReadinessCaido+`" o "`+ReadinessPrefijoFrio+`"`)
 		return
 	}
 
@@ -198,6 +226,19 @@ func (h *readinessHandler) handle(w http.ResponseWriter, r *http.Request) {
 			Readiness: estado, Applied: false,
 			Reason: "este daemon no tiene stream a la nube (CloudLink deshabilitado)",
 		})
+		return
+	}
+
+	if prefijoFrio {
+		// EL CAJERO NO AFIRMA UN ESTADO AQUÍ: afirma que perdió su caché de prefijo y pide la única acción
+		// que lo repone. Por eso el log dice eso y no «readiness CAMBIA»: el cajero no se cayó.
+		cambio := h.sink.ReponerCalentamientoInferencia()
+		if h.log != nil {
+			h.log.Info("plano de control: el worker-cajero avisa de que su PREFIJO se enfrió (sigue sirviendo); "+
+				"se provoca la transición de readiness para que el Cloud vuelva a calentar (DEUDA-044.10)",
+				"data_dir", dataDir, "emitido", cambio)
+		}
+		writeJSON(w, http.StatusOK, ReadinessResponse{Readiness: estado, Applied: true, Changed: cambio})
 		return
 	}
 

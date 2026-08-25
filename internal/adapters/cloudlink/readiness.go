@@ -89,6 +89,43 @@ func (a *Adapter) MarcarInferenciaReadiness(listo bool) bool {
 	return true
 }
 
+// ReponerCalentamientoInferencia provoca la transición `NOT_READY → READY` que hace que el Cloud vuelva a
+// calentar el prefijo de este Edge (DEUDA-044.10, Plan 044). La llama el plano de control cuando el cajero
+// avisa de que su caché de prefijo se perdió — típicamente porque **Ollama se reinició por debajo**, que es
+// el caso que el fusible `MemoryMax` de `ollama.service` está puesto para provocar a propósito.
+//
+// 🔴 POR QUÉ HAY QUE PROVOCARLA Y NO BASTA CON MARCAR READY. El Cloud calienta **sólo en la transición a
+// READY desde otra cosa** (gateway/grpc/readiness.go: `r == READY && anterior != READY`), y tras un
+// reinicio de Ollama este Edge **sigue marcado READY**, porque su readiness observa a SU CAJERO, no al
+// proveedor: el cajero no se reinició. `MarcarInferenciaReadiness(true)` es idempotente y devolvería false
+// sin emitir nada. El estado es correcto y aun así el sistema necesita una acción — de ahí este método.
+//
+// 🔴 SON DOS LATIDOS, Y LOS DOS HACEN FALTA. El Cloud lleva su propia copia del último estado por Edge, así
+// que si sólo mandáramos el READY final vería «READY después de READY» ⇒ no es transición ⇒ no calienta. El
+// gRPC preserva el orden dentro del stream, así que llegan como se emiten.
+//
+// ⚠️ LO QUE ESTE MÉTODO NO ES, Y CONVIENE NO CONFUNDIRLO: no es «el Edge se cayó y volvió». Durante los
+// milisegundos que dura, este Edge PUEDE servir — mal, pagando el prefill entero, que es justo lo que se
+// quiere evitar. El `NOT_READY` intermedio es la forma más honesta que el contrato de hoy sabe expresar de
+// «no puedo servir DENTRO DEL PLAZO», y está medido que con el prefijo frío no cabe: 49 s de prefill contra
+// un techo de 45 s. La forma limpia sería un valor propio en el enum del proto (rompe contrato ⇒
+// `wapp-cloudlink` primero), y queda anotada como el arreglo de fondo.
+func (a *Adapter) ReponerCalentamientoInferencia() bool {
+	// Si nadie ha afirmado nada todavía (UNSPECIFIED) NO se fabrica una transición: el arranque tiene su
+	// propio camino —el aviso «listo» del cajero— y adelantarlo desde aquí mandaría a calentar a un Cloud
+	// que aún no sabe siquiera si este Edge sirve.
+	if a.infReadiness.Load() == readinessDesconocida {
+		a.log.Info("CloudLink: aviso de prefijo frío IGNORADO; este Edge aún no ha afirmado su readiness " +
+			"(el calentamiento de arranque lo dispara el aviso del cajero, no esto)")
+		return false
+	}
+
+	a.log.Info("CloudLink: el cajero avisa de que su PREFIJO se enfrió; se provoca NOT_READY→READY para que " +
+		"el Cloud vuelva a calentar (DEUDA-044.10). Este Edge NO se ha caído: lo que se perdió es la caché")
+	a.MarcarInferenciaReadiness(false)
+	return a.MarcarInferenciaReadiness(true)
+}
+
 // readinessProto traduce el estado interno al enum del contrato. La usa sendHeartbeat, o sea TODOS los
 // latidos: el campo es de ESTADO, no de transición, y el Cloud tiene que poder leerlo en cualquier
 // latido sin haber visto el anterior.

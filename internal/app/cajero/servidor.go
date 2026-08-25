@@ -262,6 +262,30 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	// diferencia fue recargar el modelo (39 s medidos) y cuánto fue digerir el prompt. Se atribuiría todo al
 	// prefijo, que es justo la magnitud que el experimento quiere medir.
 	regimen := c.observarFases(m.PromptMs, resp.EvalDuration/int64(time.Millisecond))
+
+	// ─── ⑨bis · EL PREFIJO SE ENFRIÓ SIN QUE NADIE SE ENTERARA (DEUDA-044.10) ──────────────────────────
+	//
+	// Una inferencia que NO es un calentamiento y sale `frio` es la prueba —la única que existe— de que la
+	// caché de prefijo se perdió por debajo: típicamente porque **Ollama se reinició**, que es justo lo que
+	// el fusible `MemoryMax` de `ollama.service` está puesto para provocar a propósito.
+	//
+	// 🔴 POR QUÉ SE MIRA EL PREFIJO Y NO A OLLAMA, que era el candidato obvio: la readiness de este Edge
+	// observa a SU CAJERO, y el cajero no se entera de que Ollama se reinició —no se reinicia él—. Y una
+	// sonda de salud contra Ollama tampoco serviría: mediría que está VIVO, y tras un reinicio lo está,
+	// con `ollama ps` diciendo `Forever` y el prefijo helado. Eso ya pasó en campo el 2026-08-25 y costó
+	// una inferencia muerta por timeout a los 37.987 ms. El prefijo es el sujeto correcto porque es lo que
+	// duele; y además es evento, no reloj (D-044.43): lo dispara el desenlace de una petición real.
+	//
+	// EL CALENTAMIENTO SE EXCLUYE Y ES LO QUE CORTA EL BUCLE: el calentamiento que se pide aquí saldrá él
+	// mismo `frio` (es el que paga el prefill), así que sin esta guarda cada uno pediría el siguiente.
+	if regimen == RegimenFrio && !p.Calentamiento {
+		c.avisarPrefijoFrio(ctx)
+	} else if regimen == RegimenCaliente {
+		// LA CACHÉ VOLVIÓ: se rearma el aviso. Cierra el ciclo con un HECHO OBSERVADO y no con un plazo,
+		// que es lo que evita tener que elegir un número arbitrario de enfriamiento.
+		c.prefijoFrioAvisado.Store(false)
+	}
+
 	salida := resp.Content()
 	// 🔴 INV-051.1: ni `p.Prompt` ni `salida`. Sólo tamaños, tiempos y el desenlace.
 	c.log.Info("cajero: inferencia SERVIDA",
