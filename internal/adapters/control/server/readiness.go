@@ -124,9 +124,10 @@ type InferenceReadinessSink interface {
 	MarcarInferenciaReadiness(listo bool) bool
 
 	// ReponerCalentamientoInferencia le pide al núcleo que consiga que el Cloud vuelva a calentar el
-	// prefijo de este Edge, y devuelve true si se emitió algo. La llama el cajero cuando descubre —por el
-	// `regimen` de una inferencia REAL, no por una sonda— que su caché de prefijo se perdió
-	// (DEUDA-044.10).
+	// prefijo de este Edge, y devuelve true si se emitió algo. La llama el cajero cuando descubre que su
+	// caché de prefijo se perdió (DEUDA-044.10). Lo descubre por el DESENLACE de una inferencia real —una
+	// que salió `regimen=frio`, o una que venció el plazo con el proveedor trabajando—, nunca por una
+	// sonda: la salud de Ollama no dice nada del calor del prefijo.
 	//
 	// 🔴 POR QUÉ ES UN MÉTODO APARTE Y NO `MarcarInferenciaReadiness(true)`: ese es IDEMPOTENTE, y ahí está
 	// el problema. Tras un reinicio de Ollama el Edge sigue marcado READY, así que repetir READY no

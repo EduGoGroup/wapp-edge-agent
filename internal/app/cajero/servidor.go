@@ -278,8 +278,13 @@ func (s *servidorInferencia) Inferir(ctx context.Context, p app.PeticionInferenc
 	//
 	// EL CALENTAMIENTO SE EXCLUYE Y ES LO QUE CORTA EL BUCLE: el calentamiento que se pide aquí saldrá él
 	// mismo `frio` (es el que paga el prefill), así que sin esta guarda cada uno pediría el siguiente.
+	//
+	// 🔴 ESTA RAMA NO BASTA, Y SE COMPROBÓ EN CAMPO: es el camino FELIZ, y tras un reinicio de Ollama la
+	// inferencia fría **no se sirve, muere por timeout**. La segunda mitad del mecanismo vive en
+	// `registrarFalloDeInferencia`; las dos comparten guarda, así que un episodio pide UN recalentamiento
+	// aunque se manifieste por los dos caminos.
 	if regimen == RegimenFrio && !p.Calentamiento {
-		c.avisarPrefijoFrio(ctx)
+		c.avisarPrefijoFrio(ctx, CausaFrioServida)
 	} else if regimen == RegimenCaliente {
 		// LA CACHÉ VOLVIÓ: se rearma el aviso. Cierra el ciclo con un HECHO OBSERVADO y no con un plazo,
 		// que es lo que evita tener que elegir un número arbitrario de enfriamiento.
@@ -477,6 +482,46 @@ func (s *servidorInferencia) registrarFalloDeInferencia(
 		c.errTimeout.Add(1)
 	} else {
 		c.errOllamaCaido.Add(1)
+	}
+
+	// ─── EL TIMEOUT TAMBIÉN ES EVIDENCIA DE PREFIJO FRÍO (DEUDA-044.10, 2.ª PASADA) ─────────────────────
+	//
+	// 🔴 LA 1.ª PASADA COLGÓ EL AVISO DEL CAMINO FELIZ, Y POR ESO NO SE DISPARÓ NUNCA. Se desplegó el
+	// 2026-08-25 mirando sólo el `regimen` de una inferencia SERVIDA (ver ⑨bis en Inferir), y en campo dio
+	// CERO avisos en su propio escenario canónico. La secuencia medida, con el reloj del VPS:
+	//
+	//   23:01:26  reinicio de Ollama ⇒ prefijo frío (el modelo SÍ está cargado: `ollama ps` = Forever)
+	//   23:02:57  1.ª clasificación real: MUERE POR TIMEOUT a los 37.993 ms  ⇒ no emite muestra de régimen
+	//             🔑 y ese timeout CALIENTA el prefijo: 37.993 ms → 1.499 ms en la siguiente
+	//   23:03:12  2.ª clasificación: SERVIDA con `regimen=caliente`          ⇒ ya no hay nada que avisar
+	//
+	// ⇒ **la ventana en la que aquel aviso podía dispararse es precisamente la que no ocurre**. Y la frase
+	// que lo predecía estaba escrita en el propio plan (T1.7-5): «una inferencia que muere por timeout no
+	// emite muestra de régimen». El fallo se auto-reparaba BORRANDO SU PROPIA EVIDENCIA antes de que nadie
+	// la leyera, así que medir después siempre daba «no pasó nada».
+	//
+	// POR QUÉ EL TIMEOUT ES BUENA EVIDENCIA, y no un parche: aquí ya se ha distinguido —preguntándole al
+	// CONTEXTO, no al texto del error— entre «el proveedor no respondió» (ollama_down) y «se agotó el plazo
+	// CON EL PROVEEDOR TRABAJANDO». Lo segundo, en este sistema, es el prefill frío: el prefijo cuesta
+	// ~21,6 ms/token en frío y ~1,5 s entero en caliente, así que un plazo agotado con Ollama vivo y el
+	// modelo cargado no tiene otra causa habitual. El `ollama_down` NO entra aquí a propósito: ése ya lo
+	// cubre la readiness de T1.8-5, que baja a DOWN y produce su propia transición al volver.
+	//
+	// ⚠️ EL ABORTO NO LLEGA HASTA AQUÍ, Y ES DELIBERADO. La rama `ctxProceso.Err() != nil` de arriba también
+	// devuelve `ErrInferenciaTimeout` —un cliente que colgó, o el apagado del proceso— pero RETORNA ANTES.
+	// Si esta comprobación se moviera por encima de aquélla, cada reconexión de CloudLink pediría un
+	// calentamiento sin que nadie hubiera tocado a Ollama.
+	//
+	// 🔴 Y EL RIESGO QUE SE ACEPTA, dicho y no escondido: un timeout puede venir de una máquina saturada y
+	// no de un prefijo frío, y entonces este aviso añade UNA inferencia a una máquina que ya va justa. Lo
+	// acota el `CompareAndSwap` de `avisarPrefijoFrio`: mientras no se observe una inferencia CALIENTE no
+	// se pide un segundo recalentamiento, así que el peor caso de un episodio de saturación —donde nada
+	// sale caliente— es exactamente **una** inferencia de más, no una por fallo.
+	//
+	// El calentamiento se excluye por lo mismo que en ⑨bis: es él quien paga el prefill, y sin la guarda
+	// un calentamiento que venciera pediría el siguiente.
+	if canonico == app.ErrInferenciaTimeout && !p.Calentamiento {
+		c.avisarPrefijoFrio(ctxProceso, CausaFrioTimeout)
 	}
 	// LA MISMA COSTURA QUE EN EL LADO ÉXITO, y por el mismo motivo (ver `cuentaParaElBreaker` en Inferir):
 	// un calentamiento que falla no es evidencia contra el proveedor para las peticiones de nadie. El
