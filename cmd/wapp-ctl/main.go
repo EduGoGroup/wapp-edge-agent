@@ -155,20 +155,43 @@ func main() {
 				return
 			}
 			log.Info("wapp-ctl: núcleo autoarrancado (agent serve) — recepción 24/7 y Restore del Plan 022 en curso")
-		}()
 
-		// El cajero va en SU PROPIA goroutine y su fallo NO puede impedir que el núcleo arranque ni tumbar
-		// wapp-ctl: el núcleo manda (sin él no hay recepción 24/7; sin cajero solo se deja de clasificar, y
-		// la cola conserva lo entrante hasta que vuelva). Por eso Error + seguir, nunca os.Exit.
-		if cajeroSup != nil {
-			go func() {
+			// ── EL CAJERO ARRANCA AQUÍ, ENCADENADO AL NÚCLEO — Y NO EN UNA GOROUTINE PARALELA (DEUDA-044.9).
+			//
+			// 🔴 QUÉ SE ARREGLA, MEDIDO EN CAMPO: el cajero anuncia «listo» al núcleo por el socket del plano de
+			// control (T1.8-5) y ese aviso FALLABA SIEMPRE en el arranque — 10 arranques, 10 fallos el
+			// 2026-08-25 —, porque los dos hijos salían en paralelo y el núcleo abre su socket DESPUÉS de
+			// `mgr.Restore(ctx)` (infra/daemon/daemon.go). Los 119 ms medidos eran el caso BENIGNO: esa ventana
+			// crece con el número de sesiones a restaurar, así que era estructural, no una carrera afortunada.
+			//
+			// 🔴 POR QUÉ AQUÍ Y NO UN REINTENTO EN `nucleoaviso` NI UNA ESPERA AL FICHERO DEL SOCKET, que eran
+			// los dos candidatos escritos: los dos son RELOJES, y D-044.43 dice que el disparo es por EVENTO.
+			// El paquete `nucleoaviso` lo argumenta él mismo («un reintento aquí añadiría un reloj al arranque,
+			// que es justo lo que D-044.43 vino a quitar»). Aquí el disparador es un hecho: `sup.Start` YA
+			// BLOQUEA sondeando la readiness del núcleo, así que cuando devuelve, el socket existe. No se
+			// añade maquinaria: se mueve el arranque a la goroutine que ya esperaba.
+			//
+			// 🔴 Y CIERRA DEUDA-044.7 POR SU MECANISMO. Aquella se cerró en campo por el EFECTO COLATERAL de
+			// `-autostart`, que reordenó el arranque y puso al cajero 58 ms antes que el núcleo; si ese orden
+			// se invirtiera, volvía. Con el encadenado el orden es GARANTIZADO y el aviso llega con el socket
+			// ya abierto, que es la vía que T1.8-5 diseñó.
+			//
+			// LO QUE NO CAMBIA: su fallo NO puede impedir que el núcleo arranque ni tumbar wapp-ctl. El núcleo
+			// manda (sin él no hay recepción 24/7; sin cajero solo se deja de clasificar, y la cola conserva
+			// lo entrante hasta que vuelva). Por eso Error + return, nunca os.Exit.
+			//
+			// NO ABRE VENTANA DE FALSO «READY»: el Edge nace en `readinessDesconocida` (UNSPECIFIED en el
+			// contrato), no en READY, así que retrasar el cajero no le hace prometer lo que no puede servir —
+			// solo retrasa la afirmación, que es lo correcto.
+			if cajeroSup != nil {
 				if err := cajeroSup.Start(ctx); err != nil {
 					log.Error("wapp-ctl: no se pudo autoarrancar el cajero; el núcleo sigue su curso, arráncalo por POST /v1/cajero/start", "error", err)
 					return
 				}
-				log.Info("wapp-ctl: cajero autoarrancado (agent cajero) — clasificación de la cola en curso")
-			}()
-		}
+				log.Info("wapp-ctl: cajero autoarrancado (agent cajero) tras el núcleo — clasificación de la cola en curso")
+			}
+		}()
+
 	}
 
 	if !*noOpen {

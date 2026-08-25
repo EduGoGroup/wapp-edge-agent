@@ -123,7 +123,19 @@ func runCajero(ctx context.Context, cfg config.Config, log sharedlogger.Logger) 
 	client := ollama.New(cfg.Intent.OllamaURL)
 
 	// ── El bucle ──────────────────────────────────────────────────────────────
+	// EL AVISADOR DE PREFIJO FRÍO (DEUDA-044.10). Se construye aquí, y no dentro del cajero, porque lo que
+	// falta en la capa de aplicación no es el hecho —ése lo descubre ella, en el `regimen` de cada
+	// inferencia— sino los DESTINATARIOS: qué instalaciones atiende este cajero. Mismo canal y mismo
+	// cliente que el aviso «listo»/«caído», con su propio valor en el cable para que el log del núcleo no
+	// tenga que fingir que el cajero se cayó.
+	avisoPrefijo := &avisadorPrefijoFrio{
+		cliente:  nucleoaviso.Nuevo(cfg.ControlSocketPath),
+		dataDirs: dataDirs,
+		log:      log,
+	}
+
 	c, err := cajero.New(cajero.Deps{
+		AvisoPrefijoFrio: avisoPrefijo,
 		// Colas (plural) y NO Cola: la lista es la fuente única desde T4.1, incluso con una entrada. Pasar
 		// las dos cosas sería dejar dos verdades sobre lo mismo esperando a divergir.
 		Colas:  colas,
@@ -451,4 +463,40 @@ func abrirCola(ctx context.Context, cfg config.Config, dataDir string, log share
 	// El NOMBRE de la cola es el data_dir: es lo que un operador con cinco instalaciones reconoce de un
 	// vistazo en el log, y es material público (una ruta de directorio), nunca contenido de negocio.
 	return cajero.ColaNombrada{Nombre: dataDir, Cola: colaCajero, Parte: parteEscritor}, cerrar, nil
+}
+
+// avisadorPrefijoFrio adapta el cliente del plano de control al puerto que la capa de aplicación
+// necesita (cajero.AvisadorPrefijoFrio). Su único trabajo es saber A QUIÉN avisar: el cajero conoce el
+// hecho —su prefijo se enfrió— pero no las instalaciones que atiende.
+//
+// 🔴 AVISA A TODAS Y NO A UNA, y ésa es la diferencia con «listo»/«caído», que son POR INSTALACIÓN. Aquí
+// el hecho no es de una instalación: la caché de prefijo vive en el runner de Ollama, que es UNO por
+// máquina y lo comparten todos los data_dir de este cajero. Mandar el aviso a uno solo dejaría a los
+// demás con el prefijo frío y sin nadie que lo dijera.
+//
+// UN FALLO NO ABORTA A LOS DEMÁS: cada núcleo es un proceso distinto y que uno no esté no dice nada de
+// los otros. Se devuelve error sólo si NINGUNO aceptó, que es la condición con la que el llamante rearma
+// su guarda para reintentar en la siguiente inferencia fría.
+type avisadorPrefijoFrio struct {
+	cliente  *nucleoaviso.Cliente
+	dataDirs []string
+	log      sharedlogger.Logger
+}
+
+func (a *avisadorPrefijoFrio) AvisarPrefijoFrio(ctx context.Context) error {
+	var ultimo error
+	aceptados := 0
+	for _, dataDir := range a.dataDirs {
+		if err := a.cliente.AvisarPrefijoFrio(ctx, dataDir); err != nil {
+			ultimo = err
+			a.log.Warn("cajero: no se pudo avisar del prefijo frío a una instalación",
+				"data_dir", dataDir, "error", err)
+			continue
+		}
+		aceptados++
+	}
+	if aceptados == 0 && ultimo != nil {
+		return fmt.Errorf("ninguna instalación aceptó el aviso de prefijo frío: %w", ultimo)
+	}
+	return nil
 }

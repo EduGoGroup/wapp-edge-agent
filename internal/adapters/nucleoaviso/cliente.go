@@ -99,6 +99,24 @@ func (c *Cliente) Anunciar(ctx context.Context, dataDir string, listo bool) erro
 	if listo {
 		estado = server.ReadinessListo
 	}
+	return c.enviar(ctx, dataDir, estado)
+}
+
+// AvisarPrefijoFrio le dice al núcleo que el cajero SIGUE SIRVIENDO pero perdió su caché de prefijo, para
+// que el Cloud vuelva a calentar (DEUDA-044.10, Plan 044). Lo dispara el desenlace de una inferencia REAL
+// —un `regimen=frio` que no era un calentamiento—, nunca una sonda ni un reloj (D-044.43).
+//
+// ES EL MISMO CANAL Y EL MISMO PLAZO que `Anunciar`, y por la misma razón: lo que viaja es un enum y una
+// ruta. Lo que cambia es lo que se AFIRMA — de ahí que el valor del cable tenga nombre propio y no se
+// simule con un «down» seguido de un «ready», que dejaría en el log del núcleo dos líneas falsas diciendo
+// que el cajero se cayó.
+func (c *Cliente) AvisarPrefijoFrio(ctx context.Context, dataDir string) error {
+	return c.enviar(ctx, dataDir, server.ReadinessPrefijoFrio)
+}
+
+// enviar es el cuerpo común: serializa, pone el plazo, habla por el socket y traduce la respuesta. Existe
+// para que los dos avisos no puedan divergir en el plazo ni en el drenaje del cuerpo.
+func (c *Cliente) enviar(ctx context.Context, dataDir, estado string) error {
 	cuerpo, err := json.Marshal(server.ReadinessRequest{Readiness: estado, DataDir: dataDir})
 	if err != nil {
 		// Imposible con dos strings; se propaga en vez de ignorarse porque un `_ =` aquí escondería un
