@@ -34,16 +34,24 @@ func TestAvisoSesionPasivaGolden(t *testing.T) {
 }
 
 // TestAvisoSesionPasivaCoincideConRunbook compara la constante contra la fuente del contrato:
-// el bloque ```text del §4 de docs/runbooks/perfiles-de-sesion.md, en la raíz wApp (cuatro
-// niveles arriba de este paquete). Hay dos copias del literal en el ecosistema —una por repo,
-// Edge y nube— y este test (y su gemelo en la nube) es lo que impide que diverjan.
-// Mutación que lo pone rojo: editar el runbook sin propagar aquí, o editar la constante sin
-// tocar el runbook (solo se ve en el árbol wApp completo; en el CI del repo suelto se salta).
+// el bloque ```text de documentations/literal-aviso-sesion-pasiva.md, en la raíz de ESTE repo.
+// Hay dos copias del literal en el ecosistema —una por repo, Edge y nube— y este test (y su
+// gemelo en la nube) es lo que impide que la constante Go y el documento diverjan.
+//
+// 🔴 EL FICHERO VIVE DENTRO DEL REPO A PROPÓSITO. Hasta el 2026-08-30 la fuente era
+// docs/runbooks/perfiles-de-sesion.md, en el repo de documentación, que NO viaja con este git:
+// en un checkout suelto el os.ReadFile fallaba y el test se SALTABA en silencio, dejando el
+// invariante sin vigilar justo donde más falta hacía. Ahora no puede saltarse: si el fichero no
+// está, es un fallo, porque su ausencia ya es el defecto.
+// Lo que la copia cuesta —que la del Edge y la de la nube diverjan entre sí— lo cubre
+// scripts/check-literales-canonicos.py del repo de documentación.
+//
+// Mutación que lo pone rojo: editar el documento sin propagar a la constante, o al revés.
 func TestAvisoSesionPasivaCoincideConRunbook(t *testing.T) {
-	const runbook = "../../../../docs/runbooks/perfiles-de-sesion.md"
+	const runbook = "../../documentations/literal-aviso-sesion-pasiva.md"
 	raw, err := os.ReadFile(runbook)
 	if err != nil {
-		t.Skipf("runbook no disponible (%v): este repo viaja sin docs/ — el test solo corre en el árbol wApp completo", err)
+		t.Fatalf("no se pudo leer %s: %v — este fichero es la fuente única del literal y vive en este repo, así que su ausencia es el defecto, no una excusa para saltar el test", runbook, err)
 	}
 	doc := string(raw)
 
