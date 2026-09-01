@@ -212,26 +212,31 @@ comentarios.)
 
 ## 4 · Interfaz local (la web embebida)
 
-### U-1 · Pares mixtos: color que sigue al tema sobre fondo que no — sigue abierto, ACOTADO al dashboard
+### U-1 · Pares mixtos: color que sigue al tema sobre fondo que no — ✅ CERRADO 2026-09-01
 
-Medido sobre los literales del CSS con la fórmula WCAG. **NO VERIFICADO en navegador**, que es como
-manda medirlos la doctrina del proyecto; lo que sí está verificado es que el literal y el `var()`
-conviven en la misma declaración.
+Eran dos reglas del Dashboard (`index.html`) con un fondo **literal** emparejado con un color de
+texto que **sí** sigue al tema — el defecto recurrente del ecosistema (ver
+`wapp-el-par-mixto-color-y-fondo` en la memoria del proyecto: «el par viaja entero, nunca uno de
+cada»). **NO VERIFICADO en navegador** (Chrome no estaba disponible en la sesión); verificado en su
+lugar calculando el ratio WCAG exacto con la misma fórmula del proyecto contra los valores reales de
+`:root`/`@media (prefers-color-scheme: dark)` de este mismo fichero.
 
-| Regla | Evidencia | Claro | **Oscuro** |
+| Regla | Antes (claro/oscuro) | Fix | Después (claro/oscuro) |
 |---|---|---|---|
-| `.enroll-form input { background:#fff; color: var(--ink) }` | `internal/webui/styles.css:167` (tras 2026-09-01, ver U-2) | 17,13:1 | **1,29:1** |
-| `.badge-unknown { background:#e5e7eb; color: var(--muted) }` | `internal/webui/styles.css:136` | 7,53:1 | **1,37:1** |
+| `.enroll-form input` (`internal/webui/styles.css`, campo del código de activación) | 17,13:1 / **1,29:1** | `background:#fff` → `background: var(--card)` | 17,13:1 / **13,27:1** |
+| `.badge-unknown` (ídem) | 7,53:1 / **1,37:1** | `background:#e5e7eb` → `background: var(--wapp-color-surface-variant)` | 7,22:1 / **5,48:1** |
 
-🔴 El primero es **el campo del código de activación del Dashboard** (`index.html`, sección
-«reconectar»), no el de `login.html`. **Sigue sin cerrar**: la tarea del 2026-09-01 que cableó
-`wapp-shared/ui` acotó su alcance a `login.html` a propósito — el Dashboard usa un vocabulario de
-clases propio (`card`, `badge`, `qr-wrap`, …) y no consume ese módulo. **Cómo se cierra.** El par
-viaja entero: si el color sigue al tema, el fondo también. Otra consola del ecosistema ya cerró
-exactamente este caso.
+`--card`/`--ink` y `--wapp-color-surface-variant`/`--muted` son pares donde AMBOS tokens se
+redefinen juntos en el bloque `@media` de este fichero, así que viajan entero. El segundo par es
+literalmente el mismo que ya usa `.wapp-chip--neutral` en `wapp-shared/ui/css/wapp-components.css`
+(«el único par que SÍ sigue al tema, y por eso es seguro» — mismos números, 7,22:1 / 5,48:1).
 
-Además, `.badge-ok` (3,00:1) y `.badge-warn` (2,86:1) están por debajo de AA para texto normal en
-**los dos** temas — no son mixtos, son bajos.
+Sin verificación en navegador real, no se cierra el hallazgo como «medido en campo», solo como
+«corregido por cálculo» — si alguien tiene Chrome a mano, vale la pena confirmar visualmente.
+
+Aparte, sin tocar (no eran mixtos, así que no entraban en este arreglo): `.badge-ok` (3,00:1) y
+`.badge-warn` (2,86:1) están por debajo de AA para texto normal en **los dos** temas por igual —
+son bajos, no mixtos, y su fix es distinto (subir el contraste del token, no emparejarlo).
 
 ### U-2 · Cuatro clases usadas y no definidas — ✅ CERRADO 2026-09-01
 

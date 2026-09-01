@@ -133,7 +133,11 @@ button.danger { border-color: var(--err); color: var(--err); background: transpa
 button.danger:hover:not(:disabled) { background: #fee2e2; opacity: 1; }
 
 .badge { font-size: 0.8rem; font-weight: 600; padding: 3px 10px; border-radius: 999px; white-space: nowrap; }
-.badge-unknown { background: #e5e7eb; color: var(--muted); }
+/* U-1 (documentations/deuda.md): el fondo literal #e5e7eb no seguía al tema mientras --muted sí,
+   dando 1,37:1 en oscuro. --wapp-color-surface-variant/--wapp-color-on-surface-variant es el MISMO
+   par que ya usa .wapp-chip--neutral en wapp-shared/ui — el único que se redefine junto en los dos
+   temas (7,22:1 en claro, 5,48:1 en oscuro). */
+.badge-unknown { background: var(--wapp-color-surface-variant); color: var(--muted); }
 .badge-ok      { background: #dcfce7; color: var(--ok); }
 .badge-down    { background: #fee2e2; color: var(--err); }
 .badge-warn    { background: #fef3c7; color: var(--warn); }
@@ -164,7 +168,11 @@ td { word-break: break-all; }
 .qr-wrap img { width: 256px; height: 256px; image-rendering: pixelated; border: 1px solid var(--border); border-radius: 8px; background: #fff; padding: 8px; }
 
 .enroll-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
-.enroll-form input { flex: 1 1 16rem; font: inherit; padding: 8px 12px; border: 1px solid var(--border); border-radius: 7px; background: #fff; color: var(--ink); }
+/* U-1 (documentations/deuda.md): el fondo literal #fff no seguía al tema mientras --ink sí, dando
+   1,29:1 en oscuro sobre el campo del código de activación — el operador lo escribiría casi
+   invisible. --card/--ink es el mismo par que ya usa .wapp-card en login.html (17,13:1 en claro,
+   13,27:1 en oscuro, medido con la fórmula WCAG contra los tokens de este mismo fichero). */
+.enroll-form input { flex: 1 1 16rem; font: inherit; padding: 8px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--card); color: var(--ink); }
 .enroll-form input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 .logs { margin: 0; background: var(--logs-bg); color: var(--logs-ink); padding: 12px; border-radius: 8px; height: 280px; overflow-y: auto; font-family: var(--wapp-font-mono); font-size: 0.8rem; white-space: pre-wrap; word-break: break-word; }
