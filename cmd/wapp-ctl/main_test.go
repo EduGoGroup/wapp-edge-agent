@@ -252,3 +252,29 @@ func TestStaticAssetsServedWithoutSession(t *testing.T) {
 		t.Fatalf("/styles.css status = %d; quería 200", rec.Code)
 	}
 }
+
+// TestSharedUICSSServedWithoutSession comprueba que las tres hojas de wapp-shared/ui que login.html
+// enlaza (tokens → componentes → tema, mismo orden y mismo patrón que las otras tres consolas del
+// ecosistema) se sirven en texto plano y sin exigir sesión.
+func TestSharedUICSSServedWithoutSession(t *testing.T) {
+	dir := t.TempDir()
+	sup := supervisor.New(supervisor.Config{SocketPath: filepath.Join(dir, "edge.sock")}, nil)
+	router := newRouter(sup, filepath.Join(dir, "edge.sock"), "", nil)
+
+	for _, path := range []string{
+		"/static/css/wapp-tokens.css",
+		"/static/css/wapp-components.css",
+		"/static/css/theme-edge.css",
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		router.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d; quería 200", path, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); ct != "text/css; charset=utf-8" {
+			t.Fatalf("%s Content-Type = %q; quería text/css; charset=utf-8", path, ct)
+		}
+	}
+}

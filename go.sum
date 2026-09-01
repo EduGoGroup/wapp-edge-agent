@@ -4,8 +4,6 @@ github.com/DATA-DOG/go-sqlmock v1.5.2 h1:OcvFkGmslmlZibjAjaHm3L//6LiuBgolP7Oputl
 github.com/DATA-DOG/go-sqlmock v1.5.2/go.mod h1:88MAG/4G7SMwSE3CeA0ZKzrT5CiOU3OJ+JlNzwDqpNU=
 github.com/EduGoGroup/identity-shared/auth v0.3.1 h1:tvjzlKUewcldbmhagTiEsv5vGweWBZR/MyrkK5WqsYE=
 github.com/EduGoGroup/identity-shared/auth v0.3.1/go.mod h1:e3n7q0UDi6u2vFjcM+yFMbyHqW/BnPH0mNR00cvYuxM=
-github.com/EduGoGroup/wapp-cloudlink v0.16.0 h1:/GBPaVejYDFG0Oipq8Ebrnmro4obTiC9pIfGupdtSr0=
-github.com/EduGoGroup/wapp-cloudlink v0.16.0/go.mod h1:/VyLjFHHIMILLtwtoDknslpxtstwRkmA9WSvwmeIrU0=
 github.com/EduGoGroup/wapp-cloudlink v0.17.0 h1:Wuosj3ZtMmDdDDw+NBEh4lN1qhBM9u/ZucJCejz4now=
 github.com/EduGoGroup/wapp-cloudlink v0.17.0/go.mod h1:/VyLjFHHIMILLtwtoDknslpxtstwRkmA9WSvwmeIrU0=
 github.com/EduGoGroup/wapp-edge-intent v0.3.0 h1:D0MAOKrDqJPKCedQpUMJYXSw/Rb+NqjDxJMdEjhCe/o=
@@ -20,6 +18,8 @@ github.com/EduGoGroup/wapp-shared/intents v0.1.0 h1:4CXTKyQi/bR3YCgLjLU/uf2fpMBP
 github.com/EduGoGroup/wapp-shared/intents v0.1.0/go.mod h1:JkiGzsfb6jVQ3Uxs3FwV4g2tDd5RXxtg2Lx0kO3ef6g=
 github.com/EduGoGroup/wapp-shared/logger v0.2.0 h1:5GWxS+fyWqnCrjedsm0t6a368uo59Xl7Om1/OBoJyfU=
 github.com/EduGoGroup/wapp-shared/logger v0.2.0/go.mod h1:jZ8GH59HUREHIEJv21jNpCdLm1P2NthGqTN/s8SrZTg=
+github.com/EduGoGroup/wapp-shared/ui v0.5.0 h1:v1AcZsCP1ot2Mvx+4OTD/R6X6rGPxLklCWfWtPvysp8=
+github.com/EduGoGroup/wapp-shared/ui v0.5.0/go.mod h1:t8Ms/wm+0DHMsxYXsBwwtWeBhzf92YQo/DKs4kRlVX0=
 github.com/agnivade/levenshtein v1.2.1 h1:EHBY3UOn1gwdy/VbFwgo4cxecRznFk7fKWN1KOX7eoM=
 github.com/agnivade/levenshtein v1.2.1/go.mod h1:QVVI16kDrtSuwcpd0p1+xMC6Z/VfhtCyDIjcwga4/DU=
 github.com/andreyvit/diff v0.0.0-20170406064948-c7f18ee00883 h1:bvNMNQO63//z+xNgfBlViaCIJKLlCJ6/fmUseuG0wVQ=

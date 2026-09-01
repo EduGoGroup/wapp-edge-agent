@@ -33,6 +33,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/infra/logger"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/webui"
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
+	sharedui "github.com/EduGoGroup/wapp-shared/ui"
 )
 
 // Version identifica la build del supervisor. Se inyecta en release vía
@@ -346,6 +347,15 @@ func newRouterConCajero(sup, cajeroSup *supervisor.Supervisor, socketPath, platf
 	mux.HandleFunc("POST /logout", auth.handleLogout)
 	mux.HandleFunc("GET /session", auth.handleSession)
 
+	// Estilos compartidos de wapp-shared/ui (deuda U-2, documentations/deuda.md): el Edge deja de
+	// forkear a mano los tokens y componentes y consume el mismo módulo que las otras tres consolas
+	// del ecosistema, mismo patrón que wapp-guardian-bff/internal/web/server.go. Solo login.html los
+	// enlaza hoy — el dashboard (index.html) tiene su propio vocabulario de clases (card, badge,
+	// qr-wrap, …) y queda fuera de este cableado.
+	mux.HandleFunc("GET /static/css/wapp-tokens.css", serveSharedCSS("wapp-tokens.css"))
+	mux.HandleFunc("GET /static/css/wapp-components.css", serveSharedCSS("wapp-components.css"))
+	mux.HandleFunc("GET /static/css/theme-edge.css", serveSharedCSS("theme-edge.css"))
+
 	// Web UI embebida, mismo origen loopback. El documento raíz (/) está PROTEGIDO: sin sesión válida
 	// redirige a /login. Los assets estáticos (app.js, styles.css, …) se sirven sin sesión (no llevan
 	// secretos y los necesita también la pantalla de login).
@@ -370,6 +380,22 @@ type cajeroStatusResponse struct {
 
 func toCajeroStatus(s supervisor.Status) cajeroStatusResponse {
 	return cajeroStatusResponse{daemonStatusResponse: toDaemonStatus(s), Probe: s.Probe}
+}
+
+// serveSharedCSS entrega una hoja del módulo compartido wapp-shared/ui, mismo patrón que las otras
+// tres consolas del ecosistema (p.ej. wapp-guardian-bff/internal/web/server.go). No lleva sesión ni
+// secretos: login.html la necesita sin autenticar.
+func serveSharedCSS(name string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		data, err := sharedui.GetCSS(name)
+		if err != nil {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		_, _ = w.Write(data)
+	}
 }
 
 // rootGate protege el documento raíz de la webui: "/" (index.html) exige sesión válida CON TENANT ASIGNADO

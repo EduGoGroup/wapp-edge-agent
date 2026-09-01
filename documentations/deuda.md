@@ -199,7 +199,7 @@ comentarios.)
 
 ## 4 · Interfaz local (la web embebida)
 
-### U-1 · Pares mixtos: color que sigue al tema sobre fondo que no
+### U-1 · Pares mixtos: color que sigue al tema sobre fondo que no — sigue abierto, ACOTADO al dashboard
 
 Medido sobre los literales del CSS con la fórmula WCAG. **NO VERIFICADO en navegador**, que es como
 manda medirlos la doctrina del proyecto; lo que sí está verificado es que el literal y el `var()`
@@ -207,36 +207,50 @@ conviven en la misma declaración.
 
 | Regla | Evidencia | Claro | **Oscuro** |
 |---|---|---|---|
-| `.enroll-form input { background:#fff; color: var(--ink) }` | `internal/webui/styles.css:303` | 17,13:1 | **1,29:1** |
-| `.badge-unknown { background:#e5e7eb; color: var(--muted) }` | `internal/webui/styles.css:273` | 7,53:1 | **1,37:1** |
+| `.enroll-form input { background:#fff; color: var(--ink) }` | `internal/webui/styles.css:167` (tras 2026-09-01, ver U-2) | 17,13:1 | **1,29:1** |
+| `.badge-unknown { background:#e5e7eb; color: var(--muted) }` | `internal/webui/styles.css:136` | 7,53:1 | **1,37:1** |
 
-🔴 El primero es **el campo del código de activación**: en modo oscuro el operador escribiría el
-código casi invisible. **Cómo se cierra.** El par viaja entero: si el color sigue al tema, el fondo
-también. Otra consola del ecosistema ya cerró exactamente este caso.
+🔴 El primero es **el campo del código de activación del Dashboard** (`index.html`, sección
+«reconectar»), no el de `login.html`. **Sigue sin cerrar**: la tarea del 2026-09-01 que cableó
+`wapp-shared/ui` acotó su alcance a `login.html` a propósito — el Dashboard usa un vocabulario de
+clases propio (`card`, `badge`, `qr-wrap`, …) y no consume ese módulo. **Cómo se cierra.** El par
+viaja entero: si el color sigue al tema, el fondo también. Otra consola del ecosistema ya cerró
+exactamente este caso.
 
 Además, `.badge-ok` (3,00:1) y `.badge-warn` (2,86:1) están por debajo de AA para texto normal en
 **los dos** temas — no son mixtos, son bajos.
 
-### U-2 · Cuatro clases usadas y no definidas
+### U-2 · Cuatro clases usadas y no definidas — ✅ CERRADO 2026-09-01
 
-`wapp-link`, `wapp-snackbar--success`, `wapp-btn--outlined` y `wapp-caption` se usan en
-`internal/webui/login.html` y **no están en `styles.css`**. Y `styles.css` **no tiene ninguna regla
-para `a`** (`grep -nE '^\s*a[ ,{:]' styles.css` → vacío), así que los enlaces «Solicita acceso» /
-«Inicia sesión» se pintan con el azul por defecto del navegador, que en oscuro da 1,82:1.
+`wapp-link`, `wapp-snackbar--success`, `wapp-btn--outlined` y `wapp-caption` se usaban en
+`internal/webui/login.html` sin estar definidas en `styles.css` (el fork local de los tokens de
+`wapp-shared/ui`). **Cierre:** el Edge pasó a **consumir el módulo `ui` como las otras tres
+consolas** (`go.mod` declara `github.com/EduGoGroup/wapp-shared/ui v0.5.0`; `cmd/wapp-ctl/main.go`
+sirve `/static/css/{wapp-tokens,wapp-components,theme-edge}.css` con `sharedui.GetCSS`, mismo
+patrón que `wapp-guardian-bff/internal/web/server.go`), y `login.html` enlaza esas tres hojas antes
+de `styles.css`. `.wapp-btn--outlined` y `.wapp-caption` no existían en `wapp-components.css`: se
+añadieron ahí (release `ui/v0.5.0`), así que el cierre beneficia también a las otras consolas si
+alguna vez las necesitan. `wapp-link` no necesitó clase propia: la regla base `a { color:
+var(--wapp-color-link) }` de `wapp-components.css` ya cubre cualquier `<a>` sin marcar.
 
-**Causa raíz.** `styles.css` es un **fork** de los tokens del módulo `ui` de `wapp-shared`, con
-alias de compatibilidad propios; el Edge **no consume ese módulo** (`grep -rn 'wapp-shared/ui' .` →
-cero; `go.mod:9-13` declara `auth`, `config`, `envelope`, `intents` y `logger`, no `ui`).
+`styles.css` retiró el bloque de layout de autenticación que duplicaba a mano (`.wapp-card`,
+`.wapp-btn`, `.wapp-field*`, `.wapp-snackbar*`, …): nadie más lo usaba (`index.html` tiene 0 clases
+`wapp-*`). Los TOKENS (`:root` y su bloque `@media (prefers-color-scheme: dark)`) se quedaron: el
+Dashboard los sigue necesitando vía sus alias de compatibilidad (`--bg`, `--card`, `--accent`, …).
 
-**Cómo se cierra.** O el Edge consume el módulo `ui` como las otras tres consolas, o el fork se
-completa. Lo que no puede quedarse es a medias.
+### U-3 · El plano de control no emite ninguna cabecera de seguridad — ✅ CERRADO 2026-09-01
 
-### U-3 · El plano de control no emite ninguna cabecera de seguridad
-
-`grep -rn 'Content-Security-Policy' --glob '!*_test.go' .` → **cero**. Las tres consolas del
-ecosistema sí las emiten. Es coherente con que `login.html` sea un documento autocontenido con
-`<script>` inline (una CSP estricta lo rompería), pero es una diferencia deliberada que conviene
-conocer antes de comparar esta UI con las otras.
+`grep -rn 'Content-Security-Policy' --glob '!*_test.go' .` daba **cero**; las otras tres consolas
+del ecosistema sí la emiten. **Cierre:** `handleLoginGet` (`cmd/wapp-ctl/auth.go`) genera un nonce
+de 16 bytes de `crypto/rand` por petición (`newNonce`, base64 `RawURLEncoding` — el estándar mete
+`+`/`=` que `html/template` escapa como entidad en el atributo) y emite `Content-Security-Policy:
+default-src 'self'; script-src 'self' 'nonce-…'; style-src 'self'; connect-src 'self';
+frame-ancestors 'none'; base-uri 'none'`. El único `<script>` inline de `login.html` lleva
+`nonce="{{ .Nonce }}"`. No se reutilizó `wapp-shared/web/gin` (nonce+CSP de las otras consolas):
+está pensado para `gin`, y `wapp-ctl` es `net/http` puro — replicarlo aquí habría significado
+adoptar su middleware entero para una sola cabecera. Vigilado por
+`TestLoginGet_CSPConNonce` (`cmd/wapp-ctl/auth_test.go`): confirma que la CSP lleva un nonce no
+vacío y que es EL MISMO que el del `<script>` del cuerpo — un nonce que no coincide no protege nada.
 
 ---
 

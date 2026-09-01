@@ -13,6 +13,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"html/template"
 	"net"
@@ -228,6 +230,17 @@ func (a *authBorder) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	enableAlpha := os.Getenv("WAPP_ALPHA_TEST_ACCOUNTS") == "true" || os.Getenv("WAPP_ENABLE_ALPHA_LOGIN") == "true"
+	nonce, err := newNonce()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal", "No se pudo preparar la pantalla de login.")
+		return
+	}
+	// CSP (deuda U-3, documentations/deuda.md): esta era la única superficie del ecosistema que
+	// servía HTML sin ninguna cabecera de seguridad. login.html es un documento autocontenido con UN
+	// <script> inline, así que necesita 'nonce-…' en vez de 'unsafe-inline'. Sin librería compartida:
+	// wapp-shared/web/gin da nonce+CSP a las otras tres consolas, pero está pensado para gin y
+	// wapp-ctl es net/http puro.
+	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'nonce-"+nonce+"'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = tmpl.Execute(w, map[string]any{
 		"EnableAlphaTestAccounts": enableAlpha,
@@ -238,7 +251,21 @@ func (a *authBorder) handleLoginGet(w http.ResponseWriter, r *http.Request) {
 		// (guardian/wapp-guardian-bff/internal/config/config.go), para que las dos superficies se
 		// configuren igual.
 		"AlphaTestPassword": os.Getenv("WAPP_ALPHA_TEST_PASSWORD"),
+		"Nonce":             nonce,
 	})
+}
+
+// newNonce genera el nonce criptográfico de la CSP de login.html (U-3): 16 bytes de crypto/rand,
+// uno distinto por petición. Base64 SIN relleno y con el alfabeto de URL (RawURLEncoding), no el
+// estándar: el estándar mete `+` y `=`, y html/template los escapa como entidad (`&#43;`, `&#61;`)
+// al interpolarlos en el atributo `nonce="…"` — el navegador decodifica la entidad al parsear el
+// HTML y el nonce efectivo coincide igual, pero evitarlo de raíz es más simple que fiarse de eso.
+func newNonce() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
 }
 
 // handleSignupPost procesa la solicitud de registro público para el Edge (C-03/T3.5): tras validar el

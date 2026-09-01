@@ -4,6 +4,13 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>wApp Edge · Iniciar sesión</title>
+    <!-- Design tokens y componentes compartidos del ecosistema (wapp-shared/ui), mismo módulo que
+         BFF/Client Console/Platform Console. Orden obligatorio: tokens → componentes → tema (ver
+         wapp-shared/documentations/arquitectura.md). styles.css va DESPUÉS y solo aporta lo que
+         sigue siendo propio de esta pantalla (hoy, las reglas del Dashboard SPA de index.html). -->
+    <link rel="stylesheet" href="/static/css/wapp-tokens.css" />
+    <link rel="stylesheet" href="/static/css/wapp-components.css" />
+    <link rel="stylesheet" href="/static/css/theme-edge.css" />
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
@@ -169,7 +176,7 @@
       </section>
     </div>
 
-    <script>
+    <script nonce="{{ .Nonce }}">
       "use strict";
       const $ = (id) => document.getElementById(id);
       const show = (elm, on) => elm.classList.toggle("hidden", !on);

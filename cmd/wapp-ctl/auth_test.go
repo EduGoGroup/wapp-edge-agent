@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -763,4 +764,33 @@ func TestLoginGet_AlphaPasswordFromEnv(t *testing.T) {
 			t.Errorf("con WAPP_ALPHA_TEST_PASSWORD puesta, data-password debía reflejarla. Body: %s", body)
 		}
 	})
+}
+
+// TestLoginGet_CSPConNonce cierra U-3 (documentations/deuda.md): login.html era la única superficie
+// del ecosistema servida sin ninguna cabecera de seguridad. Verifica que la CSP viaje con un nonce
+// no vacío y que ESE MISMO nonce sea el que lleva el <script> inline del documento — un nonce en la
+// cabecera que no coincide con el del HTML no protege nada.
+func TestLoginGet_CSPConNonce(t *testing.T) {
+	auth := newAuthBorder(newSessionStore(), nil, nil, "", nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/login", nil)
+	auth.handleLoginGet(rec, req)
+
+	csp := rec.Header().Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("falta la cabecera Content-Security-Policy en /login")
+	}
+
+	re := regexp.MustCompile(`'nonce-([^']+)'`)
+	m := re.FindStringSubmatch(csp)
+	if len(m) != 2 || m[1] == "" {
+		t.Fatalf("la CSP no lleva un nonce no vacío: %q", csp)
+	}
+	nonce := m[1]
+
+	body := rec.Body.String()
+	if !strings.Contains(body, `<script nonce="`+nonce+`">`) {
+		t.Errorf("el <script> inline no lleva el MISMO nonce que la cabecera CSP (%q). Body: %s", nonce, body)
+	}
 }

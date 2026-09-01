@@ -11,6 +11,7 @@ require (
 	github.com/EduGoGroup/wapp-shared/envelope v0.2.1
 	github.com/EduGoGroup/wapp-shared/intents v0.1.0
 	github.com/EduGoGroup/wapp-shared/logger v0.2.0
+	github.com/EduGoGroup/wapp-shared/ui v0.5.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/lib/pq v1.12.3
