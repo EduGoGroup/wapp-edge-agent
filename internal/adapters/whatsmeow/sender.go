@@ -1,25 +1,18 @@
-// Package whatsmeow — adaptador Sender (RF-4, design §3 fila 5): ejecuta el envío efímero a
-// WhatsApp. Por CADA envío:
+// Package whatsmeow — helpers de envío compartidos por el CLIENTE VIVO de la escucha
+// (ListenGateway.SendViaLiveClient/SendViaLiveClientTracked/SendMediaViaLiveClientTracked,
+// listen_gateway.go): parseo del destino, construcción del *waE2E.Message (texto y media, con
+// Upload) y los dos loaders de device sobre la BD única del Edge.
 //
-//  1. cryptostore.NewEncryptedContainer(ctx, db, dialect, dek) -> store cifrado con la DEK custodiada (RAM).
-//  2. cryptostore.FirstDeviceJID(ctx, db)              -> JID de la única sesión pareada del Edge.
-//  3. cryptostore.LoadDevice(ctx, container, jid)       -> carga el device EXISTENTE de esa sesión.
-//  4. whatsmeow.NewClient(device, waLog→slog)           -> cliente efímero (puente de log, walog.go).
-//  5. client.Connect() + client.WaitForConnection(t)    -> espera DETERMINISTA de la conexión.
-//  6. client.SendMessage(texto).
-//  7. Sleep(flush) -> Disconnect()                       -> flush del frame y cierre del socket.
+// 🔴 Hasta el 2026-09-01 este fichero también definía un adaptador `Sender` que ejecutaba un ciclo
+// EFÍMERO propio (connect -> send -> sleep -> disconnect) para envíos sin acuse. Ese adaptador tenía
+// CERO llamantes en producción (deuda M-2, documentations/deuda.md) y se borró junto con
+// `internal/app/send.go`. Lo que queda aquí —parseRecipient, buildMessage, downloadMedia,
+// buildMediaMessage, mediaTypeForKind, realLoadDevice, realLoadDeviceByJID— SÍ tiene llamante real:
+// listen_gateway.go, que construye el mensaje y descarga el media con las mismas funciones antes de
+// enviarlo por el cliente vivo. No vuelvas a borrar este fichero entero sin comprobar eso primero.
 //
-// Copia-adaptación de edugo-api-messaging/internal/infra/whatsapp/sender.go (ADR-0004): renombrado
-// al namespace wApp, puerto -> internal/app.Sender, cryptostore -> wApp. RECORTES respecto a EduGo:
-//   - SOLO texto: se eliminó SendPDF / DocumentMessage / client.Upload (media, no necesario para el
-//     spike RF-4; arrastraba el campo pdf* del outgoing y la rama de Upload en buildMessage).
-//   - El JID de la sesión NO se recibe como parámetro (EduGo lo pasaba como waSessionID): el Edge
-//     custodia UNA sesión, así que se resuelve internamente con cryptostore.FirstDeviceJID.
-//
-// La DEK (32B en claro) la pasa el caso de uso app.Send desde la custodia (RAM); este adaptador NO
-// la retiene ni la loguea: solo la usa para construir el container. No se prueba E2E aquí (necesita
-// un teléfono pareado): el ciclo real vive tras la costura `dispatch`, inyectable, para testear el
-// cableado (DEK -> device -> mensaje) con fakes sin abrir un socket real.
+// La DEK (32B en claro) la pasa el caso de uso al loader; estos helpers NO la retienen ni la loguean:
+// solo la usan para construir el container.
 package whatsmeow
 
 import (
@@ -35,21 +28,12 @@ import (
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
-	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
-	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
-	"github.com/EduGoGroup/wapp-shared/logger"
 )
 
 const (
-	// defaultConnectTimeout acota cuánto espera WaitForConnection a que el socket conecte y
-	// autentique. Holgura para redes lentas.
-	defaultConnectTimeout = 15 * time.Second
-	// defaultFlushDelay deja a whatsmeow vaciar el frame saliente al socket antes de Disconnect.
-	// Sin esto, un Disconnect inmediato puede cortar el envío.
-	defaultFlushDelay = 1500 * time.Millisecond
 	// waServer es el sufijo del JID de usuario de WhatsApp cuando `to` viene como dígitos crudos.
 	waServer = "s.whatsapp.net"
 	// defaultDownloadTimeout acota la descarga del binario desde la presigned URL (Plan 017 §7). El
@@ -61,30 +45,9 @@ const (
 	mediaKindImage = "image"
 )
 
-// Sender implementa app.Sender sobre whatsmeow efímero.
-//
-// loadDevice construye el store cifrado con la DEK, resuelve el JID de la sesión pareada y carga el
-// device EXISTENTE (en producción: NewEncryptedContainer + FirstDeviceJID + LoadDevice sobre la BD
-// propia; inyectable para tests). dispatch ejecuta el ciclo real connect-send-disconnect sobre un
-// cliente whatsmeow; se inyecta para testear el cableado (DEK -> device -> mensaje) sin socket real.
-type Sender struct {
-	loadDevice     loadDeviceFunc
-	dispatch       dispatchFunc
-	connectTimeout time.Duration
-	flushDelay     time.Duration
-}
-
 // loadDeviceFunc construye el container cifrado con la DEK y carga el device de la sesión pareada.
 // Devuelve error si la DEK no construye el container, no hay sesión pareada o el JID es inválido.
 type loadDeviceFunc func(ctx context.Context, dek []byte) (*store.Device, error)
-
-// dispatchFunc ejecuta el ciclo efímero sobre el device ya cargado: NewClient -> Connect ->
-// WaitForConnection -> SendMessage -> Sleep(flush) -> Disconnect. Aislado tras esta costura porque
-// depende de un teléfono pareado (no testeable sin E2E); en tests se inyecta un stub que verifica
-// el cableado sin red.
-type dispatchFunc func(ctx context.Context, device *store.Device, msg outgoing, connectTimeout, flushDelay time.Duration) error
-
-var _ app.Sender = (*Sender)(nil)
 
 // outgoing describe un mensaje listo para enviar a un JID destino, ya conectado el cliente. text y los
 // campos media* son mutuamente excluyentes: si mediaData != nil es un envío de ARCHIVO (Document/Image
@@ -107,70 +70,6 @@ type outgoing struct {
 // *wm.Client lo satisface (Upload(ctx, plaintext, appInfo) (UploadResponse, error)).
 type mediaUploader interface {
 	Upload(ctx context.Context, plaintext []byte, appInfo wm.MediaType) (wm.UploadResponse, error)
-}
-
-// NewSender construye el adaptador real sobre la BD ÚNICA del Edge (store cifrado por envío, Plan 022
-// T3). La BD debe estar YA migrada (tablas whatsmeow_* y msg_enc_*) y con una sesión pareada; dialect es
-// el motor con el que se abrió (DialectSQLite|DialectPostgres, fin del "sqlite" hardcodeado).
-// log da voz al cliente whatsmeow efímero vía el puente waLog→slog (walog.go); nil ⇒ silencioso.
-func NewSender(db *sql.DB, dialect string, log logger.Logger) *Sender {
-	waLogger := newWALog(log)
-	return &Sender{
-		loadDevice: realLoadDevice(db, dialect),
-		dispatch: func(ctx context.Context, device *store.Device, msg outgoing, connectTimeout, flushDelay time.Duration) error {
-			return realDispatch(ctx, device, msg, connectTimeout, flushDelay, waLogger)
-		},
-		connectTimeout: defaultConnectTimeout,
-		flushDelay:     defaultFlushDelay,
-	}
-}
-
-// newSenderWithDeps construye un Sender con dependencias inyectadas (tests): permite verificar el
-// cableado DEK->device y la construcción del mensaje sin socket real.
-func newSenderWithDeps(loadDevice loadDeviceFunc, dispatch dispatchFunc) *Sender {
-	return &Sender{
-		loadDevice:     loadDevice,
-		dispatch:       dispatch,
-		connectTimeout: defaultConnectTimeout,
-		flushDelay:     defaultFlushDelay,
-	}
-}
-
-// SendText envía un mensaje de texto a `to` (número crudo o JID), descifrando el store con `dek`.
-// Ciclo efímero completo (ver doc del paquete).
-func (s *Sender) SendText(ctx context.Context, dek []byte, to, text string) error {
-	device, err := s.loadDevice(ctx, dek)
-	if err != nil {
-		return err
-	}
-	toJID, err := parseRecipient(to)
-	if err != nil {
-		return err
-	}
-	return s.dispatch(ctx, device, outgoing{to: toJID, text: text}, s.connectTimeout, s.flushDelay)
-}
-
-// SendMedia envía un ARCHIVO (documento/imagen) a `to` por el ciclo efímero, descifrando el store con
-// `dek`. Antes del envío DESCARGA el binario de la presigned URL con net/http normal (SIN credenciales,
-// SIN SDK S3): la URL prefirmada ES la capability (Plan 017 §7, zero-knowledge). El caption viaja
-// embebido en el mismo mensaje (§9.I). La DEK NO cifra el media (solo descifra el store); se conserva en
-// la firma por simetría con SendText.
-func (s *Sender) SendMedia(ctx context.Context, dek []byte, to, presignedURL, filename, mime, kind, caption string) error {
-	device, err := s.loadDevice(ctx, dek)
-	if err != nil {
-		return err
-	}
-	toJID, err := parseRecipient(to)
-	if err != nil {
-		return err
-	}
-	data, err := downloadMedia(ctx, presignedURL)
-	if err != nil {
-		return err
-	}
-	return s.dispatch(ctx, device, outgoing{
-		to: toJID, mediaData: data, filename: filename, mime: mime, kind: kind, caption: caption,
-	}, s.connectTimeout, s.flushDelay)
 }
 
 // downloadMedia baja el binario de la presigned URL con un net/http normal, SIN credenciales ni SDK S3
@@ -275,19 +174,10 @@ func parseRecipient(to string) (types.JID, error) {
 }
 
 // buildMessage arma el *waE2E.Message de TEXTO (Conversation). La rama de media vive en
-// buildMediaMessage (necesita el cliente para Upload); messageFor elige según outgoing.
+// buildMediaMessage (necesita el cliente para Upload); ListenGateway.sendViaLiveClient elige entre
+// las dos según si el `outgoing` trae mediaData.
 func buildMessage(msg outgoing) *waE2E.Message {
 	return &waE2E.Message{Conversation: proto.String(msg.text)}
-}
-
-// messageFor elige el *waE2E.Message según el outgoing: si trae media la sube (Upload) y arma
-// Document/Image; si no, un Conversation de texto. Comparte la rama de media entre el ciclo efímero
-// (realDispatch) y el envío por cliente vivo (ListenGateway.SendMediaViaLiveClientTracked).
-func messageFor(ctx context.Context, up mediaUploader, msg outgoing) (*waE2E.Message, error) {
-	if msg.mediaData != nil {
-		return buildMediaMessage(ctx, up, msg)
-	}
-	return buildMessage(msg), nil
 }
 
 // mediaTypeForKind mapea el discriminador (string) al MediaType de whatsmeow para el Upload y devuelve
@@ -334,42 +224,4 @@ func buildMediaMessage(ctx context.Context, up mediaUploader, msg outgoing) (*wa
 		FileSHA256:    upload.FileSHA256,
 		FileLength:    proto.Uint64(upload.FileLength),
 	}}, nil
-}
-
-// realDispatch es el ciclo efímero PRODUCTIVO sobre whatsmeow. No se ejercita en los tests de este
-// repo (necesita un teléfono pareado): calca el ciclo de EduGo con WaitForConnection determinista.
-//
-// LEGADO / DEPRECADO para envío real (Plan 013 §10.C): el envío que espera ACUSES (delivered/read) debe
-// ir por el CLIENTE VIVO de la escucha (ListenGateway.SendViaLiveClient/SendViaLiveClientTracked), NO
-// por este cliente efímero. El Disconnect inmediato pierde los events.Receipt asíncronos (que llegan
-// DESPUÉS) y este ciclo además descarta el SendResponse, con lo que se pierde el MessageID necesario
-// para la correlación (§10.E). Se conserva como costura de tests/legacy; no se borra en este plan.
-func realDispatch(ctx context.Context, device *store.Device, msg outgoing, connectTimeout, flushDelay time.Duration, wlog waLog.Logger) error {
-	// whatsmeow loguea por el puente waLog→slog (walog.go) que le pasa NewSender; los fallos del ciclo
-	// efímero (conexión/socket) YA quedan trazados en el log del agente (antes waLog.Noop los callaba).
-	client := wm.NewClient(device, wlog)
-	disableHistorySync(client)
-
-	if err := client.Connect(); err != nil {
-		return fmt.Errorf("whatsapp: conectar: %w", err)
-	}
-	// Cierre garantizado del socket pase lo que pase (éxito, error de envío o timeout).
-	defer func() {
-		time.Sleep(flushDelay) // deja a whatsmeow vaciar el frame antes de cerrar.
-		client.Disconnect()
-	}()
-
-	// WaitForConnection bloquea hasta socket conectado + autenticado, o false en timeout/desconexión.
-	if !client.WaitForConnection(connectTimeout) {
-		return fmt.Errorf("whatsapp: la conexión efímera expiró tras %s", connectTimeout)
-	}
-
-	waMsg, err := messageFor(ctx, client, msg)
-	if err != nil {
-		return err
-	}
-	if _, err := client.SendMessage(ctx, msg.to, waMsg); err != nil {
-		return fmt.Errorf("whatsapp: enviar mensaje: %w", err)
-	}
-	return nil
 }

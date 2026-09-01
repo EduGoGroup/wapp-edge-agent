@@ -52,6 +52,13 @@ func (f *fakeCustody) Load() ([]byte, error) {
 
 func (f *fakeCustody) Exists() bool { return f.stored != nil }
 
+// custodyWith construye un fakeCustody ya sembrado con una DEK. Vivía en send_test.go; se movió aquí
+// junto a fakeCustody cuando M-2 borró la vertical de envío efímero (documentations/deuda.md) porque
+// listen_test.go y listen_watchdog_test.go también lo usan.
+func custodyWith(dek []byte) *fakeCustody {
+	return &fakeCustody{stored: append([]byte(nil), dek...)}
+}
+
 // chanOf construye un canal de señales ya pobladas y CERRADO (fin de pairing).
 func chanOf(sigs ...PairingSignal) <-chan PairingSignal {
 	ch := make(chan PairingSignal, len(sigs))

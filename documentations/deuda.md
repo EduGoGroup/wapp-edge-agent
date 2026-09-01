@@ -101,32 +101,45 @@ Gateway**, y el síntoma aparece en casa del cliente.
 
 ## 2 · Código muerto verificado
 
-### M-1 · `internal/infra/deps/deps.go` — 16 líneas sin un solo importador
+### M-1 · `internal/infra/deps/deps.go` — ✅ BORRADO 2026-09-01
 
-Su propio doc dice que se retira «en cuanto el código real las importe», y eso ya pasó: `qrterminal`
-lo usa `internal/adapters/control/qr.go`, `modernc.org/sqlite` lo usa `internal/infra/db/db.go` y
-`whatsmeow` lo usan 19 ficheros.
+Su propio doc decía que se retiraba «en cuanto el código real las importe», y eso ya había pasado:
+`qrterminal` lo usa `internal/adapters/control/qr.go`, `modernc.org/sqlite` lo usa
+`internal/infra/db/db.go` y `whatsmeow` lo usan 19 ficheros. Confirmado de nuevo antes de borrar
+(`grep -rn 'infra/deps' --include='*.go' .` → cero fuera del propio fichero) y cerrado: se borró el
+paquete entero y se corrió `go mod tidy`. `go build`/`vet`/`test ./...` en verde tras el borrado.
 
-**Evidencia.** `grep -rn 'infra/deps' --include='*.go' .` → **cero resultados** fuera del propio
-fichero. **Cómo se cierra.** Borrar el paquete y correr `go mod tidy`.
+### M-2 · La vertical de envío efímero — ⚠️ PARCIALMENTE CERRADO 2026-09-01: el diagnóstico original ERA IMPRECISO
 
-### M-2 · La vertical de envío efímero — 894 líneas
+**La instrucción de esta ficha («Borrar los cuatro ficheros») habría roto producción.** Antes de
+borrar se re-verificó cada símbolo de `internal/adapters/whatsmeow/sender.go` con
+`grep -rln` **fuera** de ese fichero, y varios —`parseRecipient`, `buildMessage`, `downloadMedia`,
+`buildMediaMessage`, `outgoing`, `loadDeviceFunc`, `realLoadDevice`, `realLoadDeviceByJID`— resultaron
+tener llamante real en `listen_gateway.go` (`ListenGateway.SendViaLiveClient(Tracked)` y
+`SendMediaViaLiveClientTracked`), que es justo el camino de producción que esta misma ficha nombraba
+como reemplazo. `sender.go` era un fichero MIXTO: la mitad (el adaptador `Sender` efímero) estaba
+muerta; la otra mitad eran helpers compartidos con el camino vivo. No se supo por qué esto no se vio
+el 2026-08-30 — probablemente `listen_gateway.go` empezó a reusar esos helpers después de esa fecha,
+o el barrido de entonces no comprobó los símbolos uno a uno, solo contó llamantes de `NewSender`.
 
-| Fichero | Líneas | Estado |
-|---|---|---|
-| `internal/app/send.go` | 107 | El caso de uso `Send` y el puerto `app.Sender`. `NewSend` solo se llama desde `send_test.go` (5 usos) |
-| `internal/adapters/whatsmeow/sender.go` | 375 | La única implementación. `NewSender` tiene **cero llamantes**: solo su definición y dos comentarios |
-| `internal/app/send_test.go` + `sender_test.go` | 123 + 289 | Los tests que la mantienen verde |
+**Lo que sí se borró (genuinamente muerto, cero llamantes reales):**
 
-El propio fichero se autodeclara legado en `internal/adapters/whatsmeow/sender.go:342-346` («LEGADO /
-DEPRECADO para envío real … se conserva como costura de tests/legacy»). El envío de producción va por
-`ListenGateway.SendViaLiveClient(Tracked)` (`internal/app/sessionmgr/listen.go:94,164`).
+| Fichero | Qué se quitó |
+|---|---|
+| `internal/app/send.go` (borrado entero) | El caso de uso `Send`, el puerto `app.Sender`, `NewSend`. Cero llamantes fuera de su propio test. |
+| `internal/app/send_test.go` (borrado entero) | Sus tests. `custodyWith` (helper compartido con `listen_test.go`/`listen_watchdog_test.go`) se movió a `pair_test.go`, junto a `fakeCustody`. |
+| `internal/adapters/whatsmeow/sender.go` (recortado, NO borrado) | El adaptador `Sender` + `NewSender` + `newSenderWithDeps` + `SendText` + `SendMedia` + `realDispatch` + `messageFor` + `dispatchFunc` + `defaultConnectTimeout`/`defaultFlushDelay` + los imports que solo ellos usaban (`internal/app`, `wapp-shared/logger`, `waLog`). El fichero pasó de 375 a ~225 líneas. |
+| `internal/adapters/whatsmeow/sender_test.go` (recortado, NO borrado) | Los tests del adaptador muerto. Los que cubrían `downloadMedia` solo indirectamente (a través de `SendMedia`) se reescribieron para llamarlo DIRECTO (`TestDownloadMedia_NoCredentials`, `TestDownloadMedia_NonOKStatus_Error`), para no perder esa cobertura al quitar el wrapper. |
 
-De regalo, `sender.go:358` contiene un `time.Sleep` dentro de un `defer`: **el único `time.Sleep` de
-todo el código de producción del repo**.
+De regalo, el único `time.Sleep` de todo el código de producción del repo (`realDispatch`, antiguo
+`sender.go:358`) se fue con el adaptador muerto — ya no existe.
 
-**Cómo se cierra.** Borrar los cuatro ficheros. Contradice la regla que el propio repo se fijó en su
-plan de limpieza: «código que no se usa se elimina — no debe existir legacy».
+**Verificado tras el recorte**: `GOWORK=off go build/vet/test ./...` en verde, y un `grep` de cada
+símbolo eliminado confirma cero referencias sueltas.
+
+**Lección para el próximo barrido de código muerto**: contar llamantes del CONSTRUCTOR (`NewX`) no
+basta cuando el fichero mezcla un tipo muerto con funciones libres que otro tipo vivo, EN EL MISMO
+PAQUETE, puede llamar sin pasar por él. Hay que grepear cada símbolo exportado o no por separado.
 
 ### M-3 · `Reclamar` y `MarcarClasificado`: vivos en tests, muertos en producción
 
