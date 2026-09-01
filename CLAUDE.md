@@ -49,6 +49,7 @@ En campo corren **tres procesos**: `wapp-ctl` y sus dos hijos, `agent serve` y `
 | [`documentations/arquitectura.md`](documentations/arquitectura.md) | Capas, los 44 paquetes, los tres binarios y los diagramas |
 | [`documentations/contratos.md`](documentations/contratos.md) | Rutas HTTP (con la regla de conteo), frames gRPC, CLI, variables de entorno, ficheros y tablas |
 | [`documentations/operacion.md`](documentations/operacion.md) | Arrancar, probar, publicar y depurar |
+| [`documentations/instalador.md`](documentations/instalador.md) | El instalador para el usuario final: SO soportados, permisos y pasos post-instalación |
 | [`documentations/deuda.md`](documentations/deuda.md) | Deuda viva con `fichero:línea`, incluida la de seguridad |
 | [`documentations/literal-aviso-sesion-pasiva.md`](documentations/literal-aviso-sesion-pasiva.md) | 🔒 Contrato ejecutable: un test lo lee en cada `make test`. **No lo edites sin propagar a la constante Go.** |
 

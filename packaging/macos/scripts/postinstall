@@ -28,12 +28,12 @@ mkdir -p "$DATA_DIR/logs"
 chmod 700 "$DATA_DIR" 2>/dev/null || true
 
 # Bootstrap SIN sobrescribir: protege un Edge ya enrolado (config + credencial mTLS + DEK ya presentes).
+# El @@ENROLLMENT_ENDPOINT@@ YA viene horneado por `make pkg` (build-time, ver Makefile): este script solo
+# corre en la máquina del cliente y su entorno no hereda el WAPP_ENROLLMENT_ENDPOINT de quien empaquetó, así
+# que sustituirlo aquí nunca surtía efecto en una instalación real por doble-click.
 first_run=0
 if [ ! -f "$CONFIG" ]; then
-	sed \
-		-e "s|@@DATA_DIR@@|$DATA_DIR|g" \
-		-e "s|@@ENROLLMENT_ENDPOINT@@|${WAPP_ENROLLMENT_ENDPOINT:-gateway.wapp.example:9443}|g" \
-		"$HERE/config.yaml.template" > "$CONFIG"
+	sed "s|@@DATA_DIR@@|$DATA_DIR|g" "$HERE/config.yaml.template" > "$CONFIG"
 	chmod 600 "$CONFIG"
 	first_run=1
 fi
@@ -50,7 +50,7 @@ WAPP_BIN_DIR="$BIN_DIR" WAPP_AGENT_DATA_DIR="$DATA_DIR" bash "$HERE/install-laun
 if [ "$first_run" = "1" ]; then
 	# Margen para que el supervisor levante el loopback antes de abrir el navegador.
 	sleep 2
-	open "http://127.0.0.1:8765" 2>/dev/null || true
+	open "http://127.0.0.1:8105" 2>/dev/null || true
 fi
 
 exit 0

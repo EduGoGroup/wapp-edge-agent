@@ -30,14 +30,20 @@ Requisitos: macOS (con `pkgbuild`/`productbuild`, y `hdiutil` para el `.dmg`) y 
 
 ```sh
 # 1) (recomendado) reemplaza el bootstrap por los valores reales de tu nube:
-#    - packaging/macos/bootstrap/ca.pem                → el TLSCA REAL (PEM público) del Gateway
-#    - WAPP_ENROLLMENT_ENDPOINT=host:puerto            → endpoint de enrolamiento real
+#    - packaging/macos/bootstrap/ca.pem   → el TLSCA REAL (PEM público) del Gateway
+#    - ENROLLMENT_ENDPOINT=host:puerto    → endpoint de enrolamiento real (variable de `make`, NO de entorno
+#                                            del cliente: se hornea en config.yaml DENTRO del .pkg en este
+#                                            paso; el postinstall que corre en la máquina del cliente ya no
+#                                            lo toca)
 # 2) compila los binarios darwin/arm64 y arma el .pkg:
-make pkg                       # → dist/wApp-Edge-<version>.pkg
-make dmg                       # opcional → dist/wApp-Edge-<version>.dmg (envoltorio)
+make pkg ENROLLMENT_ENDPOINT=gateway.tu-nube:8102   # → dist/wApp-Edge-<version>.pkg
+make dmg                                            # opcional → dist/wApp-Edge-<version>.dmg (envoltorio)
 ```
 
-`make pkg` compila `dist/darwin-arm64/` (T0), valida el zero-knowledge y construye un `.pkg` por-usuario.
+`make pkg` compila `dist/darwin-arm64/` (T0), sustituye `@@ENROLLMENT_ENDPOINT@@` por el valor anterior
+(default `gateway.wapp.example:8102` si se omite — un placeholder, no una nube real), valida el
+zero-knowledge y construye un `.pkg` por-usuario. Solo `@@DATA_DIR@@` se resuelve más tarde, en el
+`postinstall`, porque depende del `$HOME` de quien instala.
 
 ## Instalar (Gatekeeper — SIN firma, D1)
 

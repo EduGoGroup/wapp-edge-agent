@@ -140,6 +140,14 @@ PKG_BUILD     := build/pkg
 PKG_MACOS     := packaging/macos
 BOOTSTRAP_DIR ?= $(PKG_MACOS)/bootstrap
 
+# Endpoint de enrolamiento embebido en el config de bootstrap — COMPARTIDO por `pkg` y por los kits
+# Windows/Linux (`dist-*`) de más abajo. Se sustituye AQUÍ, en build-time, porque el `.pkg` de Apple
+# Installer no propaga el entorno de quien ejecuta `make pkg` al script `postinstall` que corre en la
+# máquina del cliente: fijarlo por env en esa etapa nunca surte efecto en un doble-click real. Override:
+# `make pkg ENROLLMENT_ENDPOINT=gateway.tu-nube:8102`. El puerto 8102 es el de enroll en todo el resto del
+# código (internal/infra/config/config.go); no reintroducir el placeholder :9443 que traía el postinstall.
+ENROLLMENT_ENDPOINT ?= gateway.wapp.example:8102
+
 ## pkg: instalador .pkg por-usuario SIN firmar (macOS; consume dist/darwin-arm64/). Decisión D1.
 .PHONY: pkg
 pkg: build-darwin-arm64
@@ -152,7 +160,7 @@ pkg: build-darwin-arm64
 	cp $(PKG_MACOS)/scripts/postinstall $(PKG_BUILD)/scripts/postinstall
 	cp $(PKG_MACOS)/install-launchagent.sh $(PKG_BUILD)/scripts/install-launchagent.sh
 	cp $(PKG_MACOS)/com.wapp.edge.plist.template $(PKG_BUILD)/scripts/com.wapp.edge.plist.template
-	cp $(BOOTSTRAP_DIR)/config.yaml.template $(PKG_BUILD)/scripts/config.yaml.template
+	sed 's|@@ENROLLMENT_ENDPOINT@@|$(ENROLLMENT_ENDPOINT)|g' $(BOOTSTRAP_DIR)/config.yaml.template > $(PKG_BUILD)/scripts/config.yaml.template
 	cp $(BOOTSTRAP_DIR)/ca.pem $(PKG_BUILD)/scripts/ca.pem
 	chmod 755 $(PKG_BUILD)/scripts/postinstall $(PKG_BUILD)/scripts/install-launchagent.sh
 	bash $(PKG_MACOS)/verify-zero-knowledge.sh $(PKG_BUILD)
@@ -165,6 +173,7 @@ pkg: build-darwin-arm64
 		--package-path $(PKG_BUILD)/flat \
 		$(PKG_OUT)
 	@echo "OK: $(PKG_OUT)"
+	@echo "  enrollment_endpoint horneado: $(ENROLLMENT_ENDPOINT) (override: make pkg ENROLLMENT_ENDPOINT=host:puerto)"
 	@echo "SIN firmar (D1) — Gatekeeper: click-derecho -> Abrir. Ver $(PKG_MACOS)/README.md"
 
 ## pkg-verify-zk: guarda zero-knowledge del staging del .pkg (falla si hay material secreto).
@@ -191,9 +200,7 @@ dmg: pkg
 # portable se descomprime en cualquier carpeta, así que usa rutas relativas y omite data_dir
 # (RUTA SAGRADA por SO). Zero-knowledge (R6): se corre verify-zero-knowledge.sh sobre el staging.
 COMMON_DIR          ?= packaging/common
-# Endpoint de enrolamiento embebido en el config de bootstrap. Override:
-# `make dist-linux-amd64 ENROLLMENT_ENDPOINT=gateway.tu-nube:8102`.
-ENROLLMENT_ENDPOINT ?= gateway.wapp.example:8102
+# ENROLLMENT_ENDPOINT se declara arriba, junto a PKG_ID: lo comparten este kit y `make pkg`.
 DIST_STAGE          := build/dist
 ZIP_OUT             := $(DISTDIR)/wapp-edge-$(VERSION)-windows-amd64.zip
 TGZ_OUT             := $(DISTDIR)/wapp-edge-$(VERSION)-linux-amd64.tar.gz

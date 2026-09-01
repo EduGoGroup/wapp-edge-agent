@@ -25,6 +25,7 @@ el catálogo ni los pedidos, y no tiene broker: la concurrencia se resuelve con 
 | [`arquitectura.md`](arquitectura.md) | Cómo está hecha por dentro: capas, los 44 paquetes, los tres binarios y qué produce cada punto de entrada, con diagramas del proceso y del camino de un mensaje entrante. |
 | [`contratos.md`](contratos.md) | Todo lo que otros consumen: las rutas HTTP del núcleo y las de `wapp-ctl` (con la regla de conteo), los frames gRPC, el socket del cajero, los subcomandos y flags, las variables de entorno con su valor por defecto, los ficheros que escribe y las 13 tablas SQLite. |
 | [`operacion.md`](operacion.md) | Cómo se arranca en local, cómo se prueba (los `make` reales y qué valida cada uno), cómo se publica una versión y cómo se depura cuando falla. |
+| [`instalador.md`](instalador.md) | El instalador para el usuario final: qué mecanismo hay por SO, la matriz real de plataformas empaquetadas, por qué corre siempre por-usuario (nunca root/admin) y los cuatro pasos que le quedan al usuario tras instalar. |
 | [`deuda.md`](deuda.md) | La deuda viva con `fichero:línea`: el código muerto verificado, los fail-open de configuración, las violaciones de capa y los hallazgos de seguridad. |
 | [`literal-aviso-sesion-pasiva.md`](literal-aviso-sesion-pasiva.md) | 🔒 **Contrato ejecutable, no documentación.** Es la fuente única del literal `AVISO_SESION_PASIVA_V1` y un test la lee en cada `make test`. Editarla sin propagar a la constante Go pone el gate en rojo. |
 
