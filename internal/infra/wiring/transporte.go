@@ -13,6 +13,7 @@ import (
 
 	sharedlogger "github.com/EduGoGroup/wapp-shared/logger"
 
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsappfalso"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/sessionmgr"
@@ -27,6 +28,20 @@ func TransporteWhatsmeow() sessionmgr.Transporte {
 		},
 		NuevaEscucha: func(db *sql.DB, dialect, jid string, log sharedlogger.Logger) sessionmgr.Escucha {
 			return whatsmeow.NewListenGatewayForDevice(db, dialect, jid, log)
+		},
+	}
+}
+
+// TransporteFalso es el transporte de WhatsApp FALSO (ADR-0049): se empareja sin QR, escucha sin socket y
+// anota en `registro` lo que el Edge «envía». No usa la BD ni el dialecto: no tiene almacén. Solo lo elige
+// el arranque con WAPP_AGENT_WHATSAPP_FALSO=true.
+func TransporteFalso(registro *whatsappfalso.Registro) sessionmgr.Transporte {
+	return sessionmgr.Transporte{
+		NuevoConector: func(*sql.DB, string, sharedlogger.Logger) app.Connector {
+			return whatsappfalso.NuevoConector()
+		},
+		NuevaEscucha: func(_ *sql.DB, _, _ string, log sharedlogger.Logger) sessionmgr.Escucha {
+			return whatsappfalso.NuevaEscucha(registro, log)
 		},
 	}
 }

@@ -531,6 +531,18 @@ type Config struct {
 	// acordarse de poner `true` en cada sitio que construye una Config para no inyectar tráfico falso.
 	// La regla, en las dos, es la misma: el olvido no puede hacer daño.
 	InyectorEntrantes bool `yaml:"inyector_entrantes"`
+	// WhatsAppFalso SUSTITUYE EL TRANSPORTE DE WHATSAPP POR UNO FALSO (ADR-0049). Se lee de
+	// WAPP_AGENT_WHATSAPP_FALSO.
+	//
+	// Con la palanca echada el Edge NO habla con WhatsApp: no abre socket, se empareja sin QR, lo que
+	// entra se inyecta (hace falta también WAPP_AGENT_INYECTOR_ENTRANTES) y lo que «envía» se captura en
+	// memoria. Todo lo demás es el de siempre: la DEK la custodia el cliente y el lease lo emite y revoca
+	// la nube. Existe para probar el Edge real sin depender de un teléfono.
+	//
+	// 🔴 EN POSITIVO Y APAGADA POR DEFECTO, igual que su vecina y por el mismo motivo: el cero de Go, una
+	// clave ausente o una variable mal tecleada significan «WhatsApp de verdad». El olvido no puede
+	// dejar un Edge de producción mudo.
+	WhatsAppFalso bool `yaml:"whatsapp_falso"`
 	// CloudLink configura el conducto edge<->cloud (pieza 02). Si Endpoint está vacío, el Edge usa
 	// SOLO el LogSink (diagnóstico, sin red): no rompe los flujos pair/send/listen del spike.
 	CloudLink CloudLinkConfig `yaml:"cloudlink"`
@@ -682,6 +694,9 @@ func defaults() Config {
 		// tráfico real del fabricado, y quien lea defaults() tiene que VER que la decisión está tomada
 		// aquí y no deducirla de una línea ausente.
 		InyectorEntrantes: false,
+		// WhatsApp de verdad por defecto, ESCRITO (ADR-0049): mismo criterio que la línea de arriba. Lo
+		// que este `false` separa es un Edge que entrega mensajes de uno que no entrega ninguno.
+		WhatsAppFalso: false,
 		CloudLink: CloudLinkConfig{
 			RuntimePort:           DefaultCloudLinkRuntimePort,
 			CommandTimeoutSeconds: DefaultCommandTimeoutSeconds,
@@ -769,6 +784,9 @@ func Load(path string) (Config, error) {
 	// aparezca tráfico fabricado en un Edge de producción. Solo un booleano válido y verdadero,
 	// escrito con esta clave exacta, lo enciende.
 	cfg.InyectorEntrantes = loader.GetBool("INYECTOR_ENTRANTES", cfg.InyectorEntrantes)
+	// WAPP_AGENT_WHATSAPP_FALSO (ADR-0049): solo un booleano válido y verdadero, con esta clave exacta,
+	// sustituye el transporte.
+	cfg.WhatsAppFalso = loader.GetBool("WHATSAPP_FALSO", cfg.WhatsAppFalso)
 	cfg.CloudLink.Endpoint = loader.GetString("CLOUDLINK_ENDPOINT", cfg.CloudLink.Endpoint)
 	cfg.CloudLink.SessionID = loader.GetString("CLOUDLINK_SESSION_ID", cfg.CloudLink.SessionID)
 	cfg.CloudLink.TLSCert = loader.GetString("CLOUDLINK_TLS_CERT", cfg.CloudLink.TLSCert)

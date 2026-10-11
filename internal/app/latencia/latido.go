@@ -87,6 +87,11 @@ type Deps struct {
 	// echada que nadie cableó aquí saldría como `no` en la línea— la custodia el test de cableado del
 	// daemon, que es donde nace el dato.
 	InyectorEntrantes bool
+	// WhatsAppFalso dice si el transporte de WhatsApp de este Edge es el FALSO (WAPP_AGENT_WHATSAPP_FALSO,
+	// ADR-0049). Como sus dos vecinas, no cambia nada de lo que el latido mide: cambia lo que SIGNIFICA.
+	// Con el transporte falso este Edge no recibe ni entrega un solo mensaje de WhatsApp, y eso tiene que
+	// decirlo cada línea, no solo el aviso del arranque. El cero (false) es «WhatsApp de verdad».
+	WhatsAppFalso bool
 	// Ahora es el reloj, inyectable para los tests. nil ⇒ time.Now.
 	Ahora func() time.Time
 }
@@ -172,6 +177,9 @@ func (d Deps) bloque(ctx context.Context, emision string, inicio, desde time.Tim
 		// tramo y no al final. Va SIEMPRE: la pregunta que se hace en el VPS es «¿estos números son de
 		// verdad?», y esa pregunta no se puede contestar con una ausencia.
 		"inyector", estadoInyector(d.InyectorEntrantes),
+		// Y EL TRANSPORTE, por el mismo criterio (ADR-0049): con el WhatsApp falso NINGÚN número de la
+		// línea viene de WhatsApp. Va SIEMPRE: un `real` explícito es un dato.
+		"whatsapp", estadoWhatsApp(d.WhatsAppFalso),
 		// La ventana REAL medida, no la pedida: en el bloque final (y tras un tick que se retrasó) las dos
 		// no coinciden, y es la real la que da sentido a `n`.
 		"ventana_ms", t.Sub(desde).Milliseconds(),
@@ -328,4 +336,19 @@ func percentil(m Muestra, q float64, clave, claveBucket string) []any {
 		return []any{clave, c.CotaMS}
 	}
 	return []any{clave, c.CotaMS, claveBucket, c.Bucket}
+}
+
+// Valores del campo `whatsapp` del bloque (ADR-0049). Constantes por el mismo motivo que las de `inyector`.
+const (
+	whatsAppReal  = "real"
+	whatsAppFalso = "FALSO (palanca WAPP_AGENT_WHATSAPP_FALSO: este Edge NO habla con WhatsApp; lo que entra es " +
+		"inyectado y lo que envia se captura en memoria)"
+)
+
+// estadoWhatsApp traduce la palanca del transporte al valor del campo (mismo molde que estadoInyector).
+func estadoWhatsApp(falso bool) string {
+	if falso {
+		return whatsAppFalso
+	}
+	return whatsAppReal
 }

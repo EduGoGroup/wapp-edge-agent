@@ -40,7 +40,8 @@ Socket: `wapp-edge.sock` por defecto (`internal/infra/config/config.go`, campo `
 | GET | `/v1/logs` | `edge.status.read` — **SSE `text/event-stream`** | `daemon.go:294` |
 | GET | `/v1/intent/status` | `edge.status.read` | `daemon.go:299` |
 | POST | `/v1/inference/readiness` | **sin gate, a propósito**: el emisor es `agent cajero`, otro proceso sin Bearer de operador. La justificación completa y **qué NO se acepta por esa puerta** están en la cabecera de `internal/adapters/control/server/readiness.go` | `readiness.go:162` |
-| POST | `/v1/diag/inbound/inject` | `edge.diag.inbound.inject` (escritura) — 🔴 **la ruta NO EXISTE si la palanca está bajada** | `diag/inyector.go:70`, colgada en `daemon.go:508` |
+| POST | `/v1/diag/inbound/inject` | `edge.diag.inbound.inject` (escritura) — 🔴 **la ruta NO EXISTE si la palanca está bajada** | `diag/inyector.go:70`, colgada en `daemon.go:518` |
+| GET | `/v1/diag/outbound/captured?session_id=…` | `edge.diag.inbound.inject` (lectura; el mismo recurso del inyector) — 🔴 **la ruta NO EXISTE si `WAPP_AGENT_WHATSAPP_FALSO` está bajada** | `diag/capturados.go:41`, colgada en `daemon.go:610` |
 
 **Los cuatro recursos RBAC**, con su nombre literal: `edge.status.read`, `edge.sessions.pair`,
 `edge.sessions.logout` (`internal/adapters/control/server/server.go:63-69`) y
@@ -188,6 +189,7 @@ así que el `MAX_SESSIONS` del código se pone en la máquina como `WAPP_AGENT_M
 | `WAPP_AGENT_CLOUDLINK_LEASE_SHADOW_MODE` | El kill-switch queda **inerte**: un lease no vigente solo produce un `Warn` y el envío sale. El propio código lo grita al arrancar por si se hereda de un `.env` viejo. |
 | `WAPP_AGENT_DESPACHADOR_APAGADO` | **Apaga la entrega de entrantes**. Palanca de diagnóstico. |
 | `WAPP_AGENT_INYECTOR_ENTRANTES` | Cuelga `POST /v1/diag/inbound/inject`. Con ella bajada la ruta no existe. |
+| `WAPP_AGENT_WHATSAPP_FALSO` | 🔴 **Este Edge deja de hablar con WhatsApp** (ADR-0049): empareja sin QR, no abre socket, lo que «envía» se captura en memoria (`GET /v1/diag/outbound/captured`) y solo recibe lo inyectado, así que necesita también `WAPP_AGENT_INYECTOR_ENTRANTES`. La DEK y el lease no cambian. Lo grita al arrancar y en el campo `whatsapp` del latido. Modo de prueba, no de operación. |
 
 ### Worker-cajero — `WAPP_WORKER_*`
 
