@@ -81,7 +81,7 @@ func newBDUnicaManagerWithMux(t *testing.T, mux CloudLinkMux) (*Manager, *sessio
 	store := sessionstore.New(database)
 	m := NewManager(NewLayout(base), store, 5, testLogger(),
 		WithSharedDB(database, wappdb.DialectSQLite),
-		WithWhatsmeowListen(mux, ""))
+		WithEscucha(transporteWhatsmeowDeTest(), mux, ""))
 	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 	return m, store, database
 }

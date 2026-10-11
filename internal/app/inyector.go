@@ -38,6 +38,8 @@ package app
 // tamaño del lote) es del borde que recibe la petición —el plano de control—, no de este tipo: un tipo que
 // valida en su constructor invita a que el borde deje de hacerlo, y el borde es el único que puede devolver
 // un 400 con una explicación útil.
+import "errors"
+
 type InyeccionEntrante struct {
 	// ChatJID es el chat EN CUYO NOMBRE se fabrica el entrante, con el mismo formato que trae un mensaje de
 	// verdad (`…@s.whatsapp.net`, o `…@lid` según el modo de direccionamiento). Nadie envía nada a ese chat:
@@ -60,3 +62,13 @@ type InyeccionEntrante struct {
 	// la cola trata como duplicado.
 	Indice int
 }
+
+// ErrSinEscuchaViva: la sesión existe y el daemon corre, pero su ciclo de escucha no tiene AHORA MISMO una
+// escucha publicada a la que entregar el sintético. Es TRANSITORIO y REINTENTABLE. Vive en el puerto (y no
+// en el adaptador de whatsmeow, donde nació) desde el ADR-0049: lo devuelve cualquier transporte y el gestor
+// de sesiones lo traduce a su 409 sin importar ningún adaptador. El porqué de cada ventana en que ocurre
+// está junto a su alias, en internal/adapters/whatsmeow/inyector.go.
+var ErrSinEscuchaViva = errors.New("whatsapp: la sesión no tiene Listener publicado ahora mismo " +
+	"(el daemon corre y la sesión existe: el ciclo de escucha está entre Register y su publicación, o " +
+	"cayó y espera el backoff de reconexión —hasta 60 s—); es TRANSITORIO y REINTENTABLE: espera unos " +
+	"segundos y repite la tanda")

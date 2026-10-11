@@ -18,6 +18,7 @@ import (
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/intent"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/keycustody"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/sessionstore"
+	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsappfalso"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/diagnostics"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app/health"
@@ -220,11 +221,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	authMgr := wiring.BuildAuthManager(cfg, log, authKeyStore, authRelay)
 	authMgr.StartProactiveRefresh(ctx)
 
+	// EL TRANSPORTE DE WHATSAPP SE ELIGE AQUÍ, UNA VEZ (ADR-0049): el gestor de sesiones lo recibe ya
+	// elegido y no construye ningún adaptador.
+	transporte, capturados := elegirTransporte(cfg, log)
+
 	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
 		sessionmgr.WithSharedDB(database, cfg.DBDialect),
 		sessionmgr.WithHealthRegistry(healthReg),
-		sessionmgr.WithWhatsmeowListen(mux, cfg.PushName),
-		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
+		sessionmgr.WithEscucha(transporte, mux, cfg.PushName),
+		sessionmgr.WithEmparejamiento(transporte, app.DefaultPairTimeout),
 		sessionmgr.WithMultiDevicePerAccount(cfg.MultiDevicePerAccount),
 		// Ventana temporal de ingesta (ADR-0037): lo que llegó del buzón que WhatsApp reencola tras una
 		// caída no se ingiere. config.Load ya garantiza un margen > 0.
@@ -318,6 +323,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// POST /v1/diag/inbound/inject — SOLO si la palanca de diagnóstico está echada (MP-10 Parte A). Ver
 	// registrarInyectorEntrantes: con la palanca bajada la ruta NO EXISTE, no es que responda 403.
 	registrarInyectorEntrantes(srv, cfg, mgr, log)
+	// La lectura de lo que el WhatsApp falso «envió» (ADR-0049): misma regla, con la palanca baja NO EXISTE.
+	registrarCapturados(srv, cfg, capturados)
 
 	ln, err := srv.Listen()
 	if err != nil {
@@ -425,6 +432,9 @@ func buildLatencia(cfg config.Config, cola app.ColaEntrantes, log sharedlogger.L
 			// línea lo dice cada vez que alguien mira los números, que es cuando importa. Sin ella, un p99
 			// medido sobre tráfico sintético se lee como un p99 de producción.
 			InyectorEntrantes: cfg.InyectorEntrantes,
+			// LA SEGUNDA PUNTA DE LA PALANCA DEL WHATSAPP FALSO (la primera es elegirTransporte, que
+			// grita al arrancar). Mismo argumento: el aviso del arranque se pierde, el latido no.
+			WhatsAppFalso: cfg.WhatsAppFalso,
 		},
 	}
 }
@@ -569,4 +579,34 @@ func parteDelWorker(cola app.ColaEntrantes, log sharedlogger.Logger) app.ParteWo
 		return nil
 	}
 	return l
+}
+
+// elegirTransporte es EL punto donde este Edge decide con qué habla con WhatsApp (ADR-0049). Con la palanca
+// baja —el default, y el de todos los Edge en campo— devuelve el transporte real y NINGÚN registro. Con
+// WAPP_AGENT_WHATSAPP_FALSO=true devuelve el falso y el registro en memoria de lo que «envía», y GRITA.
+//
+// Es una función aparte, y no un `if` en Run, por el mismo motivo que registrarInyectorEntrantes: a Run no
+// lo ejercita ningún test, así que una condición invertida aquí dejaría mudos a todos los Edge de
+// producción con los gates en verde. Ver palanca_whatsapp_falso_test.go.
+func elegirTransporte(cfg config.Config, log sharedlogger.Logger) (sessionmgr.Transporte, *whatsappfalso.Registro) {
+	if !cfg.WhatsAppFalso {
+		return wiring.TransporteWhatsmeow(), nil
+	}
+	log.Warn("transporte de WhatsApp: PALANCA ECHADA (WAPP_AGENT_WHATSAPP_FALSO=true): este daemon NO HABLA " +
+		"CON WHATSAPP. No abre socket, empareja sin QR, NO ENTREGA ningún mensaje a nadie (lo que «envía» " +
+		"se captura en memoria y se lee en GET /v1/diag/outbound/captured) y solo recibe lo que se le " +
+		"inyecta por POST /v1/diag/inbound/inject, que SUBE A LA NUBE marcado como sintético. La DEK y el " +
+		"lease son los de siempre. Es un modo de PRUEBA, no de operación: bájala al terminar")
+	registro := whatsappfalso.NuevoRegistro(0)
+	return wiring.TransporteFalso(registro), registro
+}
+
+// registrarCapturados cuelga GET /v1/diag/outbound/captured SOLO con la palanca del WhatsApp falso echada.
+// Con ella baja la ruta no existe (un 403 confirmaría que sí). Es lectura: `write` va a false.
+func registrarCapturados(srv *server.Server, cfg config.Config, registro *whatsappfalso.Registro) {
+	if !cfg.WhatsAppFalso || registro == nil {
+		return
+	}
+	srv.HandleAuthorized(http.MethodGet, diag.RutaCapturados, diag.RecursoCapturados, false,
+		diag.CapturadosHandler(diag.CapturadosDeps{Leer: registro.De}))
 }

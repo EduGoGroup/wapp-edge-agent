@@ -15,7 +15,7 @@ package sessionmgr
 // REUSO (no duplicación): app.Listen YA opera por-sesión (recibe custodia+gateway por inyección);
 // "generalizarlo a N" es construir UNA instancia por sesión con SU custodia y SU gateway (sobre el
 // *sql.DB de su store), no reescribir la conexión. El factory listenFactory es la única costura de
-// producción (WithWhatsmeowListen) vs. tests (fake), igual que pairFactory en el emparejamiento.
+// producción (WithEscucha) vs. tests (fake), igual que pairFactory en el emparejamiento.
 //
 // El SEGUNDO hilo de cada sesión —el despachador que drena su cola y entrega al cable— nace en el mismo
 // startListener pero se cablea aparte (despacho.go): desde la Ola 3, la escucha ANOTA y el despachador
@@ -35,8 +35,8 @@ import (
 )
 
 // ErrListenNotConfigured: se llamó a Restore sin haber inyectado el factory de escucha (falta
-// WithWhatsmeowListen en producción). Es un error de cableado, no de runtime de una sesión.
-var ErrListenNotConfigured = errors.New("sessionmgr: escucha no configurada (usa WithWhatsmeowListen)")
+// WithEscucha en producción). Es un error de cableado, no de runtime de una sesión.
+var ErrListenNotConfigured = errors.New("sessionmgr: escucha no configurada (usa WithEscucha)")
 
 // listenRunner abstrae la escucha always-on de UNA sesión: Run BLOQUEA manteniendo el socket vivo
 // hasta que el ctx se cancele (apagado) o la conexión caiga (devuelve error). En producción lo cumple
@@ -81,7 +81,7 @@ type CloudLinkMux interface {
 	SendLoggedOut(sessionID string)
 }
 
-// WithWhatsmeowListen habilita Restore/startListener con la escucha REAL sobre whatsmeow Y la cablea al
+// WithEscucha habilita Restore/startListener con la escucha del transporte recibido Y la cablea al
 // multiplexor CloudLink (T7): por cada sesión monta un ListenGateway per-device sobre la BD ÚNICA
 // COMPARTIDA (m.db) que carga el device CONCRETO de la sesión por SU JID (s.meta.JID) con SU DEK, y un
 // app.Listen que mantiene el socket vivo mientras el listener ANOTA los entrantes en la cola durable
@@ -97,7 +97,10 @@ type CloudLinkMux interface {
 //
 // pushName es el nombre visible de FALLBACK para anunciar presencia (Plan 013 §10.D): se aplica a cada
 // gateway y solo se usa si el store restaurado no conoce ya el nombre real de la cuenta (ver SetPushName).
-func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
+//
+// EL TRANSPORTE LO ELIGE EL ARRANQUE (ADR-0049): este factory ya no construye el adaptador de whatsmeow,
+// pide la escucha a `t.NuevaEscucha` y la cablea igual sea cual sea. Ver transporte.go.
+func WithEscucha(t Transporte, mux CloudLinkMux, pushName string) Option {
 	return func(m *Manager) {
 		m.cloudMux = mux
 		m.newListener = func(_ context.Context, s *liveSession) (listenRunner, io.Closer, error) {
@@ -107,7 +110,10 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// BD ÚNICA COMPARTIDA (Plan 022 §10.A): el gateway carga el device de ESTA sesión por SU JID
 			// (s.meta.JID) con SU DEK sobre la db compartida (N devices, 1 *sql.DB). El *sql.DB NO se cierra
 			// por-listener: lo posee el daemon (apagado ordenado §10.I), por eso el io.Closer es nil.
-			gateway := whatsmeow.NewListenGatewayForDevice(m.db, m.dbDialect, s.meta.JID, s.log)
+			if t.NuevaEscucha == nil {
+				return nil, nil, fmt.Errorf("transporte de WhatsApp sin escucha (Transporte.NuevaEscucha es nil)")
+			}
+			gateway := t.NuevaEscucha(m.db, m.dbDialect, s.meta.JID, s.log)
 			// Salud por sesión (Plan 031 T6): liga el gateway/listener al registro (connected/connecting/dead
 			// + edad del último entrante). health.Registry.For es nil-safe (registro no cableado ⇒ reporter no-op).
 			gateway.SetHealthReporter(m.health.For(s.meta.SessionID))
@@ -190,7 +196,7 @@ func WithWhatsmeowListen(mux CloudLinkMux, pushName string) Option {
 			// sube al cloud por el stream. Sin correlación (vencido/desconocido) sube como estado crudo.
 			gateway.SetReceiptHandler(func(evt domain.ReceiptEvent) {
 				evt.SessionID = sid
-				cmd, _ := gateway.Correlator().Lookup(evt.MessageIDs)
+				cmd, _ := gateway.ComandoDe(evt.MessageIDs)
 				mux.SendReceipt(cmd, evt)
 			})
 			// Plan 022 T5 (reusa Plan 020 T3): al llegar events.LoggedOut, el Manager PROPAGA el estado ZOMBIE
@@ -273,11 +279,11 @@ func (m *Manager) Restore(ctx context.Context) error {
 // sobrevivir al ctx de la petición que lo originó —p.ej. el request de Pair—; SOLO Stop lo cancela),
 // lo guarda en la liveSession para el apagado ordenado, suma al WaitGroup y lanza la goroutine.
 //
-// Si la escucha NO está configurada (falta WithWhatsmeowListen, p.ej. en los tests de Pair sin
+// Si la escucha NO está configurada (falta WithEscucha, p.ej. en los tests de Pair sin
 // WhatsApp), la sesión queda registrada pero SIN listener (warn), en vez de arrancar uno a medias.
 func (m *Manager) startListener(s *liveSession) {
 	if m.newListener == nil {
-		s.log.Warn("sesión registrada pero SIN escucha: falta WithWhatsmeowListen (listener no arrancado)")
+		s.log.Warn("sesión registrada pero SIN escucha: falta WithEscucha (listener no arrancado)")
 		return
 	}
 	// Register-on-start (Restore y Pair): multiplexa esta sesión en el único stream del Edge (ADR-0008).

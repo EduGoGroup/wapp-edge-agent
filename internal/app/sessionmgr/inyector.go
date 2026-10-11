@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 )
 
@@ -93,7 +92,7 @@ func (m *Manager) InyectarEntrante(ctx context.Context, sessionID string, p app.
 	// muere aquí. Aguas arriba solo viaja el del puerto (ErrInyectorNoCableado), que es lo que el borde
 	// conoce; dejar salir los dos invitaría al plano de control a discriminar por el del adaptador y ataría
 	// el borde HTTP a whatsmeow. El TEXTO sí sube entero: es el que explica si fue el hueco o el backoff.
-	if errors.Is(err, whatsmeow.ErrSinEscuchaViva) {
+	if errors.Is(err, app.ErrSinEscuchaViva) {
 		return false, fmt.Errorf("%w: %v", ErrInyectorNoCableado, err)
 	}
 	return acusar, err

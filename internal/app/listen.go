@@ -146,7 +146,7 @@ func WithDEKDurationReporter(fn func(time.Duration)) ListenOption {
 // watchdog/reporte de salud (Plan 031 T6); sin opts, defaults seguros (plazo default, sin reporte).
 //
 // Sin parámetro `sink` desde T3.8: ver la nota del puerto ListenGateway. El llamante de producción
-// (sessionmgr.WithWhatsmeowListen) dejó con ello de pedir un `mux.SinkFor(session_id)` que no usaba nadie
+// (sessionmgr.WithEscucha) dejó con ello de pedir un `mux.SinkFor(session_id)` que no usaba nadie
 // —era la SEGUNDA llamada por sesión, junto a la del despachador, que sí es la de verdad.
 func NewListen(custody KeyCustody, gateway ListenGateway, log logger.Logger, opts ...ListenOption) *Listen {
 	if log == nil {

@@ -222,6 +222,27 @@ nada.
 **Candado.** 19 tests, entre ellos `TestColaMeta_UnEntranteREAL_NoSeMarcaComoSintetico`, que es un
 aserto de ausencia **con su testigo real** (sin testigo, un aserto de ausencia mide cero).
 
+### INV-E10 · El transporte de WhatsApp se elige UNA vez, en el arranque, y el falso no tiene excepción de llaves
+
+Desde el ADR-0049 `sessionmgr` **recibe** el transporte (`sessionmgr.Transporte`) y no construye
+ningún adaptador; lo elige `elegirTransporte` (`internal/infra/daemon/daemon.go`). Con
+`WAPP_AGENT_WHATSAPP_FALSO` en positivo el transporte es `internal/adapters/whatsappfalso`: sin
+socket, sin QR, sin device. El default es `false`, **escrito** en `defaults()`.
+
+Lo que el falso **no** cambia, y no se toca:
+
+- La **DEK** la genera y la sella `app.Pair` en la custodia del cliente, igual que en una sesión real.
+  El paquete del falso la recibe por los puertos y la **ignora**: ni la guarda ni la registra.
+- El **lease** lo emite y lo revoca la nube. El gate 2-de-2 está **antes** del transporte
+  (`internal/adapters/cloudlink`), así que con el lease revocado el falso no captura nada.
+- La **puerta de entrantes** es la del adaptador real, sin una guarda reescrita
+  (`internal/adapters/whatsmeow/sin_transporte.go`).
+
+**Candado.** `TestPalancaWhatsAppFalso_ConLaPalancaBAJADANadaCambia` (el aserto fuerte: transporte
+real, sin ruta, sin grito), `TestWhatsAppFalso_ConElLeaseRevocadoNoSeCapturaNingunEnvio`,
+`TestWhatsAppFalso_LaDEKNoSeGuardaNiSeRegistra` y
+`TestFronteraDelTransporte_SessionmgrNoConstruyeElAdaptadorReal`.
+
 ---
 
 ## 3 · Tecnología y versiones reales

@@ -247,7 +247,7 @@ func TestStartDespachador_ElBucleDespiertaPorElTimbreDeSuSesion(t *testing.T) {
 	sink := sinkConCanal{entregas: make(chan string, 8)}
 	m := NewManager(NewLayout(t.TempDir()), nil, 5, testLogger(),
 		WithColaDespachador(cola),
-		WithWhatsmeowListen(muxDeEsteSink{sink: sink}, "wApp"),
+		WithEscucha(transporteWhatsmeowDeTest(), muxDeEsteSink{sink: sink}, "wApp"),
 	)
 	s := &liveSession{meta: domain.Session{SessionID: uuidA}, log: testLogger()}
 

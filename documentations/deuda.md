@@ -158,22 +158,53 @@ razón por la que `EstadoClasificado` sigue declarado, `internal/app/cola.go:121
 
 ## 3 · Arquitectura y mantenibilidad
 
-### A-1 · `app` importa adaptadores concretos en 4 ficheros (5 líneas de import)
+### A-1 · `app` importa adaptadores concretos en 3 ficheros (3 líneas de import)
 
 ```
+internal/app/sessionmgr/listen.go:31    → internal/adapters/whatsmeow     (solo `whatsmeow.Backoff`)
 internal/app/sessionmgr/pairing.go:24   → internal/adapters/cryptostore
-internal/app/sessionmgr/pairing.go:25   → internal/adapters/whatsmeow
-internal/app/sessionmgr/inyector.go:24  → internal/adapters/whatsmeow
 internal/app/sessionmgr/unlink.go:19    → internal/adapters/cryptostore
-internal/app/sessionmgr/listen.go:31    → internal/adapters/whatsmeow
 ```
+
+Eran 5 líneas en 4 ficheros hasta el 2026-10-11: el ADR-0049 sacó de `sessionmgr` la **construcción**
+del adaptador de whatsmeow (ver A-5). Lo que queda de ese adaptador es un tipo puro, y un candado
+sobre el AST no deja añadir nada más
+(`TestFronteraDelTransporte_SessionmgrNoConstruyeElAdaptadorReal`, `internal/app/sessionmgr/transporte_test.go`).
 
 `internal/domain` sí está limpio (cero imports internos). El plan que «desacopló DIP en `sessionmgr`»
-cerró **solo la de `keycustody`**, que es lo que su tarea pedía; quien lea «DIP desacoplado»
-concluirá algo falso.
+cerró **solo la de `keycustody`**; quien lea «DIP desacoplado» concluirá algo falso.
 
-**Cómo se cierra.** Extraer puertos para lo que hoy se usa de esos dos adaptadores. No es urgente,
-pero **sí hay que dejar de venderlo como hexagonal limpio**.
+**Cómo se cierra.** Mudar `Backoff` a un paquete neutral y extraer un puerto para lo que se usa de
+`cryptostore`. No es urgente, pero **sí hay que dejar de venderlo como hexagonal limpio**.
+
+### A-5 · La frontera del transporte de WhatsApp existe, pero `whatsmeow` sigue asomando fuera de su adaptador
+
+**Qué hay (ADR-0049, 2026-10-11).** `sessionmgr` ya no construye ningún adaptador: recibe un
+`sessionmgr.Transporte` (`internal/app/sessionmgr/transporte.go`) que el arranque elige una vez
+(`elegirTransporte`, `internal/infra/daemon/daemon.go`). Hay dos: `wiring.TransporteWhatsmeow` y
+`wiring.TransporteFalso`. Añadir un tercero —otra librería, un proceso auxiliar, la API oficial de
+WhatsApp— es otro adaptador que rellena ese struct y otra rama en `elegirTransporte`.
+
+**Qué se dejó a propósito** (decisión D-FW-4 de la reconstrucción de la plataforma: «solo lo que
+estorba»; el resto es deuda **de este repo**):
+
+| # | Qué queda | Dónde | Qué pide el siguiente transporte |
+|---|---|---|---|
+| a | **La puerta de entrantes vive dentro del adaptador de whatsmeow** y recibe `*events.Message`. El transporte falso la reutiliza a través de `whatsmeow/sin_transporte.go` | `internal/adapters/whatsmeow/listener.go` (`handleEvent`, las cinco guardas) | Sacar las guardas, el meta y el encolado a un sitio neutral que reciba un entrante **sin tipos de la librería**; cada adaptador traduce su evento a ese tipo. Hasta entonces, un transporte nuevo tendría que fabricar `*events.Message` o reescribir las guardas, y lo segundo está descartado en el ADR-0041 |
+| b | Los métodos de `sessionmgr.Escucha` heredan los nombres del gateway de whatsmeow (`SendViaLiveClientTracked`, …) | `internal/app/sessionmgr/transporte.go` | Renombrar a nombres neutros el día que haya un segundo transporte real |
+| c | `types.ParseJID` antes de `cryptostore.DeleteDevice` | `internal/app/sessionmgr/pairing.go:181`, `unlink.go:262` | Un transporte sin device de whatsmeow no tiene nada que borrar ahí: hoy funciona porque `DeleteDevice` es idempotente (medido con el transporte falso), pero la limpieza debería pedírsela al transporte |
+| d | `whatsmeow.Backoff` | `internal/app/sessionmgr/listen.go` | Ver A-1 |
+| e | 9 ficheros de producción fuera de `internal/adapters/whatsmeow/` importan `go.mau.fi/*` (`cryptostore`, `edgemigrate`, `sessionmgr`) | `grep -rn 'go.mau.fi/' --include='*.go' . \| grep -v _test.go` | El almacén cifrado y la migración de arranque son de whatsmeow por naturaleza; solo estorban si el transporte por defecto deja de ser whatsmeow |
+
+**Lo que un transporte distinto cambiaría de verdad** (para quien lo aborde; no está decidido):
+
+- **Una librería en otro lenguaje** (p. ej. Baileys, que es Node) no se enlaza en el binario: sería un
+  proceso auxiliar hablando por un socket local. Sin broker (ADR-0003), y sus credenciales tendrían
+  que quedar bajo la DEK del cliente como hoy el almacén de whatsmeow.
+- **La API oficial de WhatsApp** no tiene device ni QR, entrega por *webhook* (el daemon hoy no abre
+  ningún puerto de red) y se autentica con un token de Meta, que es una **credencial**: zero-knowledge
+  exige que viva en el cliente y nunca suba a la nube. El emparejamiento, la custodia y el modelo de
+  «sesión» cambian, no solo el adaptador.
 
 ### A-2 · `Daemon.Run` son 307 líneas y **ningún test la ejercita**
 

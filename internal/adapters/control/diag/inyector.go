@@ -1,5 +1,10 @@
-// Package diag sirve las rutas de DIAGNÓSTICO del plano de control local: instrumentos de medida que
-// existen para responder una pregunta concreta y que se BORRAN cuando esa pregunta está respondida.
+// Package diag sirve las rutas de DIAGNÓSTICO del plano de control local: instrumentos que solo existen con
+// su palanca echada y que, con ella baja, no dejan ni la ruta registrada.
+//
+// 🔴 ESTE PAQUETE ES PERMANENTE (ADR-0041 y ADR-0049). Nació para una medición (MP-10 Parte A) y esta
+// cabecera decía que se borraba al cerrarla; ya no: el transporte falso de WhatsApp (ADR-0049) entra por la
+// ruta de aquí, que es su ÚNICA puerta de entrada. Lo que sigue explica por qué está agrupado, y eso sigue
+// valiendo; donde dice «el día que se borre» léase «si un día sobrara».
 //
 // 🔴 POR QUÉ UN PAQUETE PROPIO Y NO UNA RUTA MÁS EN `control/server`. Tres razones, en orden de peso:
 //

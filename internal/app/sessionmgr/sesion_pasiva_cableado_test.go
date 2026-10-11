@@ -57,7 +57,7 @@ func managerConPerfiles(t *testing.T, pred func(string) bool) *Manager {
 
 	m := NewManager(NewLayout(base), sessionstore.New(database), 5, testLogger(),
 		WithSharedDB(database, wappdb.DialectSQLite),
-		WithWhatsmeowListen(&recordMux{}, ""),
+		WithEscucha(transporteWhatsmeowDeTest(), &recordMux{}, ""),
 		WithSesionPasiva(pred))
 	m.newCustody = newMemCustodyFactory() // doble en memoria: no tocar el Keychain real (Plan 023 T2)
 	return m

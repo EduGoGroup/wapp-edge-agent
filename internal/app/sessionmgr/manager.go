@@ -72,12 +72,12 @@ type Manager struct {
 	log sharedlogger.Logger
 
 	// newPairer construye, para UNA sesión, el caso de uso de pairing sobre su custodia y su store
-	// (design §5). Se inyecta por opción (WithWhatsmeowPairing en producción; un fake en los tests)
+	// (design §5). Se inyecta por opción (WithEmparejamiento en producción; un fake en los tests)
 	// para que Manager.Pair sea testeable sin WhatsApp. nil hasta que se configure: Pair lo exige.
 	newPairer pairFactory
 
 	// newListener construye, para UNA sesión, el runner de escucha always-on sobre su custodia y su
-	// store (design §6). Se inyecta por opción (WithWhatsmeowListen en producción; un fake en los
+	// store (design §6). Se inyecta por opción (WithEscucha en producción; un fake en los
 	// tests) para que Restore/runListener sean testeables sin WhatsApp. nil hasta que se configure:
 	// Restore lo exige y startListener registra la sesión SIN escucha (warn) si falta.
 	newListener listenFactory
@@ -92,7 +92,7 @@ type Manager struct {
 
 	// cloudMux es el multiplexor CloudLink del Edge (UN stream, N sesiones, ADR-0008): el Manager
 	// registra cada sesión al arrancar su listener (Restore/Pair) y la quita al desvincularla (Unlink).
-	// Lo inyecta WithWhatsmeowListen junto al factory de escucha. nil en los tests que cablean newListener
+	// Lo inyecta WithEscucha junto al factory de escucha. nil en los tests que cablean newListener
 	// directamente (sin mux): startListener/Unlink omiten el registro de forma segura.
 	cloudMux CloudLinkMux
 
@@ -174,7 +174,7 @@ type Option func(*Manager)
 // NewManager construye el Manager con el Layout, el puerto de persistencia de metadatos, el límite
 // suave de sesiones (max) y el logger. No abre sockets ni restaura sesiones: eso lo hacen
 // Pair/Restore en tramos posteriores. Las opciones inyectan dependencias del ciclo de vida (p.ej.
-// WithWhatsmeowPairing para habilitar Manager.Pair).
+// WithEmparejamiento para habilitar Manager.Pair).
 func NewManager(layout Layout, sessions app.SessionStore, max int, log sharedlogger.Logger, opts ...Option) *Manager {
 	m := &Manager{
 		live:                  make(map[string]*liveSession),
