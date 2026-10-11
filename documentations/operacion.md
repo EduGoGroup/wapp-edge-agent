@@ -130,6 +130,63 @@ curl -s http://127.0.0.1:8105/v1/daemon/status
 curl -s http://127.0.0.1:8105/v1/cajero/status
 ```
 
+### 3.3 · Arrancar sin WhatsApp: el transporte falso (ADR-0049)
+
+Para probar el Edge entero —cola cifrada, despachador, lease, CloudLink— sin una sesión de WhatsApp
+viva. Es un **modo de prueba**: con él echado este Edge **no entrega nada a nadie**.
+
+**Echarla.** Dos variables del daemon (prefijo `WAPP_AGENT_`), las dos, y reiniciar:
+
+```bash
+WAPP_AGENT_WHATSAPP_FALSO=true          # el transporte: empareja sin QR, captura lo que «envía»
+WAPP_AGENT_INYECTOR_ENTRANTES=true      # la única puerta de entrada del falso (ADR-0041)
+```
+
+Con solo la primera, el Edge arranca y «envía», pero no hay por dónde hacer entrar un mensaje
+(`/v1/diag/inbound/inject` no existe). El hijo `agent serve` hereda el entorno de `wapp-ctl`.
+
+**Comprobar que es lo que corre**, antes de concluir nada:
+
+```bash
+grep -c 'PALANCA ECHADA (WAPP_AGENT_WHATSAPP_FALSO=true)' <log del daemon>     # ≥ 1 tras este arranque
+grep 'CloudLink habilitado' <log del daemon> | tail -1    # lease_gate=true sealed_transit=true lease_shadow_mode=false
+curl -s --unix-socket <socket> http://unix/v1/health      # status ok, y la versión que esperas
+```
+
+Sin `lease_gate=true` el Edge envía con el lease revocado: la prueba no mide el kill-switch.
+
+**Conducirlo** (todo por el socket unix del plano de control, con el Bearer de un operador:
+`POST /v1/auth/login`; hasta que llega el JWKS de la nube las escrituras dan `403 degraded_read_only`,
+y se reintenta):
+
+| Paso | Llamada | Qué vuelve |
+|---|---|---|
+| Emparejar | `POST /v1/sessions/pair` y luego `GET /v1/sessions/{id}/pair` | `status: success` sin QR, un `session_id` y un JID que empieza por `0000` (ningún teléfono empieza así) |
+| Activar | En la **nube**: `POST /api/v1/sessions/{session_id}/profile` con `{"profile":"active"}` | La sesión nace **pasiva** (INV-E5): hasta activarla, lo inyectado se descarta en la puerta |
+| Entra un mensaje | `POST /v1/diag/inbound/inject` con `session_id`, `texto`, `chat_jid` y un `lote` **distinto cada vez** | `inyectados: 1, acusados: 1`. Un `lote` repetido se descarta en silencio (mismo `wa_message_id`). `409` = la escucha aún no está publicada: reintentar |
+| Leer lo «enviado» | `GET /v1/diag/outbound/captured?session_id=…` | `capturados` en orden, cada uno con `command_id`, `to`, `text` y un `message_id` `SINTETICO-…`; `descartados` > 0 = el anillo dio la vuelta |
+
+🔴 **Lo capturado vive en memoria**: un reinicio lo borra. Guárdalo antes de reiniciar.
+
+🔴 **Con la palanca echada, TODA sesión `active` del `data_dir` escucha por el transporte falso**,
+también una emparejada con WhatsApp real: la escucha falsa no mira el JID
+(`internal/infra/wiring/transporte.go`, `whatsappfalso.NuevaEscucha`). Esa sesión sale `listening` en
+`/v1/sessions` y late hacia la nube, pero **no está conectada a WhatsApp**: lo que le escriban no
+entra y lo que la nube le mande se captura en vez de salir. Su almacén cifrado no se toca —el falso no
+lo abre—, así que al bajar la palanca vuelve a su transporte. (Leído en el código; no ejecutado con una
+sesión real.) Mira `GET /v1/sessions` **antes** de echar la palanca.
+
+**Bajarla.** En este orden:
+
+1. `DELETE /v1/sessions/{session_id}` de **cada** sesión falsa (las del JID `0000…`).
+2. Quitar las dos variables y reiniciar.
+3. Comprobar: cero líneas `PALANCA ECHADA` tras ese arranque, las dos rutas de `/v1/diag` dan `404`, y
+   la línea del latido (`listener: latencia del handler de entrantes`) dice `inyector=no whatsapp=real`.
+
+Si se baja **sin** desvincular (medido el 2026-10-11): la sesión falsa queda `active` / `degraded` y el
+transporte real la reintenta con *backoff* para siempre —`listen: whatsapp: no hay device pareado para
+el JID de la sesión`—. No rompe nada más, y el `DELETE` funciona igual con la palanca ya baja.
+
 ---
 
 ## 4 · Publicar una versión
@@ -182,7 +239,9 @@ con el del binario en disco. Instalar y reiniciar son dos pasos, y el segundo se
 | «No entra nada» | Mira primero si el despachador está apagado (`WAPP_AGENT_DESPACHADOR_APAGADO`), luego el perfil de la sesión (una **pasiva** descarta los entrantes en el Edge, y es el default de una sesión recién emparejada). |
 | «El circuito abrió sin un solo fallo» | Es correcto: cinco aciertos **lentos** (≥80 % del plazo) abren el circuito. Ver INV-E8. |
 | «La inferencia da timeout y `ollama ps` dice que el modelo está cargado» | Modelo cargado ≠ prefijo precalentado: son dos cachés distintas. |
-| Un `curl` a `/v1/...` da 404 desde el navegador | `/v1/auth/*` está **bloqueado en el proxy** a propósito; y `/v1/diag/inbound/inject` **no existe** sin su palanca. |
+| Un `curl` a `/v1/...` da 404 desde el navegador | `/v1/auth/*` está **bloqueado en el proxy** a propósito; y las dos rutas de `/v1/diag` **no existen** sin su palanca (§3.3). |
+| «`listener caído` … `no hay device pareado para el JID`» con un JID `0000…`, en bucle | Quedó una sesión del WhatsApp falso y la palanca ya está baja: `DELETE /v1/sessions/{id}` (§3.3). |
+| «La sesión dice `listening` y no llega ni sale nada de verdad» | Mira si el arranque gritó `PALANCA ECHADA (WAPP_AGENT_WHATSAPP_FALSO=true)`: con ella este Edge no habla con WhatsApp (§3.3). |
 
 ### 5.3 · El bundle de diagnóstico
 

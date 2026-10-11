@@ -44,8 +44,12 @@ un `LeaseUpdate` posterior no la levanta (`adapter.go:987-996`).
    `internal/infra/wiring/cloudlink.go:291-293` avisa y **devuelve `nil`**; sin validator, las dos
    líneas de arriba no gatean nada. Y esa ruta **no tiene valor por defecto**.
 
-**Candado.** Los tests del lease viven en el módulo `wapp-cloudlink`, no aquí. En este repo **no hay
-ningún test que afirme «sin material de lease el Edge no debe despachar»**.
+**Candado.** Los tests del validador viven en el módulo `wapp-cloudlink`. En este repo hay **uno** que
+afirma «con el lease revocado no se despacha», y tiene control positivo:
+`TestWhatsAppFalso_ConElLeaseRevocadoNoSeCapturaNingunEnvio`
+(`internal/adapters/cloudlink/whatsapp_falso_lease_test.go`) monta el adaptador de CloudLink de verdad
+con el transporte falso detrás: con lease vigente el envío se captura, tras revocar no. 🔴 Sigue **sin
+test** el segundo escape: que un Edge **sin** `lease_pubkey_path` no despache (hoy despacha).
 
 ### INV-3 · Sin Redis ni broker en el Edge
 
@@ -329,6 +333,6 @@ bundler, no hay framework, y **no consume el módulo `ui` de `wapp-shared`**.
 | 7 | **Contar las rutas sin decir la regla** | Hay dos superficies (socket unix y loopback) y tres de las de `wapp-ctl` dependen de un flag. Cualquier número sin su regla es falso. Ver `contratos.md`. |
 | 8 | **`POST /v1/daemon/stop` no pide nada si no hay sesión** | `requireCSRFIfSession` solo exige CSRF **si** hay cookie. Sin sesión de operador, cualquier página puede pararte el daemon 24/7. Está en `deuda.md` como hallazgo de seguridad. |
 | 9 | **El bind de `wapp-ctl` se asume loopback y no lo vigila nadie** | La defensa anti-CSRF está escrita apoyándose en que el bind sea `127.0.0.1` (`cmd/wapp-ctl/session.go:163`), pero `-addr` acepta cualquier cosa y **en UAT se arranca con `-addr :8105`**. Ningún `IsLoopback` mira la dirección del listener. |
-| 10 | **Tocar el envío por `internal/app/send.go` o `adapters/whatsmeow/sender.go`** | Es la vertical **muerta**: cero llamantes de producción. El envío real va por `ListenGateway.SendViaLiveClient` (`internal/app/sessionmgr/listen.go`). Ver `deuda.md`. |
+| 10 | **Buscar el envío en `internal/app/send.go`** | Ya no existe: la vertical muerta de envío se borró (`deuda.md`, «código muerto retirado»), y de `adapters/whatsmeow/sender.go` quedó solo lo que usa la escucha. El envío real va por las *closures* `liveSend` / `liveMediaSend` de la sesión (`internal/app/sessionmgr/listen.go`), que llaman al transporte elegido en el arranque: `ListenGateway.SendViaLiveClientTracked` con WhatsApp real, o el registro de capturados con el falso (INV-E10). |
 | 11 | **Fiarse del `CHANGELOG.md`** | Su `[Unreleased]` (`CHANGELOG.md:53`) dice `wapp-cloudlink v0.16.0`; `go.mod:7` fija **`v0.17.0`** (la línea 8 es `wapp-edge-intent v0.3.0`). |
 | 12 | **Contar un `rc=0` como «todo pasó»** | Hay `t.Skip` que se disparan solos (sin Keychain accesible, sin `WAPP_AGENT_TEST_PG_DSN`) y dos ficheros que **ni se compilan** sin su build-tag. Un `rc=0` cuenta igual un `--- SKIP` que un `--- PASS`. Ver `operacion.md`. |
