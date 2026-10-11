@@ -239,6 +239,13 @@ func NewListenGatewayForDevice(db *sql.DB, dialect, jid string, log logger.Logge
 // command_id para etiquetar el acuse antes de subirlo.
 func (g *ListenGateway) Correlator() *Correlator { return g.correlator }
 
+// ComandoDe devuelve el command_id del envío al que pertenece alguno de los messageIDs de un acuse. Es
+// Correlator().Lookup tras un método plano: la frontera del transporte (sessionmgr.Escucha, ADR-0049) no
+// puede nombrar el tipo concreto *Correlator.
+func (g *ListenGateway) ComandoDe(messageIDs []string) (string, bool) {
+	return g.correlator.Lookup(messageIDs)
+}
+
 // SetReceiptHandler cablea el destino de los acuses (delivered/read) de esta sesión. Se llama ANTES de
 // Listen (al construir el gateway). El CloudLink lo usa en T2 para subir el estado; en T0 queda nil
 // (los acuses se mapean y se descartan silenciosamente hasta que T2 lo conecte).

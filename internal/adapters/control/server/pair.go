@@ -40,7 +40,7 @@ type pairManager struct {
 	log    logger
 	// base es el contexto que acota el ciclo de vida de los pairings (independiente del ctx de la
 	// petición HTTP, que muere al responder el POST). Por defecto context.Background; Manager.Pair aplica
-	// su propio timeout (app.DefaultPairTimeout vía WithWhatsmeowPairing).
+	// su propio timeout (app.DefaultPairTimeout vía WithEmparejamiento).
 	base context.Context //nolint:containedctx // ciclo de vida del pairing, no de una request.
 
 	mu     sync.Mutex

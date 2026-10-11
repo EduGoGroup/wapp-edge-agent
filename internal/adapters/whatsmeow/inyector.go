@@ -30,7 +30,6 @@ package whatsmeow
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -77,10 +76,10 @@ const PrefijoSintetico = "SINTETICO-"
 //
 // Por eso es TRANSITORIO y REINTENTABLE, y el mensaje lo dice: quien lo reciba tiene que ESPERAR unos
 // segundos y volver a lanzar la tanda, no ir a comprobar si el daemon está levantado.
-var ErrSinEscuchaViva = errors.New("whatsapp: la sesión no tiene Listener publicado ahora mismo " +
-	"(el daemon corre y la sesión existe: el ciclo de escucha está entre Register y su publicación, o " +
-	"cayó y espera el backoff de reconexión —hasta 60 s—); es TRANSITORIO y REINTENTABLE: espera unos " +
-	"segundos y repite la tanda")
+//
+// EL VALOR VIVE EN EL PUERTO (app.ErrSinEscuchaViva) desde el ADR-0049: el gestor de sesiones decide el 409
+// por él sin importar este paquete, y cualquier otro transporte devuelve el mismo. Aquí queda el nombre.
+var ErrSinEscuchaViva = app.ErrSinEscuchaViva
 
 const (
 	// usuarioChatSintetico es la user-part del JID de chat que se usa cuando el llamante no da ninguno.

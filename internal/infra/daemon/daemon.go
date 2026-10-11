@@ -220,11 +220,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 	authMgr := wiring.BuildAuthManager(cfg, log, authKeyStore, authRelay)
 	authMgr.StartProactiveRefresh(ctx)
 
+	// EL TRANSPORTE DE WHATSAPP SE ELIGE AQUÍ, UNA VEZ (ADR-0049): el gestor de sesiones lo recibe ya
+	// elegido y no construye ningún adaptador.
+	transporte := wiring.TransporteWhatsmeow()
+
 	mgr := sessionmgr.NewManager(layout, sessions, cfg.MaxSessions, log,
 		sessionmgr.WithSharedDB(database, cfg.DBDialect),
 		sessionmgr.WithHealthRegistry(healthReg),
-		sessionmgr.WithWhatsmeowListen(mux, cfg.PushName),
-		sessionmgr.WithWhatsmeowPairing(app.DefaultPairTimeout),
+		sessionmgr.WithEscucha(transporte, mux, cfg.PushName),
+		sessionmgr.WithEmparejamiento(transporte, app.DefaultPairTimeout),
 		sessionmgr.WithMultiDevicePerAccount(cfg.MultiDevicePerAccount),
 		// Ventana temporal de ingesta (ADR-0037): lo que llegó del buzón que WhatsApp reencola tras una
 		// caída no se ingiere. config.Load ya garantiza un margen > 0.

@@ -72,7 +72,7 @@ func managerCableadoDelTodo(t *testing.T, apagada bool) (*Manager, *liveSession,
 	buf := &logConCandado{}
 	m := NewManager(NewLayout(filepath.Join(t.TempDir(), "edge-data")), nil, 5, testLogger(),
 		WithColaDespachador(colaMuda{}),
-		WithWhatsmeowListen(muxDeUnSink{}, "wApp"),
+		WithEscucha(transporteWhatsmeowDeTest(), muxDeUnSink{}, "wApp"),
 		WithDespachadorApagado(apagada),
 	)
 	s := &liveSession{

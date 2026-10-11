@@ -22,14 +22,13 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/cryptostore"
-	"github.com/EduGoGroup/wapp-edge-agent/internal/adapters/whatsmeow"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/app"
 	"github.com/EduGoGroup/wapp-edge-agent/internal/domain"
 )
 
 // ErrPairingNotConfigured: se llamó a Pair sin haber inyectado el factory de pairing (falta
-// WithWhatsmeowPairing en producción). Es un error de cableado, no de runtime de una sesión.
-var ErrPairingNotConfigured = errors.New("sessionmgr: pairing no configurado (usa WithWhatsmeowPairing)")
+// WithEmparejamiento en producción). Es un error de cableado, no de runtime de una sesión.
+var ErrPairingNotConfigured = errors.New("sessionmgr: pairing no configurado (usa WithEmparejamiento)")
 
 // pairRunner abstrae el caso de uso de emparejamiento de UNA sesión (en producción *app.Pair). Run
 // bloquea hasta éxito (devuelve el JID), error o timeout; el Manager lo usa sin conocer whatsmeow, lo
@@ -44,15 +43,19 @@ type pairRunner interface {
 // compartir un sink global). El factory decide qué connector (real o fake) cablear.
 type pairFactory func(custody app.KeyCustody, storeDB *sql.DB, qr app.QRSink) pairRunner
 
-// WithWhatsmeowPairing habilita Manager.Pair con el pairing REAL sobre whatsmeow: construye un Connector
+// WithEmparejamiento habilita Manager.Pair con el conector del transporte recibido (en producción, el pairing
+// REAL sobre whatsmeow): construye un Connector
 // sobre la BD ÚNICA COMPARTIDA (whatsmeow.NewConnector con el dialecto del Manager) que monta el Container
 // per-device con la DEK del pairing, y un app.Pair que pinta el QR en el QRSink que Manager.Pair recibe
 // POR llamada y acota el flujo con timeout. La DEK la genera/sella app.Pair en keys/<id>.key. El QRSink ya
 // NO es global: lo provee cada POST /v1/sessions/pair (un MemoryQRSink propio) para el polling por-emparejamiento.
-func WithWhatsmeowPairing(timeout time.Duration) Option {
+//
+// EL TRANSPORTE LO ELIGE EL ARRANQUE (ADR-0049): el conector lo construye `t.NuevoConector`. Lo que NO
+// cambia con el transporte es quién genera y sella la DEK: sigue siendo app.Pair, en el cliente.
+func WithEmparejamiento(t Transporte, timeout time.Duration) Option {
 	return func(m *Manager) {
 		m.newPairer = func(custody app.KeyCustody, storeDB *sql.DB, qr app.QRSink) pairRunner {
-			connector := whatsmeow.NewConnector(storeDB, m.dbDialect, m.log)
+			connector := t.NuevoConector(storeDB, m.dbDialect, m.log)
 			return app.NewPair(connector, qr, custody, app.WithTimeout(timeout))
 		}
 	}
@@ -156,7 +159,7 @@ func (m *Manager) Pair(ctx context.Context, qr app.QRSink) (app.PairResult, erro
 		return app.PairResult{}, fmt.Errorf("sessionmgr: promover sesión a active: %w", err)
 	}
 
-	// 7. Arrancar la escucha always-on (real vía WithWhatsmeowListen).
+	// 7. Arrancar la escucha always-on (real vía WithEscucha).
 	m.startListener(s)
 
 	// Invariante: solo el JID + el session_id salen del núcleo; la DEK queda sellada en la custodia de la
