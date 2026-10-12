@@ -338,8 +338,8 @@ func (a *authBorder) handleSignupPost(w http.ResponseWriter, r *http.Request) {
 
 // decodePlatformError extrae un mensaje legible del cuerpo de error de POST /api/v1/signup. A diferencia
 // del socket del núcleo (envelope estable {"error":{code,message}}, ver decodeAuthError), este endpoint
-// HOY devuelve texto plano en sus errores (http.Error, ver wapp-cloud-platform/internal/platformadmin/
-// signup.go) y su contrato de error está EN EVOLUCIÓN en paralelo a este cambio (C-03). Por eso se
+// HOY devuelve texto plano en sus errores (http.Error, ver wapp-cloud-platform/internal/modulos/acceso/
+// platformadmin/signup.go) y su contrato de error está EN EVOLUCIÓN en paralelo a este cambio (C-03). Por eso se
 // prueba, en orden: (1) el envelope JSON estándar por si el endpoint lo adopta, (2) un objeto JSON simple
 // {"message":"..."}, (3) el cuerpo crudo como texto (recortado) — nunca se asume un shape concreto.
 func decodePlatformError(raw []byte) string {
