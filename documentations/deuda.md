@@ -2,13 +2,13 @@
 
 Lo que está mal, incompleto o pendiente **hoy**, con `fichero:línea`, qué consecuencia tiene y cómo
 se cerraría. Levantado el **2026-08-30** contra `main` en `490f8212`. **Ampliado el 2026-10-14** con
-S-8, S-9, A-6 y A-7, los hallazgos del laboratorio de flujos (Plan 058 de la raíz de wApp), localizados
+S-8, S-9, A-6, A-7 y A-8, los hallazgos del laboratorio de flujos (Plan 058 de la raíz de wApp), localizados
 por símbolo ese día en la rama `laboratorio` (`e48c038`). Lo que no verifiqué va marcado **NO
 VERIFICADO**, **sin medir** o **leído, sin ejecutar**.
 
-**Recuento** (contando los títulos `### X-n` de este fichero, con X en S, M, A y U): **22**
+**Recuento** (contando los títulos `### X-n` de este fichero, con X en S, M, A y U): **23**
 identificadores. **4 cerrados** (M-1, U-1, U-2 y U-3), **1 cerrado en parte** (M-2), **1 nota
-informativa** (A-7) y **16 abiertos**. Las tablas de §5 y la observación de §6 no llevan identificador
+informativa** (A-7) y **17 abiertos**. Las tablas de §5 y la observación de §6 no llevan identificador
 y no cuentan. Un identificador cerrado no se reutiliza ni se borra.
 
 Lo que **no** está aquí: las trampas que un agente pisa al programar (eso es
@@ -362,6 +362,49 @@ con los constructores de producción.
 **Cómo se cierra.** No hace falta cerrarlo. Si algún día estorba, se excluye `laboratorio/` en el
 recorrido, con un comentario que diga por qué. Mientras tanto, quien escriba en el laboratorio debe
 saber que este candado lo lee.
+
+### A-8 · 🟡 Reiniciar `wapp-ctl` no reinicia el Edge: adopta los hijos con el entorno del arranque viejo
+
+> Añadida el 2026-10-14: hallazgo del laboratorio de flujos (Plan 058 de la raíz, escalón E18, el
+> ecosistema real). Sin corregir. Lo de abajo es **diseño**, no un fallo del supervisor. Lo que es deuda es
+> que nada avisa de que el hijo adoptado arrancó con otra configuración.
+
+Que el hijo sobreviva a `wapp-ctl` es a propósito: «parar wapp-ctl no para el daemon 24/7» (cabecera de
+`internal/adapters/supervisor/supervisor.go`, apartado HIJO ADOPTADO, y el cierre de `cmd/wapp-ctl/main.go:211`
+a `:214`, que no para ni al núcleo ni al cajero). Al volver, `Start` (`internal/adapters/supervisor/supervisor.go:211`)
+encuentra vivo el PID file (`runningLocked`, `:385`), lo da por bueno («Start idempotente») y le arma el
+vigía (`vigilarAdoptadoLocked`, `internal/adapters/supervisor/restart.go:280`, que escribe «supervisor:
+hijo adoptado de un arranque previo»). El entorno del hijo es el de quien lo lanzó (`cfg.Env = os.Environ()`,
+`supervisor.go:184`, y `cmd.Env`, `:269`), y nadie lo compara con el del `wapp-ctl` nuevo.
+
+**Consecuencia.** Quien «reinicia el Edge» matando `wapp-ctl` para quitar una palanca
+(`WAPP_AGENT_DESPACHADOR_APAGADO`, el inyector, el WhatsApp falso) sigue teniendo el Edge del arranque
+anterior: con la palanca echada y, si era el transporte falso, sin WhatsApp de verdad. Medido en E18: el
+`wapp-ctl` nuevo adoptó `agent serve` y `agent cajero` (ppid 1, con la hora de arranque de antes),
+`/v1/diag/outbound/captured` seguía respondiendo (400 `session_id_required`, no 404), y el log nuevo tenía
+**0 líneas `PALANCA`**. La comprobación del runbook («cero líneas PALANCA») daba un falso «bajada». Los
+gritos de la palanca (`internal/infra/daemon/daemon.go:513` para el inyector e
+`internal/app/sessionmgr/despacho.go:104` para el despachador) se escriben al arrancar el núcleo y sus
+sesiones, y el núcleo no volvió a arrancar.
+
+**Deducido, NO VERIFICADO**: el hijo escribe en el `os.Stdout` heredado del `wapp-ctl` que lo lanzó
+(`supervisor.go:270`). Si ese era un fichero de log, el hijo adoptado sigue escribiendo en el log viejo, y
+el nuevo no tendrá ninguna línea suya, ni siquiera el latido.
+
+**Gravedad.** 🟡 y no 🔴, porque exige que alguien echara antes una palanca de diagnóstico, y la forma
+buena ya existe: parar los hijos por el supervisor (`POST /v1/daemon/stop` y `/v1/cajero/stop`, los dos
+200 en E18). Pero el modo de fallo es mudo, y el estado que deja (un Edge sin WhatsApp real que parece
+normal) es de los caros.
+
+**Cómo se cierra.** Que `wapp-ctl` diga en voz alta, al adoptar, que el hijo **no** recoge la configuración
+actual (o que compare un resumen del entorno de diagnóstico y avise si difiere). Que el latido del hijo
+llegue al log de quien lo supervisa. Y que el runbook de la raíz
+(`conversar-con-el-edge-sin-whatsapp.md` §5, que ya lleva el aviso) diga «parar por la API del
+supervisor», nunca «matar `wapp-ctl`».
+
+**Lo reproduce**: laboratorio E18, `conductor-falso.sh bajar` en su primera versión (Plan 058 de la raíz).
+El escalón del Edge que lo provoca a mano: matar solo `wapp-ctl`, arrancarlo otra vez y buscar «hijo
+adoptado» en el log.
 
 ---
 
