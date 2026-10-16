@@ -187,6 +187,37 @@ Si se baja **sin** desvincular (medido el 2026-10-11): la sesión falsa queda `a
 transporte real la reintenta con *backoff* para siempre —`listen: whatsapp: no hay device pareado para
 el JID de la sesión`—. No rompe nada más, y el `DELETE` funciona igual con la palanca ya baja.
 
+
+### 3.4 · El laboratorio de flujos (Plan 058): nada de esto es un gate
+
+`laboratorio/` guarda **programas pedagógicos**: cada uno monta una pieza del Edge con el código de
+producción, dobla lo que la rodea y cuenta por pantalla qué pasa y por qué. Hoy hay uno,
+`laboratorio/e15-edge-inside` (E15 · el Edge por dentro, sin nube): WhatsApp falso → puerta de
+entrantes → cola cifrada → despachador → un sumidero en memoria, y la vuelta (lo enviado se captura y
+se acusa a los ~50 ms). Su ficha vive en la documentación del ecosistema, en
+`documentations/operacion/laboratorio/e15-el-edge-por-dentro.md` de la raíz de wApp.
+
+```bash
+GOTOOLCHAIN=go1.26.5 GOWORK=off go build -tags laboratorio ./laboratorio/...
+GOTOOLCHAIN=go1.26.5 GOWORK=off go run -tags laboratorio ./laboratorio/e15-edge-inside   # rc=0 si todo cuadra
+```
+
+**Por qué ningún gate lo ve.** Todo `.go` de `laboratorio/` empieza por `//go:build laboratorio`: sin
+la etiqueta no lo compilan `go build ./...`, `go vet ./...`, `go test ./...`, `golangci-lint`,
+`make ci-local` ni `make ci-docker`, y `go list ./...` sigue dando 44 paquetes. Es **a propósito**: el
+laboratorio dobla lo que el producto no deja doblar —la custodia de la DEK es un fichero y no el
+Keychain, el plano de control va **sin authorizer**, CloudLink y su lease son un sumidero en memoria—,
+y el ADR-0049 exige que esos dobles vivan **fuera** del binario. Ningún `cmd/` lo importa.
+
+⚠️ **Dos consecuencias que muerden:**
+
+- Un cambio del código puede romper el laboratorio **sin que nada se ponga rojo**. El primer paso de
+  cada sesión es el `go build -tags laboratorio` de arriba.
+- **Un test sí lo lee**: `internal/infra/db/cola_cableado_ast_test.go` parsea todos los `.go` del repo
+  sin mirar etiquetas. Un programa del laboratorio que escriba el nombre del fichero de la cola o
+  convierta `layout.ColaDB()` a `string` pone `make test` en rojo (comprobado el 2026-10-14 con un
+  fichero de sonda).
+
 ---
 
 ## 4 · Publicar una versión

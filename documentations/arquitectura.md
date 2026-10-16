@@ -14,6 +14,10 @@ camina un mensaje. Los contratos concretos (rutas, frames, variables) están en
 | `cmd/wapp-ctl` | `wapp-ctl` | El **supervisor**: arranca y para a los hijos, sirve la web embebida y hace de reverse-proxy al socket del núcleo. | **Sí** |
 | `cmd/colaseed` | `colaseed` | Carga sintética sobre `cola_entrantes.db` (mismo cifrado que producción). **Deliberadamente fuera de `CMDS`** (`Makefile:35`): no se empaqueta, para que nunca llegue al equipo de un cliente. | **No** |
 
+Fuera de la tabla, y fuera de los 44 paquetes, está `laboratorio/`: programas `package main` bajo
+`//go:build laboratorio` que ningún binario enlaza y que `go list ./...` no lista. Qué son y por qué
+ningún gate los ve, en [`operacion.md` §3.4](operacion.md#34--el-laboratorio-de-flujos-plan-058-nada-de-esto-es-un-gate).
+
 En una máquina en marcha hay **tres procesos**: `wapp-ctl` y sus **dos** hijos, `agent serve` y
 `agent cajero`. ⚠️ Cinco comentarios del código llaman al cajero «el **tercer** hijo»
 (`cmd/agent/main.go:11` entre ellos); `wapp-ctl` construye exactamente **dos** supervisores
