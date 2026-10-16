@@ -1,7 +1,15 @@
 # Deuda viva de `wapp-edge-agent`
 
 Lo que está mal, incompleto o pendiente **hoy**, con `fichero:línea`, qué consecuencia tiene y cómo
-se cerraría. Levantado el **2026-08-30** contra `main` en `490f8212`.
+se cerraría. Levantado el **2026-08-30** contra `main` en `490f8212`. **Ampliado el 2026-10-14** con
+S-8, S-9, A-6, A-7 y A-8, los hallazgos del laboratorio de flujos (Plan 058 de la raíz de wApp), localizados
+por símbolo ese día en la rama `laboratorio` (`e48c038`). Lo que no verifiqué va marcado **NO
+VERIFICADO**, **sin medir** o **leído, sin ejecutar**.
+
+**Recuento** (contando los títulos `### X-n` de este fichero, con X en S, M, A y U): **23**
+identificadores. **4 cerrados** (M-1, U-1, U-2 y U-3), **1 cerrado en parte** (M-2), **1 nota
+informativa** (A-7) y **17 abiertos**. Las tablas de §5 y la observación de §6 no llevan identificador
+y no cuentan. Un identificador cerrado no se reutiliza ni se borra.
 
 Lo que **no** está aquí: las trampas que un agente pisa al programar (eso es
 [`constitucion.md`](constitucion.md) §5) y las decisiones deliberadas que parecen defectos y no lo
@@ -96,6 +104,77 @@ Gateway**, y el síntoma aparece en casa del cliente.
 
 **Cómo se cierra.** Que `verify-zero-knowledge.sh` (que ya corre en `make pkg`) falle también si
 `ca.pem` sigue siendo el placeholder. Es una línea de `grep`.
+
+### S-8 · 🔴 El `chat_jid` va EN CLARO en `cola_entrantes.db`
+
+> Añadida el 2026-10-14: hallazgo del laboratorio de flujos (Plan 058 de la raíz, escalón E15). Sin
+> corregir. Localizada por símbolo ese día en la rama `laboratorio` (`e48c038`).
+
+`internal/infra/db/migrations/cola/0001_cola_entrantes.sql:104` (la columna) y `:123` (el índice
+`ix_cola_conv`). El texto y los metadatos sí van sellados con la DEK de la sesión (`texto_enc`,
+`meta_enc`), pero `chat_jid` se escribe tal cual al encolar
+(`internal/adapters/colaentrantes/colaentrantes.go:285`), y el `chat_jid` es el **teléfono del
+cliente**. Medido por E15 sobre los bytes crudos del fichero y de su WAL: «tequeños» aparece **0**
+veces y el número del cliente, **20**.
+
+**Es una decisión escrita, no un descuido**, y por eso hay que revisarla en lugar de parchearla. El DDL
+la justifica en `0001_cola_entrantes.sql:21` a `:25`: `chat_jid` es «la clave de conversación del claim
+atómico del cajero y del índice `ix_cola_conv`», «metadato de enrutado, no contenido de negocio». Hay
+tres cosas que no cuadran con esa justificación:
+
+- **El mismo repo lo trata como dato personal.** `chat_jid` no se loguea en ninguna línea: los logs
+  llevan una huella (`chatJIDHash`, `internal/adapters/colaentrantes/claim.go:15` a `:24`), y el
+  despachador lo prohíbe (`internal/app/despachador/despachador.go:73`). Y el remitente de la misma fila
+  sí va sellado dentro de `meta_enc`.
+- **El claim del cajero que lo justifica no corre en producción** (M-3). Lo que sí lo usa en producción
+  es el sacrificio por tope, que agrupa por conversación
+  (`dropConversacionPendienteMasViejaLocked`,
+  `internal/adapters/colaentrantes/colaentrantes.go:625`), y la entrega, que lo pasa al evento
+  (`internal/app/despachador/despachador.go:574`).
+- **Ningún ADR lo decide.** `grep -rn chat_jid` sobre los ADR de la raíz de wApp no devuelve nada: la
+  decisión vive solo en el comentario del DDL.
+
+**Consecuencia.** Quien copie `cola_entrantes.db` (una copia de seguridad, un disco que se cambia, un
+fichero que se manda a soporte) se lleva la lista de teléfonos que escribieron al negocio, con su
+`ts_whatsapp`, sin necesitar la DEK. Las filas `despachado` duran el TTL (24 h); las de una sesión
+desvinculada, más (S-9). No rompe el zero-knowledge (es el disco del cliente y la nube no lo ve), pero
+deja sin cifrar el dato personal más directo de la fila.
+
+**Cómo se cierra.** Separar las dos funciones del campo: para agrupar y para el índice, una huella con
+llave (por ejemplo, un HMAC con una llave derivada de la DEK de la sesión, que `session_id` ya permite
+elegir); el valor, dentro de `meta_enc`, que ya está sellado. Ojo con la trampa del esquema: aquí no hay
+tabla de versión, así que una columna nueva va con un `ensure…` en Go y no editando el `CREATE TABLE`. Y
+la decisión del DDL se reescribe con ella.
+
+**Sin medir**: si `edge.db` guarda también el número en claro en otras tablas. E15 solo miró
+`cola_entrantes.db`.
+
+**Lo reproduce**: laboratorio E15, paso 5 (Plan 058), PR #15, abierto, en revisión.
+
+### S-9 · 🟡 Desvincular no borra las filas de la cola
+
+> Añadida el 2026-10-14: hallazgo del laboratorio de flujos (Plan 058 de la raíz, escalón E15). Sin
+> corregir. **Leído en el código, sin ejecutar** para las filas `nuevo`.
+
+`Unlink` (`internal/app/sessionmgr/unlink.go:43`) borra la DEK (`clearDEK`, `:73`), el material
+cifrado y la fila de metadatos, y olvida el sobre cacheado de la cola (`forgetColaCrypter`, `:231`, que
+llama a `Store.Forget`, `internal/adapters/colaentrantes/colaentrantes.go:391`). Pero `Forget` solo
+vacía dos mapas en memoria: **ninguna fila de `cola_entrantes` se borra**. La poda por TTL solo toca
+filas `despachado` con sello (`pruneTTLLocked`, `colaentrantes.go:452`), a propósito (REQ-051.7).
+
+**Consecuencia.** Las filas `despachado` de la sesión desvinculada duran hasta el TTL (24 h); E15 lo
+comprobó (las 5 filas siguen tras el `DELETE`). Una fila `nuevo` de esa sesión no la drena nadie: su
+despachador ya paró, el `session_id` no vuelve (cada emparejamiento acuña uno nuevo) y su texto ya no se
+puede abrir, porque la DEK se borró. Solo la saca el sacrificio por tope (`dropOldestLocked`, `:498`),
+bajo presión. Mientras tanto ocupa sitio y conserva el `chat_jid` en claro (S-8).
+
+**Cómo se cierra.** Que `Unlink` borre las filas de la sesión en la cola, en el mismo punto donde hoy
+llama a `forgetColaCrypter` (después del join de las goroutines, para que nadie las vuelva a escribir).
+Antes hay que decidir qué pasa con una fila `nuevo` que no llegó a la nube: con la DEK borrada ya no se
+puede entregar, así que borrarla es reconocer una pérdida que hoy ya existe en silencio.
+
+**Lo reproduce**: laboratorio E15, paso 11 (Plan 058), PR #15, abierto, en revisión (solo las filas
+`despachado`).
 
 ---
 
@@ -238,6 +317,94 @@ contrato no tiene un frame agregable por número. **El corte está en el repo de
 
 (El resto de los ~117 aciertos de «TODO» en el repo son la palabra española en mayúsculas dentro de
 comentarios.)
+
+### A-6 · 🟡 El reintento del despachador espera 5 s, aunque el log anuncie 0 y después 500 ms
+
+> Añadida el 2026-10-14: hallazgo del laboratorio de flujos (Plan 058 de la raíz, escalón E15). Sin
+> corregir.
+
+`esperaTrasFallo` (`internal/app/despachador/despachador.go:154`) se escribió para el poll de 500 ms
+(`pollBase`, `:168`): 0 tras el primer fallo, 500 ms tras el segundo, y duplica hasta 30 s. Esa espera
+solo pone la marca `desde` (`:411`), y el log la anuncia como `proximo_intento_en_ms` (`:456`). Pero
+tras una vuelta sin progreso, `Run` (`:318`) se duerme en el despertador (`:339`), y en producción el
+despertador es `AvisoConRespaldo` (cableado en `internal/app/sessionmgr/despacho.go:149`): despierta con
+un `Enqueue` nuevo o al vencer el **respaldo de 5 s** (`DefaultRespaldoMS`,
+`internal/app/despachador/despertador.go:137`). Sin mensajes nuevos, el reintento llega a los 5 s.
+
+**Consecuencia.** Un tropiezo puntual del sumidero (CloudLink reconectando) retrasa el mensaje del
+cliente 5 s en vez de reintentarlo al instante, y el log da una cifra que no es la real. Medido en E15
+con `-sink-rejects 2`: la primera entrega llega a los **10,0 s** (dos rechazos por 5 s), con el log
+diciendo `proximo_intento_en_ms=0` y después `=500`. El backoff solo manda cuando pasa de 5 s.
+
+**Cómo se cierra.** Que tras un fallo el bucle espere `espera` con su propio temporizador (o que el
+despertador acepte un «despiértame en X»), y no el respaldo. Si se prefiere no tocar el bucle, al menos
+que el log anuncie la espera real. `freno_entrega_test.go` fija los valores de `esperaTrasFallo`, no lo
+que tarda la re-entrega con el despertador de producción.
+
+**Lo reproduce**: laboratorio E15 con `-sink-rejects 2` (Plan 058), PR #15, abierto, en revisión.
+
+### A-7 · El candado de cableado de la cola lee todos los `.go`, sin mirar etiquetas de compilación
+
+> Añadida el 2026-10-14 como **nota informativa**, no como defecto. Salió del laboratorio de flujos
+> (Plan 058 de la raíz, escalón E15).
+
+`fuentesDeProduccion` (`internal/infra/db/cola_cableado_ast_test.go:213`), que alimenta a
+`TestColaSeAbreSiemprePorOpenCola`, recorre el repo entero, descarta solo los `_test.go` (`:233`) y
+parsea cada fichero con `parser.ParseFile` (`:237`) sin evaluar `//go:build`. Para los ficheros por
+sistema operativo (`_linux.go`, `_darwin.go`) eso es lo que se quiere: el candado los vigila aunque el
+binario de la máquina no los compile.
+
+**Consecuencia.** El directorio `laboratorio/` (código `//go:build laboratorio` que no entra en el
+binario, PR #15) también tiene que cumplir la regla de producción: si un fichero del laboratorio escribe
+la ruta de la cola como literal, `make test` se pone en rojo. Hoy no pasa: el laboratorio abre la cola
+con los constructores de producción.
+
+**Cómo se cierra.** No hace falta cerrarlo. Si algún día estorba, se excluye `laboratorio/` en el
+recorrido, con un comentario que diga por qué. Mientras tanto, quien escriba en el laboratorio debe
+saber que este candado lo lee.
+
+### A-8 · 🟡 Reiniciar `wapp-ctl` no reinicia el Edge: adopta los hijos con el entorno del arranque viejo
+
+> Añadida el 2026-10-14: hallazgo del laboratorio de flujos (Plan 058 de la raíz, escalón E18, el
+> ecosistema real). Sin corregir. Lo de abajo es **diseño**, no un fallo del supervisor. Lo que es deuda es
+> que nada avisa de que el hijo adoptado arrancó con otra configuración.
+
+Que el hijo sobreviva a `wapp-ctl` es a propósito: «parar wapp-ctl no para el daemon 24/7» (cabecera de
+`internal/adapters/supervisor/supervisor.go`, apartado HIJO ADOPTADO, y el cierre de `cmd/wapp-ctl/main.go:211`
+a `:214`, que no para ni al núcleo ni al cajero). Al volver, `Start` (`internal/adapters/supervisor/supervisor.go:211`)
+encuentra vivo el PID file (`runningLocked`, `:385`), lo da por bueno («Start idempotente») y le arma el
+vigía (`vigilarAdoptadoLocked`, `internal/adapters/supervisor/restart.go:280`, que escribe «supervisor:
+hijo adoptado de un arranque previo»). El entorno del hijo es el de quien lo lanzó (`cfg.Env = os.Environ()`,
+`supervisor.go:184`, y `cmd.Env`, `:269`), y nadie lo compara con el del `wapp-ctl` nuevo.
+
+**Consecuencia.** Quien «reinicia el Edge» matando `wapp-ctl` para quitar una palanca
+(`WAPP_AGENT_DESPACHADOR_APAGADO`, el inyector, el WhatsApp falso) sigue teniendo el Edge del arranque
+anterior: con la palanca echada y, si era el transporte falso, sin WhatsApp de verdad. Medido en E18: el
+`wapp-ctl` nuevo adoptó `agent serve` y `agent cajero` (ppid 1, con la hora de arranque de antes),
+`/v1/diag/outbound/captured` seguía respondiendo (400 `session_id_required`, no 404), y el log nuevo tenía
+**0 líneas `PALANCA`**. La comprobación del runbook («cero líneas PALANCA») daba un falso «bajada». Los
+gritos de la palanca (`internal/infra/daemon/daemon.go:513` para el inyector e
+`internal/app/sessionmgr/despacho.go:104` para el despachador) se escriben al arrancar el núcleo y sus
+sesiones, y el núcleo no volvió a arrancar.
+
+**Deducido, NO VERIFICADO**: el hijo escribe en el `os.Stdout` heredado del `wapp-ctl` que lo lanzó
+(`supervisor.go:270`). Si ese era un fichero de log, el hijo adoptado sigue escribiendo en el log viejo, y
+el nuevo no tendrá ninguna línea suya, ni siquiera el latido.
+
+**Gravedad.** 🟡 y no 🔴, porque exige que alguien echara antes una palanca de diagnóstico, y la forma
+buena ya existe: parar los hijos por el supervisor (`POST /v1/daemon/stop` y `/v1/cajero/stop`, los dos
+200 en E18). Pero el modo de fallo es mudo, y el estado que deja (un Edge sin WhatsApp real que parece
+normal) es de los caros.
+
+**Cómo se cierra.** Que `wapp-ctl` diga en voz alta, al adoptar, que el hijo **no** recoge la configuración
+actual (o que compare un resumen del entorno de diagnóstico y avise si difiere). Que el latido del hijo
+llegue al log de quien lo supervisa. Y que el runbook de la raíz
+(`conversar-con-el-edge-sin-whatsapp.md` §5, que ya lleva el aviso) diga «parar por la API del
+supervisor», nunca «matar `wapp-ctl`».
+
+**Lo reproduce**: laboratorio E18, `conductor-falso.sh bajar` en su primera versión (Plan 058 de la raíz).
+El escalón del Edge que lo provoca a mano: matar solo `wapp-ctl`, arrancarlo otra vez y buscar «hijo
+adoptado» en el log.
 
 ---
 
